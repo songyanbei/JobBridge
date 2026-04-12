@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     oss_access_key: str = ""
     oss_secret_key: str = ""
     oss_bucket: str = ""
+    oss_local_dir: str = "uploads"           # 本地存储目录（oss_provider=local 时生效）
+    oss_local_url_prefix: str = "/files"     # 本地文件 URL 前缀
 
     # ---- 运营后台 JWT ----
     admin_jwt_secret: str = "change-me"

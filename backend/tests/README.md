@@ -1,11 +1,12 @@
-# Phase 1 测试运行说明
+# Backend Test Runbook
 
-## 环境准备
+## Environment
 
-1. 复制 `.env.example` 为 `.env`，填入本地数据库和 Redis 连接信息
-2. 安装依赖：`pip install -r requirements.txt`
+1. Copy `.env.example` to `.env`
+2. Fill in local MySQL and Redis connection values
+3. Install dependencies: `pip install -r requirements.txt`
 
-## 数据库初始化
+## Database Bootstrap
 
 ```bash
 # 建库
@@ -19,20 +20,20 @@ mysql -u root -p jobbridge < sql/seed.sql
 mysql -u root -p jobbridge < sql/seed_cities_full.sql
 ```
 
-## 运行测试
+## Test Commands
 
 ### Linux / macOS / Git Bash
 
 ```bash
 cd backend
 
-# 单元测试（不需要 MySQL/Redis）
+# Unit tests
 pytest tests/unit/ -v
 
-# 集成测试（需要启动 MySQL + Redis）
+# Integration tests
 RUN_INTEGRATION=1 pytest tests/integration/ -v
 
-# 全部测试
+# All tests
 RUN_INTEGRATION=1 pytest tests/ -v
 ```
 
@@ -41,13 +42,13 @@ RUN_INTEGRATION=1 pytest tests/ -v
 ```powershell
 cd backend
 
-# 单元测试（不需要 MySQL/Redis）
+# Unit tests
 pytest tests/unit/ -v
 
-# 集成测试（需要启动 MySQL + Redis）
+# Integration tests
 $env:RUN_INTEGRATION='1'; pytest tests/integration/ -v
 
-# 全部测试
+# All tests
 $env:RUN_INTEGRATION='1'; pytest tests/ -v
 ```
 
@@ -56,20 +57,55 @@ $env:RUN_INTEGRATION='1'; pytest tests/ -v
 ```cmd
 cd backend
 
-:: 单元测试
+:: Unit tests
 pytest tests/unit/ -v
 
-:: 集成测试
+:: Integration tests
 set RUN_INTEGRATION=1 && pytest tests/integration/ -v
 
-:: 全部测试
+:: All tests
 set RUN_INTEGRATION=1 && pytest tests/ -v
 ```
 
-## 自测验证
+## Phase 2 Pressure Test
+
+The composite Phase 2 pressure test covers:
+
+- WeCom crypto and callback parsing
+- Redis rate-limit / dedup / queue flow
+- Mocked Qwen provider extract + rerank
+- Local storage save / exists / delete
+- Mocked WeCom client outbound calls
+
+### PowerShell
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe tests/perf/phase2_pressure.py
+```
+
+### Linux / macOS / Git Bash
+
+```bash
+cd backend
+python tests/perf/phase2_pressure.py
+```
+
+Example custom run:
+
+```bash
+python tests/perf/phase2_pressure.py --messages 2400 --ingress-workers 32 --consumer-workers 16 --client-iterations 1800 --client-workers 48
+```
+
+## Smoke Checks
 
 ```bash
 cd backend
 python -c "from app.models import *; print('models OK')"
 python -c "from app.schemas import *; print('schemas OK')"
+python -c "from app.llm import get_intent_extractor, get_reranker; print('llm OK')"
+python -c "from app.storage import get_storage; print('storage OK')"
+python -c "from app.wecom.client import WeComClient; print('wecom OK')"
+python -c "from app.wecom.crypto import verify_signature, decrypt_message; print('crypto OK')"
+python -c "from app.wecom.callback import parse_message, WeComMessage; print('callback OK')"
 ```

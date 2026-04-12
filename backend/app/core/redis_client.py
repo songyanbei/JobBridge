@@ -74,10 +74,16 @@ QUEUE_INCOMING = "queue:incoming"
 QUEUE_DEAD_LETTER = "queue:dead_letter"
 
 
-def enqueue_message(message_json: str) -> None:
-    """将消息推入待处理队列。"""
+def enqueue_message(message_json: str, queue: str = QUEUE_INCOMING) -> None:
+    """将消息推入指定队列。
+
+    Args:
+        message_json: 消息 JSON 字符串
+        queue: 目标队列 key，默认为 queue:incoming，
+               死信场景传入 QUEUE_DEAD_LETTER
+    """
     r = get_redis()
-    r.rpush(QUEUE_INCOMING, message_json)
+    r.rpush(queue, message_json)
 
 
 def dequeue_message(timeout: int = 0) -> str | None:
