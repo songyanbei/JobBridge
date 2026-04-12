@@ -103,17 +103,22 @@ JobBridge/
 
 - [方案设计](方案设计_v0.1.md) — 产品需求、数据模型、匹配引擎、多轮对话、运营后台、部署方案
 - [技术架构](docs/architecture.md) — 分层架构、接口契约、前后端通信协议、Prompt 设计规范
+- [实施计划](docs/implementation-plan.md) — 8 阶段开发与测试计划、里程碑、验收标准
+- [Phase 0 验收](docs/phase0-kickoff.md) — Kickoff 基线确认、环境验证、外部依赖清单
+- [前后端协作](collaboration/使用说明.md) — 前后端协作工作区使用说明
 
 ## 当前状态
 
-**阶段**：骨架代码完成，进入业务开发
+**阶段**：Phase 0（Kickoff）验收通过，准备进入 Phase 1（数据与后端骨架）
 
+- ✅ 需求设计 + 架构设计 + 实施计划已冻结
 - ✅ 数据库 DDL（11 张表）+ 种子数据
 - ✅ 项目骨架 + 核心抽象接口
 - ✅ Docker 开发/生产环境配置
 - ✅ 前端 P0 原型
-- 🔧 业务逻辑实现中（services 层）
-- 🔧 运营后台前端开发中
+- ✅ 开发环境全链路验证通过（WSL2 + Docker + MySQL + Redis + /health）
+- ✅ 前后端协作文档就绪（`collaboration/`）
+- 🔜 Phase 1：ORM 模型 + Pydantic Schemas
 
 ## License
 
