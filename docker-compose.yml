@@ -1,0 +1,60 @@
+# ============================================================================
+# JobBridge 本地开发基础设施
+# 使用: docker compose up -d
+# ============================================================================
+# 启动后：
+#   MySQL 首次启动会自动执行 sql/ 目录下的 .sql 文件（按文件名顺序）：
+#     1. schema.sql              (建表)
+#     2. seed.sql                (工种字典 + 系统配置 + 默认管理员)
+#     3. seed_cities_full.sql    (342 条全国地级行政区)
+#
+#   默认管理员账号 / 密码: admin / admin123  （生产部署前必改）
+#   MySQL root 密码:        root
+#   业务数据库账号:         jobbridge / jobbridge
+# ============================================================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: jobbridge-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: jobbridge
+      MYSQL_USER: jobbridge
+      MYSQL_PASSWORD: jobbridge
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/sql:/docker-entrypoint-initdb.d:ro
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+      --default-time-zone=+08:00
+      --explicit_defaults_for_timestamp=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: jobbridge-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  mysql_data:
+  redis_data:

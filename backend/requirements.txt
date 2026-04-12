@@ -1,0 +1,43 @@
+# ============================================================================
+# JobBridge backend dependencies
+# Python 3.11+
+# ============================================================================
+
+# Web framework
+fastapi>=0.110,<0.120
+uvicorn[standard]>=0.27,<0.35
+
+# Database
+sqlalchemy>=2.0,<2.1
+pymysql>=1.1,<2.0
+cryptography>=42.0            # required by pymysql for auth
+alembic>=1.13,<2.0
+
+# Validation & settings
+pydantic>=2.6,<3.0
+pydantic-settings>=2.2,<3.0
+
+# Cache / session
+redis>=5.0,<6.0
+
+# HTTP client (for LLM and 企微 API calls)
+httpx>=0.27,<0.29
+
+# Auth
+bcrypt>=4.1,<5.0
+python-jose[cryptography]>=3.3,<4.0
+
+# Scheduled tasks
+apscheduler>=3.10,<4.0
+
+# Utils
+python-dotenv>=1.0,<2.0
+python-multipart>=0.0.9       # FastAPI form/file uploads
+
+# Logging
+loguru>=0.7,<1.0
+
+# Testing (dev only)
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0
+httpx>=0.27                   # also used as test client

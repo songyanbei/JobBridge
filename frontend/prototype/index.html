@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI蓝领匹配引擎 - 后台 V2</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .hidden-el { display: none !important; }
+        /* 抽屉动效 */
+        .drawer-open { transform: translateX(0); }
+        .drawer-closed { transform: translateX(100%); }
+        /* 断网横幅动效 */
+        @keyframes slideDown { from { transform: translateY(-100%); } to { transform: translateY(0); } }
+        .offline-banner { animation: slideDown 0.3s ease-out; }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800 font-sans h-screen overflow-hidden">
+
+    <!-- 🔴 全局断网横幅 (边界状态) -->
+    <div id="state-offline" class="hidden-el offline-banner w-full bg-red-500 text-white text-center py-2 text-sm font-bold z-[100] fixed top-0 shadow-md">
+        <i class="fa-solid fa-wifi text-red-200 mr-2"></i> 网络连接已断开，请检查您的网络设置，系统正在尝试重连...
+    </div>
+
+    <!-- 🔴 LLM 宕机横幅 (边界状态) -->
+    <div id="state-llm-error" class="hidden-el offline-banner w-full bg-yellow-500 text-yellow-900 text-center py-2 text-sm font-bold z-[99] fixed top-0 shadow-md">
+        <i class="fa-solid fa-robot mr-2"></i> LLM 节点响应超时，当前审核内容可能丢失 AI 结构化建议，请转人工精核或稍后重试。
+    </div>
+
+    <!-- ================= 页面 1：登录页 ================= -->
+    <div id="page-login" class="flex h-screen w-full items-center justify-center bg-gray-100 absolute z-50">
+        <div class="bg-white p-10 rounded-lg shadow-lg w-[400px]">
+            <div class="text-center mb-8">
+                <div class="bg-blue-600 text-white w-12 h-12 rounded-lg flex items-center justify-center mx-auto mb-4 text-xl shadow-md"><i class="fa-solid fa-robot"></i></div>
+                <h1 class="text-2xl font-bold text-gray-800">AI 蓝领匹配系统</h1>
+            </div>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">管理员账号</label>
+                    <input type="text" value="admin" class="w-full px-4 py-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-1">密码 <span class="text-xs text-gray-400 font-normal ml-2">(原型测试请用 admin123)</span></label>
+                    <input type="password" id="login-pwd" value="admin123" class="w-full px-4 py-2 border border-gray-300 rounded focus:ring-2 focus:ring-blue-500 outline-none" onkeypress="if(event.key === 'Enter') doLogin()">
+                </div>
+                <button onclick="doLogin()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded transition">登 录 (Enter)</button>
+            </div>
+            <div class="mt-8 text-center text-xs text-gray-400">v0.1.0 (prototype)</div>
+        </div>
+    </div>
+
+    <!-- ================= 主框架布局 ================= -->
+    <div id="app-layout" class="flex h-screen hidden-el pt-0 mt-0" style="padding-top: env(safe-area-inset-top);">
+        
+        <!-- 左侧菜单 (全量补齐) -->
+        <aside class="w-64 bg-gray-900 text-white flex flex-col flex-shrink-0 relative z-20">
+            <div class="h-16 flex items-center px-6 border-b border-gray-800 font-bold text-lg">
+                <i class="fa-solid fa-robot text-blue-400 mr-3"></i> 匹配引擎后台
+            </div>
+            <nav class="flex-1 overflow-y-auto py-4 space-y-1 custom-scrollbar">
+                <a href="#" onclick="switchPage('page-dashboard')" id="nav-dashboard" class="flex items-center px-6 py-3 text-gray-300 hover:bg-gray-800 hover:text-white transition"><i class="fa-solid fa-chart-pie w-6"></i> <span>今日概览</span></a>
+                <a href="#" onclick="switchPage('page-audit')" id="nav-audit" class="flex items-center px-6 py-3 text-gray-300 hover:bg-gray-800 hover:text-white transition bg-gray-800 text-white border-l-4 border-blue-500"><i class="fa-solid fa-clipboard-check w-6"></i> <span>审核工作台</span> <span class="ml-auto bg-red-500 text-xs px-2 py-0.5 rounded-full font-bold" id="sidebar-badge">42</span></a>
+                
+                <div class="px-6 pt-4 pb-2 text-xs text-gray-500 uppercase font-bold">内容管理</div>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-briefcase w-6"></i> 岗位管理</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-file-lines w-6"></i> 简历管理</a>
+
+                <div class="px-6 pt-4 pb-2 text-xs text-gray-500 uppercase font-bold">账号管理</div>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-industry w-6"></i> 厂家管理</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-handshake w-6"></i> 中介管理</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-helmet-safety w-6"></i> 工人管理</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-user-lock w-6 text-red-400"></i> 黑名单</a>
+
+                <div class="px-6 pt-4 pb-2 text-xs text-gray-500 uppercase font-bold">配置与字典</div>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-map-location-dot w-6"></i> 城市字典</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-tags w-6"></i> 工种字典</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-ban w-6"></i> 敏感词字典</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-sliders w-6"></i> 系统配置</a>
+
+                <div class="px-6 pt-4 pb-2 text-xs text-gray-500 uppercase font-bold">数据与日志</div>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-solid fa-chart-line w-6"></i> 数据看板 (Reports)</a>
+                <a href="#" class="flex items-center px-6 py-2 text-sm text-gray-400 hover:text-white"><i class="fa-regular fa-comments w-6"></i> 对话日志</a>
+            </nav>
+        </aside>
+
+        <!-- 右侧主区 -->
+        <main class="flex-1 flex flex-col min-w-0 bg-gray-50 relative">
+            <!-- 顶栏 -->
+            <header class="h-16 bg-white border-b flex items-center justify-between px-6 shadow-sm z-10 flex-shrink-0">
+                <div class="flex items-center space-x-2">
+                    <span class="text-sm text-gray-400">首页 / </span>
+                    <h2 class="text-lg font-semibold text-gray-800" id="top-title">审核工作台</h2>
+                </div>
+                <div class="flex items-center space-x-6">
+                    <div class="relative">
+                        <i class="fa-solid fa-search absolute left-3 top-2.5 text-gray-400 text-sm"></i>
+                        <input type="text" placeholder="全局搜索 UserID/内容..." class="pl-9 pr-4 py-1.5 bg-gray-100 rounded-full text-sm focus:bg-white focus:border-blue-300 focus:ring-2 focus:ring-blue-100 outline-none w-64 transition-all">
+                    </div>
+                    <!-- 通知铃铛 -->
+                    <div class="relative cursor-pointer text-gray-500 hover:text-gray-800 transition" onclick="showToast('暂无新通知')">
+                        <i class="fa-solid fa-bell text-lg"></i>
+                        <span class="absolute -top-1 -right-1 bg-red-500 border-2 border-white w-3 h-3 rounded-full"></span>
+                    </div>
+                    <!-- 头像菜单 -->
+                    <div class="flex items-center cursor-pointer group relative">
+                        <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Admin" class="w-8 h-8 rounded-full bg-gray-200 border">
+                        <span class="ml-2 text-sm font-medium">Admin</span>
+                        <i class="fa-solid fa-chevron-down text-xs ml-2 text-gray-400"></i>
+                        <div class="absolute right-0 top-10 w-32 bg-white rounded shadow-lg border border-gray-100 hidden group-hover:block z-50">
+                            <a href="#" class="block px-4 py-2 text-sm text-gray-700 hover:bg-gray-50">个人设置</a>
+                            <a href="#" class="block px-4 py-2 text-sm text-red-600 hover:bg-red-50 border-t" onclick="location.reload()">退出登录</a>
+                        </div>
+                    </div>
+                </div>
+            </header>
+
+            <!-- 动态路由容器 -->
+            <div class="flex-1 overflow-auto p-6 relative custom-scrollbar" id="main-content">
+
+                <!-- =============== P0 首页 Dashboard =============== -->
+                <div id="page-dashboard" class="hidden-el max-w-7xl mx-auto">
+                    <div class="flex justify-between items-center mb-6">
+                        <h3 class="font-bold text-gray-700">实时业务大屏</h3>
+                        <div class="flex space-x-4 items-center">
+                            <div class="bg-white border rounded p-1 flex text-sm shadow-sm">
+                                <button class="px-3 py-1 bg-blue-50 text-blue-600 font-bold rounded">今日</button>
+                                <button class="px-3 py-1 text-gray-500 hover:bg-gray-50 rounded">本周</button>
+                                <button class="px-3 py-1 text-gray-500 hover:bg-gray-50 rounded">本月</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 5 指标网格 -->
+                    <div class="grid grid-cols-5 gap-4 mb-6">
+                        <div class="bg-white p-4 rounded-lg shadow-sm border border-gray-100 cursor-pointer hover:shadow-md transition" onclick="showToast('跳转: 活跃用户明细')">
+                            <div class="text-sm text-gray-500 mb-1">今日活跃用户</div>
+                            <div class="text-2xl font-bold text-gray-800">1,245</div>
+                            <div class="mt-2 text-xs text-green-600"><i class="fa-solid fa-arrow-up"></i> 12% 较昨日</div>
+                        </div>
+                        <div class="bg-white p-4 rounded-lg shadow-sm border border-gray-100 cursor-pointer hover:shadow-md transition" onclick="showToast('跳转: 上传量明细')">
+                            <div class="text-sm text-gray-500 mb-1">新增上传 (岗+简)</div>
+                            <div class="text-2xl font-bold text-gray-800">342</div>
+                            <div class="mt-2 text-xs text-red-500"><i class="fa-solid fa-arrow-down"></i> 5% 较昨日</div>
+                        </div>
+                        <div class="bg-white p-4 rounded-lg shadow-sm border border-gray-100 cursor-pointer hover:shadow-md transition" onclick="showToast('跳转: 检索分析页')">
+                            <div class="text-sm text-gray-500 mb-1">🎯 检索命中率</div>
+                            <div class="text-2xl font-bold text-gray-800">82.1%</div>
+                            <div class="mt-2 text-xs text-green-600"><i class="fa-solid fa-arrow-up"></i> 1.5% 较昨日</div>
+                        </div>
+                        <div class="bg-white p-4 rounded-lg border border-transparent hover:border-gray-200 shadow-sm cursor-pointer hover:shadow-md transition" onclick="showToast('跳转: 空召回明细')">
+                            <div class="text-sm text-gray-500 mb-1">💡 空召回率</div>
+                            <div class="text-2xl font-bold text-gray-800">18.5%</div>
+                            <div class="mt-2 text-xs text-green-600"><i class="fa-solid fa-arrow-down"></i> 2% (健康)</div>
+                        </div>
+                        <div class="bg-red-50 p-4 rounded-lg border border-red-200 cursor-pointer hover:bg-red-100 transition shadow-sm" onclick="switchPage('page-audit')">
+                            <div class="text-sm text-red-600 font-bold mb-1">🚨 待审队列</div>
+                            <div class="text-2xl font-bold text-red-600 dash-audit-num">42</div>
+                            <div class="mt-2 text-xs text-red-700">点击前往审核工作台 <i class="fa-solid fa-arrow-right"></i></div>
+                        </div>
+                    </div>
+
+                    <!-- 趋势图占位区 (3图分离) -->
+                    <div class="grid grid-cols-3 gap-6">
+                        <div class="bg-white rounded-lg shadow-sm border border-gray-100 p-4 h-72 flex flex-col">
+                            <div class="font-bold text-sm mb-2">活跃趋势 (7天)</div>
+                            <div class="flex-1 bg-gray-50 border border-dashed rounded flex items-center justify-center text-gray-400 text-xs">Echarts: 折线图</div>
+                        </div>
+                        <div class="bg-white rounded-lg shadow-sm border border-gray-100 p-4 h-72 flex flex-col">
+                            <div class="font-bold text-sm mb-2">上传分类占比</div>
+                            <div class="flex-1 bg-gray-50 border border-dashed rounded flex items-center justify-center text-gray-400 text-xs">Echarts: 堆叠柱状图</div>
+                        </div>
+                        <div class="bg-white rounded-lg shadow-sm border border-gray-100 p-4 h-72 flex flex-col">
+                            <div class="font-bold text-sm mb-2">命中与检索 (双轴)</div>
+                            <div class="flex-1 bg-gray-50 border border-dashed rounded flex items-center justify-center text-gray-400 text-xs">Echarts: 折线+柱状图</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- =============== P0 审核工作台 =============== -->
+                <div id="page-audit" class="max-w-[1400px] mx-auto h-full flex flex-col hidden-el">
+                    <!-- 顶层进度与模式栏 -->
+                    <div class="flex justify-between items-center mb-4 bg-white p-3 rounded-lg shadow-sm border border-gray-200 flex-shrink-0">
+                        <div class="flex items-center space-x-4 w-1/3">
+                            <div class="text-sm font-bold text-gray-600">处理进度</div>
+                            <div class="w-full bg-gray-200 rounded-full h-2"><div class="bg-blue-500 h-2 rounded-full w-[15%]"></div></div>
+                            <div class="text-sm text-gray-500 w-24 whitespace-nowrap"><span class="dash-audit-num font-bold">42</span> 待办</div>
+                        </div>
+                        <div class="flex items-center space-x-4">
+                            <span class="text-xs text-green-600"><i class="fa-solid fa-check-circle"></i> 上一条已通过</span>
+                            <button onclick="handleAudit('undo')" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded text-xs border border-gray-300 transition" title="撤销 (U)"><i class="fa-solid fa-rotate-left mr-1"></i> 撤销</button>
+                            <button onclick="toggleModal('help-modal')" class="w-7 h-7 rounded-full bg-blue-50 text-blue-600 hover:bg-blue-100 transition flex items-center justify-center" title="快捷键 (?)"><i class="fa-solid fa-keyboard"></i></button>
+                            <div class="border-l pl-4 ml-2 flex bg-gray-100 rounded p-0.5">
+                                <button onclick="toggleViewMode('detail')" id="btn-mode-detail" class="px-3 py-1 text-xs rounded bg-white shadow-sm font-bold text-blue-600">精读</button>
+                                <button onclick="toggleViewMode('list')" id="btn-mode-list" class="px-3 py-1 text-xs rounded text-gray-500 hover:text-gray-800">列表</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 🔴 空状态 (受 JS 控制) -->
+                    <div id="audit-empty-state" class="hidden-el absolute inset-0 bg-gray-50 z-20 flex flex-col items-center justify-center pt-20">
+                        <div class="text-6xl mb-4">🎉</div>
+                        <h3 class="text-xl font-bold text-gray-700">队列已清空！</h3>
+                        <p class="text-gray-500 mt-2">暂无待审内容，去喝杯咖啡休息一下吧。</p>
+                        <button onclick="location.reload()" class="mt-6 px-6 py-2 bg-white border border-gray-300 rounded shadow-sm hover:bg-gray-50">刷新重试</button>
+                    </div>
+
+                    <!-- ================= 模式 1：精读模式 (左右对照) ================= -->
+                    <div id="view-mode-detail" class="flex-1 grid grid-cols-12 gap-6 min-h-0 relative">
+                        
+                        <!-- 左半区：原始输入 -->
+                        <div class="col-span-5 bg-white rounded-lg shadow-sm border border-gray-200 flex flex-col h-full overflow-hidden">
+                            <div class="px-4 py-3 border-b bg-gray-50 flex justify-between items-center">
+                                <div class="font-bold text-sm"><i class="fa-solid fa-file-lines text-gray-400 mr-1"></i> 原始提交内容</div>
+                                <span class="text-xs text-gray-500 font-mono">ID: job_998273</span>
+                            </div>
+                            <div class="p-5 overflow-y-auto flex-1 custom-scrollbar">
+                                <!-- 用户卡片 -> 点击呼出 Drawer -->
+                                <div onclick="toggleDrawer('user-drawer')" class="flex items-center p-3 bg-blue-50 border border-blue-100 rounded mb-5 cursor-pointer hover:bg-blue-100 transition group shadow-sm">
+                                    <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Jack" class="w-10 h-10 rounded-full border border-white shadow-sm">
+                                    <div class="ml-3 flex-1">
+                                        <div class="font-bold text-sm text-blue-900">张老板五金厂 <span class="bg-blue-200 text-blue-800 text-[10px] px-1 rounded ml-1 font-normal">厂家</span></div>
+                                        <div class="text-xs text-blue-600 mt-0.5">历史审核：通过 120 | 驳回 <span class="text-red-500 font-bold">2</span></div>
+                                    </div>
+                                    <div class="text-xs text-blue-500 group-hover:text-blue-700 flex flex-col items-end">
+                                        <span>看历史</span><i class="fa-solid fa-chevron-right mt-1"></i>
+                                    </div>
+                                </div>
+                                
+                                <h4 class="text-xs font-bold text-gray-400 mb-2 uppercase">原文文本</h4>
+                                <div class="bg-gray-50 p-4 rounded border text-gray-700 leading-relaxed text-sm mb-6 whitespace-pre-wrap font-serif">急招焊工3名，要二保焊，包吃住，一天300，在浦东张江，限男的，50岁以下，鸽子勿扰。急急急！！！</div>
+
+                                <h4 class="text-xs font-bold text-gray-400 mb-2 uppercase">附件图片 (支持全屏)</h4>
+                                <div class="w-32 aspect-square bg-gray-200 rounded border border-gray-300 cursor-pointer hover:opacity-80 relative group overflow-hidden shadow-sm" onclick="toggleModal('image-modal')">
+                                    <img src="https://images.unsplash.com/photo-1504328345606-18bbc8c9d7d1?auto=format&fit=crop&w=300&q=80" class="object-cover w-full h-full">
+                                    <div class="absolute inset-0 bg-black bg-opacity-40 hidden group-hover:flex items-center justify-center text-white text-xs font-bold backdrop-blur-sm"><i class="fa-solid fa-magnifying-glass-plus mr-1"></i> 放大预览</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 右半区：AI 结构化与操作区 (🔴 红框警示) -->
+                        <div class="col-span-7 bg-white rounded-lg shadow-lg border-2 border-red-500 flex flex-col h-full relative overflow-hidden transition-opacity" id="audit-right-panel">
+                            
+                            <!-- 🔴 LLM 审核建议块 (C块 - 核心补充) -->
+                            <div class="bg-red-50 border-b border-red-200 p-4 relative">
+                                <div class="absolute right-4 top-4 text-red-200 opacity-30 text-6xl"><i class="fa-solid fa-shield-halved"></i></div>
+                                <div class="flex items-center justify-between relative z-10 mb-2">
+                                    <div class="flex items-center space-x-2">
+                                        <span class="bg-red-600 text-white px-2 py-0.5 rounded text-sm font-bold shadow-sm">AI 建议：拦截驳回</span>
+                                        <span class="text-[10px] text-red-500 font-medium border border-red-200 px-1.5 py-0.5 rounded bg-white">系统置信度 99%</span>
+                                    </div>
+                                    <div class="text-right text-xs">
+                                        <span class="text-gray-500">查重分析：</span><span class="font-medium text-green-600 bg-green-50 px-1 py-0.5 rounded">无重复项</span>
+                                    </div>
+                                </div>
+                                <div class="text-xs text-red-800 space-y-1 relative z-10 bg-white bg-opacity-60 p-2 rounded border border-red-100">
+                                    <p><i class="fa-solid fa-circle-exclamation w-4 text-red-500"></i> 触发强规则：违规限制词拦截 <span class="font-bold">("限男的")</span></p>
+                                    <p><i class="fa-solid fa-circle-exclamation w-4 text-red-500"></i> 触发强规则：年龄硬限制不合规 <span class="font-bold">("50岁以下")</span></p>
+                                </div>
+                            </div>
+                            
+                            <!-- 表单字段区 -->
+                            <div class="p-5 flex-1 overflow-y-auto space-y-4 pb-4 custom-scrollbar">
+                                <div class="flex items-center border-b border-gray-100 pb-2">
+                                    <div class="w-20 text-sm text-gray-500 text-right pr-4">工种</div>
+                                    <div class="flex-1 text-sm font-medium">焊工 / 二保焊</div>
+                                    <div class="w-16 text-right"><span class="text-[10px] bg-green-100 text-green-700 px-1 rounded">98% 🟢</span></div>
+                                </div>
+                                <div class="flex items-center border-b border-gray-100 pb-2">
+                                    <div class="w-20 text-sm text-gray-500 text-right pr-4">薪资</div>
+                                    <div class="flex-1 text-sm font-medium">300元/天</div>
+                                    <div class="w-16 text-right"><span class="text-[10px] bg-green-100 text-green-700 px-1 rounded">95% 🟢</span></div>
+                                </div>
+                                <!-- 修改痕迹 -->
+                                <div class="flex items-center border-b border-gray-100 pb-2 bg-yellow-50 -mx-5 px-5 py-2">
+                                    <div class="w-20 text-sm text-gray-500 text-right pr-4">地点</div>
+                                    <div class="flex-1 text-sm">
+                                        <span class="line-through text-gray-400 mr-2 text-xs">上海市</span>
+                                        <span class="font-bold text-blue-700 border-b border-blue-400">上海市-浦东新区</span>
+                                        <span class="ml-2 text-[10px] bg-blue-100 text-blue-600 px-1 rounded">👤已修改</span>
+                                    </div>
+                                    <div class="w-16 text-right"><span class="text-[10px] bg-yellow-100 text-yellow-700 px-1 rounded">82% 🟡</span></div>
+                                </div>
+                                <!-- 敏感词高亮 -->
+                                <div class="flex items-center border-b border-red-100 pb-2 bg-red-50 -mx-5 px-5 py-2">
+                                    <div class="w-20 text-sm text-red-600 font-bold text-right pr-4">性别</div>
+                                    <div class="flex-1 text-sm text-red-700 font-medium border-b border-red-300 pb-0.5">仅限男性 <span class="ml-2 text-[10px] font-normal text-red-400">提取自: "限男的"</span></div>
+                                    <div class="w-16 text-right"><span class="text-[10px] bg-red-600 text-white px-1 rounded">高危 🔴</span></div>
+                                </div>
+                            </div>
+
+                            <!-- 🔴 悬浮驳回理由面板 -->
+                            <div id="reject-panel" class="absolute bottom-[72px] left-0 right-0 bg-white border-t border-red-200 shadow-[0_-15px_30px_-5px_rgba(239,68,68,0.15)] p-4 hidden-el z-20">
+                                <div class="flex justify-between items-center mb-3">
+                                    <label class="text-sm font-bold text-red-600"><i class="fa-solid fa-ban mr-1"></i> 填写驳回理由 (必填)</label>
+                                    <i class="fa-solid fa-times text-gray-400 cursor-pointer hover:text-gray-600" onclick="toggleRejectPanel(false)"></i>
+                                </div>
+                                <div class="flex space-x-2 mb-3">
+                                    <span class="text-xs bg-red-50 border border-red-100 hover:bg-red-100 text-red-700 px-2 py-1 rounded cursor-pointer transition" onclick="fillReason('违规限制词汇（性别/年龄等）')">违规限制词</span>
+                                    <span class="text-xs bg-gray-100 border border-gray-200 hover:bg-gray-200 text-gray-700 px-2 py-1 rounded cursor-pointer transition" onclick="fillReason('薪资虚假或不明确')">虚假薪资</span>
+                                    <span class="text-xs bg-gray-100 border border-gray-200 hover:bg-gray-200 text-gray-700 px-2 py-1 rounded cursor-pointer transition" onclick="fillReason('图片模糊或包含联系方式二维码')">图片违规</span>
+                                </div>
+                                <div class="flex items-center space-x-2 mb-3">
+                                    <input type="text" id="reject-reason-input" class="flex-1 border border-gray-300 rounded px-3 py-2 text-sm focus:border-red-500 focus:ring-1 focus:ring-red-500 outline-none" placeholder="输入补充理由...">
+                                    <button onclick="confirmReject()" class="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded text-sm font-bold transition shadow-md">确认驳回 (Enter)</button>
+                                </div>
+                                <div class="flex space-x-4 text-xs text-gray-500 bg-gray-50 p-2 rounded">
+                                    <label class="flex items-center cursor-pointer"><input type="checkbox" checked class="mr-1"> 微信消息通知该用户</label>
+                                    <label class="flex items-center cursor-pointer text-red-500"><input type="checkbox" class="mr-1"> 将此用户拉入黑名单</label>
+                                </div>
+                            </div>
+
+                            <!-- 底部固定操作区 -->
+                            <div class="bg-gray-50 border-t border-gray-200 p-3 flex items-center justify-between z-10 h-[72px] shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.05)]">
+                                <div class="flex space-x-3 w-[40%] h-full">
+                                    <button onclick="toggleRejectPanel(true)" class="flex-1 bg-white border border-red-300 text-red-600 hover:bg-red-50 hover:border-red-400 font-bold rounded transition flex flex-col items-center justify-center group shadow-sm">
+                                        <span class="leading-none mb-1 text-sm">驳 回</span><span class="text-[10px] text-gray-400 group-hover:text-red-400">快捷键 R</span>
+                                    </button>
+                                    <button onclick="handleAudit('skip')" class="flex-1 bg-white border border-gray-300 text-gray-600 hover:bg-gray-100 font-medium rounded transition flex flex-col items-center justify-center shadow-sm">
+                                        <span class="leading-none mb-1 text-sm">稍 后</span><span class="text-[10px] text-gray-400">快捷键 S</span>
+                                    </button>
+                                </div>
+                                <button onclick="handleAudit('pass')" class="w-[55%] h-full bg-green-500 hover:bg-green-600 text-white font-bold rounded shadow-md transition flex items-center justify-center group transform active:scale-[0.98]">
+                                    <div class="flex flex-col items-center">
+                                        <span class="text-lg leading-none mb-1"><i class="fa-solid fa-check mr-1"></i> 通过</span>
+                                        <span class="text-[10px] text-green-200 leading-none font-normal tracking-wide">P 或 Space</span>
+                                    </div>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ================= 模式 2：列表模式 (快速简览) ================= -->
+                    <div id="view-mode-list" class="flex-1 bg-white rounded-lg shadow-sm border border-gray-200 hidden-el overflow-hidden flex flex-col">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm text-left">
+                                <thead class="text-xs text-gray-500 bg-gray-50 uppercase border-b">
+                                    <tr>
+                                        <th class="px-6 py-3">ID / 发布者</th>
+                                        <th class="px-6 py-3">核心抽取信息</th>
+                                        <th class="px-6 py-3">风险评估</th>
+                                        <th class="px-6 py-3 w-48 text-right">快捷操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <tr class="bg-red-50 border-b hover:bg-red-100 transition">
+                                        <td class="px-6 py-4"><div class="font-bold">job_998273</div><div class="text-xs text-gray-500 mt-1">张老板五金厂</div></td>
+                                        <td class="px-6 py-4">焊工 · 300元/天 · 浦东张江</td>
+                                        <td class="px-6 py-4"><span class="bg-red-600 text-white px-2 py-1 rounded text-xs">🔴 敏感词/年龄违规</span></td>
+                                        <td class="px-6 py-4 text-right space-x-2">
+                                            <button class="text-blue-600 hover:underline text-xs">精读</button>
+                                            <button class="text-red-600 hover:underline text-xs" onclick="handleAudit('reject')">驳回</button>
+                                            <button class="bg-green-500 text-white px-3 py-1 rounded text-xs shadow-sm hover:bg-green-600" onclick="handleAudit('pass')">通过</button>
+                                        </td>
+                                    </tr>
+                                    <tr class="bg-white border-b hover:bg-gray-50 transition">
+                                        <td class="px-6 py-4"><div class="font-bold">job_998274</div><div class="text-xs text-gray-500 mt-1">李姐劳务</div></td>
+                                        <td class="px-6 py-4">普工 · 200元/天 · 苏州昆山</td>
+                                        <td class="px-6 py-4"><span class="bg-green-100 text-green-700 border border-green-200 px-2 py-1 rounded text-xs">🟢 无异常风险</span></td>
+                                        <td class="px-6 py-4 text-right space-x-2">
+                                            <button class="text-blue-600 hover:underline text-xs">精读</button>
+                                            <button class="text-red-600 hover:underline text-xs">驳回</button>
+                                            <button class="bg-green-500 text-white px-3 py-1 rounded text-xs shadow-sm hover:bg-green-600" onclick="handleAudit('pass')">通过</button>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- ================= 弹窗与抽屉 ================= -->
+    
+    <!-- 全局密码重置 Modal (真实登录闭环) -->
+    <div id="reset-pwd-modal" class="fixed inset-0 bg-gray-900 bg-opacity-70 z-[100] hidden-el flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white rounded-lg shadow-xl w-[400px] overflow-hidden">
+            <div class="px-6 py-4 border-b bg-yellow-50 flex items-center">
+                <i class="fa-solid fa-triangle-exclamation text-yellow-600 text-xl mr-3"></i>
+                <h3 class="font-bold text-yellow-800">首次登录强制改密</h3>
+            </div>
+            <div class="p-6 space-y-4">
+                <p class="text-xs text-gray-500">系统检测到您使用的是公开的默认密码 <code>admin123</code>，请设置新密码以保障系统安全。</p>
+                <div>
+                    <input type="password" id="new-pwd-input" class="w-full px-4 py-2 border border-gray-300 rounded text-sm focus:border-blue-500 outline-none" placeholder="输入新密码 (不少于6位)">
+                </div>
+            </div>
+            <div class="px-6 py-4 bg-gray-50 flex justify-end">
+                <button class="bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700" onclick="submitNewPwd()">确认修改并进入系统</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 图片大图全屏 Modal -->
+    <div id="image-modal" class="fixed inset-0 bg-black bg-opacity-90 z-[80] hidden-el flex flex-col items-center justify-center backdrop-blur-md">
+        <div class="absolute top-4 right-6 flex space-x-4 text-white">
+            <button class="text-3xl hover:text-gray-300 transition" onclick="toggleModal('image-modal')">&times;</button>
+        </div>
+        <img src="https://images.unsplash.com/photo-1504328345606-18bbc8c9d7d1?auto=format&fit=crop&w=1200&q=80" class="max-h-[85vh] max-w-[90vw] object-contain shadow-2xl rounded border border-gray-700">
+        <div class="mt-4 text-gray-400 text-sm flex items-center space-x-6">
+            <span><kbd class="bg-gray-800 border border-gray-600 px-2 py-0.5 rounded text-white mr-1">&larr;</kbd> 上一张</span>
+            <span><kbd class="bg-gray-800 border border-gray-600 px-2 py-0.5 rounded text-white mr-1">Esc</kbd> 关闭大图</span>
+            <span><kbd class="bg-gray-800 border border-gray-600 px-2 py-0.5 rounded text-white mr-1">&rarr;</kbd> 下一张</span>
+        </div>
+    </div>
+
+    <!-- 快捷键帮助 Modal (?) -->
+    <div id="help-modal" class="fixed inset-0 bg-gray-900 bg-opacity-50 z-[70] hidden-el flex items-center justify-center backdrop-blur-sm" onclick="if(event.target===this)toggleModal('help-modal')">
+        <div class="bg-white rounded-lg shadow-2xl w-[450px] overflow-hidden">
+            <div class="px-6 py-4 border-b flex justify-between items-center bg-gray-50">
+                <h3 class="font-bold text-lg"><i class="fa-solid fa-keyboard text-blue-600 mr-2"></i> 快捷键对照表</h3>
+                <button class="text-gray-400 hover:text-gray-600" onclick="toggleModal('help-modal')"><i class="fa-solid fa-times text-xl"></i></button>
+            </div>
+            <div class="p-6 space-y-3">
+                <div class="flex justify-between items-center border-b border-gray-100 pb-2"><span class="text-gray-600">✅ 确认并加载下一条</span><div class="space-x-1"><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">P</kbd><span class="text-gray-400 text-xs">或</span><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">Space</kbd></div></div>
+                <div class="flex justify-between items-center border-b border-gray-100 pb-2"><span class="text-gray-600">❌ 呼出驳回面板</span><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">R</kbd></div>
+                <div class="flex justify-between items-center border-b border-gray-100 pb-2"><span class="text-gray-600">⏳ 稍后处理 (移至队尾)</span><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">S</kbd></div>
+                <div class="flex justify-between items-center border-b border-gray-100 pb-2"><span class="text-gray-600">↩️ 撤销上一次操作</span><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">U</kbd></div>
+                <div class="flex justify-between items-center"><span class="text-gray-600">❓ 显示本帮助面板</span><kbd class="bg-gray-100 border text-gray-800 px-2 py-1 rounded font-mono font-bold text-xs">Shift + ?</kbd></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 提交者历史 Drawer -->
+    <div id="user-drawer" class="fixed inset-y-0 right-0 w-[450px] bg-white shadow-2xl z-[70] drawer-closed transition-transform duration-300 flex flex-col border-l border-gray-200">
+        <div class="h-16 px-6 border-b flex items-center justify-between bg-gray-50 flex-shrink-0">
+            <h3 class="font-bold text-gray-800">提交者画像</h3>
+            <button onclick="toggleDrawer('user-drawer')" class="text-gray-400 hover:text-gray-600 p-2"><i class="fa-solid fa-times text-xl"></i></button>
+        </div>
+        <div class="p-6 flex-1 overflow-y-auto">
+            <div class="flex items-center mb-6">
+                <img src="https://api.dicebear.com/7.x/avataaars/svg?seed=Jack" class="w-14 h-14 rounded-full border shadow-sm">
+                <div class="ml-4">
+                    <h2 class="text-lg font-bold">张老板五金厂</h2>
+                    <p class="text-xs text-gray-500">ID: usr_1002341 <i class="fa-regular fa-copy ml-1 cursor-pointer hover:text-blue-500" title="复制"></i></p>
+                </div>
+            </div>
+            <!-- 数据指标 -->
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <div class="bg-green-50 border border-green-100 p-3 rounded text-center"><div class="text-xs text-green-600 mb-1">近7天通过</div><div class="text-2xl font-bold text-green-700">120</div></div>
+                <div class="bg-red-50 border border-red-100 p-3 rounded text-center"><div class="text-xs text-red-600 mb-1">近7天驳回</div><div class="text-2xl font-bold text-red-700">2</div></div>
+            </div>
+            <!-- 记录列表 -->
+            <h4 class="font-bold text-sm mb-3 border-l-4 border-blue-500 pl-2">最近驳回记录</h4>
+            <div class="space-y-3">
+                <div class="text-sm p-3 border rounded border-red-200 bg-red-50/50">
+                    <div class="flex justify-between text-xs mb-2"><span class="text-gray-500">2024-05-12 14:30</span><span class="text-red-600 font-bold">虚假薪资</span></div>
+                    <div class="text-gray-700 bg-white p-2 border rounded">"日结5000，无需经验，限女..."</div>
+                </div>
+            </div>
+        </div>
+        <div class="p-4 border-t bg-gray-50 flex space-x-3 flex-shrink-0">
+            <button class="flex-1 bg-white hover:bg-red-50 text-red-600 py-2 rounded font-bold border border-red-200 transition" onclick="showToast('已拉入黑名单', 'success');toggleDrawer('user-drawer')"><i class="fa-solid fa-ban mr-1"></i> 拉黑封禁</button>
+        </div>
+    </div>
+    
+    <div id="drawer-overlay" class="fixed inset-0 bg-black bg-opacity-30 z-[65] hidden-el backdrop-blur-sm transition-opacity" onclick="toggleDrawer('user-drawer')"></div>
+
+    <!-- 全局 Toast -->
+    <div id="toast" class="fixed top-5 left-1/2 transform -translate-x-1/2 bg-gray-800 text-white px-6 py-3 rounded shadow-lg transition-opacity duration-300 opacity-0 pointer-events-none z-[110] flex items-center font-medium">
+        <i id="toast-icon" class="mr-2"></i><span id="toast-msg"></span>
+    </div>
+
+    <!-- ================= 开发者调试沙盒 (左下角浮动) ================= -->
+    <div class="fixed bottom-4 left-4 z-[100] flex flex-col space-y-2 opacity-30 hover:opacity-100 transition-opacity bg-white p-3 border rounded-lg shadow-lg text-xs">
+        <div class="font-bold text-gray-500 border-b pb-1 mb-1 text-center"><i class="fa-solid fa-bug"></i> 边缘状态模拟</div>
+        <button onclick="currentQueueNum=1;handleAudit('pass')" class="bg-gray-100 border px-3 py-1.5 rounded hover:bg-gray-200 text-left w-full">🎉 清空审核队列</button>
+        <button onclick="document.getElementById('state-offline').classList.toggle('hidden-el')" class="bg-red-50 text-red-600 border border-red-200 px-3 py-1.5 rounded hover:bg-red-100 text-left w-full">🔌 切换断网横幅</button>
+        <button onclick="document.getElementById('state-llm-error').classList.toggle('hidden-el')" class="bg-yellow-50 text-yellow-700 border border-yellow-200 px-3 py-1.5 rounded hover:bg-yellow-100 text-left w-full">🤖 切换 LLM 宕机横幅</button>
+    </div>
+
+    <!-- ================= 核心 JS 逻辑 ================= -->
+    <script>
+        let currentQueueNum = 42;
+        let isRejectPanelOpen = false;
+        let isModalOpen = false;
+
+        // --- 1. 登录与重置密码逻辑 ---
+        function doLogin() {
+            const pwd = document.getElementById('login-pwd').value;
+            if(pwd === 'admin123') {
+                toggleModal('reset-pwd-modal');
+                document.getElementById('new-pwd-input').focus();
+            } else if (pwd.length > 0) {
+                showToast('账号或密码错误', 'error');
+            }
+        }
+        function submitNewPwd() {
+            const val = document.getElementById('new-pwd-input').value;
+            if(val.length < 6) return showToast('密码太短啦', 'error');
+            toggleModal('reset-pwd-modal');
+            
+            // 登录成功特效
+            document.getElementById('page-login').classList.add('hidden-el');
+            document.getElementById('app-layout').classList.remove('hidden-el');
+            switchPage('page-dashboard');
+            showToast('登录成功，密码已更新', 'success');
+        }
+
+        // --- 2. 路由与菜单 ---
+        function switchPage(pageId) {
+            document.getElementById('page-dashboard').classList.add('hidden-el');
+            document.getElementById('page-audit').classList.add('hidden-el');
+            document.getElementById(pageId).classList.remove('hidden-el');
+
+            document.querySelectorAll('aside nav a').forEach(el => {
+                el.classList.remove('bg-gray-800', 'text-white', 'border-l-4', 'border-blue-500');
+                el.classList.add('text-gray-300');
+            });
+            
+            if(pageId === 'page-dashboard') {
+                document.getElementById('nav-dashboard').classList.add('bg-gray-800', 'text-white', 'border-l-4', 'border-blue-500');
+                document.getElementById('top-title').innerText = '今日概览 (Dashboard)';
+            } else if(pageId === 'page-audit') {
+                document.getElementById('nav-audit').classList.add('bg-gray-800', 'text-white', 'border-l-4', 'border-blue-500');
+                document.getElementById('top-title').innerText = '审核工作台 (Workbench)';
+            }
+        }
+
+        function toggleViewMode(mode) {
+            const btnDetail = document.getElementById('btn-mode-detail');
+            const btnList = document.getElementById('btn-mode-list');
+            const viewDetail = document.getElementById('view-mode-detail');
+            const viewList = document.getElementById('view-mode-list');
+
+            if(mode === 'detail') {
+                btnDetail.className = "px-3 py-1 text-xs rounded bg-white shadow-sm font-bold text-blue-600";
+                btnList.className = "px-3 py-1 text-xs rounded text-gray-500 hover:text-gray-800";
+                viewDetail.classList.remove('hidden-el');
+                viewList.classList.add('hidden-el');
+            } else {
+                btnList.className = "px-3 py-1 text-xs rounded bg-white shadow-sm font-bold text-blue-600";
+                btnDetail.className = "px-3 py-1 text-xs rounded text-gray-500 hover:text-gray-800";
+                viewList.classList.remove('hidden-el');
+                viewDetail.classList.add('hidden-el');
+            }
+        }
+
+        // --- 3. UI 交互件 ---
+        function toggleModal(id) {
+            const el = document.getElementById(id);
+            isModalOpen = el.classList.contains('hidden-el');
+            el.classList.toggle('hidden-el');
+        }
+
+        function toggleDrawer(id) {
+            const drawer = document.getElementById(id);
+            const overlay = document.getElementById('drawer-overlay');
+            if(drawer.classList.contains('drawer-closed')) {
+                drawer.classList.replace('drawer-closed', 'drawer-open');
+                overlay.classList.remove('hidden-el');
+                isModalOpen = true; // 抽屉打开时阻止全局快捷键
+            } else {
+                drawer.classList.replace('drawer-open', 'drawer-closed');
+                overlay.classList.add('hidden-el');
+                isModalOpen = false;
+            }
+        }
+
+        function showToast(msg, type = 'info') {
+            const toast = document.getElementById('toast');
+            const icon = document.getElementById('toast-icon');
+            document.getElementById('toast-msg').innerText = msg;
+            toast.className = 'fixed top-5 left-1/2 transform -translate-x-1/2 text-white px-6 py-3 rounded shadow-lg transition-opacity duration-300 z-[110] flex items-center font-medium bg-gray-800';
+            if(type === 'success') toast.classList.add('bg-green-600');
+            if(type === 'error') toast.classList.add('bg-red-600');
+            icon.className = type === 'success' ? 'fa-solid fa-check-circle mr-2' : type === 'error' ? 'fa-solid fa-circle-exclamation mr-2' : 'fa-solid fa-info-circle mr-2';
+            toast.classList.remove('opacity-0');
+            setTimeout(() => toast.classList.add('opacity-0'), 2500);
+        }
+
+        // --- 4. 审核流核心业务逻辑 ---
+        function toggleRejectPanel(show) {
+            const panel = document.getElementById('reject-panel');
+            isRejectPanelOpen = show;
+            if(show) {
+                panel.classList.remove('hidden-el');
+                setTimeout(() => document.getElementById('reject-reason-input').focus(), 50);
+            } else {
+                panel.classList.add('hidden-el');
+            }
+        }
+
+        function fillReason(text) {
+            document.getElementById('reject-reason-input').value = text;
+        }
+
+        function confirmReject() {
+            const val = document.getElementById('reject-reason-input').value;
+            if(!val) return showToast('必须填写驳回理由！', 'error');
+            toggleRejectPanel(false);
+            document.getElementById('reject-reason-input').value = '';
+            handleAudit('reject');
+        }
+
+        function handleAudit(action) {
+            if (currentQueueNum <= 0 && action !== 'undo') return;
+
+            if(action === 'pass') showToast('✅ 审核通过', 'success');
+            if(action === 'reject') showToast('❌ 审核驳回', 'error');
+            if(action === 'skip') showToast('⏳ 已放入稍后处理队列', 'info');
+            if(action === 'undo') {
+                currentQueueNum++;
+                showToast('↩️ 撤销上一条', 'info');
+            } else {
+                currentQueueNum--;
+            }
+
+            // 更新所有数字
+            document.getElementById('sidebar-badge').innerText = currentQueueNum;
+            document.querySelectorAll('.dash-audit-num').forEach(el => el.innerText = currentQueueNum);
+            
+            // 闪烁切换动效
+            if(currentQueueNum <= 0) {
+                document.getElementById('audit-empty-state').classList.remove('hidden-el');
+                document.getElementById('view-mode-detail').classList.add('opacity-0');
+            } else if(action !== 'undo') {
+                const rightPanel = document.getElementById('audit-right-panel');
+                rightPanel.style.opacity = '0.4';
+                setTimeout(() => rightPanel.style.opacity = '1', 150);
+            }
+        }
+
+        // --- 5. 快捷键系统 (键盘优先原则) ---
+        document.addEventListener('keydown', function(event) {
+            // 如果页面隐藏，或弹窗打开，拦截全局快捷键
+            if(document.getElementById('page-audit').classList.contains('hidden-el')) return;
+            if(isModalOpen) {
+                if(event.key === 'Escape') {
+                    if(!document.getElementById('image-modal').classList.contains('hidden-el')) toggleModal('image-modal');
+                    if(!document.getElementById('help-modal').classList.contains('hidden-el')) toggleModal('help-modal');
+                    if(document.getElementById('user-drawer').classList.contains('drawer-open')) toggleDrawer('user-drawer');
+                    if(!document.getElementById('reset-pwd-modal').classList.contains('hidden-el')) toggleModal('reset-pwd-modal');
+                }
+                return; // 弹窗打开时不响应 P/R/S
+            }
+
+            // 输入框焦点时拦截
+            if(['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) {
+                if(event.key === 'Enter' && isRejectPanelOpen) confirmReject();
+                if(event.key === 'Escape' && isRejectPanelOpen) toggleRejectPanel(false);
+                return;
+            }
+
+            const key = event.key.toLowerCase();
+            
+            // P 或 空格 -> 通过
+            if (key === 'p' || event.code === 'Space') {
+                event.preventDefault(); 
+                if(!isRejectPanelOpen) handleAudit('pass');
+            } 
+            // R -> 驳回面板
+            else if (key === 'r') {
+                event.preventDefault(); 
+                toggleRejectPanel(!isRejectPanelOpen);
+            } 
+            // S -> 稍后
+            else if (key === 's') {
+                handleAudit('skip');
+            } 
+            // U -> 撤销
+            else if (key === 'u') {
+                handleAudit('undo');
+            } 
+            // ? -> 帮助
+            else if (key === '?') {
+                toggleModal('help-modal');
+            }
+        });
+    </script>
+</body>
+</html>
