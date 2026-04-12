@@ -1,7 +1,7 @@
 # Phase 0 Kickoff 基线确认
 
 > 日期：2026-04-12
-> 状态：部分完成（环境验证待 Docker 安装后补充）
+> 状态：✅ 全部完成
 
 ---
 
@@ -26,34 +26,41 @@
 | Node.js | 16+ | v24.14.1 | ✅ 通过 |
 | npm | 8+ | 11.11.0 | ✅ 通过 |
 | Git | 2.x | 2.53.0 | ✅ 通过 |
-| Docker | Docker Desktop 或 WSL2 Docker | 未安装 | ❌ 待安装 |
-| Docker Compose | v2+ | 未安装 | ❌ 待安装 |
+| Docker | Docker Desktop 或 WSL2 Docker | 29.4.0 (WSL2 Ubuntu-24.04) | ✅ 通过 |
+| Docker Compose | v2+ | v5.1.2 | ✅ 通过 |
 
-### Docker 安装后需验证
+### WSL2 环境详情
+
+- **发行版**：Ubuntu 24.04，安装在 `D:\WSL\Ubuntu`
+- **默认用户**：dev
+- **Docker 镜像源**：已配置国内镜像（docker.1ms.run 等）
+- **Docker 自启动**：已配置随 WSL 启动自动运行
+
+### 基础设施验证结果（2026-04-12）
+
+| 验证项 | 结果 |
+|--------|------|
+| `docker compose up -d` | ✅ MySQL + Redis 容器 healthy |
+| MySQL 11 张表建表 | ✅ 含 wecom_inbound_event |
+| MySQL 种子数据导入 | ✅ 管理员/城市/工种/敏感词/系统配置 |
+| Redis PING | ✅ PONG |
+| Python venv 创建 + 依赖安装 | ✅ backend/.venv/ |
+| `uvicorn app.main:app` 启动 | ✅ |
+| `GET /health` | ✅ `{"status":"ok","db":{"ok":true}}` |
+
+### 启动命令速查
 
 ```bash
-# 1. 启动基础设施
-docker compose up -d
+# 启动基础设施（在 WSL2 中）
+wsl -d Ubuntu-24.04 -- bash -c "cd /mnt/d/work/JobBridge && docker compose up -d"
 
-# 2. 验证 MySQL
-docker exec jobbridge-mysql mysql -u jobbridge -pjobbridge -e "SELECT 1"
-
-# 3. 验证 Redis
-docker exec jobbridge-redis redis-cli ping
-
-# 4. 启动后端
-cd backend
-python -m venv .venv
+# 启动后端（在 Windows Git Bash 中）
+cd /d/work/JobBridge/backend
 source .venv/Scripts/activate
-pip install -r requirements.txt
-cd ..
-cp .env.example .env
-cd backend
 uvicorn app.main:app --reload
 
-# 5. 验证 /health
+# 验证
 curl http://localhost:8000/health
-# 预期: {"status":"ok","db":{"ok":true}}
 ```
 
 ---
@@ -155,8 +162,9 @@ curl http://localhost:8000/health
 | 环境变量基线已确认 | ✅ |
 | 目录职责已确认 | ✅ |
 | Python/Node/Git 版本满足要求 | ✅ |
-| Docker 环境可用 | ❌ 待安装 |
-| 基础设施（MySQL + Redis）可启动 | ❌ 待 Docker |
-| 后端 /health 可通 | ❌ 待 Docker |
+| Docker 环境可用（WSL2） | ✅ |
+| 基础设施（MySQL + Redis）可启动 | ✅ |
+| MySQL 11 张表 + 种子数据 | ✅ |
+| 后端 /health 可通 | ✅ |
 
-**Phase 0 结论**：文档基线、决策冻结、依赖清单全部就绪。Docker 安装后补验基础设施启动即可进入 Phase 1。Phase 1 的 ORM 和 Schema 编写不依赖数据库运行（对着 schema.sql 写），Docker 安装可与 Phase 1 开发并行进行。
+**Phase 0 结论**：全部验收通过。文档基线冻结、冻结决策确认、外部依赖清单生成、开发环境全链路验证均已完成。可以进入 Phase 1。
