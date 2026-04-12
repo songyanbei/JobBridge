@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     redis_port: int = 6379
     redis_db: int = 0
     redis_password: str = ""
+    redis_max_connections: int = 50  # 连接池上限，按并发量调整
 
     @property
     def redis_url(self) -> str:
