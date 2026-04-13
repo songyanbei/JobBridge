@@ -97,6 +97,40 @@ Example custom run:
 python tests/perf/phase2_pressure.py --messages 2400 --ingress-workers 32 --consumer-workers 16 --client-iterations 1800 --client-workers 48
 ```
 
+## Phase 3 Tests (Business Services)
+
+Phase 3 adds 7 service unit tests and 4 integration tests.
+
+### Unit Tests (no external dependencies)
+
+```bash
+cd backend
+
+# All Phase 3 service unit tests
+pytest tests/unit/test_intent_service.py tests/unit/test_conversation_service.py tests/unit/test_user_service.py tests/unit/test_audit_service.py tests/unit/test_permission_service.py tests/unit/test_upload_service.py tests/unit/test_search_service.py -v
+```
+
+### Integration Tests (require MySQL + Redis)
+
+```bash
+cd backend
+
+# All Phase 3 integration tests
+RUN_INTEGRATION=1 pytest tests/integration/test_phase3_upload_and_search.py tests/integration/test_phase3_delete_flow.py tests/integration/test_phase3_broker_flow.py tests/integration/test_phase3_upload_then_search_smoke.py -v
+```
+
+PowerShell:
+```powershell
+$env:RUN_INTEGRATION='1'; pytest tests/integration/test_phase3_upload_and_search.py tests/integration/test_phase3_delete_flow.py tests/integration/test_phase3_broker_flow.py tests/integration/test_phase3_upload_then_search_smoke.py -v
+```
+
+### Phase 3 Smoke Flow
+
+The `test_phase3_upload_then_search_smoke.py` integration test serves as the Phase 3 smoke flow:
+- Factory uploads a job → passes audit → enters DB
+- Worker searches → finds the job → result formatted correctly
+- Worker result does not leak phone/address/discriminatory fields
+
 ## Smoke Checks
 
 ```bash

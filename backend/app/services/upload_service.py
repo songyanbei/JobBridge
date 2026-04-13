@@ -1,0 +1,307 @@
+"""上传服务（Phase 3）。
+
+岗位/简历入库编排：消费 IntentResult → 必填字段检查 → 审核 → 入库。
+不重复调用 LLM；追问轮数由 session.follow_up_rounds 统一承载。
+"""
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy.orm import Session
+
+from app.llm.base import IntentResult
+from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
+from app.models import Job, Resume, SystemConfig
+from app.services import audit_service, conversation_service
+from app.services.user_service import UserContext
+from app.schemas.conversation import SessionState
+
+logger = logging.getLogger(__name__)
+
+# 必填字段的中文展示名（用于生成追问文案）
+_FIELD_DISPLAY_NAMES = {
+    "city": "工作城市",
+    "job_category": "工种",
+    "salary_floor_monthly": "月薪下限",
+    "pay_type": "计薪方式",
+    "headcount": "招聘人数",
+    "expected_cities": "期望城市",
+    "expected_job_categories": "期望工种",
+    "salary_expect_floor_monthly": "期望月薪",
+    "gender": "性别",
+    "age": "年龄",
+}
+
+MAX_FOLLOW_UP_ROUNDS = 2
+
+
+@dataclass
+class UploadResult:
+    success: bool
+    reply_text: str
+    entity_type: str | None = None  # "job" / "resume"
+    entity_id: int | None = None
+    needs_followup: bool = False
+
+
+# ---------------------------------------------------------------------------
+# 公开 API
+# ---------------------------------------------------------------------------
+
+def process_upload(
+    user_ctx: UserContext,
+    intent_result: IntentResult,
+    raw_text: str,
+    image_keys: list[str],
+    session: SessionState,
+    db: Session,
+) -> UploadResult:
+    """上传编排主入口。"""
+    entity_type = _resolve_entity_type(intent_result.intent, user_ctx.role)
+    if entity_type is None:
+        return UploadResult(
+            success=False,
+            reply_text="无法确定您要发布的内容类型，请重新描述。",
+        )
+
+    required = JOB_REQUIRED_FIELDS if entity_type == "job" else RESUME_REQUIRED_FIELDS
+    data = intent_result.structured_data
+
+    # 检查缺失必填字段
+    missing = _check_required_fields(data, required)
+
+    if missing:
+        # 检查追问轮数
+        if session.follow_up_rounds >= MAX_FOLLOW_UP_ROUNDS:
+            # 超过 2 轮追问，返回降级提示
+            session.follow_up_rounds = 0  # 重置
+            return UploadResult(
+                success=False,
+                reply_text="信息仍不完整，请补齐后重新提交。需要以下信息：\n"
+                           + "\n".join(f"- {_FIELD_DISPLAY_NAMES.get(f, f)}" for f in missing),
+                needs_followup=False,
+            )
+
+        # 生成追问文本
+        conversation_service.increment_follow_up(session)
+        followup_text = _generate_followup_text(missing)
+        return UploadResult(
+            success=False,
+            reply_text=followup_text,
+            needs_followup=True,
+        )
+
+    # 必填字段齐全 → 先审核文本（不写 audit_log），再入库，最后用真实 ID 写 audit_log
+    ttl_days = _read_ttl_days(entity_type, db)
+
+    # 审核（此时还不写 audit_log，因为实体尚未入库）
+    audit_result = audit_service.audit_content_only(
+        text=raw_text,
+        db=db,
+    )
+
+    # 入库（带审核结果）
+    if entity_type == "job":
+        entity = _create_job(
+            data, user_ctx, audit_result, ttl_days, raw_text, image_keys, db,
+        )
+    else:
+        entity = _create_resume(
+            data, user_ctx, audit_result, ttl_days, raw_text, image_keys, db,
+        )
+
+    # 用真实实体 ID 写 audit_log
+    audit_service.write_audit_log_for_result(
+        entity_type, entity.id, audit_result, db,
+    )
+
+    # 重置追问轮数
+    session.follow_up_rounds = 0
+
+    # 根据审核状态生成回复
+    reply = _audit_status_reply(audit_result.status, entity_type)
+
+    return UploadResult(
+        success=True,
+        reply_text=reply,
+        entity_type=entity_type,
+        entity_id=entity.id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 内部实现
+# ---------------------------------------------------------------------------
+
+def _resolve_entity_type(intent: str, role: str) -> str | None:
+    """根据意图和角色确定实体类型。"""
+    if intent in ("upload_job", "upload_and_search"):
+        return "job"
+    if intent == "upload_resume":
+        return "resume"
+    # follow_up 场景需要从上下文推断
+    if role == "worker":
+        return "resume"
+    if role in ("factory", "broker"):
+        return "job"
+    return None
+
+
+def _check_required_fields(data: dict, required: frozenset) -> list[str]:
+    """返回缺失的必填字段列表。"""
+    missing = []
+    for f in sorted(required):
+        val = data.get(f)
+        if val is None:
+            missing.append(f)
+        elif isinstance(val, (list, str)) and len(val) == 0:
+            missing.append(f)
+    return missing
+
+
+def _generate_followup_text(missing: list[str]) -> str:
+    """生成追问文本。1-2 个字段合并成一句，3+ 列表式引导。"""
+    names = [_FIELD_DISPLAY_NAMES.get(f, f) for f in missing]
+    if len(names) <= 2:
+        return f"还需要您补充一下：{'和'.join(names)}，方便我帮您处理。"
+    lines = "\n".join(f"- {n}" for n in names)
+    return f"还缺少以下信息，请补充：\n{lines}"
+
+
+def _read_ttl_days(entity_type: str, db: Session) -> int:
+    """从 system_config 读取 TTL 天数。"""
+    key = f"ttl.{entity_type}.days"
+    config = db.query(SystemConfig).filter(
+        SystemConfig.config_key == key,
+    ).first()
+    if config:
+        try:
+            return int(config.config_value)
+        except (ValueError, TypeError):
+            pass
+    return 30  # 默认 30 天
+
+
+def _extract_scalar(data: dict, key: str, default: str = "") -> str:
+    """从 data 中提取标量值。如果值是 list，取第一个元素。"""
+    val = data.get(key, default)
+    if isinstance(val, list):
+        return val[0] if val else default
+    return val if val is not None else default
+
+
+def _create_job(
+    data: dict,
+    user_ctx: UserContext,
+    audit_result,
+    ttl_days: int,
+    raw_text: str,
+    image_keys: list[str],
+    db: Session,
+) -> Job:
+    """创建岗位记录。"""
+    now = datetime.now(timezone.utc)
+    job = Job(
+        owner_userid=user_ctx.external_userid,
+        city=_extract_scalar(data, "city", ""),
+        job_category=data.get("job_category", ""),
+        salary_floor_monthly=data.get("salary_floor_monthly", 0),
+        pay_type=data.get("pay_type", "月薪"),
+        headcount=data.get("headcount", 1),
+        gender_required=data.get("gender_required", "不限"),
+        is_long_term=data.get("is_long_term", True),
+        raw_text=raw_text,
+        description=data.get("description") or raw_text,
+        images=image_keys or None,
+        audit_status=audit_result.status,
+        audit_reason=audit_result.reason or None,
+        audited_by="system",
+        audited_at=now,
+        expires_at=now + timedelta(days=ttl_days),
+        # 可选软匹配字段
+        district=data.get("district"),
+        salary_ceiling_monthly=data.get("salary_ceiling_monthly"),
+        provide_meal=data.get("provide_meal"),
+        provide_housing=data.get("provide_housing"),
+        dorm_condition=data.get("dorm_condition"),
+        shift_pattern=data.get("shift_pattern"),
+        work_hours=data.get("work_hours"),
+        accept_couple=data.get("accept_couple"),
+        accept_student=data.get("accept_student"),
+        accept_minority=data.get("accept_minority"),
+        age_min=data.get("age_min"),
+        age_max=data.get("age_max"),
+        height_required=data.get("height_required"),
+        experience_required=data.get("experience_required"),
+        education_required=data.get("education_required"),
+        rebate=data.get("rebate"),
+        employment_type=data.get("employment_type"),
+        contract_type=data.get("contract_type"),
+        min_duration=data.get("min_duration"),
+        job_sub_category=data.get("job_sub_category"),
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def _create_resume(
+    data: dict,
+    user_ctx: UserContext,
+    audit_result,
+    ttl_days: int,
+    raw_text: str,
+    image_keys: list[str],
+    db: Session,
+) -> Resume:
+    """创建简历记录。"""
+    now = datetime.now(timezone.utc)
+    resume = Resume(
+        owner_userid=user_ctx.external_userid,
+        expected_cities=data.get("expected_cities", []),
+        expected_job_categories=data.get("expected_job_categories", []),
+        salary_expect_floor_monthly=data.get("salary_expect_floor_monthly", 0),
+        gender=data.get("gender", "男"),
+        age=data.get("age", 0),
+        accept_long_term=data.get("accept_long_term", True),
+        accept_short_term=data.get("accept_short_term", False),
+        raw_text=raw_text,
+        description=data.get("description") or raw_text,
+        images=image_keys or None,
+        audit_status=audit_result.status,
+        audit_reason=audit_result.reason or None,
+        audited_by="system",
+        audited_at=now,
+        expires_at=now + timedelta(days=ttl_days),
+        # 可选软匹配字段
+        expected_districts=data.get("expected_districts"),
+        height=data.get("height"),
+        weight=data.get("weight"),
+        education=data.get("education"),
+        work_experience=data.get("work_experience"),
+        accept_night_shift=data.get("accept_night_shift"),
+        accept_standing_work=data.get("accept_standing_work"),
+        accept_overtime=data.get("accept_overtime"),
+        accept_outside_province=data.get("accept_outside_province"),
+        couple_seeking_together=data.get("couple_seeking_together"),
+        has_health_certificate=data.get("has_health_certificate"),
+        ethnicity=data.get("ethnicity"),
+        available_from=data.get("available_from"),
+        has_tattoo=data.get("has_tattoo"),
+        taboo=data.get("taboo"),
+    )
+    db.add(resume)
+    db.flush()
+    return resume
+
+
+def _audit_status_reply(status: str, entity_type: str) -> str:
+    """根据审核状态生成回复文案。"""
+    type_name = "岗位信息" if entity_type == "job" else "简历信息"
+    if status == "passed":
+        return f"您的{type_name}已入库，将进入匹配池。"
+    if status == "pending":
+        return f"您的{type_name}已收到，正在等待人工审核，通过后即可进入匹配池。"
+    if status == "rejected":
+        return f"您的{type_name}已收到，但未通过内容审核。如有疑问请联系客服。"
+    return f"您的{type_name}已收到。"

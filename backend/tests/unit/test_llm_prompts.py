@@ -17,8 +17,8 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        assert prompts.PROMPT_VERSION == "v1.0"
-        assert prompts.PROMPT_DATE == "2026-04-12"
+        assert prompts.PROMPT_VERSION == "v2.0"
+        assert prompts.PROMPT_DATE == "2026-04-13"
 
     def test_token_budget_constants(self):
         assert prompts.INTENT_INPUT_TOKEN_BUDGET == 2000
