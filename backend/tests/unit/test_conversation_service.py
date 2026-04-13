@@ -1,4 +1,5 @@
 """conversation_service 单元测试。"""
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -8,7 +9,10 @@ from app.services.conversation_service import (
     compute_query_digest,
     create_session,
     get_next_candidate_ids,
+    get_remaining_count,
     increment_follow_up,
+    invalidate_snapshot_if_expired,
+    is_snapshot_expired,
     merge_criteria_patch,
     record_history,
     record_shown,
@@ -186,6 +190,77 @@ class TestBrokerDirection:
         session = _make_session(role="broker")
         err = set_broker_direction(session, "invalid")
         assert err is not None
+
+
+class TestSnapshotExpiry:
+    def test_fresh_snapshot_not_expired(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3"], "abc")
+        assert is_snapshot_expired(session) is False
+
+    def test_old_snapshot_expired(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3"], "abc")
+        # 手动将 expires_at 设置为过去时间
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        session.candidate_snapshot.expires_at = past
+        assert is_snapshot_expired(session) is True
+
+    def test_expired_snapshot_cleared_by_get_next(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3"], "abc")
+        past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        session.candidate_snapshot.expires_at = past
+        session.shown_items = ["1"]
+
+        ids = get_next_candidate_ids(session, 3)
+        assert ids == []
+        assert session.candidate_snapshot is None
+        assert session.shown_items == []
+
+    def test_invalidate_clears_and_returns_true(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2"], "abc")
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        session.candidate_snapshot.expires_at = past
+        session.shown_items = ["1"]
+
+        assert invalidate_snapshot_if_expired(session) is True
+        assert session.candidate_snapshot is None
+        assert session.shown_items == []
+
+    def test_invalidate_keeps_fresh_snapshot(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2"], "abc")
+        assert invalidate_snapshot_if_expired(session) is False
+        assert session.candidate_snapshot is not None
+
+    def test_no_snapshot_counts_as_expired(self):
+        session = _make_session()
+        assert is_snapshot_expired(session) is True
+
+
+class TestGetRemainingCount:
+    def test_full_snapshot(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3", "4", "5"], "abc")
+        assert get_remaining_count(session) == 5
+
+    def test_after_showing_some(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3", "4", "5"], "abc")
+        session.shown_items = ["1", "2", "3"]
+        assert get_remaining_count(session) == 2
+
+    def test_all_shown(self):
+        session = _make_session()
+        save_snapshot(session, ["1", "2", "3"], "abc")
+        session.shown_items = ["1", "2", "3"]
+        assert get_remaining_count(session) == 0
+
+    def test_no_snapshot(self):
+        session = _make_session()
+        assert get_remaining_count(session) == 0
 
 
 class TestFollowUp:

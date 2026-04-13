@@ -99,7 +99,7 @@ def search_jobs(
     conversation_service.record_shown(session, shown_ids)
 
     # 格式化
-    remaining = len(ranked_ids) - len(session.shown_items)
+    remaining = conversation_service.get_remaining_count(session)
     reply = _format_job_results(filtered, remaining)
 
     return SearchResult(
@@ -168,7 +168,7 @@ def search_workers(
     shown_ids = [str(r["id"]) for r in batch]
     conversation_service.record_shown(session, shown_ids)
 
-    remaining = len(ranked_ids) - len(session.shown_items)
+    remaining = conversation_service.get_remaining_count(session)
     reply = _format_resume_results(filtered, remaining)
 
     return SearchResult(
@@ -186,6 +186,10 @@ def show_more(
     """show_more：从快照取下一批，跳过失效条目。"""
     if session.candidate_snapshot is None:
         return SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
+
+    # 快照过期检查
+    if conversation_service.invalidate_snapshot_if_expired(session):
+        return SearchResult(reply_text="搜索结果已过期，请重新搜索。")
 
     top_n = _get_config_int("match.top_n", db, 3)
     # 确定搜索方向
@@ -230,13 +234,13 @@ def show_more(
 
     # 截断到 top_n
     collected = collected[:top_n]
-    remaining_ids = conversation_service.get_next_candidate_ids(session, 1)
-    has_more = len(remaining_ids) > 0
+    remaining = conversation_service.get_remaining_count(session)
+    has_more = remaining > 0
 
     if is_job_search:
-        reply = _format_job_results(collected, len(remaining_ids) if has_more else 0)
+        reply = _format_job_results(collected, remaining)
     else:
-        reply = _format_resume_results(collected, len(remaining_ids) if has_more else 0)
+        reply = _format_resume_results(collected, remaining)
 
     return SearchResult(
         reply_text=reply,

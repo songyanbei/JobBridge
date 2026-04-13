@@ -171,9 +171,36 @@ def save_snapshot(
     session.shown_items = []
 
 
-def get_next_candidate_ids(session: SessionState, count: int) -> list[str]:
-    """从快照中取下一批未展示的候选 ID。"""
+def is_snapshot_expired(session: SessionState) -> bool:
+    """判断快照是否已过期。"""
     if session.candidate_snapshot is None:
+        return True
+    expires_at = session.candidate_snapshot.expires_at
+    if not expires_at:
+        return True
+    try:
+        expires_dt = datetime.fromisoformat(expires_at)
+        return datetime.now(timezone.utc) > expires_dt
+    except (ValueError, TypeError):
+        return True
+
+
+def invalidate_snapshot_if_expired(session: SessionState) -> bool:
+    """如果快照已过期则清空，返回 True 表示已过期并被清空。"""
+    if is_snapshot_expired(session):
+        session.candidate_snapshot = None
+        session.shown_items = []
+        return True
+    return False
+
+
+def get_next_candidate_ids(session: SessionState, count: int) -> list[str]:
+    """从快照中取下一批未展示的候选 ID。快照过期则返回空。"""
+    if session.candidate_snapshot is None:
+        return []
+    if is_snapshot_expired(session):
+        session.candidate_snapshot = None
+        session.shown_items = []
         return []
 
     shown_set = set(session.shown_items)
@@ -182,6 +209,17 @@ def get_next_candidate_ids(session: SessionState, count: int) -> list[str]:
         if cid not in shown_set
     ]
     return remaining[:count]
+
+
+def get_remaining_count(session: SessionState) -> int:
+    """获取快照中尚未展示的候选总数。"""
+    if session.candidate_snapshot is None:
+        return 0
+    shown_set = set(session.shown_items)
+    return sum(
+        1 for cid in session.candidate_snapshot.candidate_ids
+        if cid not in shown_set
+    )
 
 
 # ---------------------------------------------------------------------------

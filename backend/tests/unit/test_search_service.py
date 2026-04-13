@@ -1,5 +1,5 @@
 """search_service 单元测试。"""
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -15,6 +15,16 @@ from app.services.search_service import (
     show_more,
 )
 from app.services.user_service import UserContext
+
+
+def _fresh_expires() -> str:
+    """生成一个 30 分钟后过期的时间戳。"""
+    return (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+
+
+def _past_expires() -> str:
+    """生成一个已过期的时间戳。"""
+    return (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
 
 
 def _make_user_ctx(role="worker"):
@@ -138,19 +148,88 @@ class TestShowMore:
     @patch("app.services.search_service._validate_job_ids")
     @patch("app.services.search_service._jobs_to_dicts")
     @patch("app.services.search_service._get_config_int")
-    def test_show_more_from_snapshot(self, mock_config, mock_dicts, mock_validate):
+    def test_show_more_from_snapshot_all_expired_items(self, mock_config, mock_dicts, mock_validate):
         mock_config.return_value = 3
-        mock_validate.return_value = []  # simulate expired items
+        mock_validate.return_value = []  # simulate all items expired
         mock_dicts.return_value = []
 
         session = _make_session()
         session.candidate_snapshot = CandidateSnapshot(
             candidate_ids=["1", "2", "3", "4", "5"],
             query_digest="abc",
+            expires_at=_fresh_expires(),
         )
         session.shown_items = ["1", "2", "3"]
 
         db = MagicMock()
         result = show_more(session, _make_user_ctx(), db)
-        # Even if all remaining are expired, should handle gracefully
         assert result is not None
+        assert result.result_count == 0
+
+    @patch("app.services.search_service._get_config_int")
+    def test_expired_snapshot_returns_re_search_prompt(self, mock_config):
+        """P1: 快照过期后 show_more 应提示重新搜索。"""
+        mock_config.return_value = 3
+        session = _make_session()
+        session.candidate_snapshot = CandidateSnapshot(
+            candidate_ids=["1", "2", "3"],
+            query_digest="abc",
+            expires_at=_past_expires(),
+        )
+        session.shown_items = ["1"]
+
+        db = MagicMock()
+        result = show_more(session, _make_user_ctx(), db)
+        assert "过期" in result.reply_text or "重新搜索" in result.reply_text
+        # 快照应被清空
+        assert session.candidate_snapshot is None
+
+    @patch("app.services.search_service.permission_service")
+    @patch("app.services.search_service._validate_job_ids")
+    @patch("app.services.search_service._jobs_to_dicts")
+    @patch("app.services.search_service._get_config_int")
+    def test_show_more_remaining_count_accurate(
+        self, mock_config, mock_dicts, mock_validate, mock_perm,
+    ):
+        """P2: show_more 的"还有 N 个"数字必须准确。"""
+        mock_config.return_value = 2  # top_n = 2
+
+        # 模拟 5 个候选，已展示 2 个，本次取 2 个有效
+        mock_job_1 = MagicMock(id=3, owner_userid="f1", city="苏州", job_category="电子厂",
+                               salary_floor_monthly=5000, salary_ceiling_monthly=None,
+                               pay_type="月薪", headcount=10, gender_required="不限",
+                               is_long_term=True, district=None, provide_meal=True,
+                               provide_housing=True, shift_pattern=None, work_hours=None,
+                               description="test", created_at=None)
+        mock_job_2 = MagicMock(id=4, owner_userid="f1", **{
+            attr: getattr(mock_job_1, attr)
+            for attr in ["city", "job_category", "salary_floor_monthly",
+                         "salary_ceiling_monthly", "pay_type", "headcount",
+                         "gender_required", "is_long_term", "district",
+                         "provide_meal", "provide_housing", "shift_pattern",
+                         "work_hours", "description", "created_at"]
+        })
+
+        mock_validate.return_value = [mock_job_1, mock_job_2]
+        mock_dicts.return_value = [
+            {"id": 3, "city": "苏州", "job_category": "电子厂",
+             "salary_floor_monthly": 5000, "pay_type": "月薪", "company": "XX"},
+            {"id": 4, "city": "苏州", "job_category": "电子厂",
+             "salary_floor_monthly": 5000, "pay_type": "月薪", "company": "YY"},
+        ]
+        mock_perm.filter_jobs_batch.return_value = mock_dicts.return_value
+
+        session = _make_session()
+        session.candidate_snapshot = CandidateSnapshot(
+            candidate_ids=["1", "2", "3", "4", "5"],
+            query_digest="abc",
+            expires_at=_fresh_expires(),
+        )
+        session.shown_items = ["1", "2"]
+
+        db = MagicMock()
+        result = show_more(session, _make_user_ctx(), db)
+        assert result.result_count == 2
+        # 展示了 3,4 后，剩余应该是 5（1个）
+        assert result.has_more is True
+        assert "1" in result.reply_text  # "还有 1 个"
