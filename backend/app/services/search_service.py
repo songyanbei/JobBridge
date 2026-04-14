@@ -315,13 +315,16 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
     )
 
     # 城市：检索条件的 city 需要与简历的 expected_cities JSON 数组匹配
-    # 使用 OR 逻辑：简历期望城市包含搜索条件中的任意一个城市即命中
+    # 使用 JSON_CONTAINS + OR 逻辑：简历期望城市包含搜索条件中的任一城市即命中
     cities = criteria.get("city", [])
     if cities:
         if isinstance(cities, str):
             cities = [cities]
         city_filters = [
-            Resume.expected_cities.op("LIKE")(f'%"{city}"%')
+            sa.func.json_contains(
+                Resume.expected_cities,
+                sa.func.cast(city, sa.JSON),
+            )
             for city in cities
         ]
         if city_filters:
@@ -332,7 +335,10 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         if isinstance(categories, str):
             categories = [categories]
         cat_filters = [
-            Resume.expected_job_categories.op("LIKE")(f'%"{cat}"%')
+            sa.func.json_contains(
+                Resume.expected_job_categories,
+                sa.func.cast(cat, sa.JSON),
+            )
             for cat in categories
         ]
         if cat_filters:
