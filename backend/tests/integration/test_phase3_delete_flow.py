@@ -34,6 +34,7 @@ def worker_with_data(db):
         can_search_workers=False,
     )
     db.add(user)
+    db.flush()  # 父记录先落库，确保外键可用
 
     resume = Resume(
         owner_userid="test_delete_worker",

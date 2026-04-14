@@ -49,7 +49,7 @@ def seed_data(db, broker_user):
     for key, val in [("match.top_n", "3"), ("match.max_candidates", "50")]:
         db.merge(SystemConfig(config_key=key, config_value=val, value_type="int"))
 
-    # 工厂用户（岗位所有者）
+    # 工厂用户（岗位所有者）— 先 flush 父记录
     factory = User(
         external_userid="test_factory_for_broker",
         role="factory", status="active",
@@ -57,6 +57,16 @@ def seed_data(db, broker_user):
         can_search_jobs=False, can_search_workers=True,
     )
     db.add(factory)
+
+    # 工人用户（简历所有者）
+    worker = User(
+        external_userid="test_worker_for_broker",
+        role="worker", status="active",
+        display_name="张三", phone="13900002222",
+        can_search_jobs=True, can_search_workers=False,
+    )
+    db.add(worker)
+    db.flush()  # 父记录先落库，确保子记录外键可用
 
     # 岗位
     job = Job(
@@ -69,15 +79,6 @@ def seed_data(db, broker_user):
         expires_at=now + timedelta(days=30),
     )
     db.add(job)
-
-    # 工人用户（简历所有者）
-    worker = User(
-        external_userid="test_worker_for_broker",
-        role="worker", status="active",
-        display_name="张三", phone="13900002222",
-        can_search_jobs=True, can_search_workers=False,
-    )
-    db.add(worker)
 
     # 简历
     resume = Resume(

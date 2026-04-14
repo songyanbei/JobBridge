@@ -42,6 +42,7 @@ def setup(db):
     )
     db.add(factory)
     db.add(worker)
+    db.flush()  # 用户先落库，后续 upload_service 创建子记录时外键可用
 
     for key, val in [
         ("match.top_n", "3"),
