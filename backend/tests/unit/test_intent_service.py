@@ -14,23 +14,49 @@ from app.services.intent_service import (
 
 class TestMatchCommand:
     def test_exact_slash_command(self):
-        assert _match_command("/帮助") == "help"
-        assert _match_command("/重新找") == "reset_search"
-        assert _match_command("/删除我的信息") == "delete_my_data"
-        assert _match_command("/找岗位") == "switch_to_job"
-        assert _match_command("/找工人") == "switch_to_worker"
-        assert _match_command("/我的状态") == "my_status"
+        assert _match_command("/帮助") == ("help", "")
+        assert _match_command("/重新找") == ("reset_search", "")
+        assert _match_command("/删除我的信息") == ("delete_my_data", "")
+        assert _match_command("/找岗位") == ("switch_to_job", "")
+        assert _match_command("/找工人") == ("switch_to_worker", "")
+        assert _match_command("/我的状态") == ("my_status", "")
 
     def test_alias_matching(self):
-        assert _match_command("帮助") == "help"
-        assert _match_command("重来") == "reset_search"
-        assert _match_command("注销") == "delete_my_data"
-        assert _match_command("转人工") == "human_agent"
+        assert _match_command("帮助") == ("help", "")
+        assert _match_command("重来") == ("reset_search", "")
+        assert _match_command("注销") == ("delete_my_data", "")
+        assert _match_command("转人工") == ("human_agent", "")
 
     def test_no_match(self):
         assert _match_command("苏州找电子厂") is None
         assert _match_command("你好") is None
         assert _match_command("") is None
+
+    def test_phase4_new_commands(self):
+        assert _match_command("/续期") == ("renew_job", "")
+        assert _match_command("/下架") == ("delist_job", "")
+        assert _match_command("/招满了") == ("filled_job", "")
+        assert _match_command("招满了") == ("filled_job", "")
+        assert _match_command("先不招了") == ("delist_job", "")
+
+    def test_command_with_space_args(self):
+        assert _match_command("/续期 15") == ("renew_job", "15")
+        assert _match_command("/续期 30") == ("renew_job", "30")
+
+    def test_command_with_sticky_args(self):
+        assert _match_command("续15天") == ("renew_job", "15天")
+        assert _match_command("续30天") == ("renew_job", "30天")
+
+    def test_p1_1_loose_xu_prefix_does_not_match_unrelated_words(self):
+        """P1-1：'续' 前缀必须紧跟数字，否则不能命中 renew_job。
+        否则 '续约一下那个岗位'、'续保'、'续杯' 会被误识别为续期命令。"""
+        assert _match_command("续约一下那个岗位") is None
+        assert _match_command("续保") is None
+        assert _match_command("续杯") is None
+        assert _match_command("续订") is None
+        # 正常数字紧跟仍命中
+        assert _match_command("续15") == ("renew_job", "15")
+        assert _match_command("续30天") == ("renew_job", "30天")
 
 
 class TestMatchShowMore:

@@ -12,6 +12,10 @@ class WeComMessage:
     """企微统一消息对象。
 
     覆盖一期范围内的文本和图片消息的所有必要字段。
+
+    image_url 不由 parse_message 填充；Phase 4 Worker 在消息路由前
+    调用 WeComClient.download_media(media_id) + storage.save() 后回填，
+    message_router._handle_image 只消费此字段，不依赖 wecom/client。
     """
     msg_id: str = ""
     from_user: str = ""
@@ -20,6 +24,7 @@ class WeComMessage:
     content: str = ""
     media_id: str = ""
     create_time: int = 0
+    image_url: str = ""
 
 
 def parse_xml(xml_text: str) -> dict:

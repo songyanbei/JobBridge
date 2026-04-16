@@ -72,6 +72,8 @@ def delete_session(userid: str) -> None:
 
 QUEUE_INCOMING = "queue:incoming"
 QUEUE_DEAD_LETTER = "queue:dead_letter"
+QUEUE_SEND_RETRY = "queue:send_retry"
+QUEUE_RATE_LIMIT_NOTIFY = "queue:rate_limit_notify"
 
 
 def enqueue_message(message_json: str, queue: str = QUEUE_INCOMING) -> None:

@@ -16,6 +16,9 @@ from app.services import audit_service, conversation_service
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
 
+# 单条记录最多挂载图片数（与 system_config.upload.max_images 对齐）
+_MAX_IMAGES_PER_RECORD = 5
+
 logger = logging.getLogger(__name__)
 
 # 必填字段的中文展示名（用于生成追问文案）
@@ -127,6 +130,69 @@ def process_upload(
         entity_type=entity_type,
         entity_id=entity.id,
     )
+
+
+def attach_image(
+    external_userid: str,
+    image_key: str,
+    session: SessionState,
+    db: Session,
+) -> str:
+    """将已保存的图片 key 附加到用户当前上传流程的实体上。
+
+    Phase 4 新增：图片下载由 Worker 完成后，message_router 调用本方法
+    把图片挂到最近一条未过期的岗位/简历上（由 session.current_intent 和用户
+    角色共同决定实体类型）。不做 OCR，不参与字段抽取。
+
+    Args:
+        external_userid: 上传者 external_userid
+        image_key: 存储层返回的 storage key 或 URL
+        session: 当前会话（用于判断 current_intent）
+        db: DB Session
+
+    Returns:
+        用户可读的反馈文案（成功 / 找不到实体 / 数量超限）
+    """
+    if not image_key:
+        return "图片保存失败，请稍后重试。"
+
+    entity_type = _attach_target_entity_type(session.current_intent)
+
+    model_cls = Job if entity_type == "job" else Resume
+    now = datetime.now(timezone.utc)
+    record = db.query(model_cls).filter(
+        model_cls.owner_userid == external_userid,
+        model_cls.deleted_at.is_(None),
+        model_cls.expires_at > now,
+    ).order_by(model_cls.created_at.desc()).first()
+
+    if record is None:
+        return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"
+
+    # 追加到 images JSON 数组（去重 + 数量上限）
+    images = list(record.images) if record.images else []
+    if image_key in images:
+        return "该图片已附加，无需重复发送。"
+    if len(images) >= _MAX_IMAGES_PER_RECORD:
+        return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
+
+    images.append(image_key)
+    record.images = images
+    db.flush()
+
+    kind = "岗位" if entity_type == "job" else "简历"
+    logger.info(
+        "upload_service.attach_image: userid=%s entity=%s id=%s images_count=%d",
+        external_userid, entity_type, record.id, len(images),
+    )
+    return f"图片已附加到您最近一条{kind}信息（第 {len(images)} 张）。"
+
+
+def _attach_target_entity_type(current_intent: str | None) -> str:
+    """根据会话 current_intent 推断图片挂载目标。"""
+    if current_intent in ("upload_job", "upload_and_search"):
+        return "job"
+    return "resume"
 
 
 # ---------------------------------------------------------------------------

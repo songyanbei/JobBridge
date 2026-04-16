@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app.api.webhook import router as webhook_router
 from app.config import settings
 from app.db import engine
 
@@ -26,6 +27,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 企微回调路由（Phase 4）
+app.include_router(webhook_router)
 
 
 @app.get("/health", tags=["system"])

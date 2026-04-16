@@ -31,6 +31,34 @@ class TestClientInit:
         assert c._agent_id == 1000001
 
 
+class TestInvalidateToken:
+    """P1-3：公开的 invalidate_token() 把缓存 token 清零，持锁写入。"""
+
+    def test_invalidate_clears_cached_token(self, client):
+        client._access_token = "some_token"
+        client._token_expires_at = 9999999999
+        client.invalidate_token()
+        assert client._access_token == ""
+        assert client._token_expires_at == 0
+
+    def test_invalidate_uses_lock(self, client):
+        """持锁写入，验证 _lock 被 acquire 过。"""
+        original_lock = client._lock
+        acquire_count = {"n": 0}
+
+        class _LockSpy:
+            def __enter__(self):
+                acquire_count["n"] += 1
+                return original_lock.__enter__()
+
+            def __exit__(self, *args):
+                return original_lock.__exit__(*args)
+
+        client._lock = _LockSpy()
+        client.invalidate_token()
+        assert acquire_count["n"] == 1
+
+
 @pytest.fixture
 def authed_client(client):
     """已有有效 token 的客户端。"""

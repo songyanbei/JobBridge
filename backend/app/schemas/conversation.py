@@ -41,6 +41,26 @@ class CriteriaPatch(BaseModel):
     value: Any = Field(default=None, description="新值")
 
 
+class ReplyMessage(BaseModel):
+    """Phase 4 消息路由层的出站回复 DTO。
+
+    由 message_router / command_service 产出，Worker 负责投递到企微。
+    一期固定 text 类型；如果未来支持卡片等扩展类型再在 msg_type 上区分。
+
+    intent 与 criteria_snapshot 非必填；message_router 在搜索/翻页等
+    场景会附带当轮 criteria 与 prompt_version，Worker 落库到
+    conversation_log.criteria_snapshot，便于后续运营查询。
+    """
+    userid: str = Field(..., description="接收者 external_userid")
+    content: str = Field(..., description="回复文本")
+    msg_type: str = Field(default="text", description="消息类型（一期固定 text）")
+    intent: str | None = Field(default=None, description="本轮意图（可选，用于日志）")
+    criteria_snapshot: dict | None = Field(
+        default=None,
+        description="本轮 criteria 快照 + prompt_version；落 conversation_log.criteria_snapshot",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 对话日志 DTO
 # ---------------------------------------------------------------------------

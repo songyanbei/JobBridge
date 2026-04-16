@@ -82,6 +82,18 @@ class WeComClient:
                 return self._access_token
             return self._refresh_token()
 
+    def invalidate_token(self) -> None:
+        """使本地缓存的 access_token 立即失效。
+
+        调用场景：
+        - send_text 等接口返回 errcode=42001（access_token expired），
+          业务方需要强制刷新后再重试一次。
+        持锁写入 _access_token / _token_expires_at 保证线程安全。
+        """
+        with self._lock:
+            self._access_token = ""
+            self._token_expires_at = 0
+
     # ------------------------------------------------------------------
     # 消息发送
     # ------------------------------------------------------------------

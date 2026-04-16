@@ -55,6 +55,35 @@ services:
       timeout: 3s
       retries: 5
 
+  # ---- 企微消息异步 Worker（Phase 4） ----
+  # 独立进程，消费 queue:incoming、queue:send_retry
+  # 手动启动：docker compose up -d worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jobbridge-worker
+    command: python -m app.services.worker
+    env_file:
+      - ./.env
+    environment:
+      - APP_ENV=development
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - worker_uploads:/app/uploads
+    restart: unless-stopped
+    # Worker 纯后台消费，不对外暴露端口
+
 volumes:
   mysql_data:
   redis_data:
+  worker_uploads:

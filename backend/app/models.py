@@ -387,10 +387,20 @@ class WecomInboundEvent(Base):
     msg_id = sa.Column(sa.String(64), nullable=False, unique=True, comment="企微消息 ID，幂等键")
     from_userid = sa.Column(sa.String(64), nullable=False, comment="发送者 external_userid")
     msg_type = sa.Column(
-        sa.Enum("text", "image", "voice", "event", name="wecom_msg_type"),
-        nullable=False, comment="消息类型",
+        sa.Enum(
+            "text", "image", "voice",
+            "video", "file", "link", "location",
+            "event", "other",
+            name="wecom_msg_type",
+        ),
+        nullable=False,
+        comment="原始企微 MsgType；一期仅 text/image/voice/event 走业务路径，其余走不支持分支",
     )
-    content_brief = sa.Column(sa.String(500), nullable=True, comment="消息摘要（文本取前 500 字，图片存 media_id）")
+    media_id = sa.Column(
+        sa.String(128), nullable=True,
+        comment="媒体消息的 media_id（image/voice/video/file 有效），用于 Worker crash 后补下载",
+    )
+    content_brief = sa.Column(sa.String(500), nullable=True, comment="消息摘要（文本取前 500 字）")
     status = sa.Column(
         sa.Enum("received", "processing", "done", "failed", "dead_letter", name="wecom_event_status"),
         nullable=False, server_default="received", comment="处理状态",

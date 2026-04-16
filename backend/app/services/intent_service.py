@@ -35,6 +35,17 @@ _COMMAND_MAP: dict[str, str] = {
     "/找工人": "switch_to_worker",
     "帮我招人": "switch_to_worker",
     "切到找工人": "switch_to_worker",
+    "/续期": "renew_job",
+    "续期": "renew_job",
+    "延期": "renew_job",
+    "/下架": "delist_job",
+    "岗位下架": "delist_job",
+    "先不招了": "delist_job",
+    "暂停招聘": "delist_job",
+    "/招满了": "filled_job",
+    "招满了": "filled_job",
+    "人招够了": "filled_job",
+    "满员了": "filled_job",
     "/删除我的信息": "delete_my_data",
     "删除信息": "delete_my_data",
     "清空我的资料": "delete_my_data",
@@ -47,6 +58,19 @@ _COMMAND_MAP: dict[str, str] = {
     "转人工": "human_agent",
     "联系人工": "human_agent",
 }
+
+# 允许参数的命令前缀（命令 + 空格 + 参数）
+# 同义词对齐方案设计 §17.2，例如 "续15天" "续30天"
+#
+# 元素：(prefix, mapped_key, strict_numeric)
+# - strict_numeric=True 时要求前缀后紧跟数字，避免把 "续约" / "续保" / "续杯"
+#   这类无关业务词误识别为续期命令
+_PARAM_COMMAND_PREFIXES: list[tuple[str, str, bool]] = [
+    ("/续期", "renew_job", False),
+    ("续期", "renew_job", False),
+    ("延期", "renew_job", False),
+    ("续", "renew_job", True),  # 兼容 "续15天"，但只接受数字紧跟
+]
 
 # ---------------------------------------------------------------------------
 # show_more 同义语
@@ -100,11 +124,15 @@ def classify_intent(
     stripped = text.strip()
 
     # Step 1: 显式命令匹配
-    cmd = _match_command(stripped)
-    if cmd is not None:
+    cmd_result = _match_command(stripped)
+    if cmd_result is not None:
+        cmd, args = cmd_result
+        data: dict = {"command": cmd}
+        if args:
+            data["args"] = args
         return IntentResult(
             intent="command",
-            structured_data={"command": cmd},
+            structured_data=data,
             confidence=1.0,
         )
 
@@ -129,10 +157,45 @@ def classify_intent(
 # 内部实现
 # ---------------------------------------------------------------------------
 
-def _match_command(text: str) -> str | None:
-    """精确匹配命令集。返回归并后的命令名或 None。"""
+def _match_command(text: str) -> tuple[str, str] | None:
+    """匹配命令集，返回 (归并命令 key, 参数字符串) 或 None。
+
+    处理三种形态：
+    1. 精确匹配 `_COMMAND_MAP`，参数为空
+    2. 带空格参数，如 "/续期 15"
+    3. 粘连参数形态，如 "续15天"（仅 `_PARAM_COMMAND_PREFIXES` 中登记的前缀）
+    """
     normalized = text.strip()
-    return _COMMAND_MAP.get(normalized)
+    if not normalized:
+        return None
+
+    # 1) 精确匹配
+    cmd = _COMMAND_MAP.get(normalized)
+    if cmd is not None:
+        return (cmd, "")
+
+    # 2) 带空格参数："/续期 15"
+    if " " in normalized:
+        prefix, _, args = normalized.partition(" ")
+        cmd = _COMMAND_MAP.get(prefix)
+        if cmd is not None:
+            return (cmd, args.strip())
+
+    # 3) 粘连参数形态："续15天" / "续期15"
+    for prefix, mapped, strict_numeric in _PARAM_COMMAND_PREFIXES:
+        if not normalized.startswith(prefix):
+            continue
+        if len(normalized) <= len(prefix):
+            continue
+        rest = normalized[len(prefix):].strip()
+        if not rest:
+            continue
+        # 宽泛前缀（如 "续"）要求紧跟数字，否则 "续约" / "续保" 会被误识
+        if strict_numeric and not rest[0].isdigit():
+            continue
+        return (mapped, rest)
+
+    return None
 
 
 def _match_show_more(text: str) -> bool:
