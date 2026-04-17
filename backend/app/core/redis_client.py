@@ -295,3 +295,21 @@ def invalidate_config_cache(key: str | None = None) -> None:
     if key:
         r.delete(f"{CONFIG_CACHE_PREFIX}{key}")
     r.delete(f"{CONFIG_CACHE_PREFIX}all")
+
+
+def get_cached_config(key: str) -> str | None:
+    """读取 Redis 端的配置缓存；失败返回 None 由调用方回源 DB。"""
+    try:
+        r = get_redis()
+        return r.get(f"{CONFIG_CACHE_PREFIX}{key}")
+    except Exception:
+        return None
+
+
+def set_cached_config(key: str, value: str, ttl: int = CONFIG_CACHE_TTL) -> None:
+    """回填配置缓存；静默忽略 Redis 异常。"""
+    try:
+        r = get_redis()
+        r.setex(f"{CONFIG_CACHE_PREFIX}{key}", ttl, value)
+    except Exception:
+        pass

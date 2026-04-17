@@ -157,12 +157,13 @@ def update_job(db: Session, job_id: int, version: int, payload: dict, operator: 
     )
     if rowcount == 0:
         db.rollback()
-        current = db.query(Job).filter(Job.id == job_id).first()
+        current = db.query(Job).populate_existing().filter(Job.id == job_id).first()
         raise BusinessException(
             40902, "此条目已被修改，请刷新",
             {"current_version": int(current.version) if current else 0},
         )
-    job = db.query(Job).filter(Job.id == job_id).first()
+    # populate_existing 避免 synchronize_session=False 与 identity map 组合下返回旧值
+    job = db.query(Job).populate_existing().filter(Job.id == job_id).first()
     after = _snapshot(job)
 
     write_admin_log(
@@ -172,7 +173,6 @@ def update_job(db: Session, job_id: int, version: int, payload: dict, operator: 
         before=before, after=after,
     )
     db.commit()
-    db.refresh(job)
     return job
 
 
@@ -180,12 +180,37 @@ def update_job(db: Session, job_id: int, version: int, payload: dict, operator: 
 # 下架 / 延期 / 取消下架
 # ---------------------------------------------------------------------------
 
-def delist(db: Session, job_id: int, reason: str, operator: str) -> None:
+def _atomic_job_update(db: Session, job_id: int, expected_version: int, patch: dict) -> Job:
+    """共用的原子 UPDATE + version 递增 + populate_existing 刷新。"""
+    new_version = int(expected_version) + 1
+    body = {**patch, "version": new_version}
+    rowcount = (
+        db.query(Job)
+        .filter(Job.id == job_id, Job.version == expected_version)
+        .update(body, synchronize_session=False)
+    )
+    if rowcount == 0:
+        db.rollback()
+        current = db.query(Job).filter(Job.id == job_id).first()
+        raise BusinessException(
+            40902, "此条目已被修改，请刷新",
+            {"current_version": int(current.version) if current else 0},
+        )
+    # populate_existing 让 identity-mapped 的 Job 实例从 DB 重新加载属性，
+    # 避免 after 快照拿到 synchronize_session=False 后的旧值。
+    job = db.query(Job).populate_existing().filter(Job.id == job_id).first()
+    return job
+
+
+def delist(db: Session, job_id: int, version: int, reason: str, operator: str) -> None:
     if reason not in ("manual_delist", "filled"):
         raise BusinessException(40101, "无效的下架原因")
     job = get_job(db, job_id)
+    if int(job.version or 0) != int(version):
+        raise BusinessException(40902, "此条目已被修改，请刷新",
+                                {"current_version": int(job.version or 0)})
     before = _snapshot(job)
-    job.delist_reason = reason
+    job = _atomic_job_update(db, job_id, version, {"delist_reason": reason})
     write_admin_log(
         db,
         target_type="job", target_id=job.id,
@@ -195,10 +220,14 @@ def delist(db: Session, job_id: int, reason: str, operator: str) -> None:
     db.commit()
 
 
-def extend(db: Session, job_id: int, days: int, operator: str) -> Job:
+def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> Job:
     if days not in (15, 30):
         raise BusinessException(40101, "延期天数仅支持 15 或 30")
     job = get_job(db, job_id)
+    if int(job.version or 0) != int(version):
+        raise BusinessException(40902, "此条目已被修改，请刷新",
+                                {"current_version": int(job.version or 0)})
+
     before = _snapshot(job)
     now = datetime.now()
     max_days = _load_config_int(db, "ttl.job.days", 30) * 2
@@ -207,8 +236,8 @@ def extend(db: Session, job_id: int, days: int, operator: str) -> Job:
     ceiling = (job.created_at or now) + timedelta(days=max_days)
     if new_expires > ceiling:
         new_expires = ceiling
-    job.expires_at = new_expires
 
+    job = _atomic_job_update(db, job_id, version, {"expires_at": new_expires})
     write_admin_log(
         db,
         target_type="job", target_id=job.id,
@@ -216,19 +245,21 @@ def extend(db: Session, job_id: int, days: int, operator: str) -> Job:
         before=before, after=_snapshot(job), reason=f"extend:{days}d",
     )
     db.commit()
-    db.refresh(job)
     return job
 
 
-def restore(db: Session, job_id: int, operator: str) -> None:
+def restore(db: Session, job_id: int, version: int, operator: str) -> None:
     job = get_job(db, job_id)
+    if int(job.version or 0) != int(version):
+        raise BusinessException(40902, "此条目已被修改，请刷新",
+                                {"current_version": int(job.version or 0)})
     if not job.delist_reason:
         raise BusinessException(40904, "岗位未下架")
     if job.expires_at and job.expires_at <= datetime.now():
         raise BusinessException(40904, "岗位已过期，无法取消下架")
 
     before = _snapshot(job)
-    job.delist_reason = None
+    job = _atomic_job_update(db, job_id, version, {"delist_reason": None})
     write_admin_log(
         db,
         target_type="job", target_id=job.id,

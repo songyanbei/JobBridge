@@ -28,7 +28,9 @@ from app.core.redis_client import (
     check_msg_duplicate,
     check_rate_limit,
     enqueue_message,
+    get_cached_config,
     get_redis,
+    set_cached_config,
 )
 from app.db import SessionLocal
 from app.models import SystemConfig, WecomInboundEvent
@@ -55,9 +57,8 @@ _VALID_INBOUND_TYPES = frozenset({
 # 被限流提示的去重窗口，避免同一用户在限流风暴下被重复 push
 _RATE_LIMIT_NOTIFY_DEDUP_SECONDS = 60
 
-# 系统配置内存缓存：key -> (value, expires_at_ts)
-_CONFIG_CACHE_TTL = 60  # 秒
-_config_cache: dict[str, tuple[int, float]] = {}
+# webhook 热路径的配置缓存 TTL（作为 Redis config_cache 未命中时的回源保护）
+_CONFIG_CACHE_TTL = 60
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +283,18 @@ def _get_rate_limit_params() -> tuple[int, int]:
 
 
 def _get_config_int(key: str, default: int) -> int:
-    now = time.monotonic()
-    cached = _config_cache.get(key)
-    if cached is not None and cached[1] > now:
-        return cached[0]
+    """读取 int 配置。
+
+    使用 Redis `config_cache:{key}` 做唯一缓存层，由 `system_config_service.update`
+    更新配置后主动 invalidate。避免进程内缓存导致的多实例配置不一致与变更不生效。
+    """
+    cached = get_cached_config(key)
+    if cached is not None:
+        try:
+            return int(cached)
+        except (ValueError, TypeError):
+            # 缓存异常值，继续回源 DB
+            pass
 
     value = default
     db = SessionLocal()
@@ -301,7 +310,8 @@ def _get_config_int(key: str, default: int) -> int:
     finally:
         db.close()
 
-    _config_cache[key] = (value, now + _CONFIG_CACHE_TTL)
+    # 回填 Redis 缓存供下次命中；失败静默
+    set_cached_config(key, str(value), ttl=_CONFIG_CACHE_TTL)
     return value
 
 

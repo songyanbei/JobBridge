@@ -90,10 +90,12 @@ def update(
     item.updated_by = operator
 
     is_danger = key in DANGER_KEYS
-    # 按 phase5-main §3.1："所有写操作必须写 audit_log"
+    # 按 phase5-main §3.1 / §5.6：所有配置变更写 audit_log；
+    # target_type 固定为 system，target_id 为 config_key 原值（无前缀），
+    # 方便按 system/<key> 条件查询变更历史。
     write_admin_log(
         db,
-        target_type="user", target_id=f"system_config:{key}",
+        target_type="system", target_id=key,
         action="manual_edit", operator=operator,
         before=before,
         after={"config_value": item.config_value, "value_type": item.value_type},

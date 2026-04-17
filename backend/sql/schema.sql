@@ -232,7 +232,7 @@ CREATE TABLE `conversation_log` (
 DROP TABLE IF EXISTS `audit_log`;
 CREATE TABLE `audit_log` (
     `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `target_type`  ENUM('job','resume','user') NOT NULL            COMMENT '审核对象类型',
+    `target_type`  ENUM('job','resume','user','system') NOT NULL   COMMENT '审核对象类型（system=系统配置变更）',
     `target_id`    VARCHAR(64)     NOT NULL                         COMMENT 'job.id / resume.id / user.external_userid',
     `action`       ENUM('auto_pass','auto_reject','manual_pass','manual_reject','manual_edit','undo','appeal','reinstate') NOT NULL,
     `reason`       VARCHAR(255)    DEFAULT NULL                     COMMENT '动作原因',
@@ -389,6 +389,9 @@ SET FOREIGN_KEY_CHECKS = 1;
 --   ALTER TABLE audit_log MODIFY COLUMN action
 --     ENUM('auto_pass','auto_reject','manual_pass','manual_reject',
 --          'manual_edit','undo','appeal','reinstate') NOT NULL;
+-- audit_log.target_type 枚举扩展：新增 system（承载系统配置变更审计）
+--   ALTER TABLE audit_log MODIFY COLUMN target_type
+--     ENUM('job','resume','user','system') NOT NULL;
 -- event_log 新表：见上
 -- ============================================================================
 

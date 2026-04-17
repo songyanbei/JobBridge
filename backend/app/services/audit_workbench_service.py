@@ -21,6 +21,7 @@ from app.core.redis_client import (
     acquire_audit_lock,
     get_audit_lock_holder,
     pop_undo,
+    refresh_audit_lock,
     release_audit_lock,
     save_undo,
 )
@@ -307,11 +308,23 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
 
 def lock(target_type: str, target_id: int, operator: str) -> None:
     _model_for(target_type)  # 参数校验
+
+    # 先看当前持有者；若已是自己则只续 TTL（重入）。
     holder = get_audit_lock_holder(target_type, target_id)
-    if holder and holder != operator:
+    if holder == operator:
+        refresh_audit_lock(target_type, target_id, operator)
+        return
+    if holder:
         raise BusinessException(40901, "条目正在被其他审核员处理", {"locked_by": holder})
-    # 已是自己持有则续期；否则新建
-    acquire_audit_lock(target_type, target_id, operator)
+
+    # 以 SETNX 的真实返回值为准：失败说明并发抢锁输了，读取最新 holder 并抛 40901。
+    acquired = acquire_audit_lock(target_type, target_id, operator)
+    if not acquired:
+        real_holder = get_audit_lock_holder(target_type, target_id)
+        raise BusinessException(
+            40901, "条目正在被其他审核员处理",
+            {"locked_by": real_holder} if real_holder else None,
+        )
 
 
 def unlock(target_type: str, target_id: int, operator: str) -> bool:
@@ -346,13 +359,15 @@ def _atomic_version_update(
     )
     if rowcount == 0:
         db.rollback()
-        current = db.query(model).filter(model.id == target_id).first()
+        current = db.query(model).populate_existing().filter(model.id == target_id).first()
         raise BusinessException(
             40902, "此条目已被修改，请刷新",
             {"current_version": int(current.version) if current else 0},
         )
-    # 将最新值同步回 ORM session（以便后续快照 / audit_log 取真实值）
-    obj = db.query(model).filter(model.id == target_id).first()
+    # populate_existing 让 identity map 的对象按 DB 新值重新加载，
+    # 否则 synchronize_session=False + 命中 identity map 会返回过期 ORM 实例，
+    # 导致 after 快照和 audit_log 记录失真。
+    obj = db.query(model).populate_existing().filter(model.id == target_id).first()
     return obj
 
 

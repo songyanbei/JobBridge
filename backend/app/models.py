@@ -262,8 +262,8 @@ class AuditLog(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     target_type = sa.Column(
-        sa.Enum("job", "resume", "user", name="audit_target_type"),
-        nullable=False, comment="审核对象类型",
+        sa.Enum("job", "resume", "user", "system", name="audit_target_type"),
+        nullable=False, comment="审核对象类型（system=系统配置）",
     )
     target_id = sa.Column(sa.String(64), nullable=False, comment="目标 ID")
     action = sa.Column(

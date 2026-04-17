@@ -249,12 +249,19 @@ class TestRateLimitNotify:
 # ---------------------------------------------------------------------------
 
 class TestRateLimitParams:
+    """Phase 5 起：webhook 通过 Redis `config_cache:{key}` 共享配置缓存，
+
+    不再维护进程内 dict，因此 system_config_service 更新配置后可立即命中新值。
+    """
+
     def test_default_values_when_db_unavailable(self):
         from app.api import webhook as webhook_mod
-        # 清理缓存
-        webhook_mod._config_cache.clear()
 
-        with patch("app.api.webhook.SessionLocal") as mock_session_factory:
+        with (
+            patch("app.api.webhook.get_cached_config", return_value=None),
+            patch("app.api.webhook.set_cached_config"),
+            patch("app.api.webhook.SessionLocal") as mock_session_factory,
+        ):
             db = MagicMock()
             db.query.return_value.filter.return_value.first.return_value = None
             mock_session_factory.return_value = db
@@ -262,24 +269,41 @@ class TestRateLimitParams:
             assert window == 10  # 默认
             assert max_count == 5
 
-    def test_cached_value_reused_within_ttl(self):
+    def test_redis_cache_hit_skips_db(self):
         from app.api import webhook as webhook_mod
-        webhook_mod._config_cache.clear()
 
-        call_count = {"n": 0}
+        def cache_get(key):
+            return {"rate_limit.window_seconds": "20", "rate_limit.max_count": "7"}.get(key)
+
+        with (
+            patch("app.api.webhook.get_cached_config", side_effect=cache_get),
+            patch("app.api.webhook.set_cached_config") as mock_set,
+            patch("app.api.webhook.SessionLocal") as mock_session_factory,
+        ):
+            window, max_count = webhook_mod._get_rate_limit_params()
+            assert window == 20
+            assert max_count == 7
+            # 命中 Redis 缓存后不应再开 DB 连接，也不需要回填 cache
+            mock_session_factory.assert_not_called()
+            mock_set.assert_not_called()
+
+    def test_redis_cache_miss_falls_back_to_db_and_backfills(self):
+        from app.api import webhook as webhook_mod
 
         def factory():
-            call_count["n"] += 1
             db = MagicMock()
             cfg = MagicMock()
-            cfg.config_value = "20"
+            cfg.config_value = "15"
             db.query.return_value.filter.return_value.first.return_value = cfg
             return db
 
-        with patch("app.api.webhook.SessionLocal", side_effect=factory):
-            w1, _ = webhook_mod._get_rate_limit_params()
-            w2, _ = webhook_mod._get_rate_limit_params()
-            assert w1 == 20
-            assert w2 == 20
-            # 两次读取只该打开 2 次连接（每个 key 一次），之后走缓存
-            assert call_count["n"] == 2
+        with (
+            patch("app.api.webhook.get_cached_config", return_value=None),
+            patch("app.api.webhook.set_cached_config") as mock_set,
+            patch("app.api.webhook.SessionLocal", side_effect=factory),
+        ):
+            window, max_count = webhook_mod._get_rate_limit_params()
+            assert window == 15
+            assert max_count == 15
+            # 每个 key 都应回填 Redis
+            assert mock_set.call_count == 2

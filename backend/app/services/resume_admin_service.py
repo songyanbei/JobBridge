@@ -149,12 +149,13 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
     )
     if rowcount == 0:
         db.rollback()
-        current = db.query(Resume).filter(Resume.id == resume_id).first()
+        current = db.query(Resume).populate_existing().filter(Resume.id == resume_id).first()
         raise BusinessException(
             40902, "此条目已被修改，请刷新",
             {"current_version": int(current.version) if current else 0},
         )
-    resume = db.query(Resume).filter(Resume.id == resume_id).first()
+    # populate_existing 避免 synchronize_session=False 与 identity map 组合下返回旧值
+    resume = db.query(Resume).populate_existing().filter(Resume.id == resume_id).first()
     after = _snapshot(resume)
 
     write_admin_log(
@@ -164,31 +165,58 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
         before=before, after=after,
     )
     db.commit()
-    db.refresh(resume)
     return resume
 
 
-def delist(db: Session, resume_id: int, reason: str, operator: str) -> None:
+def _atomic_resume_update(db: Session, resume_id: int, expected_version: int, patch: dict) -> Resume:
+    new_version = int(expected_version) + 1
+    body = {**patch, "version": new_version}
+    rowcount = (
+        db.query(Resume)
+        .filter(Resume.id == resume_id, Resume.version == expected_version)
+        .update(body, synchronize_session=False)
+    )
+    if rowcount == 0:
+        db.rollback()
+        current = db.query(Resume).filter(Resume.id == resume_id).first()
+        raise BusinessException(
+            40902, "此条目已被修改，请刷新",
+            {"current_version": int(current.version) if current else 0},
+        )
+    resume = db.query(Resume).populate_existing().filter(Resume.id == resume_id).first()
+    return resume
+
+
+def delist(db: Session, resume_id: int, version: int, reason: str, operator: str) -> None:
     """简历软下架：置 deleted_at（简历没有 delist_reason 字段）。"""
     resume = get_resume(db, resume_id)
+    if int(resume.version or 0) != int(version):
+        raise BusinessException(40902, "此条目已被修改，请刷新",
+                                {"current_version": int(resume.version or 0)})
     if resume.deleted_at is not None:
         raise BusinessException(40904, "简历已下架")
     before = _snapshot(resume)
-    resume.deleted_at = datetime.now()
+    now = datetime.now()
+    resume = _atomic_resume_update(db, resume_id, version, {"deleted_at": now})
     write_admin_log(
         db,
         target_type="resume", target_id=resume.id,
         action="manual_edit", operator=operator,
-        before=before, after=_snapshot(resume) | {"deleted_at": resume.deleted_at.isoformat()},
+        before=before,
+        after=_snapshot(resume) | {"deleted_at": now.isoformat()},
         reason=f"delist:{reason}",
     )
     db.commit()
 
 
-def extend(db: Session, resume_id: int, days: int, operator: str) -> Resume:
+def extend(db: Session, resume_id: int, version: int, days: int, operator: str) -> Resume:
     if days not in (15, 30):
         raise BusinessException(40101, "延期天数仅支持 15 或 30")
     resume = get_resume(db, resume_id)
+    if int(resume.version or 0) != int(version):
+        raise BusinessException(40902, "此条目已被修改，请刷新",
+                                {"current_version": int(resume.version or 0)})
+
     before = _snapshot(resume)
     now = datetime.now()
     max_days = _load_config_int(db, "ttl.resume.days", 30) * 2
@@ -197,8 +225,8 @@ def extend(db: Session, resume_id: int, days: int, operator: str) -> Resume:
     ceiling = (resume.created_at or now) + timedelta(days=max_days)
     if new_expires > ceiling:
         new_expires = ceiling
-    resume.expires_at = new_expires
 
+    resume = _atomic_resume_update(db, resume_id, version, {"expires_at": new_expires})
     write_admin_log(
         db,
         target_type="resume", target_id=resume.id,
@@ -206,7 +234,6 @@ def extend(db: Session, resume_id: int, days: int, operator: str) -> Resume:
         before=before, after=_snapshot(resume), reason=f"extend:{days}d",
     )
     db.commit()
-    db.refresh(resume)
     return resume
 
 

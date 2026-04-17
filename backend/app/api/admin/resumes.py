@@ -25,10 +25,12 @@ class ResumeEditRequest(BaseModel):
 
 
 class DelistRequest(BaseModel):
+    version: int = Field(..., ge=1)
     reason: str = Field(default="manual_delist")
 
 
 class ExtendRequest(BaseModel):
+    version: int = Field(..., ge=1)
     days: int
 
 
@@ -145,7 +147,7 @@ def delist_resume(
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    resume_admin_service.delist(db, resume_id, req.reason, current.username)
+    resume_admin_service.delist(db, resume_id, req.version, req.reason, current.username)
     return ok()
 
 
@@ -156,5 +158,5 @@ def extend_resume(
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    r = resume_admin_service.extend(db, resume_id, req.days, current.username)
+    r = resume_admin_service.extend(db, resume_id, req.version, req.days, current.username)
     return ok({"expires_at": r.expires_at.isoformat() if r.expires_at else None})

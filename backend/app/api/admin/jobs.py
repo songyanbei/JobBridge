@@ -25,11 +25,17 @@ class JobEditRequest(BaseModel):
 
 
 class DelistRequest(BaseModel):
+    version: int = Field(..., ge=1)
     reason: str = Field(..., description="manual_delist | filled")
 
 
 class ExtendRequest(BaseModel):
+    version: int = Field(..., ge=1)
     days: int = Field(..., description="15 或 30")
+
+
+class RestoreRequest(BaseModel):
+    version: int = Field(..., ge=1)
 
 
 def _collect_filters(
@@ -155,7 +161,7 @@ def delist_job(
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    job_admin_service.delist(db, job_id, req.reason, current.username)
+    job_admin_service.delist(db, job_id, req.version, req.reason, current.username)
     return ok()
 
 
@@ -166,15 +172,16 @@ def extend_job(
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    job = job_admin_service.extend(db, job_id, req.days, current.username)
+    job = job_admin_service.extend(db, job_id, req.version, req.days, current.username)
     return ok({"expires_at": job.expires_at.isoformat() if job.expires_at else None})
 
 
 @router.post("/{job_id}/restore", summary="岗位取消下架")
 def restore_job(
     job_id: int,
+    req: RestoreRequest,
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    job_admin_service.restore(db, job_id, current.username)
+    job_admin_service.restore(db, job_id, req.version, current.username)
     return ok()

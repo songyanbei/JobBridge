@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.models import AuditLog
 
 
-_ALLOWED_TARGET_TYPES = {"job", "resume", "user"}
+_ALLOWED_TARGET_TYPES = {"job", "resume", "user", "system"}
 _ALLOWED_ACTIONS = {
     "auto_pass", "auto_reject",
     "manual_pass", "manual_reject",
