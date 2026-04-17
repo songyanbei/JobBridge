@@ -23,12 +23,44 @@ from app.db import engine
 
 logger = logging.getLogger(__name__)
 
+OPENAPI_TAGS = [
+    {"name": "system", "description": "系统健康检查与元数据。"},
+    {"name": "admin-auth", "description": "运营后台鉴权：登录、当前用户、修改密码。"},
+    {"name": "admin-audit", "description": "审核工作台：队列、详情、软锁、pass/reject/edit/undo。"},
+    {"name": "admin-accounts", "description": "账号管理：厂家 / 中介 / 工人 / 黑名单 + Excel 批量导入。"},
+    {"name": "admin-jobs", "description": "岗位管理：列表 / 编辑 / 下架 / 延期 / 取消下架 / CSV 导出。"},
+    {"name": "admin-resumes", "description": "简历管理：列表 / 编辑 / 下架 / 延期 / CSV 导出。"},
+    {"name": "admin-dicts", "description": "字典管理：城市 / 工种 / 敏感词（含批量导入）。"},
+    {"name": "admin-config", "description": "系统配置读取与单项更新；危险项变更会写 audit_log。"},
+    {"name": "admin-reports", "description": "数据看板：dashboard / trends / top / funnel / export。"},
+    {"name": "admin-logs", "description": "对话日志查询与导出（必须带 userid + 时间范围）。"},
+    {"name": "events", "description": "外部事件回传（小程序点击等），走 X-Event-Api-Key 鉴权。"},
+    {"name": "wecom-webhook", "description": "企业微信回调入口（内部使用，非后台用户直连）。"},
+]
+
+
 app = FastAPI(
-    title="JobBridge 招聘撮合平台",
-    description="企业微信 + LLM 的招聘撮合后端（v1）",
+    title="JobBridge 招聘撮合平台 API",
+    description=(
+        "企业微信 + LLM 的招聘撮合后端 API（v1）。\n\n"
+        "**统一响应协议**：所有 `/admin/*` 与 `/api/events/*` 接口均返回 HTTP 200，\n"
+        "以 `{\"code\": 0 | <err>, \"message\": \"...\", \"data\": ...}` 结构区分成败。\n\n"
+        "**鉴权**：\n"
+        "- `/admin/*`：Bearer Token（`POST /admin/login` 获取），请求头 `Authorization: Bearer <token>`\n"
+        "- `/api/events/*`：请求头 `X-Event-Api-Key: <EVENT_API_KEY>`（与 JWT 分离）\n\n"
+        "**错误码范围**：\n"
+        "- `40001`–`40099` 鉴权（40001 账密错误 / 40002 token 过期 / 40003 token 无效）\n"
+        "- `40101` 参数错误\n"
+        "- `40301` 权限不足\n"
+        "- `40401` 资源不存在\n"
+        "- `40901` 软锁冲突 / `40902` 乐观锁冲突 / `40903` 撤销窗口已过 / `40904` 业务冲突\n"
+        "- `50001` 内部错误 / `50101` LLM 异常\n\n"
+        "详见 `docs/frontend-handoff.md`。"
+    ),
     version="0.1.0",
     docs_url="/docs" if settings.is_development else None,
-    redoc_url=None,
+    redoc_url="/redoc" if settings.is_development else None,
+    openapi_tags=OPENAPI_TAGS,
 )
 
 # CORS：通过 CORS_ORIGINS 环境变量配置，开发环境默认放开全部
