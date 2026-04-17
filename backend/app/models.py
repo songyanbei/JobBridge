@@ -267,7 +267,13 @@ class AuditLog(Base):
     )
     target_id = sa.Column(sa.String(64), nullable=False, comment="目标 ID")
     action = sa.Column(
-        sa.Enum("auto_pass", "auto_reject", "manual_pass", "manual_reject", "appeal", "reinstate", name="audit_action"),
+        sa.Enum(
+            "auto_pass", "auto_reject",
+            "manual_pass", "manual_reject",
+            "manual_edit", "undo",
+            "appeal", "reinstate",
+            name="audit_action",
+        ),
         nullable=False,
     )
     reason = sa.Column(sa.String(255), nullable=True, comment="动作原因")
@@ -377,7 +383,35 @@ class AdminUser(Base):
 
 
 # ============================================================================
-# 11. WecomInboundEvent 企微入站事件表
+# 11. EventLog 小程序点击等外部事件回传日志（Phase 5 新增）
+# ============================================================================
+
+class EventLog(Base):
+    __tablename__ = "event_log"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    event_type = sa.Column(
+        sa.Enum("miniprogram_click", name="event_type"),
+        nullable=False, comment="事件类型",
+    )
+    userid = sa.Column(sa.String(64), nullable=False, comment="external_userid")
+    target_type = sa.Column(
+        sa.Enum("job", "resume", name="event_target_type"),
+        nullable=False, comment="点击目标类型",
+    )
+    target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, comment="目标主键")
+    occurred_at = sa.Column(sa.DateTime, nullable=False, comment="客户端上报的发生时间")
+    extra = sa.Column(sa.JSON, nullable=True, comment="扩展字段（版本号 / 来源页面等）")
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.Index("idx_target", "target_type", "target_id", "occurred_at"),
+        sa.Index("idx_user_time", "userid", "occurred_at"),
+    )
+
+
+# ============================================================================
+# 12. WecomInboundEvent 企微入站事件表
 # ============================================================================
 
 class WecomInboundEvent(Base):

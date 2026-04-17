@@ -28,7 +28,11 @@ pycryptodome>=3.20,<4.0
 
 # Auth
 bcrypt>=4.1,<5.0
+passlib[bcrypt]>=1.7,<2.0
 python-jose[cryptography]>=3.3,<4.0
+
+# Excel（Phase 5 账号批量导入）
+openpyxl>=3.1,<4.0
 
 # Scheduled tasks
 apscheduler>=3.10,<4.0

@@ -1,14 +1,31 @@
 """自定义业务异常。
 
 所有业务异常继承 AppError，API 层统一 catch 并转换为 HTTP 响应。
+
+Phase 5 新增 BusinessException（int code + message + optional data），
+配合 /admin/* 与 /api/events/* 的统一响应协议（code/message/data）。
 """
 
 
 class AppError(Exception):
-    """应用基础异常。"""
+    """应用基础异常（历史遗留，使用字符串 code）。"""
     def __init__(self, message: str = "", code: str = "INTERNAL_ERROR"):
         self.message = message
         self.code = code
+        super().__init__(message)
+
+
+class BusinessException(Exception):
+    """Phase 5 统一业务异常。
+
+    使用 int 错误码（与 §6.4 错误码范围对齐），API 层全局异常处理器
+    会将其转为 `{"code": <int>, "message": <str>, "data": <any>}` 响应。
+    """
+
+    def __init__(self, code: int, message: str, data=None):
+        self.code = code
+        self.message = message
+        self.data = data
         super().__init__(message)
 
 

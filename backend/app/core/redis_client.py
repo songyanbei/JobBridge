@@ -4,6 +4,7 @@
 - 会话状态管理（conversation_session）
 - 分布式锁（消息串行化，见方案 §11.7）
 - 配置缓存（system_config 热加载）
+- Phase 5：审核工作台软锁、Undo 暂存、事件回传幂等、管理员登录失败计数
 """
 import json
 from contextlib import contextmanager
@@ -159,3 +160,138 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[bool, None, None]:
                 lock.release()
             except redis.exceptions.LockNotOwnedError:
                 pass  # TTL 已过期自动释放
+
+
+# ---------------------------------------------------------------------------
+# Phase 5：审核工作台软锁（§5.2）
+# ---------------------------------------------------------------------------
+
+AUDIT_LOCK_PREFIX = "audit_lock:"
+AUDIT_LOCK_TTL = 300  # 5 分钟
+
+
+def acquire_audit_lock(target_type: str, target_id: int | str, operator: str, ttl: int = AUDIT_LOCK_TTL) -> bool:
+    """尝试获取审核软锁，返回 True 表示成功持有。"""
+    r = get_redis()
+    key = f"{AUDIT_LOCK_PREFIX}{target_type}:{target_id}"
+    return bool(r.set(key, operator, nx=True, ex=ttl))
+
+
+def refresh_audit_lock(target_type: str, target_id: int | str, operator: str, ttl: int = AUDIT_LOCK_TTL) -> bool:
+    """如果当前锁由 operator 持有则续期。"""
+    r = get_redis()
+    key = f"{AUDIT_LOCK_PREFIX}{target_type}:{target_id}"
+    holder = r.get(key)
+    if holder == operator:
+        r.expire(key, ttl)
+        return True
+    return False
+
+
+def get_audit_lock_holder(target_type: str, target_id: int | str) -> str | None:
+    """返回当前锁持有者 username，如未锁定返回 None。"""
+    r = get_redis()
+    return r.get(f"{AUDIT_LOCK_PREFIX}{target_type}:{target_id}")
+
+
+def release_audit_lock(target_type: str, target_id: int | str, operator: str) -> bool:
+    """仅持有者可释放锁，返回是否成功释放。"""
+    r = get_redis()
+    key = f"{AUDIT_LOCK_PREFIX}{target_type}:{target_id}"
+    if r.get(key) == operator:
+        r.delete(key)
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Phase 5：Undo 动作暂存（§5.2）
+# ---------------------------------------------------------------------------
+
+UNDO_PREFIX = "undo_action:"
+UNDO_TTL = 30  # 30 秒
+
+
+def save_undo(target_type: str, target_id: int | str, payload: dict, ttl: int = UNDO_TTL) -> None:
+    r = get_redis()
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    r.setex(key, ttl, json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def pop_undo(target_type: str, target_id: int | str) -> dict | None:
+    """取出并删除 Undo 快照；超过 TTL 返回 None。"""
+    r = get_redis()
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    data = r.get(key)
+    if not data:
+        return None
+    r.delete(key)
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5：事件回传幂等（§5.9）
+# ---------------------------------------------------------------------------
+
+EVENT_IDEM_PREFIX = "event_idem:"
+EVENT_DEDUPE_TTL_DEFAULT = 600  # 10 分钟
+
+
+def mark_event_idem(userid: str, target_type: str, target_id: int | str, ttl: int = EVENT_DEDUPE_TTL_DEFAULT) -> bool:
+    """标记事件幂等 key；返回 True 表示首次出现（需写库），False 表示已去重。"""
+    r = get_redis()
+    key = f"{EVENT_IDEM_PREFIX}{userid}:{target_type}:{target_id}"
+    return bool(r.set(key, "1", nx=True, ex=ttl))
+
+
+def clear_event_idem(userid: str, target_type: str, target_id: int | str) -> None:
+    """写库失败时调用，让下次同事件可以重试。"""
+    r = get_redis()
+    r.delete(f"{EVENT_IDEM_PREFIX}{userid}:{target_type}:{target_id}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5：管理员登录失败计数（§5.1）
+# ---------------------------------------------------------------------------
+
+ADMIN_LOGIN_FAIL_PREFIX = "admin_login_fail:"
+ADMIN_LOGIN_FAIL_TTL = 60
+
+
+def incr_admin_login_fail(username: str) -> int:
+    r = get_redis()
+    key = f"{ADMIN_LOGIN_FAIL_PREFIX}{username}"
+    count = r.incr(key)
+    if count == 1:
+        r.expire(key, ADMIN_LOGIN_FAIL_TTL)
+    return count
+
+
+def get_admin_login_fail(username: str) -> int:
+    r = get_redis()
+    v = r.get(f"{ADMIN_LOGIN_FAIL_PREFIX}{username}")
+    return int(v) if v else 0
+
+
+def clear_admin_login_fail(username: str) -> None:
+    r = get_redis()
+    r.delete(f"{ADMIN_LOGIN_FAIL_PREFIX}{username}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5：system_config 缓存
+# ---------------------------------------------------------------------------
+
+CONFIG_CACHE_PREFIX = "config_cache:"
+CONFIG_CACHE_TTL = 300
+
+
+def invalidate_config_cache(key: str | None = None) -> None:
+    """清除单项或全量 config_cache。"""
+    r = get_redis()
+    if key:
+        r.delete(f"{CONFIG_CACHE_PREFIX}{key}")
+    r.delete(f"{CONFIG_CACHE_PREFIX}all")

@@ -234,7 +234,7 @@ CREATE TABLE `audit_log` (
     `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     `target_type`  ENUM('job','resume','user') NOT NULL            COMMENT '审核对象类型',
     `target_id`    VARCHAR(64)     NOT NULL                         COMMENT 'job.id / resume.id / user.external_userid',
-    `action`       ENUM('auto_pass','auto_reject','manual_pass','manual_reject','appeal','reinstate') NOT NULL,
+    `action`       ENUM('auto_pass','auto_reject','manual_pass','manual_reject','manual_edit','undo','appeal','reinstate') NOT NULL,
     `reason`       VARCHAR(255)    DEFAULT NULL                     COMMENT '动作原因',
     `operator`     VARCHAR(64)     DEFAULT NULL                     COMMENT 'system / admin 用户名',
     `snapshot`     JSON            DEFAULT NULL                     COMMENT '动作发生时的对象快照（可选）',
@@ -359,7 +359,38 @@ CREATE TABLE `wecom_inbound_event` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='企微入站事件表';
 
 
+-- ============================================================================
+-- 12. event_log 外部事件回传日志（Phase 5 §5.9）
+-- ============================================================================
+-- 用途：接收小程序点击等外部事件回传，用于数据看板"详情点击率"指标
+-- ============================================================================
+DROP TABLE IF EXISTS `event_log`;
+CREATE TABLE `event_log` (
+    `id`          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `event_type`  ENUM('miniprogram_click') NOT NULL COMMENT '事件类型',
+    `userid`      VARCHAR(64) NOT NULL COMMENT 'external_userid',
+    `target_type` ENUM('job','resume') NOT NULL COMMENT '点击目标类型',
+    `target_id`   BIGINT UNSIGNED NOT NULL COMMENT '目标主键',
+    `occurred_at` DATETIME NOT NULL COMMENT '客户端上报的发生时间',
+    `extra`       JSON DEFAULT NULL COMMENT '扩展字段',
+    `created_at`  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_target` (`target_type`, `target_id`, `occurred_at`),
+    KEY `idx_user_time` (`userid`, `occurred_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='外部事件回传日志';
+
+
 SET FOREIGN_KEY_CHECKS = 1;
+
+-- ============================================================================
+-- Phase 5 新增/变更 DDL（已存在库需单独执行 ALTER）
+-- ============================================================================
+-- audit_log.action 枚举扩展：新增 manual_edit / undo
+--   ALTER TABLE audit_log MODIFY COLUMN action
+--     ENUM('auto_pass','auto_reject','manual_pass','manual_reject',
+--          'manual_edit','undo','appeal','reinstate') NOT NULL;
+-- event_log 新表：见上
+-- ============================================================================
 
 -- ============================================================================
 -- 索引策略说明

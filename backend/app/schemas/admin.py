@@ -18,6 +18,14 @@ class AdminToken(BaseModel):
     """登录成功后返回的 Token。"""
     access_token: str
     token_type: str = "bearer"
+    expires_at: datetime | None = None
+    password_changed: bool = False
+
+
+class ChangePasswordRequest(BaseModel):
+    """修改管理员密码。"""
+    old_password: str = Field(..., min_length=1, max_length=64)
+    new_password: str = Field(..., min_length=8, max_length=64)
 
 
 class AdminUserRead(BaseModel):

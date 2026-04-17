@@ -90,7 +90,14 @@ INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `descri
 
 -- 限流（防刷）
 ('rate_limit.window_seconds',       '10',  'int',  '限流时间窗口（秒）'),
-('rate_limit.max_count',            '5',   'int',  '窗口内最大消息数');
+('rate_limit.max_count',            '5',   'int',  '窗口内最大消息数'),
+
+-- Phase 5 运营后台参数
+('event.dedupe_window_seconds',     '600', 'int',  '事件回传去重窗口（秒）'),
+('audit.lock_ttl_seconds',          '300', 'int',  '审核工作台软锁 TTL（秒）'),
+('audit.undo_window_seconds',       '30',  'int',  'Undo 撤销窗口 TTL（秒）'),
+('report.cache_ttl_seconds',        '60',  'int',  '看板缓存 TTL（秒）'),
+('account.import_max_rows',         '500', 'int',  '账号 Excel 批量导入单次最大行数');
 
 
 -- ============================================================================

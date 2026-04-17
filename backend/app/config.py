@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     admin_jwt_secret: str = "change-me"
     admin_jwt_expires_hours: int = 24
 
+    # ---- 事件回传 API ----
+    event_api_key: str = ""  # 小程序点击事件回传 API Key（生产环境每季度轮换）
+
     # ---- CORS ----
     cors_origins: str = ""  # 逗号分隔的允许域名列表，为空时开发环境允许全部，生产环境拒绝全部
 
