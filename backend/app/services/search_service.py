@@ -2,22 +2,78 @@
 
 三步漏斗：硬过滤 → Reranker 重排 → 权限过滤 → 文本格式化。
 show_more 复用快照，不重新执行全量检索。
+
+Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 """
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm import get_reranker
+from app.llm.base import RerankResult
 from app.models import Job, Resume, SystemConfig, User
 from app.schemas.conversation import SessionState
 from app.services import conversation_service, permission_service
 from app.services.user_service import UserContext
+from app.tasks.common import log_event
 
 logger = logging.getLogger(__name__)
+
+RERANK_PROMPT_VERSION = "v1"
+
+
+def _rerank_with_logging(
+    query: str,
+    candidates: list[dict],
+    role: str,
+    top_n: int,
+    call_site: str,
+) -> RerankResult:
+    """统一封装 reranker.rerank，附带 loguru 结构化打点。"""
+    reranker = get_reranker()
+    start = time.perf_counter()
+    status = "ok"
+    result: RerankResult | None = None
+    try:
+        result = reranker.rerank(
+            query=query,
+            candidates=candidates,
+            role=role,
+            top_n=top_n,
+        )
+    except LLMTimeout:
+        status = "timeout"
+        raise
+    except LLMParseError:
+        status = "parse_failed"
+        raise
+    except LLMError:
+        status = "http_error"
+        raise
+    except Exception:
+        status = "http_error"
+        raise
+    finally:
+        log_event(
+            "llm_call",
+            call_site=call_site,
+            provider=settings.llm_provider,
+            model=settings.llm_reranker_model,
+            prompt_version=RERANK_PROMPT_VERSION,
+            duration_ms=int((time.perf_counter() - start) * 1000),
+            candidate_count=len(candidates),
+            top_n=top_n,
+            ranked_count=len(result.ranked_items) if result else 0,
+            status=status,
+        )
+    return result
 
 
 @dataclass
@@ -60,13 +116,13 @@ def search_jobs(
     # 转为 dict 列表用于 rerank
     candidate_dicts = _jobs_to_dicts(candidates, db)
 
-    # Reranker
-    reranker = get_reranker()
-    rerank_result = reranker.rerank(
+    # Reranker（含结构化打点）
+    rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
         role=user_ctx.role,
         top_n=top_n,
+        call_site="search_jobs",
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
@@ -135,12 +191,12 @@ def search_workers(
 
     candidate_dicts = _resumes_to_dicts(candidates)
 
-    reranker = get_reranker()
-    rerank_result = reranker.rerank(
+    rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
         role=user_ctx.role,
         top_n=top_n,
+        call_site="search_workers",
     )
 
     ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]

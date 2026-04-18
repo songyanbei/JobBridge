@@ -53,6 +53,9 @@ INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `descri
 ('ttl.job.days',                  '30',  'int',  '岗位 TTL（天）'),
 ('ttl.resume.days',                '30', 'int',  '简历 TTL（天）'),
 ('ttl.conversation_log.days',      '30', 'int',  '对话日志 TTL（天）'),
+('ttl.audit_log.days',             '180','int',  '审核日志 TTL（天）— Phase 7 新增'),
+('ttl.wecom_inbound_event.days',   '30', 'int',  '入站事件表 TTL（天）— Phase 7 新增'),
+('ttl.hard_delete.delay_days',     '7',  'int',  '软删到硬删延迟（天）— Phase 7 新增'),
 
 -- 匹配引擎参数
 ('match.top_n',                    '3',  'int',  '首轮推荐条数（§10.3）'),

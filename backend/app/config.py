@@ -3,6 +3,7 @@
 所有配置通过 pydantic-settings 从 .env 或环境变量加载。
 其它模块统一 `from app.config import settings` 使用。
 """
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -80,9 +81,20 @@ class Settings(BaseSettings):
     # ---- CORS ----
     cors_origins: str = ""  # 逗号分隔的允许域名列表，为空时开发环境允许全部，生产环境拒绝全部
 
+    # ---- Phase 7：定时任务与监控 ----
+    scheduler_timezone: str = "Asia/Shanghai"
+    daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送
+    monitor_queue_incoming_threshold: int = 50
+    monitor_send_retry_threshold: int = 20
+    monitor_alert_dedupe_seconds: int = 600
+
     @property
     def is_development(self) -> bool:
         return self.app_env.lower() == "development"
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env.lower() == "production"
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -90,6 +102,34 @@ class Settings(BaseSettings):
         if self.cors_origins:
             return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
         return ["*"] if self.is_development else []
+
+    # ------------------------------------------------------------------
+    # 启动校验：生产环境禁止 CORS_ORIGINS 为空或包含 "*"
+    # ------------------------------------------------------------------
+
+    @model_validator(mode="after")
+    def _validate_production_cors(self) -> "Settings":
+        """生产环境拒绝以下三种非法配置：
+        - CORS_ORIGINS="" （为空）
+        - CORS_ORIGINS="*"
+        - CORS_ORIGINS="https://a.com, *" （任意一项为 "*"）
+
+        对齐 phase7-main.md §4 实现基线与 §17.3 外部依赖确认单。
+        """
+        if self.app_env.lower() != "production":
+            return self
+        origins = [o.strip() for o in (self.cors_origins or "").split(",") if o.strip()]
+        if not origins:
+            raise ValueError(
+                "CORS_ORIGINS must not be empty in production. "
+                "Set it to concrete origins, e.g. https://admin.example.com"
+            )
+        if any(o == "*" for o in origins):
+            raise ValueError(
+                "CORS_ORIGINS must not contain '*' in production "
+                "(even when mixed with concrete origins)."
+            )
+        return self
 
 
 settings = Settings()

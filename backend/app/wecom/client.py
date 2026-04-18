@@ -142,6 +142,71 @@ class WeComClient:
 
         return data
 
+    def send_text_to_group(self, chat_id: str, content: str) -> bool:
+        """向指定企微群聊发送文本消息（Phase 7 §3.1 模块 H）。
+
+        接口：``cgi-bin/appchat/send``（应用群聊消息推送）。
+
+        与 :py:meth:`send_text` 的差异：
+        - 失败不抛异常，仅返回 False，便于上层把失败消息改写入 `queue:group_send_retry` 独立重试；
+        - token 过期（42001）时触发一次本地 token 失效 + 重试。
+
+        Args:
+            chat_id: 企微群 chatid（应用创建的群聊 ID）。
+            content: 文本内容。
+
+        Returns:
+            True: errcode=0 推送成功；False: 推送失败（已 loguru 记录）。
+        """
+        if not chat_id:
+            logger.warning("send_text_to_group: empty chat_id, skip")
+            return False
+
+        payload = {
+            "chatid": chat_id,
+            "msgtype": "text",
+            "text": {"content": content},
+            "safe": 0,
+        }
+
+        try:
+            token = self.get_access_token()
+            resp = httpx.post(
+                f"{WECOM_API_BASE}/appchat/send",
+                params={"access_token": token},
+                json=payload,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            errcode = data.get("errcode", -1)
+            if errcode == 0:
+                return True
+
+            # token 过期 → 失效并重试一次
+            if errcode == 42001:
+                self.invalidate_token()
+                token = self.get_access_token()
+                resp = httpx.post(
+                    f"{WECOM_API_BASE}/appchat/send",
+                    params={"access_token": token},
+                    json=payload,
+                    timeout=self._timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("errcode", -1) == 0:
+                    return True
+
+            logger.warning(
+                "send_text_to_group failed: chat_id=%s errcode=%s errmsg=%s",
+                chat_id, data.get("errcode"), data.get("errmsg"),
+            )
+            return False
+        except Exception:
+            logger.exception("send_text_to_group raised: chat_id=%s", chat_id)
+            return False
+
     # ------------------------------------------------------------------
     # 素材下载
     # ------------------------------------------------------------------

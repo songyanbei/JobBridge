@@ -75,6 +75,9 @@ QUEUE_INCOMING = "queue:incoming"
 QUEUE_DEAD_LETTER = "queue:dead_letter"
 QUEUE_SEND_RETRY = "queue:send_retry"
 QUEUE_RATE_LIMIT_NOTIFY = "queue:rate_limit_notify"
+# Phase 7：群消息推送失败重试队列（独立于 QUEUE_SEND_RETRY：后者 payload 形态为
+# {userid, content, ...}，消费侧调用 send_text；群消息 payload 含 chat_id，不兼容）。
+QUEUE_GROUP_SEND_RETRY = "queue:group_send_retry"
 
 
 def enqueue_message(message_json: str, queue: str = QUEUE_INCOMING) -> None:

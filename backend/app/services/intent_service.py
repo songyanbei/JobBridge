@@ -2,10 +2,16 @@
 
 识别顺序：显式命令 → show_more 同义语 → LLM IntentExtractor。
 LLM 结果进入业务层前做 canonical key 校验和类型整理。
+
+Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件），
+便于运营追踪 provider / model / 耗时 / 状态。
 """
 import logging
 import re
+import time
 
+from app.config import settings
+from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm import get_intent_extractor
 from app.llm.base import IntentResult
 from app.llm.prompts import (
@@ -13,8 +19,12 @@ from app.llm.prompts import (
     RESUME_REQUIRED_FIELDS,
     SENSITIVE_SOFT_FIELDS,
 )
+from app.tasks.common import log_event
 
 logger = logging.getLogger(__name__)
+
+# intent 抽取提示词版本：随 prompts.py 改动一起 bump，便于日志回溯。
+INTENT_PROMPT_VERSION = "v1"
 
 # ---------------------------------------------------------------------------
 # §17.2 命令集 — 固定别名归并表
@@ -140,14 +150,41 @@ def classify_intent(
     if _match_show_more(stripped):
         return IntentResult(intent="show_more", confidence=1.0)
 
-    # Step 3: LLM 意图抽取
+    # Step 3: LLM 意图抽取（带结构化打点）
     extractor = get_intent_extractor()
-    result = extractor.extract(
-        text=stripped,
-        role=role,
-        history=history,
-        current_criteria=current_criteria,
-    )
+    start = time.perf_counter()
+    status = "ok"
+    result: IntentResult | None = None
+    try:
+        result = extractor.extract(
+            text=stripped,
+            role=role,
+            history=history,
+            current_criteria=current_criteria,
+        )
+    except LLMTimeout:
+        status = "timeout"
+        raise
+    except LLMParseError:
+        status = "parse_failed"
+        raise
+    except LLMError:
+        status = "http_error"
+        raise
+    except Exception:
+        status = "http_error"
+        raise
+    finally:
+        log_event(
+            "llm_call",
+            call_site="intent_extract",
+            provider=settings.llm_provider,
+            model=settings.llm_intent_model,
+            prompt_version=INTENT_PROMPT_VERSION,
+            duration_ms=int((time.perf_counter() - start) * 1000),
+            intent=getattr(result, "intent", None),
+            status=status,
+        )
 
     # Step 4: 校验和清洗
     return _sanitize_intent_result(result, role)

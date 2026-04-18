@@ -4,8 +4,10 @@
     uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Phase 5：注册 /admin/* 与 /api/events/* 路由，并挂载统一响应 / 全局异常处理。
+Phase 7：在 lifespan 内启动 APScheduler（同进程内嵌，非独立容器）。
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -20,8 +22,23 @@ from app.config import settings
 from app.core.exceptions import AppError, BusinessException
 from app.core.responses import fail
 from app.db import engine
+from app.tasks import scheduler as task_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启停阶段挂载 APScheduler（Phase 7 §3.1 模块 A）。
+
+    - 启动阶段：`task_scheduler.start()` 构造 BackgroundScheduler 并注册任务。
+    - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
+    """
+    task_scheduler.start()
+    try:
+        yield
+    finally:
+        task_scheduler.shutdown()
 
 OPENAPI_TAGS = [
     {"name": "system", "description": "系统健康检查与元数据。"},
@@ -61,6 +78,7 @@ app = FastAPI(
     docs_url="/docs" if settings.is_development else None,
     redoc_url="/redoc" if settings.is_development else None,
     openapi_tags=OPENAPI_TAGS,
+    lifespan=lifespan,
 )
 
 # CORS：通过 CORS_ORIGINS 环境变量配置，开发环境默认放开全部

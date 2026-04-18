@@ -215,6 +215,17 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     )
     db.add(audit_entry)
 
+    # 7. 记录硬删倒计时起点到 User.extra['deleted_at']（Phase 7 §3.1 模块 C）。
+    #    存储为 MySQL 友好的 UTC 字符串，供 ttl_cleanup 用 STR_TO_DATE 解析；
+    #    不用 isoformat()（会带 "T" 和时区后缀）。
+    user = db.query(User).filter(
+        User.external_userid == external_userid,
+    ).one_or_none()
+    if user is not None:
+        extra = dict(user.extra or {})
+        extra["deleted_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
+        user.extra = extra
+
     db.flush()
 
     logger.info("user_service: deleted user data for %s", external_userid)
