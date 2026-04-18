@@ -1,0 +1,35 @@
+module.exports = {
+  root: true,
+  env: {
+    browser: true,
+    es2022: true,
+    node: true,
+  },
+  parserOptions: {
+    ecmaVersion: 'latest',
+    sourceType: 'module',
+  },
+  extends: ['eslint:recommended', 'plugin:vue/vue3-recommended'],
+  globals: {
+    defineProps: 'readonly',
+    defineEmits: 'readonly',
+    defineExpose: 'readonly',
+    defineOptions: 'readonly',
+    defineModel: 'readonly',
+    withDefaults: 'readonly',
+  },
+  rules: {
+    'vue/multi-word-component-names': 'off',
+    'vue/singleline-html-element-content-newline': 'off',
+    'vue/max-attributes-per-line': 'off',
+    'vue/html-self-closing': 'off',
+    'vue/html-indent': 'off',
+    'vue/attributes-order': 'off',
+    'vue/require-default-prop': 'off',
+    'vue/html-closing-bracket-newline': 'off',
+    'vue/first-attribute-linebreak': 'off',
+    'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+    'no-empty': ['error', { allowEmptyCatch: true }],
+  },
+  ignorePatterns: ['dist', 'node_modules', 'prototype'],
+}
