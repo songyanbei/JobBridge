@@ -39,7 +39,10 @@ class WeComClient:
     ):
         self._corp_id = corp_id or settings.wecom_corp_id
         self._secret = secret or settings.wecom_secret
-        raw_agent_id = agent_id or settings.wecom_agent_id
+        # Distinguish "caller explicitly passed empty/0 agent" from "caller
+        # didn't pass one". `or` treats "" as falsy and silently falls back to
+        # the default config, which broke test_empty_agent_id_defaults_to_zero.
+        raw_agent_id = settings.wecom_agent_id if agent_id is None else agent_id
         if raw_agent_id and not raw_agent_id.isdigit():
             raise ValueError(
                 f"wecom_agent_id must be a numeric string, got: '{raw_agent_id}'"
