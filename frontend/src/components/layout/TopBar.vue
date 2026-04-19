@@ -26,11 +26,17 @@
         <span class="kbd mono">↵</span>
       </div>
 
-      <el-tooltip content="通知" placement="bottom">
-        <button class="icon-btn" @click="onNotify">
-          <el-icon :size="18"><Bell /></el-icon>
-          <span v-if="hasNotify" class="dot-indicator" />
-        </button>
+      <el-tooltip :content="notifyTip" placement="bottom">
+        <el-badge
+          :value="pendingTotal"
+          :hidden="pendingTotal === 0"
+          :max="99"
+          class="notify-badge"
+        >
+          <button class="icon-btn" @click="onNotify">
+            <el-icon :size="18"><Bell /></el-icon>
+          </button>
+        </el-badge>
       </el-tooltip>
 
       <el-tooltip :content="themeTip" placement="bottom">
@@ -80,8 +86,12 @@ const authStore = useAuthStore()
 
 const search = ref('')
 const searchFocused = ref(false)
-const hasNotify = ref(false)
 const pwdVisible = ref(false)
+
+const pendingTotal = computed(() => appStore.pendingCount.total || 0)
+const notifyTip = computed(() =>
+  pendingTotal.value > 0 ? `待审 ${pendingTotal.value} 条，点击进入审核工作台` : '暂无待办',
+)
 
 const crumbs = computed(() => {
   const titles = []
@@ -106,7 +116,11 @@ function onSearch() {
 }
 
 function onNotify() {
-  ElMessage.info('暂无新通知')
+  if (pendingTotal.value > 0) {
+    router.push('/admin/audit')
+  } else {
+    ElMessage.info('暂无待办')
+  }
 }
 
 async function onCommand(cmd) {

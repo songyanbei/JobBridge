@@ -5,12 +5,25 @@
         <div class="jb-page-title">Dashboard</div>
         <div class="page-subtitle jb-muted">实时运营概览 · 更新于 {{ updatedAt }}</div>
       </div>
-      <div>
+      <div class="range-bar">
         <el-radio-group v-model="range" size="small" @change="onRangeChange">
           <el-radio-button label="7d">近 7 天</el-radio-button>
           <el-radio-button label="30d">近 30 天</el-radio-button>
           <el-radio-button label="custom">自定义</el-radio-button>
         </el-radio-group>
+        <el-date-picker
+          v-if="range === 'custom'"
+          v-model="customRange"
+          type="daterange"
+          value-format="YYYY-MM-DD"
+          range-separator="至"
+          start-placeholder="开始"
+          end-placeholder="结束"
+          size="small"
+          :disabled-date="disabledAfterToday"
+          style="margin-left: 8px; width: 260px"
+          @change="onCustomRangeChange"
+        />
       </div>
     </div>
 
@@ -36,7 +49,7 @@
     <div class="lower-grid">
       <div class="trend-card">
         <ChartCard
-          :title="`趋势（${range === '7d' ? '7 天' : '30 天'}）`"
+          :title="trendTitle"
           :option="trendOption"
           :loading="trendLoading"
           :empty="trendEmpty"
@@ -64,7 +77,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import ChartCard from '@/components/ChartCard.vue'
 import { fetchDashboard, fetchTrends } from '@/api/reports'
 import { fetchPendingCount } from '@/api/audit'
@@ -80,6 +92,8 @@ const today = ref({})
 const yesterday = ref({})
 const trend7d = ref([])
 const trend30d = ref([])
+const trendCustom = ref([])
+const customRange = ref([])
 const pendingCount = ref({ job: 0, resume: 0, total: 0 })
 const updatedAt = ref('--')
 
@@ -88,6 +102,10 @@ let refreshTimer = null
 function formatClock(d = new Date()) {
   const pad = (n) => String(n).padStart(2, '0')
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function disabledAfterToday(d) {
+  return d.getTime() > Date.now()
 }
 
 function deltaPercent(curr, prev) {
@@ -152,13 +170,28 @@ const metrics = computed(() => [
   },
 ])
 
+function currentSource() {
+  if (range.value === '7d') return trend7d.value
+  if (range.value === '30d') return trend30d.value
+  return trendCustom.value
+}
+
 const trendEmpty = computed(() => {
-  const arr = range.value === '7d' ? trend7d.value : trend30d.value
+  const arr = currentSource()
   return !arr || arr.length === 0
 })
 
+const trendTitle = computed(() => {
+  if (range.value === '7d') return '趋势（7 天）'
+  if (range.value === '30d') return '趋势（30 天）'
+  if (customRange.value && customRange.value.length === 2) {
+    return `趋势（${customRange.value[0]} ~ ${customRange.value[1]}）`
+  }
+  return '趋势（自定义）'
+})
+
 const trendOption = computed(() => {
-  const source = range.value === '7d' ? trend7d.value : trend30d.value
+  const source = currentSource()
   const dates = source.map((d) => d.date)
   const dau = source.map((d) => d.dau ?? 0)
   const upload = source.map((d) => (d.job_uploads ?? 0) + (d.resume_uploads ?? 0))
@@ -218,16 +251,32 @@ async function loadTrends30d() {
   }
 }
 
-function onRangeChange(v) {
-  if (v === 'custom') {
-    ElMessage.info('自定义区间请前往“数据看板”')
-    router.push('/admin/reports')
-    range.value = '7d'
-    return
+async function loadTrendsCustom(from, to) {
+  trendLoading.value = true
+  try {
+    const data = await fetchTrends({ range: 'custom', from, to })
+    trendCustom.value = data?.days || data?.items || data?.points || []
+  } finally {
+    trendLoading.value = false
   }
+}
+
+function onRangeChange(v) {
   if (v === '30d' && trend30d.value.length === 0) {
     loadTrends30d()
   }
+  if (v === 'custom') {
+    trendCustom.value = []
+  }
+}
+
+function onCustomRangeChange(val) {
+  if (!val || val.length !== 2) {
+    trendCustom.value = []
+    return
+  }
+  const [from, to] = val
+  loadTrendsCustom(from, to)
 }
 
 function onMetricClick(m) {
@@ -247,6 +296,10 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.range-bar {
+  display: flex;
+  align-items: center;
+}
 .page-subtitle {
   font-size: var(--text-base);
   color: var(--ink-muted);
