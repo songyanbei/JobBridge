@@ -24,7 +24,7 @@ ACTION="${1:-seed}"
 
 if [ "$ACTION" = "clean" ]; then
     echo "[+] 清理 dev_* 测试数据..."
-    docker exec -i jobbridge-mysql mysql -u jobbridge -pjobbridge jobbridge <<'SQL'
+    docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 -u jobbridge -pjobbridge jobbridge <<'SQL'
 DELETE FROM conversation_log   WHERE userid       LIKE 'dev_%';
 DELETE FROM wecom_inbound_event WHERE from_userid  LIKE 'dev_%';
 DELETE FROM audit_log          WHERE target_id    LIKE 'dev_%' OR operator LIKE 'dev_%';
@@ -41,7 +41,7 @@ fi
 
 echo "[+] Seed Phase 5 开发假数据到 MySQL..."
 
-docker exec -i jobbridge-mysql mysql -u jobbridge -pjobbridge jobbridge <<'SQL'
+docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 -u jobbridge -pjobbridge jobbridge <<'SQL'
 -- ============================================================================
 -- 用户 × 8（2 厂家 + 2 中介 + 4 工人）
 -- ============================================================================

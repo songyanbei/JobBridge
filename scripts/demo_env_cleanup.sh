@@ -7,7 +7,7 @@
 set -euo pipefail
 
 echo "[+] 清理 MySQL Demo 数据..."
-docker exec -i jobbridge-mysql mysql -u jobbridge -pjobbridge jobbridge <<'SQL'
+docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 -u jobbridge -pjobbridge jobbridge <<'SQL'
 DELETE FROM conversation_log
   WHERE userid LIKE 'demo_%' OR userid LIKE 'test_e2e_%';
 DELETE FROM wecom_inbound_event

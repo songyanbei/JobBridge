@@ -49,7 +49,7 @@ if ! docker ps --format '{{.Names}}' | grep -q jobbridge-mysql; then
 fi
 
 docker exec -i jobbridge-mysql \
-    mysql -u jobbridge -pjobbridge jobbridge < "$OUTPUT"
+    mysql --default-character-set=utf8mb4 -u jobbridge -pjobbridge jobbridge < "$OUTPUT"
 
 echo ""
 echo "[✓] Seed 完成"
