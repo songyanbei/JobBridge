@@ -22,7 +22,7 @@
         :class="{ 'metric-clickable': !!m.to }"
         @click="onMetricClick(m)"
       >
-        <div class="metric-label mono">{{ m.label }}</div>
+        <div class="metric-label">{{ m.label }}</div>
         <div class="metric-value">{{ m.value }}</div>
         <div class="metric-delta">
           <span class="jb-muted">昨日 {{ m.yesterday }}</span>
@@ -293,9 +293,8 @@ onUnmounted(() => {
   box-shadow: var(--elev-2);
 }
 .metric-label {
-  font-size: 11.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: 12px;
+  font-weight: 500;
   color: var(--ink-muted);
   display: flex;
   justify-content: space-between;

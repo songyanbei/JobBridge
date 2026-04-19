@@ -205,14 +205,13 @@ function isActive(item) {
 }
 
 .sidebar-section {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.12em;
+  font-size: 11px;
+  font-weight: 500;
   color: var(--sidebar-fg-muted);
   padding: 14px 10px 6px;
   white-space: nowrap;
   overflow: hidden;
+  opacity: 0.75;
 }
 
 .nav-item {
