@@ -54,6 +54,28 @@ UPDATE `user` SET blocked_reason =
          OR blocked_reason LIKE '%ã%' OR blocked_reason LIKE '%â%')
     AND CONVERT(CAST(CONVERT(blocked_reason USING latin1) AS BINARY) USING utf8mb4) IS NOT NULL;
 
+-- ---- job 表：硬过滤字段（VARCHAR 副本，非 FK）----
+UPDATE `job` SET city =
+  CONVERT(CAST(CONVERT(city USING latin1) AS BINARY) USING utf8mb4)
+  WHERE city IS NOT NULL
+    AND (city LIKE '%ç%' OR city LIKE '%å%' OR city LIKE '%æ%'
+         OR city LIKE '%è%' OR city LIKE '%é%' OR city LIKE '%ã%')
+    AND CONVERT(CAST(CONVERT(city USING latin1) AS BINARY) USING utf8mb4) IS NOT NULL;
+
+UPDATE `job` SET district =
+  CONVERT(CAST(CONVERT(district USING latin1) AS BINARY) USING utf8mb4)
+  WHERE district IS NOT NULL
+    AND (district LIKE '%ç%' OR district LIKE '%å%' OR district LIKE '%æ%'
+         OR district LIKE '%è%' OR district LIKE '%é%' OR district LIKE '%ã%')
+    AND CONVERT(CAST(CONVERT(district USING latin1) AS BINARY) USING utf8mb4) IS NOT NULL;
+
+UPDATE `job` SET job_category =
+  CONVERT(CAST(CONVERT(job_category USING latin1) AS BINARY) USING utf8mb4)
+  WHERE job_category IS NOT NULL
+    AND (job_category LIKE '%ç%' OR job_category LIKE '%å%' OR job_category LIKE '%æ%'
+         OR job_category LIKE '%è%' OR job_category LIKE '%é%' OR job_category LIKE '%ã%')
+    AND CONVERT(CAST(CONVERT(job_category USING latin1) AS BINARY) USING utf8mb4) IS NOT NULL;
+
 -- ---- job 表：自由文本列 ----
 UPDATE `job` SET dorm_condition =
   CONVERT(CAST(CONVERT(dorm_condition USING latin1) AS BINARY) USING utf8mb4)
@@ -124,6 +146,31 @@ UPDATE `job` SET audit_reason =
     AND (audit_reason LIKE '%ç%' OR audit_reason LIKE '%å%' OR audit_reason LIKE '%æ%'
          OR audit_reason LIKE '%è%' OR audit_reason LIKE '%é%' OR audit_reason LIKE '%ã%')
     AND CONVERT(CAST(CONVERT(audit_reason USING latin1) AS BINARY) USING utf8mb4) IS NOT NULL;
+
+-- ---- resume 表：JSON 期望字段（CAST 成 CHAR 做反解码，JSON_VALID 防护）----
+UPDATE `resume` SET expected_cities =
+  CONVERT(CAST(CONVERT(CAST(expected_cities AS CHAR) USING latin1) AS BINARY) USING utf8mb4)
+  WHERE expected_cities IS NOT NULL
+    AND (CAST(expected_cities AS CHAR) LIKE '%ç%' OR CAST(expected_cities AS CHAR) LIKE '%å%'
+         OR CAST(expected_cities AS CHAR) LIKE '%æ%' OR CAST(expected_cities AS CHAR) LIKE '%è%'
+         OR CAST(expected_cities AS CHAR) LIKE '%é%' OR CAST(expected_cities AS CHAR) LIKE '%ã%')
+    AND JSON_VALID(CONVERT(CAST(CONVERT(CAST(expected_cities AS CHAR) USING latin1) AS BINARY) USING utf8mb4));
+
+UPDATE `resume` SET expected_job_categories =
+  CONVERT(CAST(CONVERT(CAST(expected_job_categories AS CHAR) USING latin1) AS BINARY) USING utf8mb4)
+  WHERE expected_job_categories IS NOT NULL
+    AND (CAST(expected_job_categories AS CHAR) LIKE '%ç%' OR CAST(expected_job_categories AS CHAR) LIKE '%å%'
+         OR CAST(expected_job_categories AS CHAR) LIKE '%æ%' OR CAST(expected_job_categories AS CHAR) LIKE '%è%'
+         OR CAST(expected_job_categories AS CHAR) LIKE '%é%' OR CAST(expected_job_categories AS CHAR) LIKE '%ã%')
+    AND JSON_VALID(CONVERT(CAST(CONVERT(CAST(expected_job_categories AS CHAR) USING latin1) AS BINARY) USING utf8mb4));
+
+UPDATE `resume` SET expected_districts =
+  CONVERT(CAST(CONVERT(CAST(expected_districts AS CHAR) USING latin1) AS BINARY) USING utf8mb4)
+  WHERE expected_districts IS NOT NULL
+    AND (CAST(expected_districts AS CHAR) LIKE '%ç%' OR CAST(expected_districts AS CHAR) LIKE '%å%'
+         OR CAST(expected_districts AS CHAR) LIKE '%æ%' OR CAST(expected_districts AS CHAR) LIKE '%è%'
+         OR CAST(expected_districts AS CHAR) LIKE '%é%' OR CAST(expected_districts AS CHAR) LIKE '%ã%')
+    AND JSON_VALID(CONVERT(CAST(CONVERT(CAST(expected_districts AS CHAR) USING latin1) AS BINARY) USING utf8mb4));
 
 -- ---- resume 表：自由文本列 ----
 UPDATE `resume` SET work_experience =
