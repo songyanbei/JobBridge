@@ -1000,7 +1000,7 @@ onUnmounted(() => {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: #dcdfe6;
+  background: var(--line);
 }
 .conf-dot--green {
   background: var(--el-color-success);
@@ -1012,6 +1012,6 @@ onUnmounted(() => {
   background: var(--el-color-danger);
 }
 .conf-dot--na {
-  background: #dcdfe6;
+  background: var(--line);
 }
 </style>

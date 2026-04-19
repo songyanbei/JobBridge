@@ -1,7 +1,10 @@
 <template>
   <div class="jb-page">
     <div class="jb-page-header">
-      <div class="jb-page-title">Dashboard</div>
+      <div>
+        <div class="jb-page-title">Dashboard</div>
+        <div class="page-subtitle jb-muted">实时运营概览 · 更新于 {{ updatedAt }}</div>
+      </div>
       <div>
         <el-radio-group v-model="range" size="small" @change="onRangeChange">
           <el-radio-button label="7d">近 7 天</el-radio-button>
@@ -11,33 +14,27 @@
       </div>
     </div>
 
-    <el-row v-loading="loading" :gutter="16" class="metric-row">
-      <el-col
+    <div v-loading="loading" class="metric-grid">
+      <div
         v-for="m in metrics"
         :key="m.key"
-        :xs="12"
-        :sm="8"
-        :md="4"
+        class="metric"
+        :class="{ 'metric-clickable': !!m.to }"
+        @click="onMetricClick(m)"
       >
-        <div
-          class="metric-card"
-          :class="{ 'metric-clickable': !!m.to }"
-          @click="onMetricClick(m)"
-        >
-          <div class="metric-label">{{ m.label }}</div>
-          <div class="metric-value">{{ m.value }}</div>
-          <div class="metric-delta jb-muted">
-            昨日 {{ m.yesterday }}
-            <span v-if="m.delta !== null" :class="deltaClass(m.delta)">
-              {{ m.delta > 0 ? '+' : '' }}{{ m.delta }}%
-            </span>
-          </div>
+        <div class="metric-label mono">{{ m.label }}</div>
+        <div class="metric-value">{{ m.value }}</div>
+        <div class="metric-delta">
+          <span class="jb-muted">昨日 {{ m.yesterday }}</span>
+          <span v-if="m.delta !== null" :class="deltaClass(m.delta)" class="mono">
+            {{ m.delta > 0 ? '▲' : m.delta < 0 ? '▼' : '·' }} {{ Math.abs(m.delta) }}%
+          </span>
         </div>
-      </el-col>
-    </el-row>
+      </div>
+    </div>
 
-    <el-row :gutter="16" class="lower-row">
-      <el-col :xs="24" :md="16">
+    <div class="lower-grid">
+      <div class="trend-card">
         <ChartCard
           :title="`趋势（${range === '7d' ? '7 天' : '30 天'}）`"
           :option="trendOption"
@@ -45,23 +42,22 @@
           :empty="trendEmpty"
           height="340px"
         />
-      </el-col>
-      <el-col :xs="24" :md="8">
-        <div class="todo-card jb-card">
-          <div class="todo-head">
-            <span class="todo-title">待办入口</span>
-          </div>
-          <el-space direction="vertical" fill style="width: 100%">
-            <el-button type="primary" @click="$router.push('/admin/audit')">
-              审核工作台（待审 {{ pendingCount.total }}）
-            </el-button>
-            <el-button @click="$router.push('/admin/jobs')">岗位管理</el-button>
-            <el-button @click="$router.push('/admin/resumes')">简历管理</el-button>
-            <el-button @click="$router.push('/admin/reports')">打开数据看板</el-button>
-          </el-space>
+      </div>
+      <div class="todo-card">
+        <div class="todo-head">
+          <span class="todo-title">待办入口</span>
+          <span class="mono todo-hint">QUICK&nbsp;NAV</span>
         </div>
-      </el-col>
-    </el-row>
+        <div class="todo-list">
+          <el-button type="primary" @click="$router.push('/admin/audit')">
+            审核工作台（待审 {{ pendingCount.total }}）
+          </el-button>
+          <el-button @click="$router.push('/admin/jobs')">岗位管理</el-button>
+          <el-button @click="$router.push('/admin/resumes')">简历管理</el-button>
+          <el-button @click="$router.push('/admin/reports')">打开数据看板</el-button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -85,8 +81,14 @@ const yesterday = ref({})
 const trend7d = ref([])
 const trend30d = ref([])
 const pendingCount = ref({ job: 0, resume: 0, total: 0 })
+const updatedAt = ref('--')
 
 let refreshTimer = null
+
+function formatClock(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
 
 function deltaPercent(curr, prev) {
   const c = Number(curr)
@@ -189,6 +191,7 @@ async function loadDashboard() {
     today.value = data?.today || {}
     yesterday.value = data?.yesterday || {}
     trend7d.value = data?.trend_7d || []
+    updatedAt.value = formatClock()
   } finally {
     loading.value = false
   }
@@ -244,43 +247,148 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.metric-row {
-  margin-bottom: 16px;
+.page-subtitle {
+  font-size: var(--text-base);
+  color: var(--ink-muted);
+  margin-top: 6px;
+  font-weight: 400;
+  line-height: 1.5;
 }
-.metric-card {
-  background: var(--el-bg-color);
-  border: 1px solid var(--el-border-color-lighter);
-  padding: 12px 14px;
-  border-radius: 6px;
-  height: 100%;
+
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--gap);
+  margin-bottom: 18px;
+}
+@media (max-width: 1280px) {
+  .metric-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+@media (max-width: 720px) {
+  .metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.metric {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: 16px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
+  box-shadow: var(--elev-1);
 }
 .metric-clickable {
   cursor: pointer;
-  transition: box-shadow 0.15s ease;
 }
 .metric-clickable:hover {
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+  box-shadow: var(--elev-2);
 }
 .metric-label {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-muted);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 .metric-value {
-  font-size: 22px;
+  font-size: 30px;
   font-weight: 600;
-  margin: 4px 0;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
 }
 .metric-delta {
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--ink-muted);
 }
-.lower-row {
-  margin-top: 4px;
+.metric-delta :deep(.jb-success-text) {
+  color: var(--success);
+  font-weight: 500;
 }
+.metric-delta :deep(.jb-danger-text) {
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.lower-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: var(--gap);
+}
+@media (max-width: 960px) {
+  .lower-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.trend-card :deep(.chart-card) {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--panel);
+  box-shadow: var(--elev-1);
+}
+.trend-card :deep(.chart-head) {
+  padding: 14px var(--card-pad);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 0;
+}
+.trend-card :deep(.chart-title) {
+  font-weight: 600;
+  font-size: var(--text-md);
+  color: var(--ink);
+}
+
 .todo-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--elev-1);
+  padding: var(--card-pad);
   height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 .todo-head {
-  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+}
+.todo-title {
+  font-size: var(--text-md);
   font-weight: 600;
+  color: var(--ink);
+}
+.todo-hint {
+  font-size: 10px;
+  color: var(--ink-muted);
+  letter-spacing: 0.18em;
+}
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.todo-list :deep(.el-button) {
+  width: 100%;
+  justify-content: flex-start;
+  height: 38px;
 }
 </style>

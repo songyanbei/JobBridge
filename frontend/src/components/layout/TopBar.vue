@@ -1,43 +1,54 @@
 <template>
   <div class="topbar">
     <div class="topbar-left">
-      <el-button link :icon="Expand" @click="appStore.toggleSidebar()" />
-      <el-breadcrumb separator="/">
-        <el-breadcrumb-item :to="{ path: '/admin/dashboard' }">首页</el-breadcrumb-item>
-        <el-breadcrumb-item v-if="crumbs.length">
-          {{ crumbs[crumbs.length - 1] }}
-        </el-breadcrumb-item>
-      </el-breadcrumb>
+      <button class="icon-btn" aria-label="切换侧栏" @click="appStore.toggleSidebar()">
+        <el-icon :size="18"><Expand /></el-icon>
+      </button>
+      <div class="crumbs">
+        <router-link to="/admin/dashboard" class="crumb">首页</router-link>
+        <template v-if="crumbs.length">
+          <span class="sep">/</span>
+          <span class="crumb current">{{ crumbs[crumbs.length - 1] }}</span>
+        </template>
+      </div>
     </div>
 
     <div class="topbar-right">
-      <el-input
-        v-model="search"
-        placeholder="搜索 userid"
-        clearable
-        class="topbar-search"
-        @keyup.enter="onSearch"
-      >
-        <template #prefix>
-          <el-icon><Search /></el-icon>
-        </template>
-      </el-input>
+      <div class="search" :class="{ focused: searchFocused }">
+        <el-icon class="leading" :size="14"><Search /></el-icon>
+        <input
+          v-model="search"
+          placeholder="搜索 userid…"
+          @focus="searchFocused = true"
+          @blur="searchFocused = false"
+          @keyup.enter="onSearch"
+        />
+        <span class="kbd mono">↵</span>
+      </div>
 
       <el-tooltip content="通知" placement="bottom">
-        <el-badge :is-dot="hasNotify" class="notify-badge">
-          <el-button link :icon="Bell" @click="onNotify" />
-        </el-badge>
+        <button class="icon-btn" @click="onNotify">
+          <el-icon :size="18"><Bell /></el-icon>
+          <span v-if="hasNotify" class="dot-indicator" />
+        </button>
       </el-tooltip>
 
       <el-tooltip :content="themeTip" placement="bottom">
-        <el-button link :icon="themeIcon" @click="appStore.toggleTheme()" />
+        <button class="icon-btn" @click="appStore.toggleTheme()">
+          <el-icon :size="18">
+            <component :is="themeIcon" />
+          </el-icon>
+        </button>
       </el-tooltip>
 
       <el-dropdown trigger="click" @command="onCommand">
-        <span class="avatar-wrap">
-          <el-avatar :size="32">{{ adminInitial }}</el-avatar>
-          <span class="avatar-name">{{ adminName }}</span>
-        </span>
+        <div class="avatar-wrap">
+          <div class="avatar mono">{{ adminInitial }}</div>
+          <div class="avatar-meta">
+            <div class="avatar-name">{{ adminName }}</div>
+            <div class="avatar-role mono">ADMIN</div>
+          </div>
+        </div>
         <template #dropdown>
           <el-dropdown-menu>
             <el-dropdown-item command="password">修改密码</el-dropdown-item>
@@ -68,6 +79,7 @@ const appStore = useAppStore()
 const authStore = useAuthStore()
 
 const search = ref('')
+const searchFocused = ref(false)
 const hasNotify = ref(false)
 const pwdVisible = ref(false)
 
@@ -79,7 +91,9 @@ const crumbs = computed(() => {
   return titles
 })
 
-const adminName = computed(() => authStore.admin?.display_name || authStore.admin?.username || 'admin')
+const adminName = computed(
+  () => authStore.admin?.display_name || authStore.admin?.username || 'admin',
+)
 const adminInitial = computed(() => (adminName.value || 'A').slice(0, 1).toUpperCase())
 
 const themeIcon = computed(() => (appStore.theme === 'dark' ? Sunny : Moon))
@@ -88,7 +102,6 @@ const themeTip = computed(() => (appStore.theme === 'dark' ? '切换为浅色' :
 function onSearch() {
   const q = search.value.trim()
   if (!q) return
-  // Global userid search → jump to conversation logs with userid prefilled
   router.push({ path: '/admin/logs/conversations', query: { userid: q } })
 }
 
@@ -119,37 +132,165 @@ async function onCommand(cmd) {
 
 <style scoped>
 .topbar {
-  height: 56px;
-  padding: 0 20px;
+  height: var(--topbar-h);
+  padding: 0 var(--page-pad);
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-elev);
 }
+
 .topbar-left {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 14px;
+  min-width: 0;
 }
+
 .topbar-right {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 8px;
 }
-.topbar-search {
-  width: 220px;
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-base);
+  color: var(--ink-muted);
+  min-width: 0;
 }
-.avatar-wrap {
+.crumb {
+  color: var(--ink-muted);
+  text-decoration: none;
+}
+.crumb:hover {
+  color: var(--ink);
+}
+.crumb.current {
+  color: var(--ink);
+  font-weight: 500;
+}
+.sep {
+  color: var(--ink-faint);
+}
+
+.search {
   display: flex;
   align-items: center;
   gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  width: 280px;
+  transition: border-color 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+}
+.search.focused {
+  border-color: var(--focus-ring);
+  background: var(--bg-elev);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus-ring) 18%, transparent);
+}
+.search input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: var(--text-base);
+  min-width: 0;
+  color: var(--ink);
+}
+.search input::placeholder {
+  color: var(--ink-faint);
+}
+.search .leading {
+  color: var(--ink-faint);
+  display: grid;
+  place-items: center;
+}
+
+.kbd {
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  color: var(--ink-muted);
+  background: var(--bg-elev);
+  line-height: 1.3;
+  min-width: 16px;
+  text-align: center;
+  display: inline-block;
+}
+
+.icon-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink-2);
   cursor: pointer;
+  position: relative;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.dot-indicator {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+.avatar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px 4px 4px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  color: var(--ink);
+  transition: background 0.12s ease;
+  border: 1px solid transparent;
+}
+.avatar-wrap:hover {
+  background: var(--hover);
+}
+.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.avatar-meta {
+  line-height: 1.1;
 }
 .avatar-name {
-  font-size: 13px;
-  color: var(--el-text-color-primary);
+  font-size: var(--text-base);
+  font-weight: 500;
 }
-.notify-badge :deep(.el-badge__content) {
-  top: 6px;
-  right: 6px;
+.avatar-role {
+  font-size: 10px;
+  color: var(--ink-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 2px;
 }
 </style>

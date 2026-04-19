@@ -1,38 +1,285 @@
+/* ============================================================
+   JobBridge UI — design tokens
+   Themes: graphite (light) | nocturne (dark)
+   Accent: indigo (default). Density: balanced.
+   ============================================================ */
+
 :root {
-  --jb-sidebar-width: 220px;
+  /* Legacy layout vars kept for backwards compatibility */
+  --jb-sidebar-width: 232px;
   --jb-sidebar-collapsed-width: 64px;
   --jb-header-height: 56px;
+
+  /* Accent */
+  --accent-h: 265;
+  --accent-c: 0.16;
+  --accent:      oklch(0.58 var(--accent-c) var(--accent-h));
+  --accent-weak: oklch(0.96 0.02 var(--accent-h));
+  --accent-ink:  oklch(0.34 0.10 var(--accent-h));
+  --accent-fg:   #ffffff;
+
+  /* Density — balanced */
+  --row-h: 40px;
+  --cell-pad-y: 10px;
+  --cell-pad-x: 14px;
+  --gap: 14px;
+  --page-pad: 24px;
+  --card-pad: 18px;
+  --text-sm: 12.5px;
+  --text-base: 13.5px;
+  --text-md: 15px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+
+  /* Radius / elevation */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-xl: 16px;
+  --elev-1: 0 1px 0 rgba(17, 24, 39, 0.04), 0 1px 2px rgba(17, 24, 39, 0.04);
+  --elev-2: 0 2px 4px rgba(17, 24, 39, 0.05), 0 8px 24px -8px rgba(17, 24, 39, 0.12);
+  --elev-3: 0 8px 32px -8px rgba(17, 24, 39, 0.18);
+
+  /* Semantic */
+  --success: oklch(0.62 0.14 155);
+  --warning: oklch(0.76 0.16 80);
+  --danger:  oklch(0.60 0.19 25);
+  --info:    oklch(0.68 0.10 240);
+
+  --success-weak: oklch(0.96 0.03 155);
+  --warning-weak: oklch(0.97 0.05 85);
+  --danger-weak:  oklch(0.96 0.04 25);
+  --info-weak:    oklch(0.97 0.02 240);
+
+  --font-ui:    'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', PingFangSC, 'Microsoft YaHei', sans-serif;
+  --font-mono:  'IBM Plex Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+
+  --sidebar-w: 232px;
+  --sidebar-w-collapsed: 64px;
+  --topbar-h: 56px;
+
+  /* ---- GRAPHITE (light) defaults ---- */
+  --bg:           oklch(0.985 0.004 80);
+  --bg-elev:      oklch(1 0 0);
+  --bg-sunk:      oklch(0.97 0.004 80);
+  --bg-shell:     oklch(0.96 0.006 80);
+  --panel:        oklch(1 0 0);
+  --panel-2:      oklch(0.985 0.004 80);
+  --sidebar-bg:   oklch(0.215 0.012 70);
+  --sidebar-fg:   oklch(0.92 0.01 80);
+  --sidebar-fg-muted: oklch(0.66 0.015 80);
+  --sidebar-hover:    oklch(0.28 0.015 70);
+  --sidebar-active:   oklch(0.32 0.02 70);
+
+  --ink:          oklch(0.22 0.01 70);
+  --ink-2:        oklch(0.36 0.008 70);
+  --ink-muted:    oklch(0.54 0.008 70);
+  --ink-faint:    oklch(0.72 0.006 70);
+
+  --line:         oklch(0.91 0.006 80);
+  --line-2:       oklch(0.94 0.006 80);
+  --line-strong:  oklch(0.82 0.008 80);
+
+  --hover:        oklch(0.96 0.008 80);
+  --row-hover:    oklch(0.975 0.006 80);
+  --row-stripe:   oklch(0.99 0.003 80);
+  --selected:     var(--accent-weak);
+  --focus-ring:   oklch(0.72 0.12 var(--accent-h));
+
+  color-scheme: light;
 }
 
-html,
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', PingFangSC, 'Microsoft YaHei',
-    'Helvetica Neue', sans-serif;
-  color: var(--el-text-color-primary);
-  background-color: var(--el-bg-color-page);
+/* ---- NOCTURNE (dark) ---- */
+html.dark,
+[data-theme='nocturne'] {
+  --bg:           oklch(0.17 0.018 260);
+  --bg-elev:      oklch(0.21 0.02 260);
+  --bg-sunk:      oklch(0.145 0.015 260);
+  --bg-shell:     oklch(0.14 0.015 260);
+  --panel:        oklch(0.205 0.018 260);
+  --panel-2:      oklch(0.23 0.02 260);
+  --sidebar-bg:   oklch(0.13 0.015 260);
+  --sidebar-fg:   oklch(0.88 0.015 260);
+  --sidebar-fg-muted: oklch(0.60 0.02 260);
+  --sidebar-hover:    oklch(0.22 0.02 260);
+  --sidebar-active:   oklch(0.26 0.025 260);
+
+  --ink:          oklch(0.95 0.01 260);
+  --ink-2:        oklch(0.82 0.012 260);
+  --ink-muted:    oklch(0.64 0.015 260);
+  --ink-faint:    oklch(0.48 0.018 260);
+
+  --line:         oklch(0.30 0.02 260);
+  --line-2:       oklch(0.26 0.018 260);
+  --line-strong:  oklch(0.40 0.025 260);
+
+  --hover:        oklch(0.25 0.022 260);
+  --row-hover:    oklch(0.235 0.02 260);
+  --row-stripe:   oklch(0.195 0.018 260);
+  --selected:     oklch(0.28 0.06 var(--accent-h));
+  --focus-ring:   oklch(0.70 0.14 var(--accent-h));
+
+  --accent-weak:  oklch(0.28 0.06 var(--accent-h));
+  --accent-ink:   oklch(0.85 0.10 var(--accent-h));
+
+  --success-weak: oklch(0.28 0.06 155);
+  --warning-weak: oklch(0.30 0.08 80);
+  --danger-weak:  oklch(0.30 0.08 25);
+  --info-weak:    oklch(0.28 0.05 240);
+
+  --elev-1: 0 1px 0 rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --elev-2: 0 4px 12px -2px rgba(0, 0, 0, 0.5);
+  --elev-3: 0 12px 40px -12px rgba(0, 0, 0, 0.6);
+
+  color-scheme: dark;
 }
 
+/* ============================================================
+   Element Plus token bridge — makes all EP components inherit
+   the new palette without touching individual views.
+   ============================================================ */
+:root,
+html.dark {
+  --el-color-primary: var(--accent);
+  --el-color-primary-light-3: color-mix(in oklab, var(--accent), white 30%);
+  --el-color-primary-light-5: color-mix(in oklab, var(--accent), white 50%);
+  --el-color-primary-light-7: color-mix(in oklab, var(--accent), white 70%);
+  --el-color-primary-light-8: color-mix(in oklab, var(--accent), white 80%);
+  --el-color-primary-light-9: var(--accent-weak);
+  --el-color-primary-dark-2: color-mix(in oklab, var(--accent), black 15%);
+
+  --el-color-success: var(--success);
+  --el-color-warning: var(--warning);
+  --el-color-danger:  var(--danger);
+  --el-color-error:   var(--danger);
+  --el-color-info:    var(--info);
+
+  --el-color-success-light-9: var(--success-weak);
+  --el-color-warning-light-9: var(--warning-weak);
+  --el-color-danger-light-9:  var(--danger-weak);
+  --el-color-error-light-9:   var(--danger-weak);
+  --el-color-info-light-9:    var(--info-weak);
+
+  --el-bg-color:         var(--panel);
+  --el-bg-color-page:    var(--bg-shell);
+  --el-bg-color-overlay: var(--bg-elev);
+  --el-fill-color:       var(--bg-sunk);
+  --el-fill-color-light: var(--panel-2);
+  --el-fill-color-blank: var(--panel);
+
+  --el-text-color-primary:   var(--ink);
+  --el-text-color-regular:   var(--ink-2);
+  --el-text-color-secondary: var(--ink-muted);
+  --el-text-color-placeholder: var(--ink-faint);
+  --el-text-color-disabled:  var(--ink-faint);
+
+  --el-border-color:         var(--line-strong);
+  --el-border-color-light:   var(--line);
+  --el-border-color-lighter: var(--line);
+  --el-border-color-extra-light: var(--line-2);
+  --el-border-color-dark:    var(--line-strong);
+  --el-border-color-hover:   var(--line-strong);
+
+  --el-border-radius-base:   var(--r-md);
+  --el-border-radius-small:  var(--r-sm);
+  --el-border-radius-round:  999px;
+
+  --el-box-shadow:        var(--elev-2);
+  --el-box-shadow-light:  var(--elev-1);
+  --el-box-shadow-lighter: var(--elev-1);
+
+  --el-font-size-base:   var(--text-base);
+  --el-font-size-small:  var(--text-sm);
+  --el-font-size-medium: var(--text-md);
+  --el-font-size-large:  var(--text-lg);
+}
+
+/* ============================================================
+   Base — body, typography, scrollbars
+   ============================================================ */
 *,
 *::before,
 *::after {
   box-sizing: border-box;
 }
 
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  color: var(--ink);
+  background: var(--bg-shell);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv08', 'cv11', 'ss01';
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-feature-settings: 'zero';
+}
+
+::selection {
+  background: var(--accent-weak);
+  color: var(--accent-ink);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 10px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--line-strong);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+/* ============================================================
+   Page utilities (used by every content view)
+   ============================================================ */
 .jb-page {
-  padding: 16px 20px;
+  padding: var(--page-pad);
   min-height: 100%;
+  background: var(--bg-shell);
 }
 
 .jb-page-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 16px;
+  align-items: flex-end;
+  gap: 24px;
+  margin-bottom: 22px;
+  flex-wrap: wrap;
 }
 
 .jb-page-title {
-  font-size: 18px;
+  font-size: var(--text-2xl);
   font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .jb-filter-bar {
@@ -40,34 +287,32 @@ body {
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
-  padding: 12px 16px;
-  background: var(--el-bg-color);
-  border-radius: 6px;
-  margin-bottom: 12px;
-  border: 1px solid var(--el-border-color-lighter);
+  padding: 14px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  margin-bottom: 14px;
 }
 
 .jb-card {
-  background: var(--el-bg-color);
-  border-radius: 6px;
-  padding: 16px;
-  border: 1px solid var(--el-border-color-lighter);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: var(--card-pad);
+  box-shadow: var(--elev-1);
 }
 
 .jb-muted {
-  color: var(--el-text-color-secondary);
+  color: var(--ink-muted);
 }
-
 .jb-danger-text {
-  color: var(--el-color-danger);
+  color: var(--danger);
 }
-
 .jb-warning-text {
-  color: var(--el-color-warning);
+  color: var(--warning);
 }
-
 .jb-success-text {
-  color: var(--el-color-success);
+  color: var(--success);
 }
 
 .jb-empty-wrap {
@@ -81,30 +326,161 @@ body {
 }
 
 .jb-risk-low {
-  border-left: 4px solid var(--el-color-success);
+  border-left: 3px solid var(--success);
 }
 .jb-risk-mid {
-  border-left: 4px solid var(--el-color-warning);
+  border-left: 3px solid var(--warning);
 }
 .jb-risk-high {
-  border-left: 4px solid var(--el-color-danger);
+  border-left: 3px solid var(--danger);
 }
 
 .jb-risk-banner-mid {
-  background: var(--el-color-warning-light-9);
-  color: var(--el-color-warning);
-  padding: 8px 12px;
-  border-radius: 4px;
+  background: var(--warning-weak);
+  color: var(--warning);
+  padding: 10px 14px;
+  border-radius: var(--r-md);
   margin-bottom: 10px;
+  border: 1px solid color-mix(in oklab, var(--warning) 25%, transparent);
 }
 .jb-risk-banner-high {
-  background: var(--el-color-danger-light-9);
-  color: var(--el-color-danger);
-  padding: 8px 12px;
-  border-radius: 4px;
+  background: var(--danger-weak);
+  color: var(--danger);
+  padding: 10px 14px;
+  border-radius: var(--r-md);
   margin-bottom: 10px;
+  border: 1px solid color-mix(in oklab, var(--danger) 25%, transparent);
 }
 
 .jb-lowconf-row {
-  background: var(--el-color-danger-light-9);
+  background: var(--danger-weak);
+}
+
+/* ============================================================
+   Element Plus surface polish
+   ============================================================ */
+.el-card {
+  border-radius: var(--r-lg) !important;
+  box-shadow: var(--elev-1) !important;
+}
+
+.el-table {
+  --el-table-border-color: var(--line);
+  --el-table-header-bg-color: var(--panel-2);
+  --el-table-header-text-color: var(--ink-muted);
+  --el-table-row-hover-bg-color: var(--row-hover);
+  --el-table-bg-color: var(--panel);
+  --el-table-tr-bg-color: var(--panel);
+  background: var(--panel);
+  font-size: var(--text-base);
+}
+.el-table th.el-table__cell {
+  font-weight: 500;
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-muted) !important;
+  background: var(--panel-2) !important;
+}
+.el-table td.el-table__cell {
+  color: var(--ink);
+}
+
+.el-button {
+  font-weight: 500;
+}
+
+.el-dialog {
+  border-radius: var(--r-lg) !important;
+}
+.el-dialog__header {
+  border-bottom: 1px solid var(--line);
+  padding: 16px 20px;
+  margin-right: 0;
+}
+.el-dialog__body {
+  padding: 20px;
+}
+.el-dialog__footer {
+  border-top: 1px solid var(--line);
+  padding: 14px 20px;
+}
+
+.el-drawer__header {
+  border-bottom: 1px solid var(--line);
+  padding: 16px 20px;
+  margin-bottom: 0;
+}
+.el-drawer__body {
+  padding: 20px;
+}
+
+.el-menu,
+.el-menu--popup {
+  border-right: none !important;
+}
+
+.el-tag {
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.el-badge__content {
+  font-family: var(--font-mono);
+  font-weight: 500;
+}
+
+/* Primary button → accent-forward look */
+.el-button--primary {
+  --el-button-bg-color: var(--accent);
+  --el-button-border-color: var(--accent);
+  --el-button-hover-bg-color: color-mix(in oklab, var(--accent), black 10%);
+  --el-button-hover-border-color: color-mix(in oklab, var(--accent), black 10%);
+  --el-button-active-bg-color: color-mix(in oklab, var(--accent), black 15%);
+  --el-button-active-border-color: color-mix(in oklab, var(--accent), black 15%);
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Breadcrumb in topbar */
+.el-breadcrumb__inner,
+.el-breadcrumb__inner a {
+  font-weight: 400;
+  color: var(--ink-muted) !important;
+}
+.el-breadcrumb__item:last-child .el-breadcrumb__inner {
+  color: var(--ink) !important;
+  font-weight: 500;
+}
+
+/* Input/select look — rounded, subtle */
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  border-radius: var(--r-md) !important;
+  box-shadow: 0 0 0 1px var(--line) inset !important;
+  background: var(--bg-elev) !important;
+  transition: box-shadow 0.12s ease;
+}
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--focus-ring) inset, 0 0 0 3px color-mix(in oklab, var(--focus-ring) 18%, transparent) !important;
+}
+
+/* Pagination chips */
+.el-pager li,
+.el-pagination button {
+  border-radius: var(--r-sm) !important;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.el-pager li.is-active {
+  background: var(--accent) !important;
+  color: var(--accent-fg) !important;
 }

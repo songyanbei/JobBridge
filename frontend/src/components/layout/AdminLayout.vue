@@ -90,21 +90,22 @@ function onPwdChanged() {
 <style scoped>
 .admin-layout {
   height: 100vh;
+  background: var(--bg-shell);
 }
 .admin-aside {
-  background: var(--el-bg-color);
-  border-right: 1px solid var(--el-border-color-lighter);
-  transition: width 0.2s ease;
+  background: var(--sidebar-bg);
+  border-right: 1px solid color-mix(in oklab, var(--sidebar-bg) 80%, transparent);
+  transition: width 0.24s cubic-bezier(0.2, 0.7, 0.2, 1);
   overflow: hidden;
 }
 .admin-header {
   padding: 0;
-  background: var(--el-bg-color);
-  border-bottom: 1px solid var(--el-border-color-lighter);
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--line);
 }
 .admin-main {
   padding: 0;
-  background: var(--el-bg-color-page);
+  background: var(--bg-shell);
   overflow: auto;
 }
 </style>

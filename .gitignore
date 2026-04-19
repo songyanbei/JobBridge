@@ -25,6 +25,7 @@ frontend/.output/
 venv/
 env/
 ENV/
+.venv-wsl/
 
 # ---- Environment ----
 .env
@@ -48,6 +49,7 @@ logs/
 *.log
 uploads/
 tmp/
+.tmp/
 
 # ---- Demo environment (phase4-demo-env) ----
 backend/sql/seed_demo.sql
