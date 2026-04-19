@@ -1,8 +1,21 @@
 # Phase 7 上线验收报告（模板）
 
+> ⚠️ **本文件目前是空白模板，不构成验收证据。**
+> Phase 7 的"正式验收"出口要求：U3（企微 / LLM 真实依赖）关闭后启动 §17.1.1
+> 至少 7 天试运营，按 §17.1.4 七项 MVP 指标记录实测，再由技术 + 测试 + 运营
+> 三方在 §8 签字。在此之前，本文件**不能**被视为已签收的验收报告。
+>
+> 当所有 ⬛ 占位符（`YYYY-MM-DD` / `<git sha>` / `__%` / 未勾选 checkbox）都被
+> 真实数据替换、§3 / §4 全部勾选 / 标记 `已确认`、§8 三方签字齐全后：
+>   1. 把顶部 `状态: template` 改为 `approved`
+>   2. 删除本警告框
+>   3. 移除标题中的"（模板）"二字
+>
+> 不允许伪造或预填指标 / 签字 —— Codex 评审与上线 checklist 都会回查。
+
 > 基于：`collaboration/features/phase7-main.md` §3.1 模块 M
 > 配套：`collaboration/features/phase7-test-checklist.md`、`方案设计_v0.1.md` §17.1.4 / §14.5.4 / §17.3
-> 状态：`draft`（首次填写时改为 `under-review`，签字后改为 `approved`）
+> 状态：`template`（依次：template → draft → under-review → approved）
 > 创建日期：2026-04-19
 > 责任人：技术负责人 + 运营负责人
 
@@ -62,7 +75,11 @@
 - [ ] `TZ=Asia/Shanghai`，容器内 `date` 与 `python -c "import datetime; print(datetime.datetime.now())"` 时间一致
 - [ ] `SCHEDULER_TIMEZONE=Asia/Shanghai`，启动日志 `next_run` 显示 `+08:00`
 - [ ] `ADMIN_FORCE_PASSWORD_CHANGE=true`
-- [ ] admin 默认密码 `admin123` 已替换；以默认口令登录后任何业务接口返回 40301
+- [ ] `ADMIN_DEFAULT_PASSWORDS` 至少包含 `admin123`（可追加企业自有的弱口令）
+- [ ] admin 默认密码 `admin123` 已替换；**以默认口令登录后**任何业务接口返回 40301
+- [ ] **以默认口令登录**：返回体 `password_changed=false`，loguru 出现
+      `default password detected, force password_changed=0`
+- [ ] **改密接口**：把新密码改成 `admin123` 应返回 40101 "新密码不能使用系统默认/弱口令"
 - [ ] `DAILY_REPORT_CHAT_ID` 已填或显式确认空（空时只 loguru 不推送）
 - [ ] `MONITOR_QUEUE_INCOMING_THRESHOLD` / `MONITOR_SEND_RETRY_THRESHOLD` / `MONITOR_ALERT_DEDUPE_SECONDS` 已确认
 

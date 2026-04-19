@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     # 默认账号未改密就能直接调业务接口（详见 phase7-release-report 上线 checklist）。
     admin_force_password_change: bool = True
 
+    # 默认/弱口令黑名单（逗号分隔）。命中场景：
+    #   1) 登录时 supplied password 命中 → 即便 password_changed=1 也强制重置为 0，
+    #      下一步业务接口被 require_admin_password_changed 拦截
+    #   2) 改密时 new_password 命中 → 直接 40101 拒绝
+    # 默认仅 "admin123"（seed.sql 的初始口令）；运营可在 .env 加企业自有的弱口令。
+    admin_default_passwords: str = "admin123"
+
+    @property
+    def admin_default_password_set(self) -> set[str]:
+        """解析 ``admin_default_passwords`` 为 set；空字符串视为不启用。"""
+        return {p.strip() for p in (self.admin_default_passwords or "").split(",") if p.strip()}
+
     # ---- 事件回传 API ----
     event_api_key: str = ""  # 小程序点击事件回传 API Key（生产环境每季度轮换）
 

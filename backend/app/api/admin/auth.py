@@ -9,9 +9,11 @@ from __future__ import annotations
 import time
 
 from fastapi import APIRouter, Depends
+from loguru import logger
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin
+from app.config import settings
 from app.core.exceptions import BusinessException
 from app.core.redis_client import (
     clear_admin_login_fail,
@@ -59,6 +61,19 @@ def login(req: AdminLogin, db: Session = Depends(get_db)):
     if not admin.enabled:
         raise BusinessException(40301, "账号已禁用")
 
+    # 默认/弱口令拦截：登录成功但提交的密码命中黑名单 → 即便 password_changed=1
+    # 也强制重置为 0。后续业务接口被 require_admin_password_changed 拦截，
+    # 前端凭 token + password_changed=false 跳到改密页。
+    # Phase 7 codex rev2 P1：覆盖"字段已置 1 但口令仍是 admin123"的历史脏数据。
+    default_set = settings.admin_default_password_set
+    if default_set and req.password in default_set and bool(admin.password_changed):
+        admin.password_changed = 0
+        logger.warning(
+            "admin login: default password detected, force password_changed=0 "
+            "for username={username}",
+            username=admin.username,
+        )
+
     admin_user_service.touch_login(db, admin)
     db.commit()
     db.refresh(admin)
@@ -94,6 +109,9 @@ def change_password(
         raise BusinessException(40101, "新密码不能与旧密码相同")
     if len(req.new_password) < 8:
         raise BusinessException(40101, "新密码长度至少 8 位")
+    # 不允许把密码改回默认/弱口令黑名单中的任意一个，否则强制改密形同虚设。
+    if req.new_password in settings.admin_default_password_set:
+        raise BusinessException(40101, "新密码不能使用系统默认/弱口令")
 
     admin_user_service.change_password(db, current, req.new_password)
     db.commit()
