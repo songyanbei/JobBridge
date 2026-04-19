@@ -9,7 +9,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_admin
+from app.api.deps import get_db, require_admin_password_changed as require_admin
 from app.core.csv_export import rows_to_csv_bytes
 from app.core.responses import ok, paged
 from app.models import AdminUser

@@ -10,10 +10,15 @@ ARG APT_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
 
-ENV PIP_DEFAULT_TIMEOUT=600 \
+# 容器时区（默认上海，可通过 build-arg 覆盖；运行时由 compose `TZ` env 进一步覆盖）。
+# Phase 7 §3.1 模块 A：APScheduler 解析 cron 与 loguru 时间戳都依赖此时区，
+# 不装 tzdata 时 zoneinfo 退回 UTC，会让日报/TTL 在错误时间触发。
+ARG TZ=Asia/Shanghai
+ENV TZ=$TZ \
+    PIP_DEFAULT_TIMEOUT=600 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# 系统依赖（编译 bcrypt/cryptography 需要）
+# 系统依赖（编译 bcrypt/cryptography + tzdata 提供 IANA 时区数据库）
 RUN set -eux; \
     sed -i \
       -e "s|http://deb.debian.org/debian|${APT_MIRROR}|g" \
@@ -22,7 +27,10 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
     gcc \
-    libffi-dev; \
+    libffi-dev \
+    tzdata; \
+    ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
+    echo "${TZ}" > /etc/timezone; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

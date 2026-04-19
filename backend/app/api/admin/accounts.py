@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_admin
+from app.api.deps import get_db, require_admin_password_changed as require_admin
 from app.core.exceptions import BusinessException
 from app.core.responses import ok, paged
 from app.models import AdminUser

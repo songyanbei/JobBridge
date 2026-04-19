@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     admin_jwt_secret: str = "change-me"
     admin_jwt_expires_hours: int = 24
 
+    # 强制首登改密。开发环境可关，生产环境必须保持 True，防止 admin/admin123
+    # 默认账号未改密就能直接调业务接口（详见 phase7-release-report 上线 checklist）。
+    admin_force_password_change: bool = True
+
     # ---- 事件回传 API ----
     event_api_key: str = ""  # 小程序点击事件回传 API Key（生产环境每季度轮换）
 

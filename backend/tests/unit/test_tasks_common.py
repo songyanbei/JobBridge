@@ -4,7 +4,7 @@
 - `ensure_ttl_config_defaults(db)`：空集 / 全集 / 子集三种场景的幂等性。
 - 释放 Lua CAS 脚本的调用路径（task_lock 在 TTL 过期后不误删）。
 
-Integration 侧的真实 MySQL 行为见 `tests/integration/test_tasks_ttl_config.py`。
+Integration 侧的真实 MySQL 行为留待运维侧 RUN_INTEGRATION 演练（不通过单测复现）。
 """
 from __future__ import annotations
 
