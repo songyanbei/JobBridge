@@ -1,0 +1,8 @@
+.tmp/
+.pytest_cache/
+.venv/
+.venv-wsl/
+__pycache__/
+*.py[cod]
+uploads/
+tests/

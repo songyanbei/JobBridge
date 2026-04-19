@@ -22,7 +22,12 @@ class LocalStorage(StorageBackend):
     def _full_path(self, key: str) -> str:
         """将 key 转换为完整本地路径，并做路径穿越/逃逸保护。"""
         normalized = os.path.normpath(key).replace("\\", "/")
-        if normalized.startswith("..") or normalized.startswith("/"):
+        has_windows_drive = (
+            len(normalized) >= 2
+            and normalized[1] == ":"
+            and normalized[0].isalpha()
+        )
+        if normalized.startswith("..") or normalized.startswith("/") or has_windows_drive:
             raise ValueError(f"Invalid storage key: '{key}'")
 
         # 拼接后取绝对路径，再校验结果确实在 base_dir 内

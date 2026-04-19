@@ -32,6 +32,33 @@
 12. **APScheduler 启动顺序**：先 `scheduler.start()` 再读 `job.next_run_time`（pending job 在 start 前没有该属性，访问会 `AttributeError`）
 13. **横向扩容验证方式**：`docker-compose.prod.yml` 中 `app` 服务有 `container_name: jobbridge-app`，与 Compose `--scale` 冲突；分布式锁测试改用**两个本地 uvicorn 实例**验证，不作为 compose scale 验收项
 
+## 0.1 当前执行进展（2026-04-18 盘点）
+
+截至本版修订时点，Phase 7 文档已**可分发**，代码侧已完成主链路 + prod 编排 + 旧库迁移闭环；剩余 U3 / U4 属外部依赖，不影响代码交付但决定上线时点。
+
+| # | 未签收项 | 状态 | 详情 | 后续动作 |
+|---|---|---|---|---|
+| **U1** | Docker prod 5 容器编排 | **✅ 已闭环** | `backend/Dockerfile` 切阿里云 apt / PyPI 镜像 + `--default-timeout=600`；`docker-compose.prod.yml` 修 nginx healthcheck IPv6；`nginx/nginx.conf` health 响应类型。WSL2 实测：`docker compose ... up -d --build` 成功；5 容器 healthy；`/health` 返回 `{"status":"ok","env":"production"}`；`/admin/*` 分流正常；登录 + `/admin/me` 成功；`nginx -t` / `docker compose config -q` 通过；压测 1200 msg，ingress P95≈47.8ms / consumer P95≈45.0ms，队列 0 死信 0；回归 417 passed | 生产上线前重跑一次作为 M5 签收证据，写入 release-report |
+| **U2** | 旧库 system_config 迁移 | **✅ 已闭环（本轮代码落地）** | 新增：<br>• `backend/sql/migrations/phase7_001_ensure_system_config.sql`（`INSERT IGNORE` 幂等迁移）<br>• `app/tasks/common.py:ensure_ttl_config_defaults(db)`（缺失 key 时插入 + `logger.warning`）<br>• `app/tasks/scheduler.py:_self_heal_ttl_config()` 在 `start()` 中调用<br>• `app/tasks/ttl_cleanup.py:run()` 入口兜底再调一次<br>• 9 条单测覆盖空库 / 全集 / 子集 / 值一致性 / owner token + Lua CAS | 上线前执行一次迁移 SQL；运营 Onboarding 时给出运维手册段落 |
+| **U3** | 外部企微 / LLM 依赖 | 未闭环 | worker 日志出现 `corpsecret missing`，`.env` 中 `WECOM_*` 为空；LLM 未跑过真实付费供应商额度 | 按 §17.3.3 关闭项执行：企微认证 → 回调域名 + HTTPS → 群消息权限 → LLM 账号连通 + 额度 |
+| **U4** | MVP 7 天试运营指标 | 未完成 | §17.1.1 要求至少 7 天试运营；§17.1.4 七项指标、真实 P95 端到端、E11 小程序点击降级/实测均未签 | U3 关闭后启动试运营；按 §3.1 模块 L 每日采集；E11 按 §17.1.3 降级规则 |
+| U5 | passlib/bcrypt 兼容性告警 | **✅ 已闭环（本轮代码落地）** | 生产日志出现 `module 'bcrypt' has no attribute '__about__'`（非阻塞）。`requirements.txt` 把 `bcrypt>=4.1,<5.0` 改为 `bcrypt>=4.0,<4.1`，让 passlib 1.7.x 探测路径走通。`warnings.simplefilter('error')` 下 hash+verify 通过；回归 417 passed | 生产镜像重构 + 验证日志无 warn |
+
+**关键原则**：
+
+- 文档侧 Phase 7 需求范围与验收口径本身已冻结
+- U1 / U2 / U5 已在代码层闭环；U3 / U4 属客户 + 运维侧外部依赖，不影响代码交付，但决定"上线就绪"签收时点
+- U3 未闭环前，E2E 真实企微链路只能走 Mock；`phase4-demo-env.md` 已保留备用路径
+- `phase7-release-report.md`（最终交付文档）必须逐项记录 U1~U5 当前状态与责任人
+
+**关键原则**：
+
+- 文档侧 Phase 7 需求范围与验收口径本身已冻结，不因 U1~U4 延期而再次变更
+- U1 与 U3 属客户/运维侧外部依赖；不满足时 Phase 7 可以交付"代码 + 文档 + 迁移 SQL"但**不能签收"上线就绪"**
+- U2 已闭环（本版修订），旧库升级有确定性路径
+- U4 是 U1 + U3 关闭后的后续阶段，不在 Phase 7 开发范围内但在 Phase 7 验收范围内
+- `phase7-release-report.md`（最终交付文档）必须逐项记录 U1~U4 当前状态与责任人
+
 ## 1. 阶段目标
 
 Phase 7 的目标，是把 Phase 1 ~ Phase 6 已构建的业务能力收口成一个可稳定运行、可运维、可上线的系统，并按《方案设计_v0.1.md》§17.1.4 的最低验收标准输出正式上线验收结果。
@@ -442,11 +469,18 @@ E2E 场景（参照 §10、§12、§13）：
 | `ttl.job.days` | 岗位 TTL（天） | 30 | 已有（seed.sql:53） |
 | `ttl.resume.days` | 简历 TTL（天） | 30 | 已有（seed.sql:54） |
 | `ttl.conversation_log.days` | 对话日志 TTL（天） | 30 | 已有（seed.sql:55） |
-| `ttl.audit_log.days` | 审核日志 TTL（天） | 180 | **Phase 7 新增** |
-| `ttl.wecom_inbound_event.days` | 入站事件表 TTL（天） | 30 | **Phase 7 新增** |
-| `ttl.hard_delete.delay_days` | 软删到硬删延迟（天） | 7 | **Phase 7 新增** |
+| `ttl.audit_log.days` | 审核日志 TTL（天） | 180 | **Phase 7 新增**（seed.sql:56） |
+| `ttl.wecom_inbound_event.days` | 入站事件表 TTL（天） | 30 | **Phase 7 新增**（seed.sql:57） |
+| `ttl.hard_delete.delay_days` | 软删到硬删延迟（天） | 7 | **Phase 7 新增**（seed.sql:58） |
 
-新增 key 必须同步更新 `backend/sql/seed.sql`。
+**既有环境升级（重要）**：
+
+`backend/sql/seed.sql` 只在 Docker MySQL 首次初始化时执行；**已有数据 volume 的环境不会自动补齐新增 key**。Phase 7 必须同时提供两条路径，缺一不可：
+
+1. **正式迁移 SQL**：`backend/sql/migrations/phase7_001_ensure_system_config.sql`（幂等 `INSERT IGNORE`），作为运维手册中的必执行步骤
+2. **启动自愈**：`tasks/common.py` 提供 `ensure_ttl_config_defaults(db)`，在 `scheduler.start()` 与 `ttl_cleanup.run()` 两处调用；发现缺失 key 时插入默认值并 loguru `warn`，让运维可见"数据库未执行迁移，已由应用自愈补齐"
+
+只依赖 seed 或只依赖迁移都不够：seed 漏掉已上线环境，迁移可能被运维漏执行。二者叠加才能保证 `ttl_cleanup` 在任何环境下都按运营配置值工作，而不是悄悄退化到代码侧 hardcode 默认。
 
 ## 5. 接口契约
 
@@ -512,7 +546,7 @@ def send_text_to_group(self, chat_id: str, content: str) -> bool: ...
 - [ ] §17.1.4 七项指标按 §17.1.1 至少 7 天试运营后全部达标（E11 按降级规则执行）
 - [ ] §14.5.4 上线前 Checklist 所有项勾选
 - [ ] §17.3.3 5 项必关闭项全部 `已确认`
-- [ ] `collaboration/handoffs/phase7-release-report.md` 验收报告 + 上线 Checklist 执行记录已归档
+- [ ] `collaboration/handoffs/phase7-release-report.md` 验收报告 + 上线 Checklist 执行记录已归档，含 §0.1 U1/U3/U4 的最终状态
 
 ## 7. 进入条件
 
@@ -540,6 +574,9 @@ def send_text_to_group(self, chat_id: str, content: str) -> bool: ...
 | `User.extra['deleted_at']` 历史遗留缺失 | 7 天硬删计时无起点 | 回落到最新 AuditLog 起点；可一次性 backfill 脚本 |
 | 生产 `CORS_ORIGINS` 配置成 `*` | 跨域风险 | `config.py` 在 `APP_ENV=production` 时拒绝 `*` 或空 |
 | 插入二期需求 | 阶段拖延 | 所有新需求走 §8 变更控制 |
+| **U1**：Docker 镜像 `pip install` 超时卡住 | 无法跑通 prod 编排 | 建议①：`pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/`；②：`Dockerfile` 里 `pip install --default-timeout=600 --no-cache-dir`；③：宿主机 `pip download -d ./wheels` 后 `Dockerfile COPY ./wheels /wheels && pip install --no-index --find-links=/wheels -r requirements.txt`；④：CI 预构建镜像推 registry，生产只 pull 不 build |
+| **U3**：企微 / LLM 真实依赖未闭环 | E2E 仅 Mock，上线验收不可通过 | 按 `phase4-demo-env.md` 路径推进自建 Demo 或等客户 Onboarding；LLM 建议先跑一个付费 Key 的小额度连通性测试 |
+| **U4**：7 天试运营窗口未启动 | MVP 指标无实测值 | 明确试运营启动条件为 "U1 + U3 均就绪"；启动后每日按 §3.1 模块 L 表格输出指标，缺一项不达标则上线延期或走 Backlog |
 
 ## 9. 文件变更清单
 
@@ -559,6 +596,7 @@ def send_text_to_group(self, chat_id: str, content: str) -> bool: ...
 | 修改 | `nginx/nginx.conf` | SPA/API 共路径冲突修复 |
 | 修改 | `.env.example` | 补 `APP_ENV` / `CORS_ORIGINS` / `SCHEDULER_TIMEZONE` / `DAILY_REPORT_CHAT_ID` / `MONITOR_*` |
 | 修改 | `backend/app/config.py` | 生产环境 `CORS_ORIGINS` 校验 + 新变量读取 |
+| 新建 | `backend/sql/migrations/phase7_001_ensure_system_config.sql` | Phase 7 TTL config key 幂等迁移（`INSERT IGNORE`） |
 | 新建 | `scripts/backup_mysql.sh` | MySQL 定时备份 |
 | 新建 | `scripts/backup_uploads.sh` | 上传目录定时备份 |
 | 新建 | `scripts/restore_drill.sh` | 恢复演练参考脚本（注释严禁在生产执行） |

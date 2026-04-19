@@ -49,6 +49,11 @@ logs/
 uploads/
 tmp/
 
+# ---- Demo environment (phase4-demo-env) ----
+backend/sql/seed_demo.sql
+scripts/demo_env_*.local.sh
+.cpolar/
+
 # ---- Docker volumes (if any local bind mount) ----
 data/
 

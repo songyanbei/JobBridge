@@ -38,6 +38,9 @@
 - [ ] 任务内部异常被捕获，不影响 FastAPI 主线程
 - [ ] `task_lock:{task_name}` 分布式锁生效（owner token + Lua CAS 释放）
 - [ ] `task_lock` 在任务超时后不误删他人锁（TC-7.1.6）
+- [ ] 旧库缺 `ttl.*` 新 key 时，app 启动自愈补齐 + 日志 warn（TC-7.1.7）
+- [ ] `phase7_001_ensure_system_config.sql` 可重复执行无报错（TC-7.1.8）
+- [ ] 运营在 admin 页改 TTL 配置后次日 `ttl_cleanup` 按新值生效（TC-7.1.9）
 - [ ] **本地双 uvicorn 实例**测试：同一任务只被一个实例执行（不使用 `docker compose --scale app=2`，避免与 `container_name: jobbridge-app` 冲突）
 - [ ] `max_instances=1 + coalesce=True` 生效
 

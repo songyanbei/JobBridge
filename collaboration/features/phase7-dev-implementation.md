@@ -124,6 +124,116 @@ def log_event(event: str, **fields) -> None:
 
 **注意**：`ttl` 必须 ≥ 任务预期最大耗时的 2x（`ttl_cleanup` 建议 3600s，短任务建议 60~300s）。不要用任意短 TTL，否则任务运行中锁会被动过期。
 
+#### 5.1.1 `ensure_ttl_config_defaults()` 启动自愈
+
+seed.sql 只在 Docker MySQL 首次初始化时执行；**已上线环境**的 MySQL volume 中不会自动补齐 Phase 7 新增的 `ttl.audit_log.days` / `ttl.wecom_inbound_event.days` / `ttl.hard_delete.delay_days`。如果仅依赖代码侧 `settings.get("ttl.audit_log.days", 180)` 兜底，运营在后台改配置时会"感觉改了但不生效"——因为数据库里根本没这个 key，下次加载又回落到 hardcode 默认。
+
+`tasks/common.py` 补充：
+
+```python
+from sqlalchemy.orm import Session
+from app.models import SystemConfig
+
+_TTL_CONFIG_DEFAULTS = [
+    ("ttl.job.days",                "30",  "int", "岗位 TTL（天）"),
+    ("ttl.resume.days",             "30",  "int", "简历 TTL（天）"),
+    ("ttl.conversation_log.days",   "30",  "int", "对话日志 TTL（天）"),
+    ("ttl.audit_log.days",          "180", "int", "审核日志 TTL（天）— Phase 7"),
+    ("ttl.wecom_inbound_event.days","30",  "int", "入站事件表 TTL（天）— Phase 7"),
+    ("ttl.hard_delete.delay_days",  "7",   "int", "软删到硬删延迟（天）— Phase 7"),
+]
+
+def ensure_ttl_config_defaults(db: Session) -> int:
+    """幂等补齐 TTL 相关 system_config key；返回新插入条数。
+
+    每次插入都会 loguru.warn 提示运维——正常情况下迁移 SQL 已执行，不应触发；
+    触发说明既有环境未跑 phase7_001 迁移，应用侧自愈但需运维后补执行。
+    """
+    existing = {
+        row.config_key
+        for row in db.query(SystemConfig.config_key).filter(
+            SystemConfig.config_key.in_([k for k, *_ in _TTL_CONFIG_DEFAULTS])
+        ).all()
+    }
+    added = 0
+    for key, value, value_type, desc in _TTL_CONFIG_DEFAULTS:
+        if key in existing:
+            continue
+        db.add(SystemConfig(
+            config_key=key,
+            config_value=value,
+            value_type=value_type,
+            description=desc,
+        ))
+        added += 1
+        logger.warning(
+            f"ensure_ttl_config_defaults: inserted missing key '{key}'={value}. "
+            f"Existing environment did NOT run phase7_001 migration."
+        )
+    if added:
+        db.commit()
+    return added
+```
+
+调用点：
+
+1. **scheduler.start()**：启动时一次性补齐，让运维在首次重启 app 即看到 warn 日志
+2. **ttl_cleanup.run()**：每日执行前再跑一次，作为最终兜底（幂等，0 插入时完全无开销）
+
+```python
+# scheduler.py 新增
+def start() -> None:
+    global _scheduler
+    if _scheduler is not None:
+        return
+    # 启动前补齐 TTL 配置 key（幂等，防止既有环境漏跑迁移）
+    with SessionLocal() as db:
+        added = ensure_ttl_config_defaults(db)
+        if added:
+            logger.warning(f"scheduler: self-healed {added} missing ttl.* system_config key(s)")
+    _scheduler = build_scheduler()
+    ...
+
+# ttl_cleanup.py run() 头部
+def run() -> None:
+    with task_lock("ttl_cleanup", ttl=3600) as acquired:
+        if not acquired:
+            return
+        with SessionLocal() as db:
+            ensure_ttl_config_defaults(db)
+            ...
+```
+
+#### 5.1.2 正式迁移 SQL
+
+`backend/sql/migrations/phase7_001_ensure_system_config.sql`：
+
+```sql
+-- Phase 7 migration #001: ensure TTL-related system_config keys exist.
+-- Idempotent: safe to run multiple times on any environment.
+-- 既有环境手动执行：
+--   docker exec -i jobbridge-mysql mysql -u root -p<pwd> jobbridge \
+--     < backend/sql/migrations/phase7_001_ensure_system_config.sql
+
+INSERT IGNORE INTO `system_config` (`config_key`, `config_value`, `value_type`, `description`) VALUES
+('ttl.audit_log.days',              '180', 'int', '审核日志 TTL（天）— Phase 7 新增'),
+('ttl.wecom_inbound_event.days',    '30',  'int', '入站事件表 TTL（天）— Phase 7 新增'),
+('ttl.hard_delete.delay_days',      '7',   'int', '软删到硬删延迟（天）— Phase 7 新增');
+
+-- 验证
+SELECT config_key, config_value FROM system_config
+ WHERE config_key LIKE 'ttl.%'
+ ORDER BY config_key;
+```
+
+`system_config.config_key` 是主键（`schema.sql:314`），`INSERT IGNORE` 遇到主键冲突时直接跳过，保证多次执行无副作用。
+
+**运维手册必须写清楚**：
+
+- 首次部署：`docker compose up` 会自动执行 `sql/` 下的初始化脚本（含最新 seed.sql），无需手动迁移
+- 升级既有环境：必须显式执行 `phase7_001_ensure_system_config.sql`；或依赖应用自愈，但会在日志留下 `did NOT run phase7_001 migration` 告警
+- 未来 Phase 7 后的迁移：新增 migration 按 `phase7_002_*.sql` / `phase8_001_*.sql` 命名，保证可顺序重放
+
 调用示例：
 
 ```python

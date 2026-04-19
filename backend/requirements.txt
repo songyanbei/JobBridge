@@ -27,7 +27,12 @@ httpx>=0.27,<0.29
 pycryptodome>=3.20,<4.0
 
 # Auth
-bcrypt>=4.1,<5.0
+# passlib 1.7.x 探测 bcrypt 版本时访问 `bcrypt.__about__.__version__`，
+# 该属性在 bcrypt 4.1+ 被移除，导致生产日志噪音：
+#   AttributeError: module 'bcrypt' has no attribute '__about__'
+# 不阻断功能但持续打 warn。Pin bcrypt<4.1 让 passlib 兼容路径走通，
+# 后续升 passlib 正式发布后再放开（passlib 项目目前维护节奏很慢）。
+bcrypt>=4.0,<4.1
 passlib[bcrypt]>=1.7,<2.0
 python-jose[cryptography]>=3.3,<4.0
 

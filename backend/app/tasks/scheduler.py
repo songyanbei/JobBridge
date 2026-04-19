@@ -98,6 +98,10 @@ def start() -> None:
     if _scheduler is not None:
         return
 
+    # 旧库升级自愈：Phase 7 新增的 ttl.* system_config key 若缺失，在此幂等补齐。
+    # 首次部署走 seed.sql 不会触发；已上线环境没跑 phase7_001 迁移时会补齐并 warn。
+    _self_heal_ttl_config()
+
     _scheduler = build_scheduler()
 
     # start 前只能读 id / trigger；pending job 的 next_run_time 尚未计算。
@@ -119,3 +123,24 @@ def shutdown() -> None:
     _scheduler.shutdown(wait=False)
     _scheduler = None
     logger.info("scheduler stopped")
+
+
+def _self_heal_ttl_config() -> None:
+    """启动前一次性补齐缺失的 ttl.* system_config key（Phase 7 §0.1 U2）。
+
+    独立函数而非内联，方便单测 mock。任何异常都只 warn，不阻塞 app 启动：
+    数据库未就绪是更上层的健康检查问题，不应被这里连累成启动失败。
+    """
+    try:
+        from app.db import SessionLocal
+        from app.tasks.common import ensure_ttl_config_defaults
+
+        with SessionLocal() as db:
+            added = ensure_ttl_config_defaults(db)
+        if added:
+            logger.warning(
+                f"scheduler: self-healed {added} missing ttl.* system_config key(s); "
+                "run phase7_001 migration on next maintenance window"
+            )
+    except Exception:
+        logger.exception("scheduler: _self_heal_ttl_config failed (non-fatal)")

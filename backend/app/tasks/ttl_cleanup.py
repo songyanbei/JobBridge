@@ -26,7 +26,7 @@ from sqlalchemy import text
 
 from app.db import SessionLocal
 from app.storage import get_storage
-from app.tasks.common import log_event, task_lock
+from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 
 BATCH_SIZE = 500
 
@@ -304,6 +304,14 @@ def run() -> None:
 
         stats: dict = {}
         with SessionLocal() as db:
+            # 旧库升级兜底：读取配置前先自愈补齐缺失 key。
+            # scheduler.start() 启动时已经跑过一次；这里再跑一次是纯兜底，
+            # 针对"app 启动后被手工 DELETE system_config 行"或"直接手工调 run()"场景。
+            try:
+                ensure_ttl_config_defaults(db)
+            except Exception:
+                logger.exception("ttl_cleanup: ensure_ttl_config_defaults failed (non-fatal)")
+
             # Phase 7：天数全量从 system_config 读取，失败兜底默认值
             cfg = _load_ttl_config(db)
             stats["_config"] = cfg  # 记录本次使用的配置，便于事后复盘

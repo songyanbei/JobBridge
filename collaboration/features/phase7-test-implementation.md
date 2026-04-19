@@ -152,6 +152,28 @@ Phase 7 的风险集中在：
   4. 进程 A 结束后调用 release
 - 预期：进程 A 的 release 通过 Lua CAS 发现 value 已变（不是自己的 token），**不删除** B 的锁；进程 B 仍然持有
 
+#### TC-7.1.7 旧库启动自愈（`ensure_ttl_config_defaults`）
+
+- 前置：从旧备份导入的 MySQL，`system_config` 中**不含** `ttl.audit_log.days` / `ttl.wecom_inbound_event.days` / `ttl.hard_delete.delay_days`
+- 操作：启动 app 进程（触发 `scheduler.start()`）
+- 预期：
+  - 启动日志含 `ensure_ttl_config_defaults: inserted missing key 'ttl.audit_log.days'=180. Existing environment did NOT run phase7_001 migration.` 等 3 行 warning
+  - 启动日志含 `scheduler: self-healed 3 missing ttl.* system_config key(s)`
+  - `SELECT config_key FROM system_config WHERE config_key LIKE 'ttl.%'` 可见全部 6 个 key
+  - 再次重启 app，不再打印 self-healed 日志（幂等）
+
+#### TC-7.1.8 迁移 SQL 幂等性
+
+- 前置：任意环境
+- 操作：连续两次执行 `docker exec -i jobbridge-mysql mysql ... < phase7_001_ensure_system_config.sql`
+- 预期：两次均无报错；末尾 SELECT 输出 6 行 `ttl.*` key；既有 key 的 value 保持不变（`INSERT IGNORE` 不覆盖）
+
+#### TC-7.1.9 运营修改 TTL 配置后生效
+
+- 前置：启动后 `system_config.ttl.hard_delete.delay_days = 7`
+- 操作：通过 admin 配置页将其改为 3；第二天 03:00 触发 `ttl_cleanup`
+- 预期：软删 4 天的数据被硬删（证明读取的是 DB 中的配置值，不是代码 hardcode 默认）
+
 ### 5.2 TTL 清理
 
 #### TC-7.2.1 岗位过期软删

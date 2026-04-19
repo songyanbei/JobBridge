@@ -179,7 +179,12 @@
 - [ ] `ttl.audit_log.days` (默认 180)
 - [ ] `ttl.wecom_inbound_event.days` (默认 30)
 - [ ] `ttl.hard_delete.delay_days` (默认 7)
-- [ ] 全部在 `backend/sql/seed.sql` 已补
+- [ ] 全部在 `backend/sql/seed.sql` 已补（首次部署生效）
+- [ ] `backend/sql/migrations/phase7_001_ensure_system_config.sql` 已创建（`INSERT IGNORE` 幂等，既有环境升级用）
+- [ ] `tasks/common.py:ensure_ttl_config_defaults(db)` 已实现，缺失 key 时插入默认值 + `logger.warning`
+- [ ] `scheduler.start()` 启动前调用一次 `ensure_ttl_config_defaults()`
+- [ ] `ttl_cleanup.run()` 主体开始前再调一次（幂等兜底）
+- [ ] 运维手册含既有环境升级步骤（手动执行迁移或依赖应用自愈）
 - [ ] 不新增 `monitor.*` key 到 `system_config`
 
 **`.env` 新增变量**：
