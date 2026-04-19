@@ -1,0 +1,173 @@
+-- =============================================================================
+-- Demo 环境测试数据 seed（模板，Phase 4 demo-env 专用）
+--
+-- 使用方式：
+--   1. 拿到企业微信企业成员的 userid 后，用 sed 替换占位符：
+--        sed \
+--          -e "s/__FACTORY_ZZ_USERID__/<厂家张总的 userid>/g" \
+--          -e "s/__FACTORY_LZ_USERID__/<厂家李总的 userid>/g" \
+--          -e "s/__BROKER_LJ_USERID__/<中介李姐的 userid>/g" \
+--          backend/sql/seed_demo.sql.template > backend/sql/seed_demo.sql
+--   2. 执行：
+--        docker exec -i jobbridge-mysql \
+--          mysql -u jobbridge -pjobbridge jobbridge < backend/sql/seed_demo.sql
+--   3. seed_demo.sql 已被 .gitignore 忽略，模板 (.template) 保留版本控制
+--
+-- 注意：
+--   - 工人账号（demo_worker_*）由系统首次消息时自动注册，**不在此 seed 中插入**
+--   - 执行前确保种子数据（dict_city, dict_job_category）已 seed
+--   - 本脚本可重复执行（全部使用 INSERT IGNORE）
+-- =============================================================================
+
+-- ---------- 预注册厂家 / 中介 ----------
+INSERT IGNORE INTO `user`
+  (external_userid, role, status, display_name, company, contact_person, phone,
+   can_search_jobs, can_search_workers, registered_at)
+VALUES
+  ('__FACTORY_ZZ_USERID__', 'factory', 'active', '张总', '苏州睿联电子有限公司',
+   '张志强', '13800000001', 0, 1, NOW()),
+  ('__FACTORY_LZ_USERID__', 'factory', 'active', '李总', '昆山锦华服装厂',
+   '李建军', '13800000002', 0, 1, NOW()),
+  ('__BROKER_LJ_USERID__',  'broker',  'active', '李姐', NULL,
+   '李桂芳', '13800000003', 1, 1, NOW());
+
+
+-- ---------- 岗位数据 × 20 条（覆盖苏州/昆山/无锡 × 电子/服装/物流/普工） ----------
+
+-- 苏州睿联电子（厂家张总名下，5 条）
+INSERT IGNORE INTO `job`
+  (owner_userid, city, job_category, salary_floor_monthly, salary_ceiling_monthly,
+   pay_type, headcount, gender_required, age_min, age_max, is_long_term,
+   provide_meal, provide_housing, shift_pattern,
+   raw_text, description,
+   audit_status, audited_by, audited_at, expires_at)
+VALUES
+  ('__FACTORY_ZZ_USERID__', '苏州市', '电子厂', 5500, 7000, '月薪', 30, '不限', 18, 40, 1,
+   1, 1, '两班倒',
+   '苏州电子厂招普工30人，5500-7000月薪包吃住，18-40岁，两班倒',
+   '苏州电子厂普工岗位，月薪5500-7000元，包吃住，两班倒',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_ZZ_USERID__', '苏州市', '电子厂', 6000, 8000, '月薪', 20, '男', 18, 35, 1,
+   1, 1, '白班',
+   '苏州电子厂招SMT技术员20人，6000-8000月薪，男18-35岁，白班',
+   '苏州电子厂SMT技术员岗位，月薪6000-8000元，白班',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_ZZ_USERID__', '苏州市', '电子厂', 5000, 6500, '时薪', 15, '女', 18, 38, 1,
+   1, 0, '做六休一',
+   '苏州电子厂招女工15人，时薪23-28元，做六休一，包午餐',
+   '苏州电子厂女工岗位，时薪23-28元，做六休一',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_ZZ_USERID__', '苏州市', '电子厂', 7000, 9000, '月薪', 10, '不限', 20, 40, 1,
+   1, 1, '白班',
+   '苏州电子厂招技术工10人，7000-9000月薪，需焊工经验，白班包吃住',
+   '苏州电子厂技术工岗位，月薪7000-9000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_ZZ_USERID__', '苏州市', '电子厂', 4800, 5800, '月薪', 50, '不限', 18, 45, 1,
+   1, 1, '三班倒',
+   '苏州电子厂招流水线普工50人，4800-5800月薪，18-45岁，三班倒',
+   '苏州电子厂流水线普工，月薪4800-5800元，三班倒',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+-- 昆山锦华服装（厂家李总名下，5 条）
+  ('__FACTORY_LZ_USERID__', '苏州市', '服装厂', 5500, 7500, '计件', 30, '女', 20, 45, 1,
+   1, 1, '白班',
+   '昆山服装厂招缝纫工30人，计件工资5500-7500，女20-45，包吃住',
+   '昆山服装厂缝纫工，计件工资月综合5500-7500元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_LZ_USERID__', '苏州市', '服装厂', 4500, 6000, '月薪', 20, '女', 18, 40, 1,
+   1, 0, '白班',
+   '昆山服装厂招熨烫工20人，月薪4500-6000，女工，包午餐',
+   '昆山服装厂熨烫工，月薪4500-6000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_LZ_USERID__', '苏州市', '服装厂', 5000, 6500, '月薪', 10, '不限', 18, 45, 1,
+   1, 1, '做六休一',
+   '昆山服装厂招质检员10人，月薪5000-6500，包吃住，做六休一',
+   '昆山服装厂质检员，月薪5000-6500元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_LZ_USERID__', '苏州市', '服装厂', 6000, 8500, '计件', 15, '女', 22, 50, 1,
+   1, 1, '白班',
+   '昆山服装厂招高级车工15人，计件6000-8500，需3年经验，包吃住',
+   '昆山服装厂高级车工，计件工资月综合6000-8500元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__FACTORY_LZ_USERID__', '苏州市', '服装厂', 4200, 5500, '月薪', 25, '不限', 18, 40, 1,
+   1, 1, '两班倒',
+   '昆山服装厂招包装工25人，4200-5500月薪，18-40岁，两班倒包吃住',
+   '昆山服装厂包装工，月薪4200-5500元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+-- 中介李姐名下（10 条，覆盖无锡/常州，跨多工种）
+  ('__BROKER_LJ_USERID__', '无锡市', '电子厂', 5800, 7200, '月薪', 40, '不限', 18, 42, 1,
+   1, 1, '两班倒',
+   '无锡电子厂招普工40人，5800-7200包吃住，18-42岁，两班倒',
+   '无锡电子厂普工，月薪5800-7200元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '无锡市', '物流仓储', 5200, 6500, '月薪', 30, '男', 20, 45, 1,
+   1, 0, '白班',
+   '无锡物流园招分拣员30人，5200-6500月薪，男20-45岁，包午餐',
+   '无锡物流园分拣员，月薪5200-6500元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '无锡市', '物流仓储', 6000, 8000, '时薪', 15, '男', 22, 50, 1,
+   0, 0, '白班',
+   '无锡物流公司招叉车司机15人，时薪28-38，需叉车证',
+   '无锡物流叉车司机，时薪28-38元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '无锡市', '普工', 4500, 5800, '月薪', 60, '不限', 18, 50, 1,
+   1, 1, '三班倒',
+   '无锡制造业招普工60人，4500-5800月薪，18-50岁，包吃住三班倒',
+   '无锡制造业普工，月薪4500-5800元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '无锡市', '电子厂', 5000, 6000, '月薪', 20, '女', 18, 40, 1,
+   1, 1, '白班',
+   '无锡电子厂招女工20人，5000-6000月薪，白班，包吃住',
+   '无锡电子厂女工，月薪5000-6000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '苏州市', '物流仓储', 5500, 7000, '月薪', 25, '不限', 20, 45, 1,
+   1, 1, '两班倒',
+   '苏州物流园招装卸工25人，5500-7000月薪，两班倒包吃住',
+   '苏州物流装卸工，月薪5500-7000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '苏州市', '食品厂', 4800, 6000, '月薪', 30, '不限', 18, 45, 1,
+   1, 1, '白班',
+   '苏州食品厂招包装工30人，4800-6000月薪，白班包吃住',
+   '苏州食品厂包装工，月薪4800-6000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '苏州市', '技工', 7500, 10000, '月薪', 8, '男', 25, 50, 1,
+   1, 1, '白班',
+   '苏州工厂招焊工8人，月薪7500-10000，需3年以上经验，包吃住',
+   '苏州工厂焊工，月薪7500-10000元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '无锡市', '服装厂', 4800, 6200, '计件', 20, '女', 20, 45, 1,
+   1, 0, '白班',
+   '无锡服装厂招女工20人，计件4800-6200，白班包午餐',
+   '无锡服装厂女工，计件工资月综合4800-6200元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)),
+
+  ('__BROKER_LJ_USERID__', '苏州市', '餐饮',   4500, 5800, '月薪', 12, '不限', 18, 45, 1,
+   1, 1, '两班倒',
+   '苏州连锁餐厅招服务员12人，月薪4500-5800，包吃住',
+   '苏州餐厅服务员，月薪4500-5800元',
+   'passed', 'system', NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY));
+
+
+-- ---------- 执行后自检查询 ----------
+SELECT
+  (SELECT COUNT(*) FROM `user` WHERE external_userid LIKE 'demo_%'
+     OR external_userid LIKE '__%') AS user_count,
+  (SELECT COUNT(*) FROM `job`  WHERE owner_userid LIKE 'demo_%'
+     OR owner_userid LIKE '__%') AS job_count;
