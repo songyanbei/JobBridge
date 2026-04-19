@@ -7,6 +7,7 @@ import logging
 
 import httpx
 
+from app.core.exceptions import LLMParseError
 from app.llm.base import IntentResult, RerankResult
 
 logger = logging.getLogger(__name__)
@@ -60,18 +61,18 @@ def _intent_fallback(raw: str) -> IntentResult:
 def parse_intent_response(raw: str) -> IntentResult:
     """从 LLM 原始输出中解析 IntentResult。
 
-    任何解析/校验失败都 fallback 为 chitchat + confidence=0.0，
-    包括：JSON 解码失败、字段类型不匹配、Pydantic ValidationError 等。
+    Phase 7：基础结构错误（非 JSON / 非 dict）抛 ``LLMParseError`` 让上层
+    把 ``status`` 记作 ``parse_failed``；字段级偏差仍走软兜底，保证业务连续。
     """
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("IntentExtractor: JSON decode failed, falling back to chitchat")
-        return _intent_fallback(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("IntentExtractor: JSON decode failed (%s), raising LLMParseError", exc)
+        raise LLMParseError("intent_json_decode_failed")
 
     if not isinstance(data, dict):
-        logger.warning("IntentExtractor: top-level value is not a dict, falling back")
-        return _intent_fallback(raw)
+        logger.warning("IntentExtractor: top-level value is not a dict, raising LLMParseError")
+        raise LLMParseError("intent_not_a_dict")
 
     intent = data.get("intent", "chitchat")
     if not isinstance(intent, str) or intent not in VALID_INTENTS:
@@ -123,18 +124,18 @@ def _rerank_fallback(raw: str) -> RerankResult:
 def parse_rerank_response(raw: str) -> RerankResult:
     """从 LLM 原始输出中解析 RerankResult。
 
-    任何解析/校验失败都返回空结果，
-    包括：JSON 解码失败、字段类型不匹配、Pydantic ValidationError 等。
+    Phase 7：基础结构错误（非 JSON / 非 dict）抛 ``LLMParseError``；
+    字段级偏差仍走软兜底。
     """
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("Reranker: JSON decode failed, returning empty result")
-        return _rerank_fallback(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("Reranker: JSON decode failed (%s), raising LLMParseError", exc)
+        raise LLMParseError("rerank_json_decode_failed")
 
     if not isinstance(data, dict):
-        logger.warning("Reranker: top-level value is not a dict, falling back")
-        return _rerank_fallback(raw)
+        logger.warning("Reranker: top-level value is not a dict, raising LLMParseError")
+        raise LLMParseError("rerank_not_a_dict")
 
     # 防御性类型校正
     ranked_items = data.get("ranked_items", [])

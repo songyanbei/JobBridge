@@ -129,8 +129,16 @@ def classify_intent(
     role: str,
     history: list[dict] | None = None,
     current_criteria: dict | None = None,
+    user_msg_id: str | None = None,
 ) -> IntentResult:
-    """识别用户意图，按 显式命令 → show_more → LLM 的优先级。"""
+    """识别用户意图，按 显式命令 → show_more → LLM 的优先级。
+
+    Phase 7：LLM 调用结构化打点（``llm_call``）含
+    provider / model / prompt_version / input_tokens / output_tokens /
+    duration_ms / intent / user_msg_id / status。
+    parse_failed 不再 raise，而是回落到 chitchat 以保持调用方（message_router）
+    的现有容错路径；status 会反映真实失败类型以便运维分析。
+    """
     stripped = text.strip()
 
     # Step 1: 显式命令匹配
@@ -155,6 +163,7 @@ def classify_intent(
     start = time.perf_counter()
     status = "ok"
     result: IntentResult | None = None
+    parse_failed = False
     try:
         result = extractor.extract(
             text=stripped,
@@ -165,14 +174,26 @@ def classify_intent(
     except LLMTimeout:
         status = "timeout"
         raise
-    except LLMParseError:
+    except LLMParseError as exc:
+        # parse_failed：日志要记真实状态，但业务链路降级到 chitchat 以保持连续。
+        # provider 在 raise 前已把本次请求的 token 用量挂到 exc.input_tokens /
+        # exc.output_tokens 上，这里回读到 fallback IntentResult 以便 log_event 记录
+        # 真实 token 用量（即使解析失败也能进账本）。
         status = "parse_failed"
-        raise
+        parse_failed = True
+        result = IntentResult(
+            intent="chitchat",
+            confidence=0.0,
+            input_tokens=getattr(exc, "input_tokens", None),
+            output_tokens=getattr(exc, "output_tokens", None),
+        )
     except LLMError:
         status = "http_error"
         raise
     except Exception:
-        status = "http_error"
+        # 非 LLMError 家族的意外异常（如 provider 实现 bug、类型错误等）。
+        # 单独打 unknown_error 便于日志归因与告警分级。
+        status = "unknown_error"
         raise
     finally:
         log_event(
@@ -183,9 +204,15 @@ def classify_intent(
             prompt_version=INTENT_PROMPT_VERSION,
             duration_ms=int((time.perf_counter() - start) * 1000),
             intent=getattr(result, "intent", None),
+            input_tokens=getattr(result, "input_tokens", None),
+            output_tokens=getattr(result, "output_tokens", None),
+            user_msg_id=user_msg_id,
             status=status,
         )
 
+    # parse_failed 的 fallback result 不需要再 sanitize（全空结构）
+    if parse_failed:
+        return result
     # Step 4: 校验和清洗
     return _sanitize_intent_result(result, role)
 

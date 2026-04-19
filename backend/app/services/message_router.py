@@ -156,6 +156,7 @@ def _handle_text(
             role=user_ctx.role,
             history=session.history,
             current_criteria=session.search_criteria,
+            user_msg_id=msg.msg_id,
         )
     except Exception as exc:
         logger.exception("message_router: classify_intent failed: %s", exc)
@@ -276,6 +277,7 @@ def _handle_upload_and_search(
     # 直接让 _resolve_search_direction 按角色兜底即可（传 None）
     search_result = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
+        user_msg_id=msg.msg_id,
     )
     if search_result is not None and search_result.reply_text:
         replies.append(_reply(msg.from_user, search_result.reply_text))
@@ -312,6 +314,7 @@ def _handle_search(
 
     search_result = _run_search(
         intent_result.intent, criteria, msg.content or "", user_ctx, session, db,
+        user_msg_id=msg.msg_id,
     )
     if search_result is None:
         return [_reply(msg.from_user, SYSTEM_BUSY_REPLY)]
@@ -345,6 +348,7 @@ def _handle_follow_up(
     criteria = dict(session.search_criteria)
     search_result = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
+        user_msg_id=msg.msg_id,
     )
     if search_result is None:
         return [_reply(msg.from_user, SYSTEM_BUSY_REPLY)]
@@ -414,17 +418,24 @@ def _run_search(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    user_msg_id: str | None = None,
 ):
     """按 intent + 角色 + session.broker_direction 选择 search_jobs 或 search_workers。
 
     intent 可以是 search_job / search_worker / upload_and_search / None；
     其中 follow_up / show_more / upload_and_search 不显式指定方向，
     走 session.broker_direction 或角色兜底。
+
+    Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
     if direction == "search_job":
-        return search_service.search_jobs(criteria, raw_query, session, user_ctx, db)
-    return search_service.search_workers(criteria, raw_query, session, user_ctx, db)
+        return search_service.search_jobs(
+            criteria, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+        )
+    return search_service.search_workers(
+        criteria, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+    )
 
 
 def _resolve_search_direction(

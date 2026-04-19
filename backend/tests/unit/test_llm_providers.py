@@ -17,18 +17,27 @@ from app.llm.providers._base import (
     VALID_INTENTS,
     call_llm_api,
 )
-from app.core.exceptions import LLMError, LLMTimeout
+from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 
 
 # ---------------------------------------------------------------------------
 # Helper: 构造 mock httpx 响应
 # ---------------------------------------------------------------------------
 
-def _make_chat_response(content: str, status_code: int = 200) -> httpx.Response:
-    """构造 OpenAI 兼容的 chat/completions 响应。"""
-    body = {
+def _make_chat_response(
+    content: str,
+    status_code: int = 200,
+    usage: dict | None = None,
+) -> httpx.Response:
+    """构造 OpenAI 兼容的 chat/completions 响应。
+
+    Phase 7：可选 ``usage`` 让测试断言 provider 从响应中提取 token。
+    """
+    body: dict = {
         "choices": [{"message": {"content": content}}],
     }
+    if usage is not None:
+        body["usage"] = usage
     resp = httpx.Response(
         status_code=status_code,
         json=body,
@@ -58,26 +67,27 @@ class TestParseIntentResponse:
         assert result.structured_data == {"city": "深圳"}
         assert result.raw_response == raw
 
-    def test_invalid_json_fallback(self):
-        result = parse_intent_response("this is not json")
-        assert result.intent == "chitchat"
-        assert result.confidence == 0.0
-        assert result.raw_response == "this is not json"
+    def test_invalid_json_raises(self):
+        """Phase 7 契约变更：非法 JSON 不再软兜底，抛 LLMParseError 让上层记 parse_failed。"""
+        with pytest.raises(LLMParseError):
+            parse_intent_response("this is not json")
 
     def test_unknown_intent_fallback(self):
+        """intent 未知仍走软兜底（已是合法 JSON + dict，不算根结构错误）。"""
         raw = json.dumps({"intent": "unknown_intent", "confidence": 0.5})
         result = parse_intent_response(raw)
         assert result.intent == "chitchat"
         assert result.raw_response == raw
 
-    def test_empty_string_fallback(self):
-        result = parse_intent_response("")
-        assert result.intent == "chitchat"
-        assert result.confidence == 0.0
+    def test_empty_string_raises(self):
+        """空字符串 → json.loads 失败 → 抛 LLMParseError。"""
+        with pytest.raises(LLMParseError):
+            parse_intent_response("")
 
-    def test_none_fallback(self):
-        result = parse_intent_response(None)
-        assert result.intent == "chitchat"
+    def test_none_raises(self):
+        """None → json.loads(TypeError) → 抛 LLMParseError。"""
+        with pytest.raises(LLMParseError):
+            parse_intent_response(None)
 
     def test_all_valid_intents(self):
         for intent in VALID_INTENTS:
@@ -85,11 +95,13 @@ class TestParseIntentResponse:
             result = parse_intent_response(raw)
             assert result.intent == intent
 
-    def test_no_hardcoded_user_facing_text(self):
-        """fallback 结果不应包含面向用户的中文回复文案。"""
-        result = parse_intent_response("bad json")
-        assert "没太理解" not in result.raw_response
-        assert "系统繁忙" not in str(result)
+    def test_parse_error_has_no_user_facing_text(self):
+        """parse 失败抛出的异常消息不应含面向用户的中文文案（属于运维错误，不回显）。"""
+        with pytest.raises(LLMParseError) as excinfo:
+            parse_intent_response("bad json")
+        msg = str(excinfo.value)
+        assert "没太理解" not in msg
+        assert "系统繁忙" not in msg
 
     def test_raw_response_preserved(self):
         raw = json.dumps({"intent": "chitchat", "confidence": 0.1})
@@ -139,12 +151,11 @@ class TestParseIntentResponse:
         result = parse_intent_response(raw)
         assert result.criteria_patch == []
 
-    def test_top_level_not_dict_fallback(self):
-        """顶层是 list 而非 dict 时 fallback。"""
+    def test_top_level_not_dict_raises(self):
+        """顶层不是 dict 属根结构错误 → 抛 LLMParseError。"""
         raw = json.dumps([{"intent": "search_job"}])
-        result = parse_intent_response(raw)
-        assert result.intent == "chitchat"
-        assert result.confidence == 0.0
+        with pytest.raises(LLMParseError):
+            parse_intent_response(raw)
 
     def test_intent_non_string_fallback(self):
         """intent 是 int 而非 string 时 fallback。"""
@@ -166,11 +177,10 @@ class TestParseRerankResponse:
         assert result.reply_text == "推荐如下"
         assert result.raw_response == raw
 
-    def test_invalid_json_fallback(self):
-        result = parse_rerank_response("not json")
-        assert result.ranked_items == []
-        assert result.reply_text == ""
-        assert result.raw_response == "not json"
+    def test_invalid_json_raises(self):
+        """Phase 7 契约变更：非法 JSON 抛 LLMParseError 让上层记 parse_failed。"""
+        with pytest.raises(LLMParseError):
+            parse_rerank_response("not json")
 
     def test_ranked_items_wrong_type_fallback(self):
         """ranked_items 是 string 而非 list 时不抛 ValidationError。"""
@@ -186,10 +196,11 @@ class TestParseRerankResponse:
         result = parse_rerank_response(raw)
         assert result.reply_text == "42"
 
-    def test_top_level_list_fallback(self):
+    def test_top_level_list_raises(self):
+        """顶层是 list 属根结构错误 → 抛 LLMParseError。"""
         raw = json.dumps([1, 2, 3])
-        result = parse_rerank_response(raw)
-        assert result.ranked_items == []
+        with pytest.raises(LLMParseError):
+            parse_rerank_response(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -255,15 +266,19 @@ class TestQwenIntentExtractor:
         assert result.confidence == 0.9
 
     @patch("app.llm.providers.qwen.call_llm_api")
-    def test_non_json_fallback(self, mock_call):
-        mock_call.return_value = _make_chat_response("I don't understand")
+    def test_non_json_raises_parse_error(self, mock_call):
+        """Phase 7 契约：LLM 返回非 JSON 抛 LLMParseError（上层降级 + 记 parse_failed）。"""
+        mock_call.return_value = _make_chat_response(
+            "I don't understand",
+            usage={"prompt_tokens": 123, "completion_tokens": 45},
+        )
 
         ext = QwenIntentExtractor()
-        result = ext.extract("随便聊聊", role="worker")
-
-        assert result.intent == "chitchat"
-        assert result.confidence == 0.0
-        assert result.raw_response == "I don't understand"
+        with pytest.raises(LLMParseError) as excinfo:
+            ext.extract("随便聊聊", role="worker")
+        # Phase 7：usage 已在 provider 层提取并挂到异常上，让上层仍能记录 token 用量
+        assert getattr(excinfo.value, "input_tokens", None) == 123
+        assert getattr(excinfo.value, "output_tokens", None) == 45
 
     @patch("app.llm.providers.qwen.call_llm_api")
     def test_timeout_raises_llm_timeout(self, mock_call):
@@ -295,6 +310,30 @@ class TestQwenIntentExtractor:
         call_kwargs = mock_call.call_args
         assert "messages" in call_kwargs.kwargs["payload"]
 
+    @patch("app.llm.providers.qwen.call_llm_api")
+    def test_success_populates_token_usage(self, mock_call):
+        """Phase 7：成功解析时把 response.usage 回填到 IntentResult。"""
+        mock_call.return_value = _make_chat_response(
+            '{"intent":"chitchat","confidence":0.5}',
+            usage={"prompt_tokens": 77, "completion_tokens": 12},
+        )
+        ext = QwenIntentExtractor()
+        result = ext.extract("hi", role="worker")
+        assert result.input_tokens == 77
+        assert result.output_tokens == 12
+
+    @patch("app.llm.providers.qwen.call_llm_api")
+    def test_success_missing_usage_yields_none(self, mock_call):
+        """响应里没有 usage 字段时，token 保持 None（不报错）。"""
+        mock_call.return_value = _make_chat_response(
+            '{"intent":"chitchat","confidence":0.5}',
+            usage=None,
+        )
+        ext = QwenIntentExtractor()
+        result = ext.extract("hi", role="worker")
+        assert result.input_tokens is None
+        assert result.output_tokens is None
+
 
 class TestQwenReranker:
 
@@ -319,6 +358,32 @@ class TestQwenReranker:
         rnk = QwenReranker()
         with pytest.raises(LLMTimeout):
             rnk.rerank("test", candidates=[], role="worker")
+
+    @patch("app.llm.providers.qwen.call_llm_api")
+    def test_success_populates_token_usage(self, mock_call):
+        """Phase 7：成功解析时把 response.usage 回填到 RerankResult。"""
+        content = json.dumps({"ranked_items": [{"id": 1}], "reply_text": "ok"})
+        mock_call.return_value = _make_chat_response(
+            content,
+            usage={"prompt_tokens": 200, "completion_tokens": 30},
+        )
+        rnk = QwenReranker()
+        result = rnk.rerank("test", candidates=[{"id": 1}], role="worker")
+        assert result.input_tokens == 200
+        assert result.output_tokens == 30
+
+    @patch("app.llm.providers.qwen.call_llm_api")
+    def test_non_json_raises_parse_error_with_usage(self, mock_call):
+        """Phase 7 契约：rerank 同样在 parse 失败时把 usage 挂到 LLMParseError。"""
+        mock_call.return_value = _make_chat_response(
+            "not a json",
+            usage={"prompt_tokens": 150, "completion_tokens": 0},
+        )
+        rnk = QwenReranker()
+        with pytest.raises(LLMParseError) as excinfo:
+            rnk.rerank("test", candidates=[{"id": 1}], role="worker")
+        assert getattr(excinfo.value, "input_tokens", None) == 150
+        assert getattr(excinfo.value, "output_tokens", None) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -345,14 +410,18 @@ class TestDoubaoIntentExtractor:
         assert result.confidence == 0.88
 
     @patch("app.llm.providers.doubao.call_llm_api")
-    def test_non_json_fallback(self, mock_call):
-        mock_call.return_value = _make_chat_response("some garbage")
+    def test_non_json_raises_parse_error(self, mock_call):
+        """Phase 7 契约：LLM 返回非 JSON 抛 LLMParseError + usage 回传到异常上。"""
+        mock_call.return_value = _make_chat_response(
+            "some garbage",
+            usage={"prompt_tokens": 50, "completion_tokens": 8},
+        )
 
         ext = DoubaoIntentExtractor()
-        result = ext.extract("test", role="worker")
-
-        assert result.intent == "chitchat"
-        assert result.confidence == 0.0
+        with pytest.raises(LLMParseError) as excinfo:
+            ext.extract("test", role="worker")
+        assert getattr(excinfo.value, "input_tokens", None) == 50
+        assert getattr(excinfo.value, "output_tokens", None) == 8
 
     @patch("app.llm.providers.doubao.call_llm_api")
     def test_timeout_raises(self, mock_call):
@@ -400,3 +469,16 @@ class TestDoubaoReranker:
 
         assert len(result.ranked_items) == 1
         assert result.ranked_items[0]["id"] == 2
+
+    @patch("app.llm.providers.doubao.call_llm_api")
+    def test_non_json_raises_parse_error_with_usage(self, mock_call):
+        """Phase 7 契约：rerank 在 parse 失败时把 usage 挂到异常。"""
+        mock_call.return_value = _make_chat_response(
+            "garbage",
+            usage={"prompt_tokens": 80, "completion_tokens": 0},
+        )
+        rnk = DoubaoReranker()
+        with pytest.raises(LLMParseError) as excinfo:
+            rnk.rerank("test", candidates=[{"id": 1}], role="worker")
+        assert getattr(excinfo.value, "input_tokens", None) == 80
+        assert getattr(excinfo.value, "output_tokens", None) == 0

@@ -7,7 +7,7 @@ import logging
 import httpx
 
 from app.config import settings
-from app.core.exceptions import LLMError, LLMTimeout
+from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm.base import IntentExtractor, IntentResult, Reranker, RerankResult
 from app.llm.prompts import (
     INTENT_SYSTEM_PROMPT,
@@ -45,6 +45,22 @@ def _extract_content(resp_json: dict) -> str:
         return resp_json["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return ""
+
+
+def _extract_usage(resp_json: dict) -> tuple[int | None, int | None]:
+    """从 OpenAI 兼容响应中提取 token 用量（Phase 7 llm_call 日志字段）。"""
+    usage = resp_json.get("usage") or {}
+    in_tok = usage.get("prompt_tokens")
+    out_tok = usage.get("completion_tokens")
+    try:
+        in_tok = int(in_tok) if in_tok is not None else None
+    except (TypeError, ValueError):
+        in_tok = None
+    try:
+        out_tok = int(out_tok) if out_tok is not None else None
+    except (TypeError, ValueError):
+        out_tok = None
+    return in_tok, out_tok
 
 
 class QwenIntentExtractor(IntentExtractor):
@@ -85,8 +101,20 @@ class QwenIntentExtractor(IntentExtractor):
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
-        raw = _extract_content(resp.json())
-        return parse_intent_response(raw)
+        resp_json = resp.json()
+        raw = _extract_content(resp_json)
+        # Phase 7：usage 先提再 parse，parse 失败时把 token 挂到异常上
+        # 让上层 log_event 仍能记录真实的 input_tokens / output_tokens。
+        in_tok, out_tok = _extract_usage(resp_json)
+        try:
+            result = parse_intent_response(raw)
+        except LLMParseError as exc:
+            exc.input_tokens = in_tok
+            exc.output_tokens = out_tok
+            raise
+        result.input_tokens = in_tok
+        result.output_tokens = out_tok
+        return result
 
 
 class QwenReranker(Reranker):
@@ -129,5 +157,16 @@ class QwenReranker(Reranker):
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
-        raw = _extract_content(resp.json())
-        return parse_rerank_response(raw)
+        resp_json = resp.json()
+        raw = _extract_content(resp_json)
+        # 同 intent 路径：usage 先提再 parse，parse 失败时把 token 挂到异常
+        in_tok, out_tok = _extract_usage(resp_json)
+        try:
+            result = parse_rerank_response(raw)
+        except LLMParseError as exc:
+            exc.input_tokens = in_tok
+            exc.output_tokens = out_tok
+            raise
+        result.input_tokens = in_tok
+        result.output_tokens = out_tok
+        return result

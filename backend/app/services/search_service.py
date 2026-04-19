@@ -35,12 +35,19 @@ def _rerank_with_logging(
     role: str,
     top_n: int,
     call_site: str,
+    user_msg_id: str | None = None,
 ) -> RerankResult:
-    """统一封装 reranker.rerank，附带 loguru 结构化打点。"""
+    """统一封装 reranker.rerank，附带 loguru 结构化打点。
+
+    Phase 7：``llm_call`` 日志含 input_tokens / output_tokens / user_msg_id，
+    便于成本分析、定位单条消息对应的检索链路；``parse_failed`` 回落为空结果以
+    保持搜索调用不中断，日志仍反映真实失败类型。
+    """
     reranker = get_reranker()
     start = time.perf_counter()
     status = "ok"
     result: RerankResult | None = None
+    parse_failed = False
     try:
         result = reranker.rerank(
             query=query,
@@ -51,14 +58,26 @@ def _rerank_with_logging(
     except LLMTimeout:
         status = "timeout"
         raise
-    except LLMParseError:
+    except LLMParseError as exc:
+        # 空结果回落，后续业务按 0 召回处理；不再 raise 以对齐 intent 侧策略。
+        # provider 在 raise 前已把 token 挂到 exc.input_tokens / exc.output_tokens，
+        # 这里回读到 fallback RerankResult，保证 log_event 记录真实 token 用量。
         status = "parse_failed"
-        raise
+        parse_failed = True
+        result = RerankResult(
+            ranked_items=[],
+            reply_text="",
+            raw_response="",
+            input_tokens=getattr(exc, "input_tokens", None),
+            output_tokens=getattr(exc, "output_tokens", None),
+        )
     except LLMError:
         status = "http_error"
         raise
     except Exception:
-        status = "http_error"
+        # 非 LLMError 家族的意外异常（如 provider 实现 bug、类型错误等）。
+        # 单独打 unknown_error 便于日志归因与告警分级。
+        status = "unknown_error"
         raise
     finally:
         log_event(
@@ -71,6 +90,9 @@ def _rerank_with_logging(
             candidate_count=len(candidates),
             top_n=top_n,
             ranked_count=len(result.ranked_items) if result else 0,
+            input_tokens=getattr(result, "input_tokens", None),
+            output_tokens=getattr(result, "output_tokens", None),
+            user_msg_id=user_msg_id,
             status=status,
         )
     return result
@@ -93,6 +115,7 @@ def search_jobs(
     session: SessionState,
     user_ctx: UserContext,
     db: Session,
+    user_msg_id: str | None = None,
 ) -> SearchResult:
     """工人/中介找岗位。"""
     top_n = _get_config_int("match.top_n", db, 3)
@@ -123,6 +146,7 @@ def search_jobs(
         role=user_ctx.role,
         top_n=top_n,
         call_site="search_jobs",
+        user_msg_id=user_msg_id,
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
@@ -171,6 +195,7 @@ def search_workers(
     session: SessionState,
     user_ctx: UserContext,
     db: Session,
+    user_msg_id: str | None = None,
 ) -> SearchResult:
     """厂家/中介找工人。"""
     top_n = _get_config_int("match.top_n", db, 3)
@@ -197,6 +222,7 @@ def search_workers(
         role=user_ctx.role,
         top_n=top_n,
         call_site="search_workers",
+        user_msg_id=user_msg_id,
     )
 
     ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]

@@ -3,17 +3,19 @@
 处理顺序（按 phase7-dev-implementation.md §5.4）：
 1. 岗位过期软删：expires_at < NOW() 且 delist_reason IS NULL → delist_reason='expired' + deleted_at=NOW()
 2. 简历过期软删：expires_at < NOW() 且 deleted_at IS NULL → deleted_at=NOW()
-3. 岗位 7 天硬删（分批）
-4. 简历 7 天硬删 + storage.delete() 附件
-5. 用户主动删除 7 天硬删：其 resume / conversation_log 残留硬删，user 记录保留
-6. conversation_log > 30 天硬删
-7. wecom_inbound_event > 30 天硬删
-8. audit_log > 180 天硬删
+3. 岗位软删后 ``ttl.hard_delete.delay_days`` 天硬删（分批）
+4. 简历软删后 ``ttl.hard_delete.delay_days`` 天硬删 + storage.delete() 附件
+5. 用户主动删除后 ``ttl.hard_delete.delay_days`` 天硬删其 resume / conversation_log 残留，user 保留
+6. conversation_log > ``ttl.conversation_log.days`` 天硬删
+7. wecom_inbound_event > ``ttl.wecom_inbound_event.days`` 天硬删
+8. audit_log > ``ttl.audit_log.days`` 天硬删
 
 约束：
 - 分批（LIMIT 500 per batch）+ 每批独立 commit，避免锁表。
 - 每步 try/except 独立，单步失败不影响其它步骤。
 - 所有汇总写 loguru 结构化日志，不写 audit_log（对齐 §0 本版修订）。
+- 天数一律从 ``system_config`` 运行时读取（phase7-main.md §4.1 新增 / 确认的 6 个 TTL key）。
+  读取失败兜底默认值 7/30/30/180。
 """
 from __future__ import annotations
 
@@ -27,6 +29,47 @@ from app.storage import get_storage
 from app.tasks.common import log_event, task_lock
 
 BATCH_SIZE = 500
+
+
+# ---------------------------------------------------------------------------
+# system_config 读取
+# ---------------------------------------------------------------------------
+
+def _read_int_config(db, key: str, default: int) -> int:
+    """从 ``system_config`` 读取整型配置，解析失败兜底 ``default``。"""
+    row = db.execute(
+        text("SELECT config_value FROM system_config WHERE config_key = :k"),
+        {"k": key},
+    ).first()
+    if row is None or row[0] is None:
+        return default
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        logger.warning(
+            "ttl_cleanup: invalid int for %s=%r, using default %d", key, row[0], default
+        )
+        return default
+
+
+def _load_ttl_config(db) -> dict[str, int]:
+    """一次性加载本次清理所需的全部天数配置。
+
+    字段含义（phase7-main.md §4.1）：
+    - ``hard_delete_delay_days`` = ``ttl.hard_delete.delay_days`` （软删→硬删间隔，默认 7）
+    - ``conversation_log_days`` = ``ttl.conversation_log.days`` （默认 30）
+    - ``wecom_inbound_event_days`` = ``ttl.wecom_inbound_event.days`` （默认 30）
+    - ``audit_log_days`` = ``ttl.audit_log.days`` （默认 180）
+
+    说明：``ttl.job.days`` / ``ttl.resume.days`` 在 upload_service 写 expires_at
+    时消费，本任务不再二次读取。
+    """
+    return {
+        "hard_delete_delay_days": _read_int_config(db, "ttl.hard_delete.delay_days", 7),
+        "conversation_log_days": _read_int_config(db, "ttl.conversation_log.days", 30),
+        "wecom_inbound_event_days": _read_int_config(db, "ttl.wecom_inbound_event.days", 30),
+        "audit_log_days": _read_int_config(db, "ttl.audit_log.days", 180),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +131,16 @@ def _soft_delete_expired_resumes(db) -> int:
     return int(result.rowcount or 0)
 
 
-def _hard_delete_expired_jobs(db) -> int:
-    """岗位软删 7 天后硬删。"""
-    return _batch_hard_delete(db, "job", "deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL 7 DAY")
+def _hard_delete_expired_jobs(db, delay_days: int) -> int:
+    """岗位软删 ``delay_days`` 天后硬删。"""
+    return _batch_hard_delete(
+        db, "job",
+        f"deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY",
+    )
 
 
-def _hard_delete_expired_resumes(db) -> int:
-    """简历软删 7 天后硬删；删除前先收集 images 中的对象存储 key 并调用 storage.delete()。"""
+def _hard_delete_expired_resumes(db, delay_days: int) -> int:
+    """简历软删 ``delay_days`` 天后硬删；删除前先收集 images 中的对象存储 key 并调用 storage.delete()。"""
     storage = None
     try:
         storage = get_storage()
@@ -106,7 +152,7 @@ def _hard_delete_expired_resumes(db) -> int:
         rows = db.execute(
             text(
                 "SELECT id, images FROM `resume` "
-                "WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL 7 DAY "
+                f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
                 f"LIMIT {BATCH_SIZE}"
             )
         ).fetchall()
@@ -155,7 +201,7 @@ def _extract_image_keys(images: Any) -> list[str]:
     return []
 
 
-def _hard_delete_deleted_users(db) -> int:
+def _hard_delete_deleted_users(db, delay_days: int) -> int:
     """用户主动 /删除我的信息 7 天后，硬删其 resume / conversation_log 残留，user 记录保留。
 
     7 天计时起点（对齐 phase7-main.md §3.1 模块 C）：
@@ -173,10 +219,11 @@ def _hard_delete_deleted_users(db) -> int:
     所有 resume 的 storage 清理由前一步 ``_hard_delete_expired_resumes`` 负责
     （``delete_user_data()`` 已在执行时把 resume.deleted_at 设为 now）。
     """
-    # 先找出目标 userid 列表
+    # 先找出目标 userid 列表；delay_days 已由调用方校验为 int
+    safe_delay = int(delay_days)
     candidate_rows = db.execute(
         text(
-            """
+            f"""
             SELECT user.external_userid
             FROM `user`
             LEFT JOIN (
@@ -192,13 +239,13 @@ def _hard_delete_deleted_users(db) -> int:
                 STR_TO_DATE(
                   JSON_UNQUOTE(JSON_EXTRACT(user.extra, '$.deleted_at')),
                   '%Y-%m-%d %H:%i:%s'
-                ) < UTC_TIMESTAMP() - INTERVAL 7 DAY
+                ) < UTC_TIMESTAMP() - INTERVAL {safe_delay} DAY
                 -- 兜底：无 extra.deleted_at 时用 audit_log；NOW() 与 created_at
                 -- 在同一 server time zone 下比较，避开 CONVERT_TZ(SYSTEM) 返回 NULL
                 OR (
                   JSON_EXTRACT(user.extra, '$.deleted_at') IS NULL
                   AND al.last_delete_at IS NOT NULL
-                  AND al.last_delete_at < NOW() - INTERVAL 7 DAY
+                  AND al.last_delete_at < NOW() - INTERVAL {safe_delay} DAY
                 )
               )
             """
@@ -257,30 +304,49 @@ def run() -> None:
 
         stats: dict = {}
         with SessionLocal() as db:
+            # Phase 7：天数全量从 system_config 读取，失败兜底默认值
+            cfg = _load_ttl_config(db)
+            stats["_config"] = cfg  # 记录本次使用的配置，便于事后复盘
+            delay = cfg["hard_delete_delay_days"]
+            conv_days = cfg["conversation_log_days"]
+            inbound_days = cfg["wecom_inbound_event_days"]
+            audit_days = cfg["audit_log_days"]
+
             _safe_step("soft_delete_jobs", stats, lambda: _soft_delete_expired_jobs(db))
             _safe_step("soft_delete_resumes", stats, lambda: _soft_delete_expired_resumes(db))
-            _safe_step("hard_delete_jobs", stats, lambda: _hard_delete_expired_jobs(db))
-            _safe_step("hard_delete_resumes", stats, lambda: _hard_delete_expired_resumes(db))
-            _safe_step("hard_delete_deleted_users", stats, lambda: _hard_delete_deleted_users(db))
+            _safe_step("hard_delete_jobs", stats, lambda: _hard_delete_expired_jobs(db, delay))
+            _safe_step(
+                "hard_delete_resumes",
+                stats,
+                lambda: _hard_delete_expired_resumes(db, delay),
+            )
+            _safe_step(
+                "hard_delete_deleted_users",
+                stats,
+                lambda: _hard_delete_deleted_users(db, delay),
+            )
             _safe_step(
                 "hard_delete_conversation",
                 stats,
                 lambda: _batch_hard_delete(
-                    db, "conversation_log", "created_at < NOW() - INTERVAL 30 DAY"
+                    db, "conversation_log",
+                    f"created_at < NOW() - INTERVAL {int(conv_days)} DAY",
                 ),
             )
             _safe_step(
                 "hard_delete_inbound",
                 stats,
                 lambda: _batch_hard_delete(
-                    db, "wecom_inbound_event", "created_at < NOW() - INTERVAL 30 DAY"
+                    db, "wecom_inbound_event",
+                    f"created_at < NOW() - INTERVAL {int(inbound_days)} DAY",
                 ),
             )
             _safe_step(
                 "hard_delete_audit_log",
                 stats,
                 lambda: _batch_hard_delete(
-                    db, "audit_log", "created_at < NOW() - INTERVAL 180 DAY"
+                    db, "audit_log",
+                    f"created_at < NOW() - INTERVAL {int(audit_days)} DAY",
                 ),
             )
 

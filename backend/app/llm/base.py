@@ -42,6 +42,10 @@ class IntentResult(BaseModel):
         default="",
         description="LLM 原始输出（调试 & 日志用）",
     )
+    # Phase 7：token 用量（OpenAI 兼容响应的 usage.prompt_tokens / completion_tokens），
+    # 由 provider 从响应体提取并回填；解析失败 / 无 usage 时保持 None。
+    input_tokens: int | None = Field(default=None, description="prompt_tokens")
+    output_tokens: int | None = Field(default=None, description="completion_tokens")
 
 
 class RerankResult(BaseModel):
@@ -58,6 +62,9 @@ class RerankResult(BaseModel):
         default="",
         description="LLM 原始输出",
     )
+    # Phase 7：同 IntentResult。
+    input_tokens: int | None = Field(default=None, description="prompt_tokens")
+    output_tokens: int | None = Field(default=None, description="completion_tokens")
 
 
 # ---------------------------------------------------------------------------
