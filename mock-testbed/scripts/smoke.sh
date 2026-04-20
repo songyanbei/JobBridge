@@ -33,6 +33,7 @@ echo "============================================================"
 
 run_check "GET  /health"                              "200" -X GET  "$BASE/health"
 run_check "GET  /"                                    "200" -X GET  "$BASE/"
+run_check "GET  /mock/wework/config"                  "200" -X GET  "$BASE/mock/wework/config"
 run_check "GET  /mock/wework/users"                   "200" -X GET  "$BASE/mock/wework/users"
 run_check "GET  /mock/wework/oauth2/authorize (302)"  "302" -X GET  --max-redirs 0 \
     "$BASE/mock/wework/oauth2/authorize?appid=wwX&redirect_uri=http%3A%2F%2Fexample.com%2Fcb&state=abc"

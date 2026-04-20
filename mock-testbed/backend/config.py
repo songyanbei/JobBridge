@@ -26,6 +26,9 @@ class MockSettings(BaseSettings):
     )
     port: int = Field(default=8001, alias="MOCK_PORT")
 
+    # 默认只绑本机 loopback；演示时若需 LAN 访问，export MOCK_HOST=0.0.0.0
+    host: str = Field(default="127.0.0.1", alias="MOCK_HOST")
+
     # 逗号分隔的 CORS origin 列表
     cors_origins: str = Field(
         default="http://localhost:5174,http://127.0.0.1:5174",

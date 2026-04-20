@@ -184,3 +184,59 @@ class TestShortCircuitWhenFlagEnabled:
         # Should not raise; still returns mock-shaped dict
         result = authed_client.send_text("wm_mock_worker_001", "hi")
         assert result["errcode"] == 0
+
+    def test_return_dict_matches_wecom_success_shape(self, authed_client, monkeypatch):
+        """Mock send_text return body aligns with /cgi-bin/message/send success
+        response (partial-failure fields present even when empty)."""
+        monkeypatch.setenv("MOCK_WEWORK_OUTBOUND", "true")
+        self._install_fake_redis(monkeypatch)
+        result = authed_client.send_text("wm_mock_worker_001", "hi")
+        assert result["errcode"] == 0
+        assert result["errmsg"] == "ok"
+        assert result["msgid"].startswith("mock_")
+        # Partial-failure fields must exist (even empty) so downstream
+        # consumers can rely on WeCom's official success-response shape
+        for k in ("invaliduser", "invalidparty", "invalidtag",
+                  "unlicenseduser", "response_code"):
+            assert k in result, f"missing WeCom field: {k}"
+
+
+# ----------------------------------------------------------------------------
+# Production environment guard — refuses to activate even if env var leaks
+# ----------------------------------------------------------------------------
+
+class TestProductionGuard:
+    def _install_fake_redis(self, monkeypatch):
+        fake = _FakeRedis()
+
+        class _FakeRedisMod:
+            Redis = MagicMock()
+            Redis.from_url = staticmethod(lambda url, **kwargs: fake)
+
+        monkeypatch.setitem(__import__("sys").modules, "redis", _FakeRedisMod)
+        return fake
+
+    def test_send_text_raises_in_production(self, authed_client, monkeypatch):
+        """If APP_ENV=production + MOCK_WEWORK_OUTBOUND=true both set
+        (operator mistake), the mock branch MUST raise rather than silently
+        short-circuit real users' outbound messages."""
+        monkeypatch.setenv("MOCK_WEWORK_OUTBOUND", "true")
+        monkeypatch.setenv("APP_ENV", "production")
+        self._install_fake_redis(monkeypatch)
+        with pytest.raises(RuntimeError, match=r"production"):
+            authed_client.send_text("wm_mock_worker_001", "hi")
+
+    def test_send_text_to_group_raises_in_production(self, authed_client, monkeypatch):
+        monkeypatch.setenv("MOCK_WEWORK_OUTBOUND", "true")
+        monkeypatch.setenv("APP_ENV", "production")
+        self._install_fake_redis(monkeypatch)
+        with pytest.raises(RuntimeError, match=r"production"):
+            authed_client.send_text_to_group("chat_x", "hi")
+
+    def test_non_production_env_allows_mock(self, authed_client, monkeypatch):
+        """APP_ENV=development / staging / anything non-production → mock works."""
+        monkeypatch.setenv("MOCK_WEWORK_OUTBOUND", "true")
+        monkeypatch.setenv("APP_ENV", "development")
+        self._install_fake_redis(monkeypatch)
+        result = authed_client.send_text("wm_mock_worker_001", "hi")
+        assert result["errcode"] == 0

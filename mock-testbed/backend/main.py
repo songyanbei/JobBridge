@@ -57,6 +57,7 @@ def root() -> dict:
         "errmsg": "ok",
         "service": "mock-wework-testbed",
         "endpoints": [
+            "GET  /mock/wework/config",
             "GET  /mock/wework/users",
             "GET  /mock/wework/oauth2/authorize",
             "GET  /mock/wework/code2userinfo",
@@ -72,11 +73,18 @@ def root() -> dict:
 @app.on_event("startup")
 async def _warn_not_for_production() -> None:
     logger.warning(
-        "⚠️  Mock WeCom testbed starting on port %s. "
+        "⚠️  Mock WeCom testbed starting on %s:%s. "
         "DO NOT USE IN PRODUCTION. CORS origins: %s",
+        settings.host,
         settings.port,
         settings.cors_origin_list,
     )
+    if settings.host == "0.0.0.0":
+        logger.warning(
+            "⚠️  MOCK_HOST=0.0.0.0 — LAN access is enabled. "
+            "Anyone on your network can hit /mock/wework/inbound and "
+            "enqueue messages. Only use on trusted networks."
+        )
 
 
 if __name__ == "__main__":
@@ -84,7 +92,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
+        host=settings.host,
         port=settings.port,
         reload=True,
     )

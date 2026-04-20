@@ -13,6 +13,7 @@ FRONTEND_DIR="$ROOT_DIR/frontend"
 LOGS_DIR="$ROOT_DIR/logs"
 
 MOCK_PORT="${MOCK_PORT:-8001}"
+MOCK_HOST="${MOCK_HOST:-127.0.0.1}"
 FRONTEND_PORT=5174
 
 mkdir -p "$LOGS_DIR"
@@ -89,8 +90,11 @@ if [ ! -f ".env" ]; then
     cp .env.example .env
 fi
 
-echo "  启动 uvicorn..."
-nohup "$PY_EXE" -m uvicorn main:app --host 0.0.0.0 --port "$MOCK_PORT" \
+echo "  启动 uvicorn（bind $MOCK_HOST:$MOCK_PORT）..."
+if [ "$MOCK_HOST" = "0.0.0.0" ]; then
+    echo "  ⚠️  MOCK_HOST=0.0.0.0 — LAN 访问已启用，注意别在不可信网络环境开启"
+fi
+nohup "$PY_EXE" -m uvicorn main:app --host "$MOCK_HOST" --port "$MOCK_PORT" \
     > "$LOGS_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 echo "$BACKEND_PID" > "$LOGS_DIR/backend.pid"
@@ -122,7 +126,7 @@ echo ""
 echo "============================================================"
 echo "  ✅ Mock 测试台已启动"
 echo "============================================================"
-echo "  backend:  http://localhost:$MOCK_PORT"
+echo "  backend:  http://$MOCK_HOST:$MOCK_PORT"
 echo "  frontend: http://localhost:$FRONTEND_PORT"
 echo "  logs:     $LOGS_DIR/backend.log, $LOGS_DIR/frontend.log"
 echo ""

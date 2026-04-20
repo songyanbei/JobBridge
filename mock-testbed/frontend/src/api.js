@@ -26,17 +26,40 @@ export async function fetchMockUsers() {
 }
 
 // ============================================================================
+// 1.5) 拉 corpid / agentid 等常量（单点真源；首次请求后缓存在内存）
+// ============================================================================
+let _configCache = null
+let _configInflight = null
+
+export async function fetchMockConfig() {
+  if (_configCache) return _configCache
+  if (_configInflight) return _configInflight
+  _configInflight = request.get('/mock/wework/config').then((data) => {
+    _configCache = data
+    _configInflight = null
+    return data
+  }).catch((err) => {
+    _configInflight = null
+    throw err
+  })
+  return _configInflight
+}
+
+// ============================================================================
 // 2) 入站消息（模拟用户在企业微信里发消息给应用）
 // ============================================================================
-export async function mockInbound({ externalUserid, content, msgType = 'text', corpid = 'wwmock_corpid', agentid = '1000002' }) {
+// 前端不再硬编码 corpid / agentid 默认值 —— 从 /mock/wework/config 拉取，
+// 避免和后端 MockSettings.corpid/agentid 两处各写一份导致漂移。
+export async function mockInbound({ externalUserid, content, msgType = 'text' }) {
+  const config = await fetchMockConfig()
   const payload = {
-    ToUserName:   corpid,
+    ToUserName:   config.corpid,
     FromUserName: externalUserid,
     CreateTime:   Math.floor(Date.now() / 1000),
     MsgType:      msgType,
     Content:      content,
     MsgId:        `mock_msgid_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
-    AgentID:      agentid,
+    AgentID:      config.agentid,
   }
   return request.post('/mock/wework/inbound', payload)
 }

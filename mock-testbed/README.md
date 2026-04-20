@@ -27,6 +27,11 @@
 - 主后端运行中（本地或 docker compose），MySQL/Redis 可连
 - 主后端启动前必须 `export MOCK_WEWORK_OUTBOUND=true`（否则出站拦截不生效，演示看不到 bot 回复）
 - 可选：`export MOCK_WEWORK_REDIS_URL=redis://localhost:6379/0`（默认值就是这个）
+- 主后端若设了 `APP_ENV=production`，`[MOCK-WEWORK]` 分支会直接 `RuntimeError` 拒绝启动（防误启兜底）
+
+**网络绑定**：沙箱后端默认只绑 `127.0.0.1:8001`（仅本机）。需要给同网段设备演示时，
+在启动前 `export MOCK_HOST=0.0.0.0`。⚠️ 绑 `0.0.0.0` 等于把 `/mock/wework/inbound`
+暴露给整条网络，注意别在不可信网络开启。
 
 ### 一键启动
 

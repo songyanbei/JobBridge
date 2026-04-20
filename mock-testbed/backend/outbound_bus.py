@@ -18,6 +18,10 @@ import redis
 from config import settings
 
 _CHANNEL_PREFIX = "mock:outbound:"
+# SSE 保活：每 15 秒发一次 event: ping
+_SSE_PING_INTERVAL_SECONDS = 15
+# 轮询间隔：50ms → ~20Hz；配合 get_message(timeout=0) 非阻塞读取
+_PUBSUB_POLL_INTERVAL_SECONDS = 0.05
 
 
 def _redis() -> redis.Redis:
@@ -54,14 +58,17 @@ def unsubscribe(pubsub: redis.client.PubSub) -> None:
 
 
 async def iter_frames(pubsub: redis.client.PubSub) -> AsyncIterator[str]:
-    """把 pubsub 消息转成 SSE 帧，阻塞等待消息或 15s 后发 ping。
+    """把 pubsub 消息转成 SSE 帧，_PUBSUB_POLL_INTERVAL_SECONDS 节拍轮询。
 
     生成的帧已按 SSE 协议拼接（含末尾双换行），直接 yield 给 StreamingResponse。
+
+    实现注意：`get_message(timeout=0)` 非阻塞 —— 不能用 timeout>0，否则会阻塞整个
+    async 事件循环（并发 SSE 连接会被串行化）；由 `await asyncio.sleep` 负责让出事件循环。
     """
     loop = asyncio.get_event_loop()
     last_ping = loop.time()
     while True:
-        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+        msg = pubsub.get_message(ignore_subscribe_messages=True, timeout=0)
         if msg and msg.get("type") == "message":
             data = msg.get("data", "")
             if isinstance(data, bytes):
@@ -69,9 +76,8 @@ async def iter_frames(pubsub: redis.client.PubSub) -> AsyncIterator[str]:
             yield f"event: message\ndata: {data}\n\n"
 
         now = loop.time()
-        if now - last_ping >= 15:
+        if now - last_ping >= _SSE_PING_INTERVAL_SECONDS:
             yield f"event: ping\ndata: {{\"ts\":{int(now)}}}\n\n"
             last_ping = now
 
-        # 让出事件循环，避免 busy-loop
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(_PUBSUB_POLL_INTERVAL_SECONDS)
