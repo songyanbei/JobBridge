@@ -32,5 +32,14 @@ Thumbs.db
 
 # pytest
 .pytest_cache/
+**/pytest-cache-files-*/
 .coverage
 htmlcov/
+
+# Stray venv artifacts if `python -m venv .` was run in backend/ by mistake
+backend/bin/
+backend/lib/
+backend/lib64/
+backend/pyvenv.cfg
+backend/include/
+backend/share/
