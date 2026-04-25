@@ -1,0 +1,19 @@
+# ============================================================================
+# Demo overlay：在 prod compose 基础上加端口暴露，方便沙箱 / 本地调试连接
+#
+# 用法：
+#   docker compose -p jobbridge \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.demo.yml \
+#     up -d
+#
+# 接入真企微 / 上线生产时：移除 -f docker-compose.demo.yml 即可关闭外露端口
+# ============================================================================
+services:
+  mysql:
+    ports:
+      - "3306:3306"
+
+  redis:
+    ports:
+      - "6379:6379"

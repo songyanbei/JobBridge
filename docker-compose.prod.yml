@@ -58,7 +58,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - APP_ENV=production
+      # 默认生产；演示/联调时在 .env 设 APP_ENV=development 即可整栈降级
+      # （[MOCK-WEWORK] 守卫只在 production 时拒绝沙箱出站拦截）
+      - APP_ENV=${APP_ENV:-production}
       - DB_HOST=mysql
       - DB_PORT=3306
       - REDIS_HOST=redis
@@ -142,7 +144,9 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - APP_ENV=production
+      # 默认生产；演示/联调时在 .env 设 APP_ENV=development 即可整栈降级
+      # （[MOCK-WEWORK] 守卫只在 production 时拒绝沙箱出站拦截）
+      - APP_ENV=${APP_ENV:-production}
       - DB_HOST=mysql
       - DB_PORT=3306
       - REDIS_HOST=redis
