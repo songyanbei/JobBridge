@@ -29,7 +29,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 cd "$BACKEND"
 cat > /tmp/mock-testbed-stress.env <<EOF
-MOCK_DB_DSN=mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge
+MOCK_DB_DSN=mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge?charset=utf8mb4
 MOCK_REDIS_URL=redis://127.0.0.1:6379/0
 MOCK_PORT=8001
 MOCK_HOST=127.0.0.1
