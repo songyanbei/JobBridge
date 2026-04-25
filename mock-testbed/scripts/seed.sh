@@ -62,18 +62,23 @@ echo "▶ 连接：${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 echo "▶ 灌入：$SQL_FILE"
 echo ""
 
+# --default-character-set=utf8mb4 至关重要：
+# mysql client 默认 latin1 会把 SQL 文件里的 UTF-8 字节当 latin1 读，
+# 然后服务端再编码为 UTF-8 入库 → 双重编码，中文显示成 `å¼ å·¥` 等
+MYSQL_OPTS="--default-character-set=utf8mb4"
+
 if [ -z "${DB_PASS}" ]; then
-    mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" < "$SQL_FILE"
+    mysql $MYSQL_OPTS -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" < "$SQL_FILE"
 else
-    MYSQL_PWD="$DB_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" < "$SQL_FILE"
+    MYSQL_PWD="$DB_PASS" mysql $MYSQL_OPTS -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" < "$SQL_FILE"
 fi
 
 echo ""
 echo "✅ seed 完成。验证："
 if [ -z "${DB_PASS}" ]; then
-    mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" \
+    mysql $MYSQL_OPTS -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" \
         -e "SELECT external_userid, role, display_name FROM user WHERE external_userid LIKE 'wm_mock_%' ORDER BY role, external_userid;"
 else
-    MYSQL_PWD="$DB_PASS" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" \
+    MYSQL_PWD="$DB_PASS" mysql $MYSQL_OPTS -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "$DB_NAME" \
         -e "SELECT external_userid, role, display_name FROM user WHERE external_userid LIKE 'wm_mock_%' ORDER BY role, external_userid;"
 fi
