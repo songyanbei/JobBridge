@@ -45,7 +45,8 @@ ENV/
 Thumbs.db
 
 # ---- Project ----
-logs/
+# 仅忽略根目录 logs/（运行时日志），不影响 frontend/src/views/logs/ 等嵌套源码目录
+/logs/
 *.log
 uploads/
 tmp/
