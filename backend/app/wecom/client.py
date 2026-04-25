@@ -114,6 +114,58 @@ class WeComClient:
         Raises:
             WeComError: API 调用失败。
         """
+        # ═══════════════════════════════════════════════════════════
+        # [MOCK-WEWORK] BEGIN — 接入真企微时删除此整块（含 BEGIN/END 注释）
+        # 说明：演示期间拦截出站消息投给 mock-testbed 的 SSE 通道。
+        # 依赖：环境变量 MOCK_WEWORK_OUTBOUND=true。
+        # 完整删除指南：mock-testbed/README.md §删除指南
+        import os as _mw_os  # noqa: E402
+        if _mw_os.environ.get("MOCK_WEWORK_OUTBOUND", "").lower() == "true":
+            # 生产环境硬守卫：防止 env var 被误带进 prod 导致所有出站消息静默吞掉
+            if _mw_os.environ.get("APP_ENV", "").lower() == "production":
+                raise RuntimeError(
+                    "[MOCK-WEWORK] refuses to activate in production "
+                    "(APP_ENV=production detected). "
+                    "Unset MOCK_WEWORK_OUTBOUND in production env or change APP_ENV."
+                )
+            import json as _mw_json  # noqa: E402
+            import secrets as _mw_secrets  # noqa: E402
+            import redis as _mw_redis  # noqa: E402
+            logger.warning(
+                "[MOCK-WEWORK] short-circuit send_text to_user=%s len=%d",
+                to_user, len(content or ""),
+            )
+            _mw_payload = {
+                "touser": to_user,
+                "msgtype": "text",
+                "agentid": self._agent_id,
+                "text": {"content": content},
+            }
+            try:
+                _mw_r = _mw_redis.Redis.from_url(
+                    _mw_os.environ.get("MOCK_WEWORK_REDIS_URL", "redis://localhost:6379/0"),
+                    decode_responses=True,
+                )
+                _mw_r.publish(
+                    f"mock:outbound:{to_user}",
+                    _mw_json.dumps(_mw_payload, ensure_ascii=False),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[MOCK-WEWORK] publish to mock bus failed; swallow and return ok")
+            # 返回体字段和真企微 /cgi-bin/message/send 成功响应对齐（partial-failure 字段为空）
+            return {
+                "errcode": 0,
+                "errmsg": "ok",
+                "invaliduser": "",
+                "invalidparty": "",
+                "invalidtag": "",
+                "unlicenseduser": "",
+                "msgid": f"mock_{_mw_secrets.token_hex(8)}",
+                "response_code": "",
+            }
+        # [MOCK-WEWORK] END
+        # ═══════════════════════════════════════════════════════════
+
         url = f"{WECOM_API_BASE}/message/send"
         token = self.get_access_token()
 
@@ -161,6 +213,46 @@ class WeComClient:
         if not chat_id:
             logger.warning("send_text_to_group: empty chat_id, skip")
             return False
+
+        # ═══════════════════════════════════════════════════════════
+        # [MOCK-WEWORK] BEGIN — 接入真企微时删除此整块（含 BEGIN/END 注释）
+        # 说明：演示期间拦截群消息出站投给 mock-testbed 的 SSE 通道。
+        # 依赖：环境变量 MOCK_WEWORK_OUTBOUND=true。
+        import os as _mw_os  # noqa: E402
+        if _mw_os.environ.get("MOCK_WEWORK_OUTBOUND", "").lower() == "true":
+            # 生产环境硬守卫（与 send_text 的分支一致）
+            if _mw_os.environ.get("APP_ENV", "").lower() == "production":
+                raise RuntimeError(
+                    "[MOCK-WEWORK] refuses to activate in production "
+                    "(APP_ENV=production detected). "
+                    "Unset MOCK_WEWORK_OUTBOUND in production env or change APP_ENV."
+                )
+            import json as _mw_json  # noqa: E402
+            import redis as _mw_redis  # noqa: E402
+            logger.warning(
+                "[MOCK-WEWORK] short-circuit send_text_to_group chat_id=%s len=%d",
+                chat_id, len(content or ""),
+            )
+            _mw_payload = {
+                "chatid": chat_id,
+                "msgtype": "text",
+                "text": {"content": content},
+                "safe": 0,
+            }
+            try:
+                _mw_r = _mw_redis.Redis.from_url(
+                    _mw_os.environ.get("MOCK_WEWORK_REDIS_URL", "redis://localhost:6379/0"),
+                    decode_responses=True,
+                )
+                _mw_r.publish(
+                    f"mock:outbound:chat:{chat_id}",
+                    _mw_json.dumps(_mw_payload, ensure_ascii=False),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("[MOCK-WEWORK] publish group msg to mock bus failed; swallow and return True")
+            return True
+        # [MOCK-WEWORK] END
+        # ═══════════════════════════════════════════════════════════
 
         payload = {
             "chatid": chat_id,
