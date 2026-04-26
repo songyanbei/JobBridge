@@ -67,6 +67,10 @@ RESET_SEARCH_PENDING_FMT = "搜索条件已重置；您仍在发布{kind}（缺{
 BROKER_ONLY = "只有中介账号可以切换双向模式。"
 SWITCH_JOB_OK = "已切换到【找岗位】模式。请告诉我您想找什么样的岗位。"
 SWITCH_WORKER_OK = "已切换到【找工人】模式。请告诉我您想招什么样的工人。"
+# Stage B P2-3：broker 切方向时若仍有 pending upload，按 spec §9.7 追加提示。
+SWITCH_DIRECTION_PENDING_FMT = (
+    "方向已切换；您仍在发布{kind}（缺{field_name}），请继续补充或发 /取消 放弃。"
+)
 
 NO_RENEWABLE_JOB = "未找到可续期的岗位。"
 NO_DELISTABLE_JOB = "未找到可下架的在线岗位。"
@@ -124,20 +128,19 @@ def _handle_human_agent(*, args: str, user_ctx: UserContext, session, db) -> lis
 def _handle_reset_search(
     *, args: str, user_ctx: UserContext, session: SessionState | None, db,
 ) -> list[ReplyMessage]:
-    if session is None or (
-        not session.search_criteria
-        and session.candidate_snapshot is None
-        and not session.shown_items
-    ):
-        return [_reply(user_ctx, RESET_SEARCH_EMPTY)]
+    has_pending = bool(session is not None and session.pending_upload_intent)
+    has_search_state = bool(session is not None and (
+        session.search_criteria
+        or session.candidate_snapshot is not None
+        or session.shown_items
+    ))
 
-    has_pending = bool(session.pending_upload_intent)
-    conversation_service.reset_search(session)
-    conversation_service.save_session(user_ctx.external_userid, session)
-
+    # Stage B P2-2：pending 草稿存在时，无论是否有搜索状态都要给"仍在发布"提示，
+    # 不能因为没有搜索条件就回 RESET_SEARCH_EMPTY 让用户误以为没有活跃流程。
     if has_pending:
-        # Stage A §9.7：pending 草稿仍在编辑时，回复带"仍在发布"的提示文案，
-        # 避免用户误以为草稿也被丢了。
+        if has_search_state:
+            conversation_service.reset_search(session)
+            conversation_service.save_session(user_ctx.external_userid, session)
         from app.services.upload_service import _FIELD_DISPLAY_NAMES
         kind = "简历" if session.pending_upload_intent == "upload_resume" else "岗位"
         field_name = _FIELD_DISPLAY_NAMES.get(session.awaiting_field, session.awaiting_field or "字段")
@@ -145,6 +148,12 @@ def _handle_reset_search(
             user_ctx,
             RESET_SEARCH_PENDING_FMT.format(kind=kind, field_name=field_name),
         )]
+
+    if not has_search_state:
+        return [_reply(user_ctx, RESET_SEARCH_EMPTY)]
+
+    conversation_service.reset_search(session)
+    conversation_service.save_session(user_ctx.external_userid, session)
     return [_reply(user_ctx, RESET_SEARCH_SUCCESS)]
 
 
@@ -172,11 +181,26 @@ def _switch_broker_direction(
     if session is None:
         session = conversation_service.create_session(user_ctx.external_userid, user_ctx.role)
 
+    has_pending = bool(session.pending_upload_intent)
+
     err = conversation_service.set_broker_direction(session, direction)
     if err:
         return [_reply(user_ctx, err)]
 
     conversation_service.save_session(user_ctx.external_userid, session)
+
+    # Stage B P2-3：pending 草稿仍在编辑时，回复带"仍在发布"的提示文案，
+    # 避免用户切方向后忘了上传草稿（spec §9.7）。
+    if has_pending:
+        from app.services.upload_service import _FIELD_DISPLAY_NAMES
+        kind = "简历" if session.pending_upload_intent == "upload_resume" else "岗位"
+        field_name = _FIELD_DISPLAY_NAMES.get(
+            session.awaiting_field, session.awaiting_field or "字段",
+        )
+        return [_reply(
+            user_ctx,
+            SWITCH_DIRECTION_PENDING_FMT.format(kind=kind, field_name=field_name),
+        )]
     return [_reply(user_ctx, success_text)]
 
 

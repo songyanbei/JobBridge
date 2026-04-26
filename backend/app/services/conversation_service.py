@@ -252,7 +252,15 @@ def set_broker_direction(
     session: SessionState,
     direction: str,
 ) -> str | None:
-    """设置中介搜索方向。返回 None 表示成功，否则返回错误信息。"""
+    """设置中介搜索方向。返回 None 表示成功，否则返回错误信息。
+
+    Stage B P2-3（spec §9.7）：
+    - 仅切换方向 + 清空检索状态。
+    - pending_upload 永远保留，提醒由 command_service 加在回复文案上。
+    - follow_up_rounds 当前在 Stage A 同时承载"上传追问"与"搜索追问"，
+      pending 存在时不能清零，避免把 pending 草稿的 max-rounds 退出条件重置；
+      Stage C 拆出 failed_patch_rounds 后再统一处理。
+    """
     if session.role != "broker":
         return "只有中介账号可以切换搜索方向"
     if direction not in ("search_job", "search_worker"):
@@ -262,7 +270,8 @@ def set_broker_direction(
     session.search_criteria = {}
     session.candidate_snapshot = None
     session.shown_items = []
-    session.follow_up_rounds = 0
+    if not session.pending_upload_intent:
+        session.follow_up_rounds = 0
     return None
 
 

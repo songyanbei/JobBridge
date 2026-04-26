@@ -363,11 +363,10 @@ def _handle_search(
             criteria_snapshot=_snapshot_meta(session),
         )]
 
+    # Stage B P1-1：不能在默认合并前用 session.search_criteria 是否为空短路；
+    # 否则 worker "看看新岗位" 这类空 structured_data 场景永远进不到
+    # _apply_default_criteria，简历 expected_* 默认条件无机会兜底。
     criteria = dict(session.search_criteria)
-    if not criteria:
-        # 极端兜底：LLM 返回 search 意图但 structured_data 为空且 session 也空
-        return [_reply(msg.from_user, FALLBACK_REPLY)]
-
     search_result = _run_search(
         intent_result.intent, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
@@ -394,9 +393,9 @@ def _handle_follow_up(
         session, intent_result.criteria_patch or [],
     )
 
-    if not session.search_criteria:
-        return [_reply(msg.from_user, FALLBACK_REPLY)]
-
+    # Stage B P1-1：同 _handle_search，不在默认合并前因 search_criteria 为空短路。
+    # _run_search 会跑 _apply_default_criteria（含 worker 简历兜底），再交给
+    # search_service.has_effective_search_criteria 决定是否真正查询。
     # 重新做一次检索：
     # - digest 变化：search_service 会按新 criteria 生成新快照
     # - digest 未变：相当于"再搜一次"，快照会被同样 digest 重置，对用户无感
@@ -688,8 +687,19 @@ def _handle_pending_upload(
     if other_merged:
         return _commit_pending_or_followup(msg, user_ctx, session, db)
 
-    # 既没补 awaiting_field 也没补其它字段：不搜索，但要让 max rounds 计数前进，
-    # 避免用户用 chitchat 无限刷请求把陈旧草稿挂着。Stage A §3.4 “沿用 follow_up_rounds”。
+    # Stage B P2-1：chitchat 不消耗追问计数（spec §9.8）。
+    # upload_collecting 中遇到 chitchat 应保留 pending、回闲聊文本 + 提醒未完成事项，
+    # 不动 follow_up_rounds / failed_patch_rounds，避免 "你好" "谢谢" 把草稿挤掉。
+    if intent_result.intent == "chitchat":
+        field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
+        text = (
+            f"{_chitchat_text(user_ctx)}\n\n"
+            f"您当前还在发布岗位/简历，请补充{field_name}，或发送 /取消 放弃草稿。"
+        )
+        return [_reply(userid, text)]
+
+    # 既没补 awaiting_field 也没补其它字段，且不是 chitchat：让 max rounds 计数前进，
+    # 避免用户答非所问无限刷请求把陈旧草稿挂着。Stage A §3.4 “沿用 follow_up_rounds”。
     if session.follow_up_rounds >= upload_service.MAX_FOLLOW_UP_ROUNDS:
         upload_service.clear_pending_upload(session)
         return [_reply(userid, PENDING_MAX_ROUNDS_REPLY)]

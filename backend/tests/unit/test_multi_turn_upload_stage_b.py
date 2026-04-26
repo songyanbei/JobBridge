@@ -16,7 +16,21 @@ import pytest
 
 from app.llm.base import IntentResult
 from app.schemas.conversation import SessionState
-from app.services import intent_service, message_router, search_service
+from app.services import (
+    command_service,
+    conversation_service,
+    intent_service,
+    message_router,
+    search_service,
+    upload_service,
+)
+from app.services.command_service import (
+    RESET_SEARCH_EMPTY,
+    RESET_SEARCH_PENDING_FMT,
+    RESET_SEARCH_SUCCESS,
+    SWITCH_DIRECTION_PENDING_FMT,
+    SWITCH_JOB_OK,
+)
 from app.services.search_service import (
     NO_JOB_MATCH_REPLY,
     NO_WORKER_MATCH_REPLY,
@@ -25,6 +39,7 @@ from app.services.search_service import (
     _strip_optional_filters,
 )
 from app.services.user_service import UserContext
+from app.wecom.callback import WeComMessage
 
 
 def _ctx(role="worker", external_userid="u1"):
@@ -343,3 +358,211 @@ class TestStageAGuardStillHolds:
         db = MagicMock()
         assert _query_jobs({"headcount": 2}, 50, db) == []
         db.query.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 修复点回归（针对 codex 第二轮审查）
+# ---------------------------------------------------------------------------
+
+def _msg(content: str, userid: str = "u1") -> WeComMessage:
+    return WeComMessage(
+        msg_id="m1", from_user=userid, to_user="bot",
+        msg_type="text", content=content, media_id="",
+        image_url="", create_time=1700000000,
+    )
+
+
+class TestFixP1ResumeDefaultsReachSearch:
+    """P1-1 回归：worker 空 criteria 也必须走到 _apply_default_criteria。"""
+
+    @patch("app.services.message_router.search_service.search_jobs")
+    @patch("app.services.message_router._load_worker_resume_defaults")
+    def test_handle_search_no_short_circuit_on_empty_criteria(
+        self, mock_load, mock_search,
+    ):
+        # 模拟 worker 已有简历兜底
+        mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
+        mock_search.return_value = search_service.SearchResult(
+            reply_text="为您找到 2 个匹配岗位", result_count=2,
+        )
+        ctx = _ctx("worker")
+        session = SessionState(role="worker")
+        intent = IntentResult(intent="search_job", structured_data={}, confidence=0.7)
+        replies = message_router._handle_search(
+            intent, _msg("看看新岗位"), ctx, session, MagicMock(),
+        )
+        # 关键断言：search_jobs 被调用，且收到的 criteria 是简历默认条件
+        mock_search.assert_called_once()
+        called_criteria = mock_search.call_args[0][0]
+        assert called_criteria.get("city") == ["无锡"]
+        assert called_criteria.get("job_category") == ["电子厂"]
+        assert "为您找到" in replies[0].content
+
+    @patch("app.services.message_router.search_service.search_jobs")
+    @patch("app.services.message_router._load_worker_resume_defaults")
+    def test_handle_follow_up_no_short_circuit_on_empty_criteria(
+        self, mock_load, mock_search,
+    ):
+        mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
+        mock_search.return_value = search_service.SearchResult(
+            reply_text="为您找到 1 个匹配岗位", result_count=1,
+        )
+        ctx = _ctx("worker")
+        session = SessionState(role="worker")
+        intent = IntentResult(intent="follow_up", criteria_patch=[], confidence=0.6)
+        replies = message_router._handle_follow_up(
+            intent, _msg("再看看"), ctx, session, MagicMock(),
+        )
+        mock_search.assert_called_once()
+        called_criteria = mock_search.call_args[0][0]
+        assert called_criteria.get("city") == ["无锡"]
+
+
+class TestFixP2ChitchatDoesNotBurnRounds:
+    """P2-1 回归：upload_collecting 中 chitchat 不递增 follow_up_rounds。"""
+
+    @patch("app.services.message_router.upload_service.is_pending_upload_expired",
+           return_value=False)
+    def test_chitchat_keeps_pending_and_counter(self, _):
+        ctx = _ctx("factory")
+        session = SessionState(
+            role="factory",
+            pending_upload={"city": "北京市", "job_category": "餐饮", "salary_floor_monthly": 7500, "pay_type": "月薪"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            pending_raw_text_parts=["北京饭店招聘厨师"],
+            follow_up_rounds=0,
+        )
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._handle_pending_upload(
+            "你好", intent, _msg("你好"), ctx, session, MagicMock(),
+        )
+        assert replies is not None
+        # follow_up_rounds 不动
+        assert session.follow_up_rounds == 0
+        # pending 仍在
+        assert session.pending_upload_intent == "upload_job"
+        assert session.awaiting_field == "headcount"
+        # 文案带 "招聘人数" 提醒
+        assert "招聘人数" in replies[0].content
+
+
+class TestFixP2ResetSearchPending:
+    """P2-2 回归：/重新找 在 pending 时无条件给 pending 提醒，不论是否有搜索状态。"""
+
+    @patch("app.services.command_service.conversation_service.save_session")
+    def test_reset_search_with_pending_only_no_search_state(self, _save):
+        ctx = UserContext(
+            external_userid="u1", role="factory", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=False, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(
+            role="factory",
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+        )
+        replies = command_service.execute(
+            "reset_search", "", ctx, session, MagicMock(),
+        )
+        assert replies[0].content != RESET_SEARCH_EMPTY
+        assert "仍在发布" in replies[0].content
+        assert "招聘人数" in replies[0].content
+
+    @patch("app.services.command_service.conversation_service.save_session")
+    @patch("app.services.command_service.conversation_service.reset_search")
+    def test_reset_search_with_pending_and_search_state(self, mock_reset, _save):
+        ctx = UserContext(
+            external_userid="u1", role="factory", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=False, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(
+            role="factory",
+            search_criteria={"city": ["北京"]},
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+        )
+        replies = command_service.execute(
+            "reset_search", "", ctx, session, MagicMock(),
+        )
+        # 搜索状态被重置
+        mock_reset.assert_called_once()
+        # 但仍给 pending 提醒
+        assert "仍在发布" in replies[0].content
+
+
+class TestFixP2BrokerDirectionPending:
+    """P2-3 回归：broker 切方向不重置 pending follow_up_rounds + 加 pending 提醒。"""
+
+    @patch("app.services.command_service.conversation_service.save_session")
+    def test_broker_switch_keeps_pending_counter(self, _save):
+        ctx = UserContext(
+            external_userid="u1", role="broker", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=True, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(
+            role="broker",
+            search_criteria={"city": ["北京"]},
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            follow_up_rounds=1,  # pending 已经追问过 1 次
+        )
+        replies = command_service.execute(
+            "switch_to_job", "", ctx, session, MagicMock(),
+        )
+        # follow_up_rounds 不被清零（因为 pending 在）
+        assert session.follow_up_rounds == 1
+        # 检索状态仍然清空
+        assert session.search_criteria == {}
+        assert session.broker_direction == "search_job"
+        # 回复包含 pending 提醒
+        assert replies[0].content != SWITCH_JOB_OK
+        assert "仍在发布" in replies[0].content
+        assert "招聘人数" in replies[0].content
+
+    @patch("app.services.command_service.conversation_service.save_session")
+    def test_broker_switch_without_pending_resets_rounds(self, _save):
+        ctx = UserContext(
+            external_userid="u1", role="broker", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=True, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(role="broker", follow_up_rounds=2)
+        replies = command_service.execute(
+            "switch_to_job", "", ctx, session, MagicMock(),
+        )
+        # 没 pending，照旧清零
+        assert session.follow_up_rounds == 0
+        assert replies[0].content == SWITCH_JOB_OK
+
+
+class TestSetBrokerDirectionPreservesPending:
+    """conversation_service.set_broker_direction：pending 在时不动 follow_up_rounds。"""
+
+    def test_pending_keeps_rounds(self):
+        session = SessionState(
+            role="broker",
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            follow_up_rounds=1,
+        )
+        err = conversation_service.set_broker_direction(session, "search_job")
+        assert err is None
+        assert session.follow_up_rounds == 1
+
+    def test_no_pending_resets_rounds(self):
+        session = SessionState(role="broker", follow_up_rounds=2)
+        err = conversation_service.set_broker_direction(session, "search_worker")
+        assert err is None
+        assert session.follow_up_rounds == 0
