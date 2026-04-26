@@ -134,7 +134,11 @@ def _handle_cancel_pending(
     *, args: str, user_ctx: UserContext, session: SessionState | None, db,
 ) -> list[ReplyMessage]:
     """Stage B P1-2：/取消 命令。清空 pending upload 草稿，相当于 §9.3 的强规则
-    cancel 在 command 路径上的对偶实现。"""
+    cancel 在 command 路径上的对偶实现。
+
+    Stage C1：upload_service.clear_pending_upload 已附带把 active_flow 复位为 idle，
+    并清空 pending_interruption / failed_patch_rounds。
+    """
     if session is None or not session.pending_upload_intent:
         return [_reply(user_ctx, CANCEL_PENDING_NO_DRAFT)]
     from app.services import upload_service

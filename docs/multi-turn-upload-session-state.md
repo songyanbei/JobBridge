@@ -150,12 +150,12 @@ class PendingInterruption(BaseModel):
     raw_text: str = ""
 ```
 
-`last_intent` 仅用于观测和日志，不参与路由决策。阶段 C 的迁移路径：
+`last_intent` 仅用于观测和日志，不参与路由决策。迁移路径：
 
 ```text
-1. 新增 last_intent 字段，并与 current_intent 同步写一段时间。
-2. 把 attach_image 的判断改用 active_flow == "upload_collecting"。
-3. 删除或停止读取 current_intent。
+1. 阶段 C1：新增 last_intent 字段，并与 current_intent 同步写。
+2. 阶段 C1：attach_image 优先使用 active_flow == "upload_collecting"，回落 current_intent。
+3. 阶段 C2：删除或停止读取 current_intent。
 ```
 
 ### 5.3 阶段 A 过渡字段
@@ -175,7 +175,7 @@ pending_interruption: dict | None = None
 
 后续再统一迁移为 `UploadDraft`。
 
-注意：阶段 A 保留 `current_intent` 字段，不改 `upload_service.attach_image` 的现有判断。阶段 C 迁移到 `active_flow == "upload_collecting"` 后，再考虑删除或降级 `current_intent`。
+注意：阶段 A 保留 `current_intent` 字段，不改 `upload_service.attach_image` 的现有判断。阶段 C1 迁移为优先使用 `active_flow == "upload_collecting"` 并回落 `current_intent`；阶段 C2 再删除或停止读取 `current_intent`。
 
 ---
 
@@ -394,7 +394,7 @@ upload_collecting + 用户表达 cancel
 不发 / 先不 / 算了，
 ```
 
-不建议把“换一个”直接归为取消。它可能表示搜索语境的“换一批推荐”，也可能表示上传语境的“换个工种”。阶段 C 让 LLM 输出 `abandon` 或 `replace` 类别后再处理。
+不建议把“换一个”直接归为取消。它可能表示搜索语境的“换一批推荐”，也可能表示上传语境的“换个工种”。阶段 C2 可让 LLM 输出 `abandon` 或 `replace` 类别后再处理。
 
 ### 9.4 timeout 自动清
 
@@ -504,7 +504,7 @@ upload_collecting + LLM 判定为 search_* / upload_* 新意图
      当前岗位还缺“招聘人数”。您要继续发布岗位，还是先找工人，或取消草稿？
 ```
 
-阶段 C 的可选动作固定为：
+阶段 C1 的可选动作固定为：
 
 | 用户选择 | 行为 |
 |---|---|
@@ -528,7 +528,7 @@ upload_collecting + LLM 判定为 search_* / upload_* 新意图
 3. LLM intent == pending_upload.origin_intent，但 structured_data 包含 pending_upload.data 已有字段且值不同
    -> 阶段 A：仍按 field patch 处理，新值覆盖旧值。
       例：“2人” -> “改5人” 应更新 headcount，而不是新建岗位。
-   -> 阶段 C：由 LLM 输出 replace 类别区分“覆盖字段”还是“新建草稿”。
+   -> 阶段 C2：由 LLM 输出 replace 类别区分“覆盖字段”还是“新建草稿”。
 
 4. 其他情况
    -> False：按 field patch 处理。
@@ -544,7 +544,7 @@ upload_collecting + LLM 判定为 search_* / upload_* 新意图
 |---|---|
 | `/帮助` | 不清 pending，只返回帮助 |
 | `/重新找` | 清 `search_state`，不清 `pending_upload` |
-| `/找岗位` / `/找工人`（broker 方向切换） | 更新 `search_state.broker_direction`；阶段 A 保留 `pending_upload` 并提醒仍在发布中，阶段 C 进入 `upload_conflict` |
+| `/找岗位` / `/找工人`（broker 方向切换） | 更新 `search_state.broker_direction`；阶段 A 保留 `pending_upload` 并提醒仍在发布中，阶段 C1 进入 `upload_conflict` |
 | `/取消` 或自然语言取消 | 清 pending |
 | `/人工客服` | 不强制清 pending |
 | `/删除我的信息` | 按现有删除流程，必要时清 session |
@@ -599,9 +599,9 @@ def handle_text(msg, user_ctx, db):
 
     intent_result = classify_intent(...)
 
-    # 1. 命令优先，但是否清 pending 由命令语义决定
+    # 1. 命令优先，但状态相关命令要先过状态机边界
     if intent_result.intent == "command":
-        return handle_command(intent_result, session)
+        return _route_command(intent_result, msg, user_ctx, session, db)
 
     # 2. 过期检查
     if pending_expired(session):
@@ -642,6 +642,16 @@ helper 约定：
 | `is_new_business_intent` | 按 §9.6 的四条规则判定 |
 | `pending_expired` | 解析 ISO 8601 UTC 字符串后与 `datetime.now(timezone.utc)` 比较 |
 
+命令分两类处理：
+
+```text
+全局型命令（/帮助、/我的状态、/人工客服、/续期、/下架、/招满了、/删除我的信息）
+  -> 直接走 command_service
+
+状态相关命令（/找岗位、/找工人、/重新找、/取消）
+  -> 先检查 active_flow，再决定是否进入 upload_conflict、清 pending 或重置搜索
+```
+
 `looks_like_upload_patch` 阶段 A 使用正则和词典规则：
 
 ```text
@@ -652,7 +662,7 @@ helper 约定：
 5. 单一工种关键词，例如“厨师”“保洁”“普工”。
 ```
 
-阶段 C 可复用 LLM 输出的 `type=field_patch` 替代这组启发式规则。
+阶段 C2 可复用 LLM 输出的 `type=field_patch` 替代这组启发式规则。
 
 ---
 
@@ -764,7 +774,7 @@ history -> llm_context_window
    - max rounds 退出：阶段 A 沿用现有 `MAX_FOLLOW_UP_ROUNDS=2`，按 `follow_up_rounds` 计数。
 6. 入库成功后清 pending，并保证 `raw_text` 使用用户原始消息拼接。
 
-阶段 C 再引入 `failed_patch_rounds`，替换 `follow_up_rounds` 作为 max rounds 的主要计数依据。
+阶段 C1 再引入 `failed_patch_rounds`，替换 `follow_up_rounds` 作为 max rounds 的主要计数依据。
 
 阶段 A 推迟项：
 
@@ -794,18 +804,35 @@ history -> llm_context_window
 4. 优化兜底文案，避免像推荐结果。
 5. 在 orchestration 层补默认搜索条件，例如 worker 最近简历或 `last_criteria`。
 
-### 阶段 C：完整状态机收敛
+### 阶段 C1：兼容式状态机落地
 
-目标：从过渡字段升级为显式 `active_flow + UploadDraft + SearchState`。
+目标：先让 `active_flow` 成为路由裁决源，同时保留 Stage A/B 的扁平 session 字段，降低测试和 Redis 兼容风险。
 
 范围：
 
-1. 给 LLM prompt 增加 session context hint。
-2. 让 LLM 输出更细的 patch 类型：`field_patch / replace / abandon / new_intent`。
-3. 增加 `upload_conflict` 确认态。
-4. 引入 `failed_patch_rounds`。
-5. 把 `history` 语义收窄或改名为 `llm_context_window`。
-6. 将 `attach_image` 的判断从 `current_intent in upload_*` 迁移到 `active_flow == "upload_collecting"`。
+1. 新增 `active_flow`，并在 `load_session` 中仅对旧 session 做一次推导。
+2. 新增 `last_intent`；`last_intent` 记录本轮 LLM 意图，只用于观测和日志，不参与路由。`upload_collecting` 期间 `current_intent` 钉在 `pending_upload_intent`，用于兼容旧图片挂载回落。
+3. 新增 `pending_interruption`、`failed_patch_rounds`、`last_criteria` 等字段。
+4. 保留 `pending_upload`、`awaiting_field`、`follow_up_rounds`、`search_criteria` 等扁平字段。
+5. 增加 `_route_idle`、`_route_upload_collecting`、`_route_upload_conflict`、`_route_search_active`，现有 `_handle_*` 复用为 helper。
+6. `attach_image` 优先看 `active_flow == "upload_collecting"`，回落 `current_intent` 兼容旧 session。
+7. LLM `session_hint` 先加形参和构造占位，不强制改 prompt。
+
+验收重点：行为满足状态机要求，但不要求完成 `UploadDraft/SearchState/llm_context_window` 嵌套结构迁移。
+
+PR 节奏：C1 单独一个 PR，合主线并在 mock-testbed 跑 1-2 天稳定后再开 C2 PR，不要把 C1/C2 塞进同一个 PR。
+
+### 阶段 C2：SessionState 结构收敛
+
+目标：在 C1 行为稳定后，把过渡字段收敛为显式嵌套结构。
+
+范围：
+
+1. 将扁平 pending 字段迁移为 `UploadDraft`。
+2. 将 `search_criteria/candidate_snapshot/shown_items/broker_direction/last_criteria` 迁移为 `SearchState`。
+3. 将 `history` 改名或迁移为 `llm_context_window`。
+4. 停止读取并清理 `current_intent`，保留 `last_intent` 作为观测字段。
+5. 删除 C1 兼容回落逻辑，补齐旧 Redis session 过期或迁移策略。
 
 ---
 
