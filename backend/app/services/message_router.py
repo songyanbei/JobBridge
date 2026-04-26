@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -59,6 +60,34 @@ IMAGE_RECEIVED_NON_UPLOAD = (
     "图片已收到。目前仅支持文字描述发布信息，图片作为附件留存。"
 )
 IMAGE_DOWNLOAD_FAILED = "图片处理失败，请稍后重试。"
+
+# Stage A：上传草稿相关固定文案（详见 docs/multi-turn-upload-stage-a-implementation.md §3.4）
+PENDING_CANCELLED_REPLY = "已取消，岗位草稿已丢弃。"
+PENDING_EXPIRED_REPLY = "上次岗位草稿已超时，请整段重新发送岗位信息。"
+PENDING_MAX_ROUNDS_REPLY = "信息仍不完整，请整段重新发送岗位信息。"
+PENDING_NO_FIELD_REPLY_FMT = "请告诉我具体的{field_name}。"
+
+# Stage A：cancel 强规则（§9.3 / §3.4）。
+# 完整句匹配 → 直接判 cancel；句首匹配 → 判 cancel。
+_CANCEL_FULL = {"取消", "不发了", "算了", "先不发了", "不要了"}
+_CANCEL_PREFIX = ("不发", "先不", "算了，", "算了,")
+
+# Stage A：判断当前消息是否像“字段补丁”。用于 timeout 后兜底文案。
+_PATCH_RE_HEADCOUNT = re.compile(
+    r"(?:招\s*)?(?:[一二两三四五六七八九十百千万0-9]+)\s*(?:个人|个|人|位|名)"
+)
+_PATCH_RE_DIGIT = re.compile(r"^\s*\d{1,5}\s*$")
+_PATCH_RE_SALARY = re.compile(r"(?:月薪|薪资|时薪|计件|底薪|\d{4,5}\s*[元块]?|\d+\s*千)")
+_KNOWN_SHORT_PATCH_KEYWORDS = (
+    "厨师", "保洁", "普工", "保安", "服务员", "电子厂", "服装厂",
+    "食品厂", "物流", "仓储", "餐饮", "技工",
+)
+# 简短城市片段：常见招聘城市（不穷举，命中即可）。
+_KNOWN_CITIES = (
+    "北京", "上海", "广州", "深圳", "苏州", "昆山", "无锡", "南京", "杭州",
+    "宁波", "合肥", "重庆", "成都", "天津", "武汉", "西安", "郑州", "青岛",
+    "济南", "厦门", "福州", "长沙",
+)
 
 _WELCOME_WORKER = (
     "您好，欢迎使用 JobBridge 招工助手！\n"
@@ -163,8 +192,29 @@ def _handle_text(
         conversation_service.save_session(userid, session)
         return [_reply(userid, SYSTEM_BUSY_REPLY)]
 
+    # ---- Stage A 上传草稿守卫 ----
+    # 顺序：command → timeout → cancel → field patch → 正常 dispatch
+    # 命令优先，但是否清 pending 由命令语义决定（阶段 A 沿用 command_service）。
+    if intent_result.intent != "command" and _has_pending_upload(session):
+        pending_reply = _handle_pending_upload(
+            content, intent_result, msg, user_ctx, session, db,
+        )
+        if pending_reply is not None:
+            if pending_reply:
+                conversation_service.record_history(
+                    session, "assistant", pending_reply[0].content,
+                )
+            conversation_service.save_session(userid, session)
+            return pending_reply
+
     intent = intent_result.intent
-    session.current_intent = intent
+    # Stage A：pending 存活时把 current_intent 钉在 pending_upload_intent 上，
+    # 否则 /帮助 等命令会把它覆盖成 "command"，导致后续图片走非上传分支无法挂载。
+    # 详见 docs/multi-turn-upload-stage-a-implementation.md §5 验收标准 7。
+    if _has_pending_upload(session):
+        session.current_intent = session.pending_upload_intent
+    else:
+        session.current_intent = intent
 
     replies = _dispatch_intent(intent_result, msg, user_ctx, session, db)
 
@@ -405,6 +455,284 @@ def _handle_image(
 
     # 非上传流程：留存提示
     return [_reply(userid, IMAGE_RECEIVED_NON_UPLOAD)]
+
+
+# ---------------------------------------------------------------------------
+# Stage A：上传草稿守卫
+# ---------------------------------------------------------------------------
+
+def _has_pending_upload(session: SessionState) -> bool:
+    """是否存在尚未完成的上传草稿。"""
+    return bool(session.pending_upload_intent)
+
+
+def _is_cancel(content: str, intent_result: IntentResult) -> bool:
+    """阶段 A：仅做强规则匹配；不做任意子串匹配。"""
+    text = (content or "").strip()
+    if not text:
+        return False
+    if text in _CANCEL_FULL:
+        return True
+    return text.startswith(_CANCEL_PREFIX)
+
+
+def _looks_like_upload_patch(content: str) -> bool:
+    """当前文本是否像“补字段”表达：人数、薪资、城市/工种片段、纯数字。"""
+    if not content:
+        return False
+    text = content.strip()
+    if not text:
+        return False
+    if _PATCH_RE_DIGIT.match(text):
+        return True
+    if _PATCH_RE_HEADCOUNT.search(text):
+        return True
+    if _PATCH_RE_SALARY.search(text):
+        return True
+    if any(c in text for c in _KNOWN_CITIES):
+        return True
+    if any(k in text for k in _KNOWN_SHORT_PATCH_KEYWORDS):
+        return True
+    return False
+
+
+def _parse_headcount_from_text(text: str) -> int | None:
+    """从"2 个人 / 招2人 / 两个"之类文本解析 headcount。
+
+    解析顺序：
+      1. 带"个人/个/人/位/名"单位的数字：1-9999 都接受。
+      2. 中文小数字（一/两/二…十）：直接映射。
+      3. 裸阿拉伯数字（无单位）：限制 1-3 位且 ≤ 999，避免把"7500"之类的薪资数字
+         误判为人数（招聘人数实务上 1000 已经是大厂量级）。
+    """
+    if not text:
+        return None
+    cn_digits = {
+        "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    }
+    # 1. 带单位匹配（必有单位）
+    m_unit = re.search(r"(?:招\s*)?(\d{1,4})\s*(?:个人|个|人|位|名)", text)
+    if m_unit:
+        try:
+            v = int(m_unit.group(1))
+            if 0 < v <= 9999:
+                return v
+        except ValueError:
+            pass
+    # 2. 中文小数字
+    for ch, v in cn_digits.items():
+        if ch in text:
+            return v
+    # 3. 裸数字（无单位）：仅当文本剥掉空格后是纯 1-3 位数字
+    m_short = re.fullmatch(r"\s*(\d{1,3})\s*", text)
+    if m_short:
+        try:
+            v = int(m_short.group(1))
+            if 0 < v <= 999:
+                return v
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_salary_floor_from_text(text: str) -> int | None:
+    """简单解析薪资下限：'7500' / '7500元' / '8千'。"""
+    if not text:
+        return None
+    m = re.search(r"(\d{4,6})", text)
+    if m:
+        try:
+            v = int(m.group(1))
+            if 1000 <= v <= 200000:
+                return v
+        except ValueError:
+            pass
+    m = re.search(r"(\d{1,3})\s*千", text)
+    if m:
+        try:
+            return int(m.group(1)) * 1000
+        except ValueError:
+            pass
+    return None
+
+
+def _extract_field_value(
+    field: str,
+    intent_result: IntentResult,
+    raw_text: str,
+):
+    """按优先级从三个来源抽取某字段的值（structured_data → criteria_patch → 规则）。"""
+    # 1. structured_data
+    sd = intent_result.structured_data or {}
+    val = sd.get(field)
+    if not _is_empty(val):
+        return val
+
+    # 2. criteria_patch
+    for patch in intent_result.criteria_patch or []:
+        if patch.get("field") == field:
+            v = patch.get("value")
+            if not _is_empty(v):
+                return v
+
+    # 3. 规则解析（仅覆盖典型上传必填）
+    if field == "headcount":
+        return _parse_headcount_from_text(raw_text)
+    if field == "salary_floor_monthly":
+        return _parse_salary_floor_from_text(raw_text)
+    if field == "pay_type":
+        if "时薪" in raw_text:
+            return "时薪"
+        if "计件" in raw_text:
+            return "计件"
+        if "月薪" in raw_text or "底薪" in raw_text:
+            return "月薪"
+    return None
+
+
+def _is_empty(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, (list, str)) and len(v) == 0:
+        return True
+    return False
+
+
+def _merge_other_upload_fields(
+    session: SessionState,
+    intent_result: IntentResult,
+) -> bool:
+    """把 structured_data / criteria_patch 中除 awaiting_field 外的有效字段合入 pending。
+
+    返回是否合入了任何新字段。这部分字段补全不视为“答非所问”。
+    """
+    merged_any = False
+    sd = intent_result.structured_data or {}
+    pending = dict(session.pending_upload or {})
+    for k, v in sd.items():
+        if _is_empty(v):
+            continue
+        if pending.get(k) != v:
+            pending[k] = v
+            merged_any = True
+    for patch in intent_result.criteria_patch or []:
+        f = patch.get("field")
+        v = patch.get("value")
+        if not f or _is_empty(v):
+            continue
+        if pending.get(f) != v:
+            pending[f] = v
+            merged_any = True
+    if merged_any:
+        session.pending_upload = pending
+    return merged_any
+
+
+def _handle_pending_upload(
+    content: str,
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage] | None:
+    """Stage A 上传草稿守卫：返回 None 表示放行到正常 dispatch。
+
+    顺序：
+      1. timeout 检查
+      2. cancel 检查
+      3. 字段补全（无字段则提示，不调用搜索）
+    """
+    userid = msg.from_user
+
+    # 1. 过期检查
+    if upload_service.is_pending_upload_expired(session):
+        was_patch = _looks_like_upload_patch(content)
+        upload_service.clear_pending_upload(session)
+        if was_patch:
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+        # 否则放行到正常 dispatch
+        return None
+
+    # 2. cancel 强规则
+    if _is_cancel(content, intent_result):
+        upload_service.clear_pending_upload(session)
+        return [_reply(userid, PENDING_CANCELLED_REPLY)]
+
+    # 3. 字段补全
+    awaiting = session.awaiting_field
+    raw_text = content or ""
+
+    awaiting_value = None
+    if awaiting:
+        awaiting_value = _extract_field_value(awaiting, intent_result, raw_text)
+
+    if awaiting and not _is_empty(awaiting_value):
+        # 补到了 awaiting_field：merge 主字段
+        pending = dict(session.pending_upload or {})
+        pending[awaiting] = awaiting_value
+        session.pending_upload = pending
+        # 顺带合并本轮其它有效上传字段
+        _merge_other_upload_fields(session, intent_result)
+        return _commit_pending_or_followup(msg, user_ctx, session, db)
+
+    # 没补到 awaiting_field：尝试合并其它有效上传字段
+    other_merged = _merge_other_upload_fields(session, intent_result)
+    if other_merged:
+        return _commit_pending_or_followup(msg, user_ctx, session, db)
+
+    # 既没补 awaiting_field 也没补其它字段：不搜索，但要让 max rounds 计数前进，
+    # 避免用户用 chitchat 无限刷请求把陈旧草稿挂着。Stage A §3.4 “沿用 follow_up_rounds”。
+    if session.follow_up_rounds >= upload_service.MAX_FOLLOW_UP_ROUNDS:
+        upload_service.clear_pending_upload(session)
+        return [_reply(userid, PENDING_MAX_ROUNDS_REPLY)]
+    conversation_service.increment_follow_up(session)
+    field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
+    return [_reply(userid, PENDING_NO_FIELD_REPLY_FMT.format(field_name=field_name))]
+
+
+def _commit_pending_or_followup(
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """把当前合入的 pending 草稿喂给 upload_service。
+
+    传入 process_upload 的 raw_text 是“当前轮”用户原文；upload_service 内部
+    会将它去重追加到 pending_raw_text_parts，并在入库时拼接所有轮原文。
+    后续是否仍缺字段 / 是否入库 / 是否 max rounds 退出，全部由 upload_service 决定。
+    """
+    userid = msg.from_user
+    pending_intent = session.pending_upload_intent or "upload_job"
+    pending_data = dict(session.pending_upload or {})
+    current_raw = msg.content or ""
+
+    intent_result = IntentResult(
+        intent=pending_intent,
+        structured_data=pending_data,
+        confidence=1.0,
+    )
+
+    if pending_intent == "upload_and_search":
+        return _handle_upload_and_search(intent_result, msg, user_ctx, session, db)
+
+    result = upload_service.process_upload(
+        user_ctx=user_ctx,
+        intent_result=intent_result,
+        raw_text=current_raw,
+        image_keys=[],
+        session=session,
+        db=db,
+    )
+    return [_reply(userid, result.reply_text)]
+
+
+def _field_display_name(field: str) -> str:
+    """字段中文展示名（与 upload_service 同步）。"""
+    from app.services.upload_service import _FIELD_DISPLAY_NAMES
+    return _FIELD_DISPLAY_NAMES.get(field, field)
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,8 @@ HUMAN_AGENT_TEXT = (
 
 RESET_SEARCH_SUCCESS = "已帮您清空当前搜索条件和结果，可以重新告诉我您的需求。"
 RESET_SEARCH_EMPTY = "当前没有可清空的搜索条件。"
+# Stage A：/重新找 撞到 pending 上传时的提示（spec §9.7）。
+RESET_SEARCH_PENDING_FMT = "搜索条件已重置；您仍在发布{kind}（缺{field_name}），请继续补充或发 /取消 放弃。"
 
 BROKER_ONLY = "只有中介账号可以切换双向模式。"
 SWITCH_JOB_OK = "已切换到【找岗位】模式。请告诉我您想找什么样的岗位。"
@@ -129,8 +131,20 @@ def _handle_reset_search(
     ):
         return [_reply(user_ctx, RESET_SEARCH_EMPTY)]
 
+    has_pending = bool(session.pending_upload_intent)
     conversation_service.reset_search(session)
     conversation_service.save_session(user_ctx.external_userid, session)
+
+    if has_pending:
+        # Stage A §9.7：pending 草稿仍在编辑时，回复带"仍在发布"的提示文案，
+        # 避免用户误以为草稿也被丢了。
+        from app.services.upload_service import _FIELD_DISPLAY_NAMES
+        kind = "简历" if session.pending_upload_intent == "upload_resume" else "岗位"
+        field_name = _FIELD_DISPLAY_NAMES.get(session.awaiting_field, session.awaiting_field or "字段")
+        return [_reply(
+            user_ctx,
+            RESET_SEARCH_PENDING_FMT.format(kind=kind, field_name=field_name),
+        )]
     return [_reply(user_ctx, RESET_SEARCH_SUCCESS)]
 
 

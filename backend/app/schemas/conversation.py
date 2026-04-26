@@ -33,6 +33,16 @@ class SessionState(BaseModel):
     broker_direction: str | None = Field(default=None, description="中介搜索方向 search_job / search_worker")
     follow_up_rounds: int = Field(default=0, description="上传追问轮数计数，最多 2 轮")
 
+    # ---- Stage A：多轮上传过渡字段（详见 docs/multi-turn-upload-stage-a-implementation.md §3.1） ----
+    # 这些字段仅在“上传缺字段”流程中使用，旧 Redis session 反序列化时全部走默认值，不影响兼容性。
+    pending_upload: dict = Field(default_factory=dict, description="上传草稿数据：已抽取的结构化字段")
+    pending_upload_intent: str | None = Field(default=None, description="原始上传 intent: upload_job/upload_resume/upload_and_search")
+    awaiting_field: str | None = Field(default=None, description="当前重点追问的字段名")
+    pending_started_at: str | None = Field(default=None, description="草稿创建时间 ISO 8601 UTC")
+    pending_updated_at: str | None = Field(default=None, description="草稿最近更新时间 ISO 8601 UTC")
+    pending_expires_at: str | None = Field(default=None, description="草稿过期时间 ISO 8601 UTC，默认创建后 10 分钟")
+    pending_raw_text_parts: list[str] = Field(default_factory=list, description="多轮原始用户文本，按时间顺序")
+
 
 class CriteriaPatch(BaseModel):
     """多轮对话的 criteria 增量更新指令。"""

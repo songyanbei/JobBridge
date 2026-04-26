@@ -37,6 +37,94 @@ _FIELD_DISPLAY_NAMES = {
 
 MAX_FOLLOW_UP_ROUNDS = 2
 
+# Stage A：上传草稿默认 10 分钟过期（详见 docs/multi-turn-upload-stage-a-implementation.md §3.4）
+PENDING_UPLOAD_TTL_MINUTES = 10
+
+
+def _save_pending_upload(
+    session: SessionState,
+    intent: str,
+    structured_data: dict,
+    missing: list[str],
+    raw_text: str,
+) -> None:
+    """把当前轮抽取到的字段合并进 session 草稿，并刷新过期时间。
+
+    raw_text 为当前轮用户原文（非已拼接结果）。函数会去重追加到
+    pending_raw_text_parts；与最后一条相同则跳过，避免重复合并。
+    """
+    now = datetime.now(timezone.utc)
+    # 固定窗口：expires_at = created_at + 10 分钟，subsequent 轮次只更新 updated_at。
+    # 避免用户用 chitchat 间歇性"续命"陈旧草稿（spec §3.4 / §9.4）。
+    if not session.pending_started_at:
+        session.pending_started_at = now.isoformat()
+        session.pending_expires_at = (
+            now + timedelta(minutes=PENDING_UPLOAD_TTL_MINUTES)
+        ).isoformat()
+    session.pending_updated_at = now.isoformat()
+
+    # 合并结构化字段（新值覆盖旧值）。
+    if structured_data:
+        merged = dict(session.pending_upload or {})
+        for k, v in structured_data.items():
+            if v is None:
+                continue
+            if isinstance(v, (list, str)) and len(v) == 0:
+                continue
+            merged[k] = v
+        session.pending_upload = merged
+
+    session.pending_upload_intent = intent
+    session.awaiting_field = missing[0] if missing else None
+
+    # 保留每一轮的用户原文（仅用户原始消息，不混入系统话术）。
+    if raw_text:
+        text = raw_text.strip()
+        if text and (not session.pending_raw_text_parts
+                     or session.pending_raw_text_parts[-1] != text):
+            session.pending_raw_text_parts.append(text)
+
+
+def _build_final_raw_text(session: SessionState, current_raw_text: str) -> str:
+    """构建入库时的 raw_text：parts + 当前轮去重拼接。"""
+    parts = list(session.pending_raw_text_parts or [])
+    current = (current_raw_text or "").strip()
+    if current and (not parts or parts[-1] != current):
+        parts.append(current)
+    return "\n".join(parts) if parts else (current_raw_text or "")
+
+
+def clear_pending_upload(session: SessionState) -> None:
+    """清空 Stage A 上传草稿过渡字段。"""
+    session.pending_upload = {}
+    session.pending_upload_intent = None
+    session.awaiting_field = None
+    session.pending_started_at = None
+    session.pending_updated_at = None
+    session.pending_expires_at = None
+    session.pending_raw_text_parts = []
+    session.follow_up_rounds = 0
+
+
+def is_pending_upload_expired(session: SessionState) -> bool:
+    """判断 pending upload 是否已过期。无草稿视为未过期。
+
+    防御点：
+    1. 解析失败按过期处理（脏数据不能卡住流程）。
+    2. 解析出 naive datetime 时补 UTC tzinfo，避免与 aware now 比较抛 TypeError。
+       我们写入时全部用 datetime.now(timezone.utc).isoformat()，但旧数据 / 未来 bug
+       可能产生 naive 字符串，比较前必须归一化。
+    """
+    if not session.pending_expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(session.pending_expires_at)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) > expires
+    except (TypeError, ValueError):
+        return True
+
 
 @dataclass
 class UploadResult:
@@ -76,14 +164,23 @@ def process_upload(
     if missing:
         # 检查追问轮数
         if session.follow_up_rounds >= MAX_FOLLOW_UP_ROUNDS:
-            # 超过 2 轮追问，返回降级提示
-            session.follow_up_rounds = 0  # 重置
+            # 超过 2 轮追问，返回降级提示并清空 pending（Stage A §3.4 max rounds 退出）
+            clear_pending_upload(session)
             return UploadResult(
                 success=False,
                 reply_text="信息仍不完整，请补齐后重新提交。需要以下信息：\n"
                            + "\n".join(f"- {_FIELD_DISPLAY_NAMES.get(f, f)}" for f in missing),
                 needs_followup=False,
             )
+
+        # Stage A：把已抽取字段保存到 session.pending_upload，避免下一轮被识别为搜索追问
+        _save_pending_upload(
+            session=session,
+            intent=intent_result.intent,
+            structured_data=data,
+            missing=missing,
+            raw_text=raw_text,
+        )
 
         # 生成追问文本
         conversation_service.increment_follow_up(session)
@@ -97,20 +194,23 @@ def process_upload(
     # 必填字段齐全 → 先审核文本（不写 audit_log），再入库，最后用真实 ID 写 audit_log
     ttl_days = _read_ttl_days(entity_type, db)
 
+    # Stage A：合并多轮原文（pending_raw_text_parts + 当前轮）作为最终 raw_text
+    final_raw_text = _build_final_raw_text(session, raw_text)
+
     # 审核（此时还不写 audit_log，因为实体尚未入库）
     audit_result = audit_service.audit_content_only(
-        text=raw_text,
+        text=final_raw_text,
         db=db,
     )
 
     # 入库（带审核结果）
     if entity_type == "job":
         entity = _create_job(
-            data, user_ctx, audit_result, ttl_days, raw_text, image_keys, db,
+            data, user_ctx, audit_result, ttl_days, final_raw_text, image_keys, db,
         )
     else:
         entity = _create_resume(
-            data, user_ctx, audit_result, ttl_days, raw_text, image_keys, db,
+            data, user_ctx, audit_result, ttl_days, final_raw_text, image_keys, db,
         )
 
     # 用真实实体 ID 写 audit_log
@@ -118,8 +218,8 @@ def process_upload(
         entity_type, entity.id, audit_result, db,
     )
 
-    # 重置追问轮数
-    session.follow_up_rounds = 0
+    # Stage A：入库成功后清 pending（含 follow_up_rounds 重置）
+    clear_pending_upload(session)
 
     # 根据审核状态生成回复
     reply = _audit_status_reply(audit_result.status, entity_type)

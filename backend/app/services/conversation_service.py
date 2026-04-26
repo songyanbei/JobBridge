@@ -124,12 +124,21 @@ def compute_query_digest(criteria: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def reset_search(session: SessionState) -> None:
-    """清空当前检索状态（/重新找）。不清 broker_direction。"""
+    """清空当前检索状态（/重新找）。不清 broker_direction。
+
+    Stage A：当 pending_upload 草稿仍在编辑时（spec §9.7 / §3 验收 7），
+    保留 current_intent 和 follow_up_rounds：
+      - current_intent 让后续图片仍能挂到 Job/Resume；
+      - follow_up_rounds 不重置，否则用户可以靠 /重新找 把 max-rounds 计数清零、
+        从而无限刷"答非所问"绕过退出。
+    """
     session.search_criteria = {}
     session.candidate_snapshot = None
     session.shown_items = []
-    session.follow_up_rounds = 0
-    session.current_intent = None
+    has_pending = bool(session.pending_upload_intent)
+    if not has_pending:
+        session.follow_up_rounds = 0
+        session.current_intent = None
     # history 清空（固定策略）
     session.history = []
 

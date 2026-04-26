@@ -335,8 +335,21 @@ def show_more(
 # 硬过滤查询
 # ---------------------------------------------------------------------------
 
+def has_effective_search_criteria(criteria: dict) -> bool:
+    """Stage A 搜索安全护栏：city / job_category 至少一个非空才允许查询。
+
+    任何无 city/job_category 的 criteria（例如只含 headcount）都视为无效，
+    上层应跳过 SQL 查询直接返回空结果，避免全表召回。
+    """
+    if not criteria:
+        return False
+    return bool(criteria.get("city") or criteria.get("job_category"))
+
+
 def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
     """构建岗位硬过滤查询。"""
+    if not has_effective_search_criteria(criteria):
+        return []
     now = datetime.now(timezone.utc)
     q = db.query(Job).join(User, Job.owner_userid == User.external_userid).filter(
         Job.audit_status == "passed",
@@ -386,6 +399,8 @@ def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
 
 def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
     """构建简历硬过滤查询。"""
+    if not has_effective_search_criteria(criteria):
+        return []
     now = datetime.now(timezone.utc)
     q = db.query(Resume).join(
         User, Resume.owner_userid == User.external_userid,
