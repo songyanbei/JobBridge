@@ -11,7 +11,9 @@ Token 预算：每个 prompt 上方标注 input/output token 上限。
 # Intent Extraction Prompt
 # ---------------------------------------------------------------------------
 
-# v2.0 2026-04-13
+# v2.1 2026-04-26
+# Stage B：补充工种 closed enum + few-shot 用于稳定类目映射；
+# 详见 docs/multi-turn-upload-stage-b-implementation.md §3.1。
 # Token 预算: input < 2000 tokens, output < 500 tokens
 INTENT_SYSTEM_PROMPT = """\
 你是一个蓝领招聘撮合平台的意图识别与结构化抽取助手。
@@ -46,7 +48,17 @@ INTENT_SYSTEM_PROMPT = """\
 
 岗位字段：
 - city (str)：城市
-- job_category (str)：工种大类（电子厂/服装厂/食品厂/物流仓储/餐饮/保洁/保安/技工/普工/其他）
+- job_category (str)：工种大类，必须从以下闭集中选择：电子厂 / 服装厂 / 食品厂 / 物流仓储 / 餐饮 / 保洁 / 保安 / 技工 / 普工 / 其他
+
+  常见同义词归并（必须映射到上述大类，禁止输出原词）：
+  - 厨师 / 服务员 / 后厨 / 饭店 / 餐厅 / 帮厨 / 传菜 → 餐饮
+  - 打包工 / 分拣 / 仓库 / 快递 / 装卸 / 拣货 → 物流仓储
+  - 普工 / 操作工 / 产线 / 流水线 / 计件工 → 普工
+  - 电子厂 / SMT / 组装 / 质检 / 焊锡 → 电子厂
+  - 保洁 / 清洁 / 客房清洁 / 保洁阿姨 → 保洁
+  - 保安 / 门岗 / 巡逻 / 保安员 → 保安
+  - 服装厂 / 缝纫 / 车工 / 锁眼 → 服装厂
+  - 食品厂 / 烘焙 / 糕点 → 食品厂
 - salary_floor_monthly (int)：月综合收入下限（元）。时薪×250 估算，模糊表述取保守低值
 - pay_type (str)：计薪方式（月薪/时薪/计件）
 - headcount (int)：招聘人数
@@ -114,6 +126,14 @@ INTENT_SYSTEM_PROMPT = """\
 示例5 - 边界输入:
 用户消息: "😊"
 {{"intent": "chitchat", "structured_data": {{}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.0}}
+
+示例6 - 工种同义词归并（餐饮）:
+用户消息: "北京饭店招聘厨师，底薪7500+绩效，包吃不包住，招2人"
+{{"intent": "upload_job", "structured_data": {{"city": "北京市", "job_category": "餐饮", "salary_floor_monthly": 7500, "pay_type": "月薪", "headcount": 2, "provide_meal": true, "provide_housing": false}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.92}}
+
+示例7 - 工种同义词归并（物流仓储）:
+用户消息: "苏州找打包分拣，5000+，包住"
+{{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["物流仓储"], "salary_floor_monthly": 5000, "provide_housing": true}}, "criteria_patch": [{{"op": "update", "field": "city", "value": ["苏州市"]}}, {{"op": "update", "field": "job_category", "value": ["物流仓储"]}}, {{"op": "update", "field": "salary_floor_monthly", "value": 5000}}, {{"op": "update", "field": "provide_housing", "value": true}}], "missing_fields": [], "confidence": 0.88}}
 """
 
 INTENT_USER_TEMPLATE = """\
@@ -172,9 +192,9 @@ RERANK_USER_TEMPLATE = """\
 # 常量汇总（便于测试和外部引用）
 # ---------------------------------------------------------------------------
 
-PROMPT_VERSION = "v2.0"
-PROMPT_DATE = "2026-04-13"
-INTENT_PROMPT_VERSION = "v2.0"
+PROMPT_VERSION = "v2.1"
+PROMPT_DATE = "2026-04-26"
+INTENT_PROMPT_VERSION = "v2.1"
 RERANK_PROMPT_VERSION = "v2.0"
 
 
