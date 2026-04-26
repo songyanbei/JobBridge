@@ -173,18 +173,11 @@ def process_upload(
     missing = _check_required_fields(data, required)
 
     if missing:
-        # 检查追问轮数
-        if session.follow_up_rounds >= MAX_FOLLOW_UP_ROUNDS:
-            # 超过 2 轮追问，返回降级提示并清空 pending（Stage A §3.4 max rounds 退出）
-            clear_pending_upload(session)
-            return UploadResult(
-                success=False,
-                reply_text="信息仍不完整，请补齐后重新提交。需要以下信息：\n"
-                           + "\n".join(f"- {_FIELD_DISPLAY_NAMES.get(f, f)}" for f in missing),
-                needs_followup=False,
-            )
-
-        # Stage A：把已抽取字段保存到 session.pending_upload，避免下一轮被识别为搜索追问
+        # Stage C1（spec §2.6）：max rounds 主退出由 message_router._handle_field_patch 的
+        # failed_patch_rounds 全权管控；process_upload 不再用 follow_up_rounds 早退，
+        # 否则用户分多轮成功补不同有效字段时（"5500月薪" → "包吃住" → ...）会因为
+        # follow_up_rounds 累计 ≥ MAX 被这里再次清掉，与 spec §9.5 "补了其它有效字段不算
+        # failed" 的语义直接冲突。follow_up_rounds 仅作为 Stage A/B 兼容计数器保留。
         _save_pending_upload(
             session=session,
             intent=intent_result.intent,
@@ -267,9 +260,10 @@ def attach_image(
     if not image_key:
         return "图片保存失败，请稍后重试。"
 
-    # Stage C1（spec §2.10）：优先 active_flow == "upload_collecting"，
-    # 回落 current_intent 兼容旧 session。C2 删除回落。
-    if session.active_flow == "upload_collecting" and session.pending_upload_intent:
+    # Stage C1（spec §2.10）：pending_upload_intent 优先 —
+    # 草稿存活时（无论 active_flow 是 upload_collecting 还是 upload_conflict）
+    # 都按 origin intent 决定实体类型；回落 current_intent 兼容旧 session（C2 删除回落）。
+    if session.pending_upload_intent:
         entity_type = _attach_target_entity_type(session.pending_upload_intent)
     else:
         entity_type = _attach_target_entity_type(session.current_intent)

@@ -118,17 +118,27 @@ class TestProcessUpload:
         assert result.needs_followup is True
 
     @patch("app.services.upload_service.conversation_service")
-    def test_max_followup_degradation(self, mock_conv):
+    def test_high_follow_up_rounds_does_not_short_circuit(self, mock_conv):
+        """Stage C1（spec §2.6）：max rounds 退出由 message_router._handle_field_patch
+        的 failed_patch_rounds 全权管控；process_upload 不再用 follow_up_rounds 早退。
+
+        旧 Stage A 行为（follow_up_rounds >= MAX 时由 process_upload 返回降级文案 +
+        needs_followup=False）已主动放弃，否则用户分多轮成功补不同有效字段时会被
+        误清草稿（spec §9.5"补了其它有效字段不算 failed"）。
+        """
         user_ctx = _make_user_ctx()
         intent = IntentResult(
             intent="upload_job",
             structured_data={"city": "苏州市"},
             confidence=0.7,
         )
-        session = _make_session(follow_up_rounds=2)
+        # follow_up_rounds 高也不应让 process_upload 早退；它只是兼容计数器
+        session = _make_session(follow_up_rounds=5)
         db = MagicMock()
 
         result = process_upload(user_ctx, intent, "苏州招工", [], session, db)
         assert result.success is False
-        assert result.needs_followup is False
-        assert "补齐" in result.reply_text
+        # C1 契约：missing 时一律返回追问（needs_followup=True），由 _handle_field_patch
+        # 在外层用 failed_patch_rounds 决定是否清草稿。
+        assert result.needs_followup is True
+        assert session.pending_upload_intent == "upload_job"

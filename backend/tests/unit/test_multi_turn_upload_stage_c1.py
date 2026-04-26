@@ -541,6 +541,10 @@ class TestUploadConflictResolution:
         called_args = mock_search_workers.call_args
         assert called_args.args[1] == "先看看厨师简历"
 
+    # NOTE: "继续看看" 路由到 proceed 的回归测试见
+    # TestUploadConflictKeywordPrecedence.test_continue_kanken_goes_to_proceed
+    # （covering codex review fix P3）。
+
     def test_dead_loop_protection_clears_after_two_rounds(self):
         ctx = _ctx("factory")
         session = SessionState(
@@ -838,3 +842,301 @@ class TestSessionHintHelper:
 
     def test_hint_with_none_session(self):
         assert intent_service.build_session_hint(None) == {}
+
+
+# ---------------------------------------------------------------------------
+# Codex review fix P1.1：process_upload 不再用 follow_up_rounds 早退草稿
+# ---------------------------------------------------------------------------
+
+class TestStairStepFieldPatchSurvivesHighFollowUpRounds:
+    """复现 codex 标的"分多轮成功补不同有效字段被 follow_up_rounds 误清"场景：
+
+    Round 1：用户发"北京饭店招聘厨师" → pending(city, jc)，follow_up_rounds=1
+    Round 2：用户补"5500月薪" → 字段成功合入(salary, pay_type)，follow_up_rounds=2
+    Round 3：用户补"包吃住" → 字段成功合入(provide_meal/housing)；
+             此时 follow_up_rounds=2 ≥ MAX，旧代码会清草稿；C1 应保留草稿继续追问 headcount。
+    """
+
+    @patch("app.services.upload_service.is_pending_upload_expired",
+           return_value=False)
+    def test_round3_useful_patch_does_not_clear_pending(self, _):
+        ctx = _ctx("factory")
+        # Round 3 起始状态：city/jc/salary/pay_type 已凑齐，follow_up_rounds 已经累到 MAX
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload={
+                "city": "北京市",
+                "job_category": "餐饮",
+                "salary_floor_monthly": 5500,
+                "pay_type": "月薪",
+            },
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=_future_iso(),
+            pending_raw_text_parts=["北京饭店招聘厨师", "5500月薪"],
+            follow_up_rounds=upload_service.MAX_FOLLOW_UP_ROUNDS,  # =2
+            failed_patch_rounds=0,
+        )
+        # 用户补"包吃住" — LLM 抽出 provide_meal/provide_housing，没有 headcount
+        intent = IntentResult(
+            intent="follow_up",
+            structured_data={"provide_meal": True, "provide_housing": True},
+            confidence=0.7,
+        )
+        replies = message_router._route_upload_collecting(
+            intent, _msg("包吃住"), ctx, session, MagicMock(),
+        )
+        # 草稿仍然存活，继续追问 headcount
+        assert session.pending_upload_intent == "upload_job"
+        assert session.active_flow == "upload_collecting"
+        assert session.awaiting_field == "headcount"
+        # 新合入的字段已落到 pending
+        assert session.pending_upload.get("provide_meal") is True
+        assert session.pending_upload.get("provide_housing") is True
+        # failed_patch_rounds 不动（因为补了其它有效字段）
+        assert session.failed_patch_rounds == 0
+        # 回复是追问招聘人数，而不是 PENDING_MAX_ROUNDS_REPLY
+        assert "招聘人数" in replies[0].content
+        assert replies[0].content != PENDING_MAX_ROUNDS_REPLY
+
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service._read_ttl_days")
+    @patch("app.services.upload_service._create_job")
+    @patch("app.services.upload_service.is_pending_upload_expired",
+           return_value=False)
+    def test_round4_finishing_patch_completes_upload(
+        self, _exp, mock_create, mock_ttl, mock_audit,
+    ):
+        """承接上一个 case：Round 4 用户补 headcount，应入库成功。"""
+        from app.services.audit_service import AuditResult
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="passed", reason="", matched_words=[],
+        )
+        mock_audit.write_audit_log_for_result = MagicMock()
+        mock_ttl.return_value = 30
+        fake = MagicMock(); fake.id = 7
+        mock_create.return_value = fake
+
+        ctx = _ctx("factory")
+        # Round 4 起始：city/jc/salary/pay_type/provide_meal/provide_housing 都在，缺 headcount
+        # follow_up_rounds 已经累到 3（旧代码这里就直接清了）
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload={
+                "city": "北京市",
+                "job_category": "餐饮",
+                "salary_floor_monthly": 5500,
+                "pay_type": "月薪",
+                "provide_meal": True,
+                "provide_housing": True,
+            },
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=_future_iso(),
+            pending_raw_text_parts=["北京饭店招聘厨师", "5500月薪", "包吃住"],
+            follow_up_rounds=3,
+            failed_patch_rounds=0,
+        )
+        intent = IntentResult(
+            intent="follow_up", structured_data={},
+            criteria_patch=[{"op": "update", "field": "headcount", "value": 2}],
+            confidence=0.7,
+        )
+        replies = message_router._route_upload_collecting(
+            intent, _msg("2个人"), ctx, session, MagicMock(),
+        )
+        # 入库成功
+        assert any("已入库" in r.content for r in replies)
+        assert session.pending_upload_intent is None
+        assert session.active_flow == "idle"
+        mock_create.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Codex review fix P1.2：_handle_image gate 改为 pending_upload_intent 优先
+# ---------------------------------------------------------------------------
+
+class TestImageAttachWithPollutedCurrentIntent:
+    """复现 codex 标的"upload_conflict 中 current_intent 被 chitchat 污染后图片漂掉"场景。
+
+    Stage C1 spec §2.10 要求 attach_image 用 pending_upload_intent 优先；
+    上层 _handle_image gate 必须同样优先 pending_upload_intent，否则根本不会进 attach_image。
+    """
+
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.upload_service.attach_image")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.user_service.check_user_status",
+           return_value=None)
+    @patch("app.services.message_router.user_service.update_last_active")
+    def test_image_attaches_when_pending_alive_even_if_current_intent_polluted(
+        self, _ula, _cus, mock_id, mock_attach, mock_load, _save,
+    ):
+        mock_id.return_value = _ctx("factory")
+        mock_attach.return_value = "图片已附加到您最近一条岗位信息（第 1 张）。"
+        # 关键场景：在 upload_conflict 期间 chitchat 把 current_intent 污染成 "chitchat"，
+        # 但 pending_upload_intent 还在
+        session = SessionState(
+            role="factory",
+            active_flow="upload_conflict",
+            pending_upload_intent="upload_job",
+            pending_upload={"city": "北京市"},
+            current_intent="chitchat",  # 被污染
+            pending_interruption={
+                "intent": "search_worker",
+                "structured_data": {},
+                "criteria_patch": [],
+                "raw_text": "看简历",
+            },
+        )
+        mock_load.return_value = session
+
+        img_msg = WeComMessage(
+            msg_id="img1", from_user="u1", to_user="bot",
+            msg_type="image", content="", media_id="media-1",
+            image_url="storage/key/img.jpg", create_time=1700000000,
+        )
+        replies = message_router.process(img_msg, MagicMock())
+
+        # 必须真的进 attach_image（而不是被 _handle_image 早退到"非上传流程"提示）
+        mock_attach.assert_called_once()
+        assert "已附加" in replies[0].content
+
+
+class TestAttachImageInternalUsesPendingIntentFirst:
+    """attach_image 内部：pending_upload_intent 存在时直接按它路由实体类型，
+    不再依赖 active_flow == upload_collecting；覆盖 conflict 期挂图。"""
+
+    def test_pending_intent_wins_over_current_intent_in_conflict(self):
+        from app.models import Job
+        session = SessionState(
+            role="factory",
+            active_flow="upload_conflict",  # 不是 upload_collecting
+            pending_upload_intent="upload_job",
+            current_intent="chitchat",  # 被污染
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+
+        feedback = upload_service.attach_image(
+            external_userid="u1", image_key="key",
+            session=session, db=db,
+        )
+        # 路由到 Job 而不是 Resume（Resume 是 fallback）
+        assert db.query.call_args.args[0] is Job
+        assert "正在处理" in feedback or "已收到" in feedback
+
+
+# ---------------------------------------------------------------------------
+# Codex review fix P3：upload_conflict 关键词优先级 — proceed 信号优先
+# ---------------------------------------------------------------------------
+
+class TestUploadConflictKeywordPrecedence:
+    """spec §2.7 要求允许裸"继续" → resume；同时 review fix #2/#3 处理重叠：
+    proceed 信号（含 "看看"/"先找"/"找工人"/"找岗位"/"看简历"/"看岗位" 或 LLM intent ∈ search_*）
+    优先级最高，让 "继续看看" / "算了，先找" 都按搜索意图处理。
+    """
+
+    def _build_conflict_session(self):
+        return SessionState(
+            role="factory",
+            active_flow="upload_conflict",
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=_future_iso(),
+            pending_interruption={
+                "intent": "search_worker",
+                "structured_data": {"city": ["北京市"]},
+                "criteria_patch": [],
+                "raw_text": "看简历",
+            },
+        )
+
+    def test_bare_continue_resumes_collecting(self):
+        """spec §2.7 明文：包含"继续"应回 upload_collecting。"""
+        session = self._build_conflict_session()
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._route_upload_conflict(
+            intent, _msg("继续"), _ctx("factory"), session, MagicMock(),
+        )
+        assert session.active_flow == "upload_collecting"
+        assert session.pending_interruption is None
+        assert "招聘人数" in replies[0].content
+
+    @patch("app.services.message_router.search_service.search_workers")
+    def test_continue_kanken_goes_to_proceed(self, mock_search):
+        """'继续看看' — 含 proceed 关键词"看看"，应执行 pending_interruption。"""
+        mock_search.return_value = search_service.SearchResult(
+            reply_text="为您找到 1 位求职者", result_count=1, has_more=False,
+        )
+        def _populate(*args, **kw):
+            args[2].candidate_snapshot = CandidateSnapshot(
+                candidate_ids=["1"], query_digest="x",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                expires_at=_future_iso(),
+            )
+            return mock_search.return_value
+        mock_search.side_effect = _populate
+
+        session = self._build_conflict_session()
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._route_upload_conflict(
+            intent, _msg("继续看看"), _ctx("factory"), session, MagicMock(),
+        )
+        assert replies[0].content == CONFLICT_PROCEED_ACK
+        assert session.active_flow == "search_active"
+        assert session.pending_upload_intent is None
+
+    @patch("app.services.message_router.search_service.search_workers")
+    def test_cancel_prefix_with_proceed_keyword_goes_to_proceed(self, mock_search):
+        """'算了，先找工人' — cancel 前缀 + proceed 关键词"先找"共存：proceed 优先；
+        草稿在 proceed 路径里同样被清，但搜索意图被尊重。"""
+        mock_search.return_value = search_service.SearchResult(
+            reply_text="为您找到 2 位求职者", result_count=2, has_more=False,
+        )
+        def _populate(*args, **kw):
+            args[2].candidate_snapshot = CandidateSnapshot(
+                candidate_ids=["1", "2"], query_digest="x",
+                created_at=datetime.now(timezone.utc).isoformat(),
+                expires_at=_future_iso(),
+            )
+            return mock_search.return_value
+        mock_search.side_effect = _populate
+
+        session = self._build_conflict_session()
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._route_upload_conflict(
+            intent, _msg("算了，先找工人"), _ctx("factory"), session, MagicMock(),
+        )
+        assert replies[0].content == CONFLICT_PROCEED_ACK
+        # 不应该是 PENDING_CANCELLED_REPLY
+        assert replies[0].content != PENDING_CANCELLED_REPLY
+        assert session.active_flow == "search_active"
+        assert session.pending_upload_intent is None
+
+    def test_pure_cancel_still_works(self):
+        """没有 proceed 信号时，cancel 强规则仍然清草稿。"""
+        session = self._build_conflict_session()
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._route_upload_conflict(
+            intent, _msg("取消"), _ctx("factory"), session, MagicMock(),
+        )
+        assert replies[0].content == PENDING_CANCELLED_REPLY
+        assert session.active_flow == "idle"
+        assert session.pending_upload_intent is None
+
+    def test_pure_resume_phrase_still_works(self):
+        session = self._build_conflict_session()
+        intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
+        replies = message_router._route_upload_conflict(
+            intent, _msg("继续发布"), _ctx("factory"), session, MagicMock(),
+        )
+        assert session.active_flow == "upload_collecting"
+        assert session.pending_interruption is None

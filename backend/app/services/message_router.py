@@ -439,14 +439,30 @@ def _route_upload_conflict(
     userid = msg.from_user
     intent = intent_result.intent
 
-    # 取消草稿（强规则 cancel 或显式“取消草稿”）
-    if _is_cancel(content, intent_result) or "取消草稿" in content:
+    # Stage C1（spec §2.7）：识别用户三选一回复时，proceed 信号优先级最高 ——
+    # "继续看看" / "算了，先找工人" 这类同时含 resume/cancel 词与 proceed 词的句子，
+    # 都按 "用户表达了搜索方向" 处理；这样:
+    #   - 裸 "继续" / "继续发布" 仍能正确回 upload_collecting（spec 明文要求）
+    #   - "继续看看" 不会被裸 "继续" 抢去 resume
+    #   - "算了，先找" 不会被 cancel 强规则吞掉搜索意图
+    interruption = session.pending_interruption or {}
+    proceed_keywords = ("先找", "找工人", "找岗位", "看简历", "看岗位", "看看")
+    has_proceed_signal = (
+        any(p in content for p in proceed_keywords)
+        or intent in ("search_job", "search_worker")
+    )
+
+    # 取消草稿（强规则 cancel 或显式"取消草稿"）—— 仅在不含 proceed 信号时
+    if (
+        not has_proceed_signal
+        and (_is_cancel(content, intent_result) or "取消草稿" in content)
+    ):
         upload_service.clear_pending_upload(session)
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
-    # 继续发布
+    # 继续发布 —— 仅在不含 proceed 信号时；spec §2.7 要求允许裸 "继续"
     resume_keywords = ("继续发布", "继续填", "继续", "接着发", "接着")
-    if any(p in content for p in resume_keywords):
+    if not has_proceed_signal and any(p in content for p in resume_keywords):
         session.pending_interruption = None
         session.conflict_followup_rounds = 0
         session.active_flow = "upload_collecting"
@@ -454,12 +470,8 @@ def _route_upload_conflict(
         field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
         return [_reply(userid, CONFLICT_RESUME_FMT.format(field_name=field_name))]
 
-    # 执行 pending_interruption
-    interruption = session.pending_interruption or {}
-    proceed_keywords = ("先找", "找工人", "找岗位", "看简历", "看岗位", "看看")
-    triggered_by_keyword = any(p in content for p in proceed_keywords)
-    triggered_by_intent = intent in ("search_job", "search_worker")
-    if triggered_by_intent or triggered_by_keyword:
+    # 执行 pending_interruption（proceed 路径）
+    if has_proceed_signal:
         # 用 pending_interruption 复原 IntentResult，避免重新调 LLM
         new_intent_name = (
             interruption.get("intent")
@@ -781,9 +793,16 @@ def _handle_image(
         logger.warning("message_router: image msg without image_url, msg_id=%s", msg.msg_id)
         return [_reply(userid, IMAGE_DOWNLOAD_FAILED)]
 
-    # 尝试挂载到当前上传流程
+    # 尝试挂载到当前上传流程。
+    # Stage C1（spec §2.10）：优先看 pending_upload_intent — 草稿存活时（含
+    # upload_collecting 与 upload_conflict 两态）都应该挂图，避免 current_intent 在
+    # 上传过程中被 chitchat / command 等中间消息污染后图片被误判为"非上传流程"。
+    # 回落 current_intent 兼容旧 session（C2 删除回落）。
     session = conversation_service.load_session(userid)
-    if session and session.current_intent in ("upload_job", "upload_resume", "upload_and_search"):
+    if session and (
+        session.pending_upload_intent
+        or session.current_intent in ("upload_job", "upload_resume", "upload_and_search")
+    ):
         feedback = upload_service.attach_image(
             external_userid=userid,
             image_key=image_url,
