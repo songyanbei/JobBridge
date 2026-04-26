@@ -525,4 +525,8 @@ _HANDLERS = {
     "human_agent": _handle_human_agent,
     "my_status": _handle_my_status,
     "cancel_pending": _handle_cancel_pending,
+    # Stage B P1-2 兼容兜底：LLM/未来命令表若直出 command="cancel"，
+    # 也走 cancel_pending 同一 handler，避免 fallback 到 UNKNOWN_COMMAND
+    # 而草稿残留。
+    "cancel": _handle_cancel_pending,
 }

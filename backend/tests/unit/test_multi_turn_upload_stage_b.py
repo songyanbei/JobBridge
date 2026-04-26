@@ -599,6 +599,27 @@ class TestFixP1CancelCommandClearsPending:
         )
         assert replies[0].content == CANCEL_PENDING_NO_DRAFT
 
+    @patch("app.services.command_service.conversation_service.save_session")
+    def test_cancel_alias_also_clears_pending(self, _save):
+        """codex P2：兜底兼容 LLM 直出 command='cancel' 不带 _pending 后缀。"""
+        ctx = UserContext(
+            external_userid="u1", role="factory", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=False, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(
+            role="factory",
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+        )
+        replies = command_service.execute(
+            "cancel", "", ctx, session, MagicMock(),
+        )
+        assert replies[0].content == CANCEL_PENDING_OK
+        assert session.pending_upload_intent is None
+
 
 class TestFixP3JobCategoryBroadening:
     """P3 回归：fallback 把工种细分类映射到 canonical 大类。"""
