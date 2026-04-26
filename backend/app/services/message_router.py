@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
+from app.models import Resume
 from app.schemas.conversation import ReplyMessage, SessionState
 from app.services import (
     command_service,
@@ -37,6 +39,7 @@ from app.services import (
 )
 from app.services.intent_service import classify_intent
 from app.services.user_service import UserContext
+from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 
 logger = logging.getLogger(__name__)
@@ -317,14 +320,17 @@ def _handle_upload_and_search(
         # 追问 / 审核拒绝 / 字段缺失 → 不继续检索
         return replies
 
-    # 上传成功后，用当前 structured_data 做一次检索
-    criteria = dict(intent_result.structured_data or {})
-    session.search_criteria = {**session.search_criteria, **criteria}
-
     # upload_and_search 的方向：
-    #   - 工人：search_job（找工作）
-    #   - 厂家/中介：search_worker（找工人）
-    # 直接让 _resolve_search_direction 按角色兜底即可（传 None）
+    #   - 工人：search_job（找工作）— 用简历字段映射成 city/job_category
+    #   - 厂家/中介：search_worker（找工人）— 直接用 city/job_category
+    # _resolve_search_direction 按角色兜底即可（传 None）
+    direction = _resolve_search_direction(None, user_ctx, session)
+    criteria = _build_upload_and_search_criteria(
+        intent_result.structured_data or {}, direction,
+    )
+    if criteria:
+        session.search_criteria = {**session.search_criteria, **criteria}
+
     search_result = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
@@ -754,16 +760,147 @@ def _run_search(
     其中 follow_up / show_more / upload_and_search 不显式指定方向，
     走 session.broker_direction 或角色兜底。
 
+    Stage B：在分发给 search_service 前，按 §3.3 合并默认 criteria：
+      1. 当前请求 criteria（已含 session.search_criteria 的累积）
+      2. 仅 worker 角色：用户最近一份 passed resume 的 expected_cities /
+         expected_job_categories
+    已有有效值不会被下层 default 覆盖。
+
     Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
+    composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
     if direction == "search_job":
         return search_service.search_jobs(
-            criteria, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
     return search_service.search_workers(
-        criteria, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+        composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage B：默认 criteria 合并（§3.3）
+# ---------------------------------------------------------------------------
+
+def _is_effective_value(v) -> bool:
+    """已有有效值的判定：非 None / 非空字符串 / 非空列表。"""
+    if v is None:
+        return False
+    if isinstance(v, str) and not v.strip():
+        return False
+    if isinstance(v, list) and len(v) == 0:
+        return False
+    return True
+
+
+def _build_upload_and_search_criteria(
+    structured_data: dict, direction: str,
+) -> dict:
+    """从 upload_and_search 的 structured_data 抽出对侧搜索的 criteria。
+
+    spec §9.2.1：
+      - factory/broker 发岗位 → search_workers，沿用 city / job_category / 薪资
+      - worker 发简历 → search_jobs，把 expected_cities → city、
+        expected_job_categories → job_category、salary_expect_floor_monthly →
+        salary_floor_monthly
+    """
+    if not structured_data:
+        return {}
+    sd = dict(structured_data)
+    out: dict = {}
+
+    if direction == "search_job":
+        # worker 简历方向 → 搜索岗位
+        ec = sd.get("expected_cities") or sd.get("city")
+        if _is_effective_value(ec):
+            out["city"] = ec if isinstance(ec, list) else [ec]
+        ej = sd.get("expected_job_categories") or sd.get("job_category")
+        if _is_effective_value(ej):
+            out["job_category"] = ej if isinstance(ej, list) else [ej]
+        salary = sd.get("salary_expect_floor_monthly") or sd.get("salary_floor_monthly")
+        if _is_effective_value(salary):
+            out["salary_floor_monthly"] = salary
+    else:
+        # factory/broker 发岗位 → 搜索工人
+        city = sd.get("city")
+        if _is_effective_value(city):
+            out["city"] = city if isinstance(city, list) else [city]
+        jc = sd.get("job_category")
+        if _is_effective_value(jc):
+            out["job_category"] = jc if isinstance(jc, list) else [jc]
+        # 把岗位薪资上限作为简历期望薪资的过滤上限
+        ceiling = sd.get("salary_ceiling_monthly") or sd.get("salary_floor_monthly")
+        if _is_effective_value(ceiling):
+            out["salary_ceiling_monthly"] = ceiling
+    return out
+
+
+def _apply_default_criteria(
+    criteria: dict,
+    session: SessionState,
+    user_ctx: UserContext,
+    db: Session,
+    direction: str,
+) -> dict:
+    """按 §3.3 固定顺序合并默认 criteria：当前请求 → session → 简历 default。
+
+    “已有有效值不覆盖”：上层 source 提供且有效（非 None / 非空字符串 / 非空列表）
+    时，不被下层 default 覆盖。
+    """
+    composed: dict = dict(criteria or {})
+
+    # Layer 2：session.search_criteria（由 _handle_search / _handle_follow_up 累积）
+    for k, v in (session.search_criteria or {}).items():
+        if _is_effective_value(v) and not _is_effective_value(composed.get(k)):
+            composed[k] = v
+
+    # Layer 3：worker + search_job 方向，从最近 passed resume 取期望城市/工种兜底
+    if user_ctx.role == "worker" and direction == "search_job":
+        defaults = _load_worker_resume_defaults(user_ctx.external_userid, db)
+        for k, v in defaults.items():
+            if _is_effective_value(v) and not _is_effective_value(composed.get(k)):
+                composed[k] = v
+
+    return composed
+
+
+def _load_worker_resume_defaults(external_userid: str, db: Session) -> dict:
+    """从用户最近一份 passed 简历抽 city / job_category 默认值。
+
+    防御点：
+    1. 任何异常（DB 不可用 / schema 漂移）记 warning 并返回空 dict，不挡搜索流程。
+    2. 只取最新一份简历，避免历史多份带来的歧义。
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        resume = db.query(Resume).filter(
+            Resume.owner_userid == external_userid,
+            Resume.audit_status == "passed",
+            Resume.deleted_at.is_(None),
+            Resume.expires_at > now,
+        ).order_by(Resume.created_at.desc()).first()
+    except Exception:
+        logger.exception(
+            "message_router: load worker resume defaults failed userid=%s",
+            external_userid,
+        )
+        return {}
+    if resume is None:
+        return {}
+    out: dict = {}
+    if resume.expected_cities:
+        out["city"] = list(resume.expected_cities)
+    if resume.expected_job_categories:
+        out["job_category"] = list(resume.expected_job_categories)
+    if out:
+        log_event(
+            "search_default_criteria_applied",
+            userid=external_userid,
+            source="worker_latest_resume",
+            applied_keys=list(out.keys()),
+        )
+    return out
 
 
 def _resolve_search_direction(

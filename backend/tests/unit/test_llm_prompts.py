@@ -17,8 +17,9 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        assert prompts.PROMPT_VERSION == "v2.0"
-        assert prompts.PROMPT_DATE == "2026-04-13"
+        # Stage B 2026-04-26: bump to v2.1，prompt 加 closed-enum job_category + few-shot 同义词归并
+        assert prompts.PROMPT_VERSION == "v2.1"
+        assert prompts.PROMPT_DATE == "2026-04-26"
 
     def test_token_budget_constants(self):
         assert prompts.INTENT_INPUT_TOKEN_BUDGET == 2000

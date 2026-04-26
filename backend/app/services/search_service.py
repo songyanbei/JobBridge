@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 RERANK_PROMPT_VERSION = "v1"
 
+# Stage B：0 命中 fallback 文案（§3.5）。
+# 不能伪装成推荐结果；必须明确告知未找到并给出可操作建议。
+NO_JOB_MATCH_REPLY = (
+    "暂未找到符合条件的岗位。可以放宽城市、工种或薪资范围后再试，"
+    "也可以补充更多偏好（例如包吃住、班次）让我重新筛选。"
+)
+NO_WORKER_MATCH_REPLY = (
+    "暂未找到匹配的求职者。可以放宽城市或工种条件，"
+    "或补充期望年龄、经验等限制让我重新筛选。"
+)
+
 
 def _rerank_with_logging(
     query: str,
@@ -124,15 +135,15 @@ def search_jobs(
     # 硬过滤
     candidates = _query_jobs(criteria, max_candidates, db)
 
-    # 0 召回 → 尝试宽松匹配（一次）
-    if 0 < len(candidates) < top_n:
-        relaxed = _try_relaxed_job_search(criteria, max_candidates, db)
-        if len(relaxed) > len(candidates):
-            candidates = relaxed
+    # Stage B（§3.4）：0 命中或低召回时按显式 fallback 步骤逐步放宽
+    if len(candidates) < top_n:
+        candidates = _run_job_fallback_steps(
+            criteria, candidates, top_n, max_candidates, db,
+        )
 
     if not candidates:
         return SearchResult(
-            reply_text="暂未找到完全匹配的岗位，建议调整条件重新搜索。比如放宽城市或薪资要求。",
+            reply_text=NO_JOB_MATCH_REPLY,
             result_count=0,
         )
 
@@ -203,14 +214,14 @@ def search_workers(
 
     candidates = _query_resumes(criteria, max_candidates, db)
 
-    if 0 < len(candidates) < top_n:
-        relaxed = _try_relaxed_resume_search(criteria, max_candidates, db)
-        if len(relaxed) > len(candidates):
-            candidates = relaxed
+    if len(candidates) < top_n:
+        candidates = _run_resume_fallback_steps(
+            criteria, candidates, top_n, max_candidates, db,
+        )
 
     if not candidates:
         return SearchResult(
-            reply_text="暂未找到完全匹配的求职者，建议调整条件重新搜索。",
+            reply_text=NO_WORKER_MATCH_REPLY,
             result_count=0,
         )
 
@@ -459,25 +470,116 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 宽松匹配
+# Stage B：显式 fallback 步骤（§3.4）
 # ---------------------------------------------------------------------------
+#
+# 步骤设计原则：
+# 1. 每一步都必须保留 city / job_category 守卫，禁止全表召回。
+# 2. 每一步都打 ``search_fallback_applied`` 日志，含 step / 候选数 / criteria 概要。
+# 3. 命中数比上一步多才采用结果；否则丢弃，避免为了"更多"返回低质量结果。
+# 4. 同省/周边城市依赖城市字典，Stage B 不实现，留作后续扩展。
 
-def _try_relaxed_job_search(criteria: dict, limit: int, db: Session) -> list:
-    """薪资下限放宽 10%（单次）。"""
-    relaxed = dict(criteria)
-    salary = relaxed.get("salary_floor_monthly")
+# 可选硬过滤字段：在 0/低召回时被允许去掉的字段（保留 city / job_category /
+# salary_*）。这与 §3.4 Step 2 “去可选硬过滤”对应。
+_OPTIONAL_HARD_FILTERS_JOB = ("gender_required", "is_long_term", "age")
+_OPTIONAL_HARD_FILTERS_RESUME = ("gender", "age")
+
+
+def _run_job_fallback_steps(
+    criteria: dict,
+    initial: list,
+    top_n: int,
+    limit: int,
+    db: Session,
+) -> list:
+    """岗位搜索 0/低召回时的分步 fallback。
+
+    Step 1: 薪资下限放宽 10%
+    Step 2: 同时去掉可选硬过滤（gender / is_long_term / age）
+    """
+    best = initial
+    steps: list[tuple[str, dict]] = []
+
+    salary = criteria.get("salary_floor_monthly")
     if salary is not None:
-        relaxed["salary_floor_monthly"] = math.floor(salary * 0.9)
-    return _query_jobs(relaxed, limit, db)
+        relaxed_salary = dict(criteria)
+        relaxed_salary["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        steps.append(("relax_salary_10pct", relaxed_salary))
+
+    drop_optional = _strip_optional_filters(criteria, _OPTIONAL_HARD_FILTERS_JOB)
+    if drop_optional != criteria:
+        # 同时叠加薪资放宽，最大化命中
+        if salary is not None:
+            drop_optional["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        steps.append(("drop_optional_filters", drop_optional))
+
+    for step_name, step_criteria in steps:
+        candidates = _query_jobs(step_criteria, limit, db)
+        log_event(
+            "search_fallback_applied",
+            direction="search_job",
+            step=step_name,
+            candidate_count=len(candidates),
+            previous_count=len(best),
+            criteria_keys=sorted(step_criteria.keys()),
+        )
+        if len(candidates) > len(best):
+            best = candidates
+            if len(best) >= top_n:
+                break
+    return best
 
 
-def _try_relaxed_resume_search(criteria: dict, limit: int, db: Session) -> list:
-    """薪资上限放宽 10%（单次）。"""
-    relaxed = dict(criteria)
-    salary = relaxed.get("salary_ceiling_monthly")
+def _run_resume_fallback_steps(
+    criteria: dict,
+    initial: list,
+    top_n: int,
+    limit: int,
+    db: Session,
+) -> list:
+    """简历搜索 0/低召回时的分步 fallback。
+
+    Step 1: 薪资上限放宽 10%
+    Step 2: 同时去掉可选硬过滤（gender / age）
+    """
+    best = initial
+    steps: list[tuple[str, dict]] = []
+
+    salary = criteria.get("salary_ceiling_monthly")
     if salary is not None:
-        relaxed["salary_ceiling_monthly"] = math.ceil(salary * 1.1)
-    return _query_resumes(relaxed, limit, db)
+        relaxed_salary = dict(criteria)
+        relaxed_salary["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        steps.append(("relax_salary_10pct", relaxed_salary))
+
+    drop_optional = _strip_optional_filters(criteria, _OPTIONAL_HARD_FILTERS_RESUME)
+    if drop_optional != criteria:
+        if salary is not None:
+            drop_optional["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        steps.append(("drop_optional_filters", drop_optional))
+
+    for step_name, step_criteria in steps:
+        candidates = _query_resumes(step_criteria, limit, db)
+        log_event(
+            "search_fallback_applied",
+            direction="search_worker",
+            step=step_name,
+            candidate_count=len(candidates),
+            previous_count=len(best),
+            criteria_keys=sorted(step_criteria.keys()),
+        )
+        if len(candidates) > len(best):
+            best = candidates
+            if len(best) >= top_n:
+                break
+    return best
+
+
+def _strip_optional_filters(criteria: dict, optional_keys: tuple[str, ...]) -> dict:
+    """返回去掉指定可选硬过滤字段后的新 criteria；保留 city / job_category / 薪资。"""
+    stripped = dict(criteria)
+    for key in optional_keys:
+        stripped.pop(key, None)
+    return stripped
 
 
 # ---------------------------------------------------------------------------
