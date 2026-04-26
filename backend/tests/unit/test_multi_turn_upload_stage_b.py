@@ -284,18 +284,22 @@ class TestJobFallbackSteps:
         mock_query.return_value = [MagicMock()] * 3
         criteria = {"city": ["北京"], "job_category": ["餐饮"], "salary_floor_monthly": 8000}
         out = _run_job_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert len(out) == 3
+        assert len(out.candidates) == 3
+        assert out.applied_step == "relax_salary_10pct"
+        assert out.suggestions == []
         # 第一次的 criteria 应当是放宽过的
         called_criteria = mock_query.call_args_list[0][0][0]
         assert called_criteria["salary_floor_monthly"] == 7200  # 8000 * 0.9
 
     @patch("app.services.search_service._query_jobs")
     def test_no_better_result_keeps_initial(self, mock_query):
-        # fallback 始终没召回；保留 initial（空）
+        # fallback 始终没召回；保留 initial（空），suggestions 也空
         mock_query.return_value = []
         criteria = {"city": ["北京"], "job_category": ["餐饮"], "salary_floor_monthly": 8000}
         out = _run_job_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert out == []
+        assert out.candidates == []
+        assert out.applied_step is None
+        assert out.suggestions == []
 
     @patch("app.services.search_service._query_jobs")
     def test_drop_optional_filters_step(self, mock_query):
@@ -306,7 +310,8 @@ class TestJobFallbackSteps:
             "salary_floor_monthly": 8000, "gender_required": "男",
         }
         out = _run_job_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert len(out) == 2
+        assert len(out.candidates) == 2
+        assert out.applied_step == "drop_optional_filters"
         # 第二次 drop_optional 应该不再带 gender_required
         second_criteria = mock_query.call_args_list[1][0][0]
         assert "gender_required" not in second_criteria
@@ -318,7 +323,8 @@ class TestResumeFallbackSteps:
         mock_query.return_value = [MagicMock()] * 3
         criteria = {"city": ["北京"], "job_category": ["餐饮"], "salary_ceiling_monthly": 5000}
         out = _run_resume_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert len(out) == 3
+        assert len(out.candidates) == 3
+        assert out.applied_step == "relax_salary_10pct"
         called = mock_query.call_args_list[0][0][0]
         assert called["salary_ceiling_monthly"] == 5500  # ceil(5000 * 1.1)
 
@@ -675,7 +681,8 @@ class TestFixP3JobCategoryBroadening:
         mock_query.side_effect = fake_query
         criteria = {"city": ["北京"], "job_category": ["厨师"]}
         out = _run_job_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert len(out) == 2
+        assert len(out.candidates) == 2
+        assert out.applied_step == "broaden_job_category"
 
     @patch("app.services.search_service._query_resumes")
     def test_resume_fallback_step_uses_broadening(self, mock_query):
@@ -687,7 +694,8 @@ class TestFixP3JobCategoryBroadening:
         mock_query.side_effect = fake_query
         criteria = {"city": ["北京"], "job_category": ["厨师"]}
         out = _run_resume_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
-        assert len(out) == 1
+        assert len(out.candidates) == 1
+        assert out.applied_step == "broaden_job_category"
 
 
 class TestSetBrokerDirectionPreservesPending:

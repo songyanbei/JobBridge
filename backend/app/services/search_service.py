@@ -8,7 +8,7 @@ Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -38,6 +38,34 @@ NO_WORKER_MATCH_REPLY = (
     "暂未找到匹配的求职者。可以放宽城市或工种条件，"
     "或补充期望年龄、经验等限制让我重新筛选。"
 )
+
+# Bug 3：fallback 采纳某步后，给搜索结果加的前缀提示。
+# 这样用户能看到"系统自动放宽了什么"，而不是把结果当成原条件命中。
+_FALLBACK_NOTICE_JOB = {
+    "relax_salary_10pct": "原条件无匹配，已自动把薪资下限放宽 10% 后重新搜索。",
+    "broaden_job_category": "原条件无匹配，已自动把工种放宽到大类后重新搜索。",
+    "drop_optional_filters": "原条件无匹配，已自动去掉部分次要条件后重新搜索。",
+}
+_FALLBACK_NOTICE_RESUME = {
+    "relax_salary_10pct": "原条件无匹配，已自动把期望薪资上限放宽 10% 后重新搜索。",
+    "broaden_job_category": "原条件无匹配，已自动把工种放宽到大类后重新搜索。",
+    "drop_optional_filters": "原条件无匹配，已自动去掉部分次要条件后重新搜索。",
+}
+
+# Bug 3：所有温和放宽都 0 召回时，再做激进探查给用户做"建议方向"。
+# 探查步只产出 suggestions（不采纳为结果），所以即使去掉薪资/工种也不会
+# 让用户在不知情下看到不符合原意的岗位。
+_SUGGESTION_LABEL_JOB = {
+    "drop_salary": "不限薪资",
+    "drop_job_category": "不限工种",
+    "keep_city_only": "只保留城市",
+}
+_SUGGESTION_LABEL_RESUME = {
+    "drop_salary_ceiling": "不限期望薪资",
+    "drop_job_category": "不限工种",
+    "keep_city_only": "只保留城市",
+}
+_MAX_SUGGESTIONS = 3
 
 
 def _rerank_with_logging(
@@ -116,6 +144,31 @@ class SearchResult:
     result_count: int = 0
 
 
+@dataclass(frozen=True)
+class FallbackSuggestion:
+    """激进放宽探查命中的方向（Bug 3）。
+
+    仅用于文案提示，不会自动用这个 criteria 返回结果——避免把不符原意的
+    岗位/简历当作"找到的"展示给用户。
+    """
+    step: str           # _SUGGESTION_LABEL_* 中的 key
+    criteria: dict      # 探查时使用的 criteria（拷贝，外部不要 mutate）
+    count: int          # 该 criteria 下的候选数（≥1 才会进 suggestions）
+
+
+@dataclass
+class FallbackOutcome:
+    """fallback 步骤的结构化产物（Bug 3）。
+
+    - candidates：最终选用的候选列表（沿用既有"严格更优才采纳"语义）
+    - applied_step：哪一步被采纳；None 表示用原 criteria 命中或全部 0 召回
+    - suggestions：当 candidates 为空时探查到的激进放宽方向（已确认 ≥1）
+    """
+    candidates: list
+    applied_step: str | None = None
+    suggestions: list[FallbackSuggestion] = field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
@@ -136,12 +189,23 @@ def search_jobs(
     candidates = _query_jobs(criteria, max_candidates, db)
 
     # Stage B（§3.4）：0 命中或低召回时按显式 fallback 步骤逐步放宽
+    # Bug 3：fallback 返回 FallbackOutcome，记录采纳步骤 + 0 召回时的建议方向
     if len(candidates) < top_n:
-        candidates = _run_job_fallback_steps(
+        outcome = _run_job_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
+        candidates = outcome.candidates
+    else:
+        outcome = FallbackOutcome(candidates=candidates)
 
     if not candidates:
+        if outcome.suggestions:
+            return SearchResult(
+                reply_text=_format_no_match_with_suggestions_job(
+                    criteria, outcome.suggestions,
+                ),
+                result_count=0,
+            )
         return SearchResult(
             reply_text=NO_JOB_MATCH_REPLY,
             result_count=0,
@@ -192,6 +256,10 @@ def search_jobs(
     # 格式化
     remaining = conversation_service.get_remaining_count(session)
     reply = _format_job_results(filtered, remaining)
+    if outcome.applied_step:
+        notice = _FALLBACK_NOTICE_JOB.get(outcome.applied_step)
+        if notice:
+            reply = f"{notice}\n\n{reply}"
 
     return SearchResult(
         reply_text=reply,
@@ -215,11 +283,21 @@ def search_workers(
     candidates = _query_resumes(criteria, max_candidates, db)
 
     if len(candidates) < top_n:
-        candidates = _run_resume_fallback_steps(
+        outcome = _run_resume_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
+        candidates = outcome.candidates
+    else:
+        outcome = FallbackOutcome(candidates=candidates)
 
     if not candidates:
+        if outcome.suggestions:
+            return SearchResult(
+                reply_text=_format_no_match_with_suggestions_resume(
+                    criteria, outcome.suggestions,
+                ),
+                result_count=0,
+            )
         return SearchResult(
             reply_text=NO_WORKER_MATCH_REPLY,
             result_count=0,
@@ -263,6 +341,10 @@ def search_workers(
 
     remaining = conversation_service.get_remaining_count(session)
     reply = _format_resume_results(filtered, remaining)
+    if outcome.applied_step:
+        notice = _FALLBACK_NOTICE_RESUME.get(outcome.applied_step)
+        if notice:
+            reply = f"{notice}\n\n{reply}"
 
     return SearchResult(
         reply_text=reply,
@@ -491,14 +573,18 @@ def _run_job_fallback_steps(
     top_n: int,
     limit: int,
     db: Session,
-) -> list:
+) -> FallbackOutcome:
     """岗位搜索 0/低召回时的分步 fallback。
 
     Step 1: 薪资下限放宽 10%
     Step 2: 工种细分类/口语化值 → canonical 大类（spec §3.4 Step 3）
     Step 3: 去掉可选硬过滤（gender / is_long_term / age），叠加薪资放宽
+
+    Bug 3：返回结构化 FallbackOutcome，包含 applied_step 用于 reply 前缀；
+    若所有温和步骤仍 0 召回，再激进探查并产出 suggestions。
     """
     best = initial
+    applied_step: str | None = None
     steps: list[tuple[str, dict]] = []
 
     salary = criteria.get("salary_floor_monthly")
@@ -533,9 +619,19 @@ def _run_job_fallback_steps(
         )
         if len(candidates) > len(best):
             best = candidates
+            applied_step = step_name
             if len(best) >= top_n:
                 break
-    return best
+
+    suggestions: list[FallbackSuggestion] = []
+    if not best:
+        suggestions = _probe_job_suggestions(criteria, limit, db)
+
+    return FallbackOutcome(
+        candidates=best,
+        applied_step=applied_step,
+        suggestions=suggestions,
+    )
 
 
 def _run_resume_fallback_steps(
@@ -544,7 +640,7 @@ def _run_resume_fallback_steps(
     top_n: int,
     limit: int,
     db: Session,
-) -> list:
+) -> FallbackOutcome:
     """简历搜索 0/低召回时的分步 fallback。
 
     Step 1: 薪资上限放宽 10%
@@ -552,6 +648,7 @@ def _run_resume_fallback_steps(
     Step 3: 去掉可选硬过滤（gender / age），叠加薪资放宽
     """
     best = initial
+    applied_step: str | None = None
     steps: list[tuple[str, dict]] = []
 
     salary = criteria.get("salary_ceiling_monthly")
@@ -585,9 +682,107 @@ def _run_resume_fallback_steps(
         )
         if len(candidates) > len(best):
             best = candidates
+            applied_step = step_name
             if len(best) >= top_n:
                 break
-    return best
+
+    suggestions: list[FallbackSuggestion] = []
+    if not best:
+        suggestions = _probe_resume_suggestions(criteria, limit, db)
+
+    return FallbackOutcome(
+        candidates=best,
+        applied_step=applied_step,
+        suggestions=suggestions,
+    )
+
+
+def _probe_job_suggestions(
+    criteria: dict,
+    limit: int,
+    db: Session,
+) -> list[FallbackSuggestion]:
+    """温和放宽全 0 后，探查激进方向给用户做选择（Bug 3）。
+
+    探查步本身不采纳为结果，仅用于"建议方向"文案；保留 has_effective_search_criteria
+    守卫，防全表召回。
+    """
+    probes: list[tuple[str, dict]] = []
+
+    if criteria.get("salary_floor_monthly") is not None:
+        c = dict(criteria)
+        c.pop("salary_floor_monthly", None)
+        c.pop("salary_ceiling_monthly", None)  # 一起去掉，避免上下限"冲突"
+        probes.append(("drop_salary", c))
+
+    if criteria.get("job_category"):
+        c = dict(criteria)
+        c.pop("job_category", None)
+        probes.append(("drop_job_category", c))
+
+    cities = criteria.get("city")
+    if cities:
+        c = {"city": cities}
+        # 跳过与原 criteria 等价（无实际放宽）或与已有 probe 重复的方向
+        if c != criteria and all(c != prev_c for _, prev_c in probes):
+            probes.append(("keep_city_only", c))
+
+    return _collect_suggestions(probes, limit, db, _query_jobs, "search_job")
+
+
+def _probe_resume_suggestions(
+    criteria: dict,
+    limit: int,
+    db: Session,
+) -> list[FallbackSuggestion]:
+    probes: list[tuple[str, dict]] = []
+
+    if criteria.get("salary_ceiling_monthly") is not None:
+        c = dict(criteria)
+        c.pop("salary_ceiling_monthly", None)
+        probes.append(("drop_salary_ceiling", c))
+
+    if criteria.get("job_category"):
+        c = dict(criteria)
+        c.pop("job_category", None)
+        probes.append(("drop_job_category", c))
+
+    cities = criteria.get("city")
+    if cities:
+        c = {"city": cities}
+        if c != criteria and all(c != prev_c for _, prev_c in probes):
+            probes.append(("keep_city_only", c))
+
+    return _collect_suggestions(probes, limit, db, _query_resumes, "search_worker")
+
+
+def _collect_suggestions(
+    probes: list[tuple[str, dict]],
+    limit: int,
+    db: Session,
+    query_fn,
+    direction: str,
+) -> list[FallbackSuggestion]:
+    """跑探查并打日志，返回命中数 ≥1 的方向，按命中数降序，截到 _MAX_SUGGESTIONS。"""
+    suggestions: list[FallbackSuggestion] = []
+    for name, c in probes:
+        # 安全护栏：city / job_category 至少一个非空才允许查询
+        if not has_effective_search_criteria(c):
+            continue
+        cands = query_fn(c, limit, db)
+        log_event(
+            "search_suggestion_probed",
+            direction=direction,
+            step=name,
+            candidate_count=len(cands),
+            criteria_keys=sorted(c.keys()),
+        )
+        if cands:
+            suggestions.append(
+                FallbackSuggestion(step=name, criteria=c, count=len(cands)),
+            )
+    suggestions.sort(key=lambda s: s.count, reverse=True)
+    return suggestions[:_MAX_SUGGESTIONS]
 
 
 def _strip_optional_filters(criteria: dict, optional_keys: tuple[str, ...]) -> dict:
@@ -845,6 +1040,62 @@ def _format_resume_results(resumes: list[dict], remaining: int) -> str:
     if remaining > 0:
         lines.append(f'还有 {remaining} 位相关求职者，回复"更多"继续查看')
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Bug 3：0 命中 + 有 suggestions 时的文案
+# ---------------------------------------------------------------------------
+
+def _summarize_search_criteria(criteria: dict, salary_key: str) -> str:
+    """把原 criteria 渲染为简短摘要（"北京·餐饮·≥2200"），供"原条件下没有匹配"前置语用。"""
+    parts: list[str] = []
+    cities = criteria.get("city") or []
+    if isinstance(cities, str):
+        cities = [cities]
+    if cities:
+        parts.append("/".join(str(c) for c in cities[:2]))
+    cats = criteria.get("job_category") or []
+    if isinstance(cats, str):
+        cats = [cats]
+    if cats:
+        parts.append("/".join(str(c) for c in cats[:2]))
+    salary = criteria.get(salary_key)
+    if salary is not None:
+        prefix = "≥" if salary_key == "salary_floor_monthly" else "≤"
+        parts.append(f"{prefix}{salary}")
+    return "·".join(parts) if parts else "当前条件"
+
+
+def _format_no_match_with_suggestions_job(
+    criteria: dict,
+    suggestions: list[FallbackSuggestion],
+) -> str:
+    summary = _summarize_search_criteria(criteria, "salary_floor_monthly")
+    lines = [
+        f"原条件（{summary}）下没有匹配的岗位。",
+        "可以放宽以下方向（已确认有结果）：",
+    ]
+    for i, s in enumerate(suggestions, 1):
+        label = _SUGGESTION_LABEL_JOB.get(s.step, s.step)
+        lines.append(f"{i}. {label} —— 约 {s.count} 条")
+    lines.append('告诉我您想换哪种条件，比如"不限薪资重新搜"。')
+    return "\n".join(lines)
+
+
+def _format_no_match_with_suggestions_resume(
+    criteria: dict,
+    suggestions: list[FallbackSuggestion],
+) -> str:
+    summary = _summarize_search_criteria(criteria, "salary_ceiling_monthly")
+    lines = [
+        f"原条件（{summary}）下没有匹配的求职者。",
+        "可以放宽以下方向（已确认有结果）：",
+    ]
+    for i, s in enumerate(suggestions, 1):
+        label = _SUGGESTION_LABEL_RESUME.get(s.step, s.step)
+        lines.append(f"{i}. {label} —— 约 {s.count} 位")
+    lines.append('告诉我您想换哪种条件，比如"不限期望薪资重新搜"。')
     return "\n".join(lines)
 
 
