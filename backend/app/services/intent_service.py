@@ -68,6 +68,10 @@ _COMMAND_MAP: dict[str, str] = {
     "客服": "human_agent",
     "转人工": "human_agent",
     "联系人工": "human_agent",
+    # Stage B P1-2：注册 /取消 为命令以闭合 LLM 误判 intent=command 的旁路。
+    # 自然语言 "取消"/"算了" 等仍由 message_router._is_cancel 在 pending guard
+    # 内处理（见 docs/multi-turn-upload-session-state.md §9.3）。
+    "/取消": "cancel_pending",
 }
 
 # 允许参数的命令前缀（命令 + 空格 + 参数）

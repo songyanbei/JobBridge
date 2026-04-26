@@ -495,7 +495,8 @@ def _run_job_fallback_steps(
     """岗位搜索 0/低召回时的分步 fallback。
 
     Step 1: 薪资下限放宽 10%
-    Step 2: 同时去掉可选硬过滤（gender / is_long_term / age）
+    Step 2: 工种细分类/口语化值 → canonical 大类（spec §3.4 Step 3）
+    Step 3: 去掉可选硬过滤（gender / is_long_term / age），叠加薪资放宽
     """
     best = initial
     steps: list[tuple[str, dict]] = []
@@ -506,11 +507,18 @@ def _run_job_fallback_steps(
         relaxed_salary["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
         steps.append(("relax_salary_10pct", relaxed_salary))
 
+    broadened = _broaden_job_categories(criteria)
+    if broadened is not None:
+        steps.append(("broaden_job_category", broadened))
+
     drop_optional = _strip_optional_filters(criteria, _OPTIONAL_HARD_FILTERS_JOB)
     if drop_optional != criteria:
-        # 同时叠加薪资放宽，最大化命中
+        # 同时叠加薪资放宽和大类放宽，最大化命中
         if salary is not None:
             drop_optional["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        broadened_drop = _broaden_job_categories(drop_optional)
+        if broadened_drop is not None:
+            drop_optional = broadened_drop
         steps.append(("drop_optional_filters", drop_optional))
 
     for step_name, step_criteria in steps:
@@ -540,7 +548,8 @@ def _run_resume_fallback_steps(
     """简历搜索 0/低召回时的分步 fallback。
 
     Step 1: 薪资上限放宽 10%
-    Step 2: 同时去掉可选硬过滤（gender / age）
+    Step 2: 工种细分类/口语化值 → canonical 大类（spec §3.4 Step 3）
+    Step 3: 去掉可选硬过滤（gender / age），叠加薪资放宽
     """
     best = initial
     steps: list[tuple[str, dict]] = []
@@ -551,10 +560,17 @@ def _run_resume_fallback_steps(
         relaxed_salary["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
         steps.append(("relax_salary_10pct", relaxed_salary))
 
+    broadened = _broaden_job_categories(criteria)
+    if broadened is not None:
+        steps.append(("broaden_job_category", broadened))
+
     drop_optional = _strip_optional_filters(criteria, _OPTIONAL_HARD_FILTERS_RESUME)
     if drop_optional != criteria:
         if salary is not None:
             drop_optional["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        broadened_drop = _broaden_job_categories(drop_optional)
+        if broadened_drop is not None:
+            drop_optional = broadened_drop
         steps.append(("drop_optional_filters", drop_optional))
 
     for step_name, step_criteria in steps:
@@ -580,6 +596,42 @@ def _strip_optional_filters(criteria: dict, optional_keys: tuple[str, ...]) -> d
     for key in optional_keys:
         stripped.pop(key, None)
     return stripped
+
+
+def _broaden_job_categories(criteria: dict) -> dict | None:
+    """把 job_category 细分类/口语化值映射到 canonical 大类（spec §3.4 Step 3）。
+
+    复用 intent_service 的同义词字典。规整层若已在抽取阶段把 LLM 输出归一到大类，
+    本步是 no-op；当 criteria 来自 session.search_criteria 历史值、默认条件兜底
+    或未走规整层的旧数据时，才真正起作用。
+
+    Returns:
+        新的 criteria dict（job_category 已映射 + 去重）；若无任何变化则返回 None
+        以便上层跳过该 fallback 步骤、避免重复查询。
+    """
+    cats = criteria.get("job_category")
+    if not cats:
+        return None
+    if isinstance(cats, str):
+        cats = [cats]
+    # 延迟 import 避免与 intent_service 的潜在循环依赖
+    from app.services.intent_service import _normalize_job_category_value
+
+    broadened: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for c in cats:
+        canonical = _normalize_job_category_value(c) or c
+        if canonical != c:
+            changed = True
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            broadened.append(canonical)
+    if not changed:
+        return None
+    out = dict(criteria)
+    out["job_category"] = broadened
+    return out
 
 
 # ---------------------------------------------------------------------------

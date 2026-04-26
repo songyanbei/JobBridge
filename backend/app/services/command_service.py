@@ -79,6 +79,11 @@ NO_FILLABLE_JOB = "未找到可标记招满的在线岗位。"
 UNKNOWN_COMMAND = "暂不支持该指令，输入 /帮助 查看可用命令。"
 ROLE_NOT_ALLOWED = "您的账号角色暂无权执行此命令。"
 
+# Stage B P1-2：/取消 命令文案。和 message_router 的 PENDING_CANCELLED_REPLY
+# 保持一致，避免出现两套"已取消"文案。
+CANCEL_PENDING_OK = "已取消，岗位草稿已丢弃。"
+CANCEL_PENDING_NO_DRAFT = "当前没有可取消的草稿。"
+
 
 # ---------------------------------------------------------------------------
 # 公开入口
@@ -123,6 +128,19 @@ def _handle_help(*, args: str, user_ctx: UserContext, session, db) -> list[Reply
 
 def _handle_human_agent(*, args: str, user_ctx: UserContext, session, db) -> list[ReplyMessage]:
     return [_reply(user_ctx, HUMAN_AGENT_TEXT)]
+
+
+def _handle_cancel_pending(
+    *, args: str, user_ctx: UserContext, session: SessionState | None, db,
+) -> list[ReplyMessage]:
+    """Stage B P1-2：/取消 命令。清空 pending upload 草稿，相当于 §9.3 的强规则
+    cancel 在 command 路径上的对偶实现。"""
+    if session is None or not session.pending_upload_intent:
+        return [_reply(user_ctx, CANCEL_PENDING_NO_DRAFT)]
+    from app.services import upload_service
+    upload_service.clear_pending_upload(session)
+    conversation_service.save_session(user_ctx.external_userid, session)
+    return [_reply(user_ctx, CANCEL_PENDING_OK)]
 
 
 def _handle_reset_search(
@@ -506,4 +524,5 @@ _HANDLERS = {
     "delete_my_data": _handle_delete_my_data,
     "human_agent": _handle_human_agent,
     "my_status": _handle_my_status,
+    "cancel_pending": _handle_cancel_pending,
 }

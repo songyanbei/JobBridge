@@ -25,15 +25,19 @@ from app.services import (
     upload_service,
 )
 from app.services.command_service import (
+    CANCEL_PENDING_NO_DRAFT,
+    CANCEL_PENDING_OK,
     RESET_SEARCH_EMPTY,
     RESET_SEARCH_PENDING_FMT,
     RESET_SEARCH_SUCCESS,
     SWITCH_DIRECTION_PENDING_FMT,
     SWITCH_JOB_OK,
 )
+from app.services.intent_service import _match_command
 from app.services.search_service import (
     NO_JOB_MATCH_REPLY,
     NO_WORKER_MATCH_REPLY,
+    _broaden_job_categories,
     _run_job_fallback_steps,
     _run_resume_fallback_steps,
     _strip_optional_filters,
@@ -545,6 +549,119 @@ class TestFixP2BrokerDirectionPending:
         # 没 pending，照旧清零
         assert session.follow_up_rounds == 0
         assert replies[0].content == SWITCH_JOB_OK
+
+
+class TestFixP1CancelCommandClearsPending:
+    """P1-2 回归：/取消 注册为 command + cancel_pending handler 清 pending。"""
+
+    def test_match_command_routes_slash_cancel(self):
+        # 闭合 LLM 误判旁路：deterministic _match_command 必须先于 LLM
+        assert _match_command("/取消") == ("cancel_pending", "")
+
+    @patch("app.services.command_service.conversation_service.save_session")
+    def test_cancel_pending_handler_clears_pending(self, _save):
+        ctx = UserContext(
+            external_userid="u1", role="factory", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=False, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(
+            role="factory",
+            pending_upload={"city": "北京市"},
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            pending_raw_text_parts=["北京饭店招聘厨师"],
+            follow_up_rounds=1,
+        )
+        replies = command_service.execute(
+            "cancel_pending", "", ctx, session, MagicMock(),
+        )
+        assert replies[0].content == CANCEL_PENDING_OK
+        assert session.pending_upload == {}
+        assert session.pending_upload_intent is None
+        assert session.awaiting_field is None
+        assert session.pending_raw_text_parts == []
+        assert session.follow_up_rounds == 0
+
+    def test_cancel_pending_no_draft(self):
+        ctx = UserContext(
+            external_userid="u1", role="factory", status="active",
+            display_name="X", company=None, contact_person=None, phone=None,
+            can_search_jobs=False, can_search_workers=True,
+            is_first_touch=False, should_welcome=False,
+        )
+        session = SessionState(role="factory")
+        replies = command_service.execute(
+            "cancel_pending", "", ctx, session, MagicMock(),
+        )
+        assert replies[0].content == CANCEL_PENDING_NO_DRAFT
+
+
+class TestFixP3JobCategoryBroadening:
+    """P3 回归：fallback 把工种细分类映射到 canonical 大类。"""
+
+    def test_broaden_maps_chef_to_catering(self):
+        out = _broaden_job_categories({"city": ["北京"], "job_category": ["厨师"]})
+        assert out == {"city": ["北京"], "job_category": ["餐饮"]}
+
+    def test_broaden_str_value(self):
+        out = _broaden_job_categories({"city": ["北京"], "job_category": "打包"})
+        assert out["job_category"] == ["物流仓储"]
+
+    def test_broaden_dedup_canonical(self):
+        out = _broaden_job_categories(
+            {"city": ["北京"], "job_category": ["厨师", "服务员", "餐饮"]},
+        )
+        # 全部映射到 餐饮，去重后只剩一个
+        assert out["job_category"] == ["餐饮"]
+
+    def test_broaden_no_change_when_already_canonical(self):
+        out = _broaden_job_categories(
+            {"city": ["北京"], "job_category": ["餐饮"]},
+        )
+        assert out is None
+
+    def test_broaden_no_change_when_no_synonym(self):
+        out = _broaden_job_categories(
+            {"city": ["北京"], "job_category": ["月嫂"]},
+        )
+        # 月嫂 不在同义词字典里，保留原值，不算变化
+        assert out is None
+
+    def test_broaden_none_when_empty(self):
+        assert _broaden_job_categories({"city": ["北京"]}) is None
+        assert _broaden_job_categories({"job_category": []}) is None
+
+    @patch("app.services.search_service._query_jobs")
+    def test_fallback_step_uses_broadening_to_recover(self, mock_query):
+        # 模拟 codex 复现：DB 仅在 job_category=餐饮 时命中。
+        # initial 用 厨师 查 → 0；fallback Step "broaden_job_category" 命中
+        def fake_query(criteria, *args, **kwargs):
+            cats = criteria.get("job_category") or []
+            if isinstance(cats, str):
+                cats = [cats]
+            if "餐饮" in cats:
+                return [MagicMock(), MagicMock()]
+            return []
+        mock_query.side_effect = fake_query
+        criteria = {"city": ["北京"], "job_category": ["厨师"]}
+        out = _run_job_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
+        assert len(out) == 2
+
+    @patch("app.services.search_service._query_resumes")
+    def test_resume_fallback_step_uses_broadening(self, mock_query):
+        def fake_query(criteria, *args, **kwargs):
+            cats = criteria.get("job_category") or []
+            if isinstance(cats, str):
+                cats = [cats]
+            return [MagicMock()] if "餐饮" in cats else []
+        mock_query.side_effect = fake_query
+        criteria = {"city": ["北京"], "job_category": ["厨师"]}
+        out = _run_resume_fallback_steps(criteria, [], top_n=3, limit=50, db=MagicMock())
+        assert len(out) == 1
 
 
 class TestSetBrokerDirectionPreservesPending:
