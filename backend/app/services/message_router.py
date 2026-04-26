@@ -695,8 +695,11 @@ def _handle_search(
     if new_criteria:
         session.search_criteria = {**session.search_criteria, **new_criteria}
 
-    # 必填字段不齐 → 追问
-    missing = list(intent_result.missing_fields or [])
+    # Bug 1 修复：合并后再判 missing。LLM 在短文本上会把已知字段错误地标进
+    # missing_fields（如用户说"西安有吗"时，session 已有 job_category="餐饮"
+    # 但 LLM 仍标 job_category 为 missing），需要按合并后的 session.search_criteria
+    # 复核——已填字段从 missing 里剔除。详见 _compute_search_missing。
+    missing = _compute_search_missing(intent_result, session)
     if missing:
         return [_reply(
             msg.from_user,
@@ -1286,6 +1289,49 @@ def _resolve_search_direction(
         return session.broker_direction or "search_job"
     # factory
     return "search_worker"
+
+
+def _is_field_filled(criteria: dict, field: str) -> bool:
+    """判断 criteria 中某字段是否已经有"有效值"。
+
+    - 缺 key / None → 未填
+    - 空 list / 空 str / 空 dict → 未填（避免 city=[] 被当作已填）
+    - 0 / False → 已填（薪资 0、provide_meal=False 都是合法值）
+    """
+    if field not in criteria:
+        return False
+    val = criteria[field]
+    if val is None:
+        return False
+    if isinstance(val, (list, str, dict)) and not val:
+        return False
+    return True
+
+
+def _compute_search_missing(
+    intent_result: IntentResult,
+    session: SessionState,
+) -> list[str]:
+    """LLM 给的 missing_fields 中，剔除 session.search_criteria 里已有值的字段。
+
+    LLM 在短文本上常误把已知字段标进 missing（例：用户说"西安有吗"，
+    session 已有 job_category="餐饮" 但 LLM 仍报 missing=["job_category"]）。
+
+    注意：这里**不**做空 criteria 兜底（min_required）。Stage B P1-1 显式要求
+    _handle_search 不在空 criteria 时短路——worker 的简历默认条件需要在下游
+    _run_search → _apply_default_criteria 才能注入；最终的安全网由
+    search_service.has_effective_search_criteria 把守。
+    """
+    criteria = session.search_criteria or {}
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for f in (intent_result.missing_fields or []):
+        if f in seen or _is_field_filled(criteria, f):
+            continue
+        seen.add(f)
+        result.append(f)
+    return result
 
 
 def _missing_follow_up_text(missing: list[str]) -> str:
