@@ -387,3 +387,233 @@ class TestBuildWelcome:
     def test_broker_welcome_with_name(self):
         text = _build_welcome(_ctx(role="broker"))
         assert "中介" in text
+
+
+# ---------------------------------------------------------------------------
+# Bug 1 — search 路径的 missing_fields 合并后复核
+# ---------------------------------------------------------------------------
+
+class TestIsFieldFilled:
+    def test_missing_key_is_not_filled(self):
+        assert message_router._is_field_filled({}, "city") is False
+
+    def test_none_is_not_filled(self):
+        assert message_router._is_field_filled({"city": None}, "city") is False
+
+    def test_empty_list_is_not_filled(self):
+        assert message_router._is_field_filled({"city": []}, "city") is False
+
+    def test_empty_string_is_not_filled(self):
+        assert message_router._is_field_filled({"city": ""}, "city") is False
+
+    def test_zero_is_filled(self):
+        # salary_floor_monthly=0 是合法值，不能算缺失
+        assert message_router._is_field_filled({"salary_floor_monthly": 0}, "salary_floor_monthly") is True
+
+    def test_false_is_filled(self):
+        # provide_meal=False 是合法值
+        assert message_router._is_field_filled({"provide_meal": False}, "provide_meal") is True
+
+    def test_non_empty_list_is_filled(self):
+        assert message_router._is_field_filled({"city": ["北京市"]}, "city") is True
+
+
+class TestComputeSearchMissing:
+    """Bug 1：合并后必须按 session.search_criteria 复核 LLM 给的 missing_fields。"""
+
+    def test_llm_missing_filtered_against_session(self):
+        # 用户先搜了"北京·餐饮·≥2200"，session 已有；现在说"西安有吗"，
+        # LLM 错误地把 job_category 标进 missing。
+        session = SessionState(
+            role="worker",
+            search_criteria={
+                "city": ["西安市"],
+                "job_category": ["餐饮"],
+                "salary_floor_monthly": 2200,
+            },
+        )
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={"city": ["西安市"]},
+            missing_fields=["job_category"],
+            confidence=0.7,
+        )
+        assert message_router._compute_search_missing(intent, session) == []
+
+    def test_empty_missing_returns_empty(self):
+        # 空 session + LLM 报 missing=[] → 不在这里兜底，下游 has_effective_search_criteria
+        # 兜（worker 简历默认条件需要在 _apply_default_criteria 里注入，Stage B P1-1）
+        session = SessionState(role="worker", search_criteria={})
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=[],
+            confidence=0.3,
+        )
+        assert message_router._compute_search_missing(intent, session) == []
+
+    def test_partial_session_keeps_unfilled_llm_missing(self):
+        # session 只有 city，LLM 报 missing=[job_category] → 保留 job_category（未填）
+        session = SessionState(
+            role="worker",
+            search_criteria={"city": ["北京市"]},
+        )
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["job_category"],
+            confidence=0.5,
+        )
+        assert message_router._compute_search_missing(intent, session) == ["job_category"]
+
+    def test_llm_extra_missing_field_kept_when_session_empty(self):
+        # LLM 主动追问 salary_floor_monthly（不在 min_required），session 没填 → 保留
+        session = SessionState(
+            role="worker",
+            search_criteria={"city": ["北京市"], "job_category": ["餐饮"]},
+        )
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["salary_floor_monthly"],
+            confidence=0.6,
+        )
+        assert message_router._compute_search_missing(intent, session) == ["salary_floor_monthly"]
+
+    def test_llm_extra_missing_field_dropped_when_session_has_it(self):
+        # 同上，但 session 已有 salary → 不再问
+        session = SessionState(
+            role="worker",
+            search_criteria={
+                "city": ["北京市"],
+                "job_category": ["餐饮"],
+                "salary_floor_monthly": 3000,
+            },
+        )
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["salary_floor_monthly"],
+            confidence=0.6,
+        )
+        assert message_router._compute_search_missing(intent, session) == []
+
+    def test_dedupes_repeated_llm_missing(self):
+        session = SessionState(role="worker", search_criteria={})
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["city", "city", "job_category"],
+            confidence=0.4,
+        )
+        result = message_router._compute_search_missing(intent, session)
+        assert result == ["city", "job_category"]
+
+    def test_preserves_llm_order(self):
+        session = SessionState(role="worker", search_criteria={})
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["salary_floor_monthly", "city"],
+            confidence=0.4,
+        )
+        assert message_router._compute_search_missing(intent, session) == [
+            "salary_floor_monthly",
+            "city",
+        ]
+
+    def test_session_with_partial_complete_filters_all_llm_missing(self):
+        # Bug 1 复刻 turn 12："饭店服务员"单字段消息，session 已有 city
+        # → LLM 错误把 city 标 missing（短文本 hallucinate），应被过滤
+        session = SessionState(
+            role="worker",
+            search_criteria={"city": ["西安市"], "job_category": ["餐饮"]},
+        )
+        intent = IntentResult(
+            intent="search_job",
+            structured_data={"job_category": ["餐饮"]},
+            missing_fields=["city", "salary_floor_monthly"],
+            confidence=0.5,
+        )
+        # city 在 session → 剔除；salary 不在 session 也不在 min → 保留
+        assert message_router._compute_search_missing(intent, session) == [
+            "salary_floor_monthly",
+        ]
+
+
+class TestSearchMissingRecheckIntegration:
+    """通过 process() 端到端验证 Bug 1 修复在分发链路上生效。"""
+
+    def _setup(self, mock_id, mock_check, mock_active, mock_load, session):
+        mock_id.return_value = _ctx()
+        mock_check.return_value = None
+        mock_load.return_value = session
+
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_jobs")
+    def test_session_has_category_llm_says_missing_still_searches(
+        self, mock_search, mock_classify, mock_save, mock_load,
+        mock_id, mock_check, mock_active,
+    ):
+        # 复刻真实 bug：session 已有 job_category，LLM 仍标它 missing → 应该直接走搜索
+        session = SessionState(
+            role="worker",
+            search_criteria={
+                "city": ["北京市"],
+                "job_category": ["餐饮"],
+                "salary_floor_monthly": 2200,
+            },
+        )
+        self._setup(mock_id, mock_check, mock_active, mock_load, session)
+        mock_classify.return_value = IntentResult(
+            intent="search_job",
+            structured_data={"city": ["西安市"]},
+            missing_fields=["job_category"],
+            confidence=0.7,
+        )
+        sr = MagicMock()
+        sr.reply_text = "1 个岗位"
+        mock_search.return_value = sr
+
+        replies = process(_msg(content="西安有吗"), MagicMock())
+
+        assert replies[0].content == "1 个岗位"
+        mock_search.assert_called_once()
+
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_jobs")
+    def test_partial_recheck_keeps_truly_missing(
+        self, mock_search, mock_classify, mock_save, mock_load,
+        mock_id, mock_check, mock_active,
+    ):
+        # session 已有 city，LLM 报 missing=[city, job_category]：
+        # city 应被过滤，job_category 保留 → 仍追问 job_category
+        session = SessionState(
+            role="worker",
+            search_criteria={"city": ["北京市"]},
+        )
+        self._setup(mock_id, mock_check, mock_active, mock_load, session)
+        mock_classify.return_value = IntentResult(
+            intent="search_job",
+            structured_data={},
+            missing_fields=["city", "job_category"],
+            confidence=0.5,
+        )
+
+        replies = process(_msg(content="想找个活"), MagicMock())
+
+        assert "信息还不够完整" in replies[0].content
+        assert "工种" in replies[0].content
+        # 工作城市不应再问（session 已有"北京市"）
+        assert "工作城市" not in replies[0].content
+        mock_search.assert_not_called()
