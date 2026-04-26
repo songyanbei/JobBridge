@@ -25,17 +25,88 @@ MAX_HISTORY_MESSAGES = 12  # 最近 6 轮对话 = 12 条 message
 # ---------------------------------------------------------------------------
 
 def load_session(userid: str) -> SessionState | None:
-    """从 Redis 加载 session，不存在则返回 None。"""
+    """从 Redis 加载 session，不存在则返回 None。
+
+    Stage C1（spec §2.4）：
+      1. 推导：仅当 active_flow 缺失/None 时，按 pending_upload_intent / candidate_snapshot
+         一次性推导，避免每轮被旧字段反向污染状态机。
+      2. 状态修复：每次 load 都跑一次 self-healing，修正 active_flow 与扁平字段的不一致组合，
+         保证旧 session 的脏数据不会让 C1 路由错位。
+    """
     data = redis_get_session(userid)
     if data is None:
         return None
-    return SessionState(**data)
+    session = SessionState(**data)
+    if session.active_flow is None:
+        session.active_flow = _derive_active_flow(session)
+    _self_heal_active_flow(session)
+    return session
+
+
+def ensure_active_flow(session: SessionState) -> None:
+    """同 ``load_session`` 末尾的推导 + self-heal，但对外可独立调用。
+
+    用于：
+      1. 业务层（``message_router._handle_text``）在拿到 session 后兜底，
+         确保即便测试或非 Redis 路径绕过 load_session 也能让 active_flow 与
+         扁平字段保持一致。
+      2. C1 期间不与 ``load_session`` 互斥；二者都是 idempotent。
+    """
+    if session.active_flow is None:
+        session.active_flow = _derive_active_flow(session)
+    _self_heal_active_flow(session)
+
+
+def _derive_active_flow(session: SessionState) -> str:
+    """旧 session 反序列化后推导 active_flow（spec §2.4）。
+
+    判定依据严格按 pending_upload_intent / candidate_snapshot，不读 pending_upload dict
+    本身（Stage A 残留 dict 但 intent 被清的 zombie pending 应视为 idle）。
+    """
+    if session.pending_upload_intent:
+        return "upload_collecting"
+    if session.candidate_snapshot is not None:
+        return "search_active"
+    return "idle"
+
+
+def _self_heal_active_flow(session: SessionState) -> None:
+    """修正 active_flow 与扁平字段的不一致组合（spec §2.4）。
+
+    每次 load 都跑，仅做最小修复，不改变核心字段语义。
+    """
+    flow = session.active_flow
+    if flow == "upload_collecting" and not session.pending_upload_intent:
+        # zombie：草稿 intent 已被清空但 active_flow 没收敛
+        session.active_flow = "idle"
+        # 残留 pending_upload dict 一并清理，避免后续误读
+        if session.pending_upload:
+            from app.services import upload_service  # 避免循环依赖
+            upload_service.clear_pending_upload(session)
+        return
+    if flow == "idle" and (session.pending_upload or session.pending_upload_intent):
+        # active_flow=idle 但有残留 pending：以 active_flow 为准，清干净
+        if session.pending_upload_intent or session.pending_upload:
+            from app.services import upload_service
+            upload_service.clear_pending_upload(session)
+        return
+    if flow == "search_active" and session.candidate_snapshot is None:
+        # 没有快照就不能算 search_active，但保留 last_criteria
+        session.active_flow = "idle"
+        return
+    if flow == "upload_conflict" and not session.pending_interruption:
+        # interruption 丢失 → 回退到合理状态：还有 pending_upload 就回 collecting，否则 idle
+        if session.pending_upload_intent:
+            session.active_flow = "upload_collecting"
+        else:
+            session.active_flow = "idle"
+        return
 
 
 def create_session(userid: str, role: str) -> SessionState:
     """创建新的空 session。"""
     now = datetime.now(timezone.utc).isoformat()
-    return SessionState(role=role, updated_at=now)
+    return SessionState(role=role, updated_at=now, active_flow="idle")
 
 
 def save_session(userid: str, session: SessionState) -> None:
@@ -139,6 +210,8 @@ def reset_search(session: SessionState) -> None:
     if not has_pending:
         session.follow_up_rounds = 0
         session.current_intent = None
+        # Stage C1：无 pending 时，/重新找 收敛为 idle；有 pending 时保留 upload_collecting
+        session.active_flow = "idle"
     # history 清空（固定策略）
     session.history = []
 
@@ -272,6 +345,8 @@ def set_broker_direction(
     session.shown_items = []
     if not session.pending_upload_intent:
         session.follow_up_rounds = 0
+        # Stage C1：无 pending 时，方向切换后回 idle，等待下一次搜索把 active_flow 推进
+        session.active_flow = "idle"
     return None
 
 

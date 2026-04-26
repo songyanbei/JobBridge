@@ -188,6 +188,7 @@ def classify_intent(
     history: list[dict] | None = None,
     current_criteria: dict | None = None,
     user_msg_id: str | None = None,
+    session_hint: dict | None = None,
 ) -> IntentResult:
     """识别用户意图，按 显式命令 → show_more → LLM 的优先级。
 
@@ -196,6 +197,10 @@ def classify_intent(
     duration_ms / intent / user_msg_id / status。
     parse_failed 不再 raise，而是回落到 chitchat 以保持调用方（message_router）
     的现有容错路径；status 会反映真实失败类型以便运维分析。
+
+    Stage C1（spec §2.11）：``session_hint`` 仅作为占位形参，便于 prompt 后续
+    携带 active_flow / awaiting_field 等状态机信息。当前 provider 不消费它，
+    只在结构化日志里记录键名，避免一次性扩大 prompt 改动面。
     """
     stripped = text.strip()
 
@@ -266,6 +271,8 @@ def classify_intent(
             output_tokens=getattr(result, "output_tokens", None),
             user_msg_id=user_msg_id,
             status=status,
+            # Stage C1：仅记录 hint 包含哪些键，方便日后比较有/无 hint 的抽取质量
+            session_hint_keys=sorted(session_hint.keys()) if session_hint else None,
         )
 
     # parse_failed 的 fallback result 不需要再 sanitize（全空结构）
@@ -577,3 +584,23 @@ def _normalize_criteria_patch(patches: list[dict]) -> list[dict]:
 
         out.append({"op": op, "field": field, "value": value})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Stage C1：session_hint 构造（spec §2.11）
+# ---------------------------------------------------------------------------
+
+def build_session_hint(session) -> dict:
+    """根据当前 session 构造给 LLM 的 session_hint。
+
+    C1 仅作为占位 helper，让上游可以稳定调用；provider 暂不消费。
+    后续 prompt 若需要把 active_flow / awaiting_field 拼进去，由 provider 按需读取。
+    """
+    if session is None:
+        return {}
+    return {
+        "active_flow": getattr(session, "active_flow", None),
+        "awaiting_field": getattr(session, "awaiting_field", None),
+        "pending_upload_intent": getattr(session, "pending_upload_intent", None),
+        "pending_upload": dict(getattr(session, "pending_upload", {}) or {}),
+    }

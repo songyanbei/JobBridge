@@ -84,6 +84,9 @@ def _save_pending_upload(
                      or session.pending_raw_text_parts[-1] != text):
             session.pending_raw_text_parts.append(text)
 
+    # Stage C1（spec §9.1）：草稿创建/续写期间 active_flow 钉在 upload_collecting。
+    session.active_flow = "upload_collecting"
+
 
 def _build_final_raw_text(session: SessionState, current_raw_text: str) -> str:
     """构建入库时的 raw_text：parts + 当前轮去重拼接。"""
@@ -95,7 +98,11 @@ def _build_final_raw_text(session: SessionState, current_raw_text: str) -> str:
 
 
 def clear_pending_upload(session: SessionState) -> None:
-    """清空 Stage A 上传草稿过渡字段。"""
+    """清空 Stage A 上传草稿过渡字段。
+
+    Stage C1：同时复位 failed_patch_rounds、conflict_followup_rounds 与 active_flow。
+    调用方若希望保留 active_flow（例如随后转入 search_active），可在 clear 之后再行覆写。
+    """
     session.pending_upload = {}
     session.pending_upload_intent = None
     session.awaiting_field = None
@@ -104,6 +111,10 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_expires_at = None
     session.pending_raw_text_parts = []
     session.follow_up_rounds = 0
+    session.failed_patch_rounds = 0
+    session.conflict_followup_rounds = 0
+    session.pending_interruption = None
+    session.active_flow = "idle"
 
 
 def is_pending_upload_expired(session: SessionState) -> bool:
@@ -256,7 +267,12 @@ def attach_image(
     if not image_key:
         return "图片保存失败，请稍后重试。"
 
-    entity_type = _attach_target_entity_type(session.current_intent)
+    # Stage C1（spec §2.10）：优先 active_flow == "upload_collecting"，
+    # 回落 current_intent 兼容旧 session。C2 删除回落。
+    if session.active_flow == "upload_collecting" and session.pending_upload_intent:
+        entity_type = _attach_target_entity_type(session.pending_upload_intent)
+    else:
+        entity_type = _attach_target_entity_type(session.current_intent)
 
     model_cls = Job if entity_type == "job" else Resume
     now = datetime.now(timezone.utc)

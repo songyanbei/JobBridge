@@ -615,11 +615,14 @@ class TestExpiredHandlesNaiveDatetime:
 
 
 class TestPendingMaxRoundsFromFallback:
-    """P1 修复：pending 中连续答非所问应在 follow_up_rounds 达到 MAX 时清空草稿。
+    """P1 修复：pending 中连续答非所问应在计数达到 MAX 时清空草稿。
 
     Stage B P2-1：mock intent 改为 follow_up（"答非所问但不是闲聊"），
     chitchat 按 spec §9.8 不再消耗追问计数，由 TestFixP2ChitchatDoesNotBurnRounds
-    覆盖。这里保留"failed patch 触发 max rounds 退出"的原意。
+    覆盖。
+
+    Stage C1：max rounds 主退出依据已切换为 ``failed_patch_rounds``
+    （spec §2.6）。``follow_up_rounds`` 作为兼容计数器仍累加。
     """
 
     @patch("app.services.message_router.conversation_service.save_session")
@@ -638,7 +641,7 @@ class TestPendingMaxRoundsFromFallback:
     ):
         future = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
         now = datetime.now(timezone.utc).isoformat()
-        # follow_up_rounds 已经 = MAX (=2)
+        # Stage C1：failed_patch_rounds 已经 = 1，本轮再失败一次即触发退出
         session = SessionState(
             role="factory",
             pending_upload={"city": "北京市", "job_category": "餐饮"},
@@ -649,6 +652,7 @@ class TestPendingMaxRoundsFromFallback:
             pending_expires_at=future,
             pending_raw_text_parts=["第一段"],
             follow_up_rounds=upload_service.MAX_FOLLOW_UP_ROUNDS,
+            failed_patch_rounds=1,
         )
         mock_load.return_value = session
         mock_classify.return_value = IntentResult(

@@ -428,9 +428,12 @@ class TestFixP2ChitchatDoesNotBurnRounds:
     @patch("app.services.message_router.upload_service.is_pending_upload_expired",
            return_value=False)
     def test_chitchat_keeps_pending_and_counter(self, _):
+        """Stage C1：chitchat 在 upload_collecting 中既不递增 follow_up_rounds
+        也不递增 failed_patch_rounds（spec §9.8）。"""
         ctx = _ctx("factory")
         session = SessionState(
             role="factory",
+            active_flow="upload_collecting",
             pending_upload={"city": "北京市", "job_category": "餐饮", "salary_floor_monthly": 7500, "pay_type": "月薪"},
             pending_upload_intent="upload_job",
             awaiting_field="headcount",
@@ -438,14 +441,16 @@ class TestFixP2ChitchatDoesNotBurnRounds:
             pending_expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
             pending_raw_text_parts=["北京饭店招聘厨师"],
             follow_up_rounds=0,
+            failed_patch_rounds=0,
         )
         intent = IntentResult(intent="chitchat", structured_data={}, confidence=0.0)
-        replies = message_router._handle_pending_upload(
-            "你好", intent, _msg("你好"), ctx, session, MagicMock(),
+        replies = message_router._route_upload_collecting(
+            intent, _msg("你好"), ctx, session, MagicMock(),
         )
         assert replies is not None
-        # follow_up_rounds 不动
+        # follow_up_rounds / failed_patch_rounds 都不动
         assert session.follow_up_rounds == 0
+        assert session.failed_patch_rounds == 0
         # pending 仍在
         assert session.pending_upload_intent == "upload_job"
         assert session.awaiting_field == "headcount"

@@ -43,6 +43,34 @@ class SessionState(BaseModel):
     pending_expires_at: str | None = Field(default=None, description="草稿过期时间 ISO 8601 UTC，默认创建后 10 分钟")
     pending_raw_text_parts: list[str] = Field(default_factory=list, description="多轮原始用户文本，按时间顺序")
 
+    # ---- Stage C1：兼容式状态机字段（详见 docs/multi-turn-upload-stage-c-implementation.md §2.3） ----
+    # 这些字段保留 Stage A/B 扁平字段并存，旧 Redis session 反序列化时全部走默认值。
+    active_flow: str | None = Field(
+        default=None,
+        description="路由裁决源：idle / upload_collecting / upload_conflict / search_active",
+    )
+    last_intent: str | None = Field(
+        default=None,
+        description="本轮 LLM 意图记录，仅供观测/日志，不参与路由（与 current_intent 双写期）",
+    )
+    pending_interruption: dict | None = Field(
+        default=None,
+        description="upload_conflict 中保存的新意图瘦身版："
+                    "{intent, structured_data, criteria_patch, raw_text}",
+    )
+    failed_patch_rounds: int = Field(
+        default=0,
+        description="精细失败补字段计数；C1 起作为 max rounds 主退出依据，>=2 清草稿",
+    )
+    last_criteria: dict = Field(
+        default_factory=dict,
+        description="最近一次有效搜索的 criteria 快照；不论命中与否都写入，方便后续放宽继承上下文",
+    )
+    conflict_followup_rounds: int = Field(
+        default=0,
+        description="upload_conflict 已经追问确认的轮数；超过 1 轮后清草稿回 idle 防死循环",
+    )
+
 
 class CriteriaPatch(BaseModel):
     """多轮对话的 criteria 增量更新指令。"""

@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ from app.schemas.conversation import ReplyMessage, SessionState
 from app.services import (
     command_service,
     conversation_service,
+    intent_service,
     search_service,
     upload_service,
     user_service,
@@ -69,6 +71,22 @@ PENDING_CANCELLED_REPLY = "已取消，岗位草稿已丢弃。"
 PENDING_EXPIRED_REPLY = "上次岗位草稿已超时，请整段重新发送岗位信息。"
 PENDING_MAX_ROUNDS_REPLY = "信息仍不完整，请整段重新发送岗位信息。"
 PENDING_NO_FIELD_REPLY_FMT = "请告诉我具体的{field_name}。"
+
+# Stage C1：upload_conflict 相关文案（spec §2.7 / §9.6）。
+CONFLICT_PROMPT_FMT = (
+    "当前{kind}还缺“{field_name}”。\n"
+    "您要继续发布{kind}，还是先{new_kind}，或取消草稿？\n"
+    "回复：继续发布 / 先{new_kind} / 取消草稿"
+)
+CONFLICT_REPROMPT_FMT = (
+    "请明确选择：\n"
+    "  · 回复“继续发布”补完{kind}（缺{field_name}）\n"
+    "  · 回复“先{new_kind}”丢弃草稿并执行新请求\n"
+    "  · 回复“取消草稿”放弃"
+)
+CONFLICT_DEAD_LOOP_REPLY = "未识别您的选择，已为您丢弃草稿。如需继续操作请整段重新发送。"
+CONFLICT_RESUME_FMT = "好的，继续。请告诉我具体的{field_name}。"
+CONFLICT_PROCEED_ACK = "草稿已丢弃，正在为您处理新请求。"
 
 # Stage A：cancel 强规则（§9.3 / §3.4）。
 # 完整句匹配 → 直接判 cancel；句首匹配 → 判 cancel。
@@ -169,6 +187,8 @@ def _handle_text(
     session = conversation_service.load_session(userid)
     if session is None:
         session = conversation_service.create_session(userid, user_ctx.role)
+    # Stage C1：兜底推导 + self-heal，覆盖测试或非 Redis 路径绕过 load_session 的场景
+    conversation_service.ensure_active_flow(session)
 
     # 首次欢迎优先于意图分类
     if user_ctx.should_welcome:
@@ -182,6 +202,8 @@ def _handle_text(
     conversation_service.record_history(session, "user", content)
 
     # 统一意图分类（命令 / show_more / LLM 三级）
+    # Stage C1（spec §2.11）：构造 session_hint 占位下发；provider 暂不消费。
+    session_hint = intent_service.build_session_hint(session)
     try:
         intent_result = classify_intent(
             text=content,
@@ -189,37 +211,45 @@ def _handle_text(
             history=session.history,
             current_criteria=session.search_criteria,
             user_msg_id=msg.msg_id,
+            session_hint=session_hint,
         )
     except Exception as exc:
         logger.exception("message_router: classify_intent failed: %s", exc)
         conversation_service.save_session(userid, session)
         return [_reply(userid, SYSTEM_BUSY_REPLY)]
 
-    # ---- Stage A 上传草稿守卫 ----
-    # 顺序：command → timeout → cancel → field patch → 正常 dispatch
-    # 命令优先，但是否清 pending 由命令语义决定（阶段 A 沿用 command_service）。
-    if intent_result.intent != "command" and _has_pending_upload(session):
-        pending_reply = _handle_pending_upload(
-            content, intent_result, msg, user_ctx, session, db,
-        )
-        if pending_reply is not None:
-            if pending_reply:
-                conversation_service.record_history(
-                    session, "assistant", pending_reply[0].content,
-                )
-            conversation_service.save_session(userid, session)
-            return pending_reply
-
     intent = intent_result.intent
-    # Stage A：pending 存活时把 current_intent 钉在 pending_upload_intent 上，
-    # 否则 /帮助 等命令会把它覆盖成 "command"，导致后续图片走非上传分支无法挂载。
-    # 详见 docs/multi-turn-upload-stage-a-implementation.md §5 验收标准 7。
-    if _has_pending_upload(session):
+
+    # Stage C1（spec §2.5）：last_intent 仅观测；current_intent 在 upload_collecting
+    # 期间钉在 pending_upload_intent，兼容旧 attach_image 的回落判断。
+    session.last_intent = intent
+    if (
+        session.active_flow == "upload_collecting"
+        and session.pending_upload_intent
+    ):
         session.current_intent = session.pending_upload_intent
     else:
         session.current_intent = intent
 
-    replies = _dispatch_intent(intent_result, msg, user_ctx, session, db)
+    # Stage C1：active_flow 主路由 + 状态相关命令 guard。
+    if intent == "command":
+        replies = _route_command_with_state_guard(
+            intent_result, msg, user_ctx, session, db,
+        )
+    elif session.active_flow == "upload_collecting":
+        replies = _route_upload_collecting(
+            intent_result, msg, user_ctx, session, db,
+        )
+    elif session.active_flow == "upload_conflict":
+        replies = _route_upload_conflict(
+            intent_result, msg, user_ctx, session, db,
+        )
+    elif session.active_flow == "search_active":
+        replies = _route_search_active(
+            intent_result, msg, user_ctx, session, db,
+        )
+    else:
+        replies = _route_idle(intent_result, msg, user_ctx, session, db)
 
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
     if replies:
@@ -264,6 +294,280 @@ def _dispatch_intent(
 
 
 # ---------------------------------------------------------------------------
+# Stage C1：active_flow 主路由（spec §2.5）
+# ---------------------------------------------------------------------------
+
+def _route_idle(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """idle 状态：复用现有 _dispatch_intent 即可；upload/search handler 内部
+    会按需把 active_flow 推进到 upload_collecting / search_active。"""
+    return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+
+
+def _route_search_active(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """search_active 状态（spec §2.8）。
+
+    - 新上传意图：清快照/shown，但保留 search_criteria 和 last_criteria，进入上传流程
+    - chitchat：保留 search state，回闲聊
+    - 其余（follow_up / show_more / search_* / command）：交给 _dispatch_intent
+    """
+    intent = intent_result.intent
+    userid = msg.from_user
+
+    if intent in ("upload_job", "upload_resume", "upload_and_search"):
+        session.candidate_snapshot = None
+        session.shown_items = []
+        # active_flow 暂回 idle，由 upload handler 内部按 missing/success 决定下一步状态
+        session.active_flow = "idle"
+        return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+
+    if intent == "chitchat":
+        return [_reply(userid, _chitchat_text(user_ctx))]
+
+    return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+
+
+def _route_command_with_state_guard(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """command 路由 + 状态机边界 guard（spec §2.5）。
+
+    全局型命令直接交给 command_service；状态相关命令在 upload_collecting 中需要
+    走状态机分支：
+      - broker /找岗位 /找工人 in upload_collecting → upload_conflict
+      - 其余命令（含 /取消 /重新找）由 command_service 内部处理（已带状态文案）
+    """
+    cmd = (intent_result.structured_data or {}).get("command", "")
+
+    # broker 在 upload_collecting 中切方向 → 进入 upload_conflict（spec §2.9）
+    if (
+        session.active_flow == "upload_collecting"
+        and user_ctx.role == "broker"
+        and cmd in ("switch_to_job", "switch_to_worker")
+    ):
+        new_intent = "search_job" if cmd == "switch_to_job" else "search_worker"
+        synthesized = IntentResult(
+            intent=new_intent, structured_data={}, confidence=1.0,
+        )
+        return _enter_upload_conflict(synthesized, msg, session)
+
+    return _handle_command_intent(intent_result, user_ctx, session, db)
+
+
+def _route_upload_collecting(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """upload_collecting 状态（spec §2.6 / §9.1-9.5）。
+
+    顺序：
+      1. timeout
+      2. cancel
+      3. chitchat（保留 pending，不递增 failed_patch_rounds）
+      4. new business intent → upload_conflict
+      5. field patch（含 failed_patch_rounds 计数和退出）
+    """
+    content = msg.content or ""
+    userid = msg.from_user
+
+    # 1. 过期
+    if upload_service.is_pending_upload_expired(session):
+        was_patch = _looks_like_upload_patch(content)
+        upload_service.clear_pending_upload(session)
+        if was_patch:
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+        # 未补丁就放行到 idle 分发
+        return _route_idle(intent_result, msg, user_ctx, session, db)
+
+    # 2. cancel 强规则
+    if _is_cancel(content, intent_result):
+        upload_service.clear_pending_upload(session)
+        return [_reply(userid, PENDING_CANCELLED_REPLY)]
+
+    # 3. 闲聊穿插（spec §9.8）
+    if intent_result.intent == "chitchat":
+        awaiting = session.awaiting_field
+        field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
+        text = (
+            f"{_chitchat_text(user_ctx)}\n\n"
+            f"您当前还在发布岗位/简历，请补充{field_name}，或发送 /取消 放弃草稿。"
+        )
+        return [_reply(userid, text)]
+
+    # 4. 新业务意图 → upload_conflict
+    if _is_new_business_intent(intent_result, session):
+        return _enter_upload_conflict(intent_result, msg, session)
+
+    # 5. 字段补全
+    return _handle_field_patch(intent_result, msg, user_ctx, session, db)
+
+
+def _route_upload_conflict(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """upload_conflict 状态（spec §2.7）。
+
+    用户回复识别（强规则；不再调用 LLM 重新分类）：
+      - 取消草稿 → 清 pending，回 idle
+      - 继续发布 → 回 upload_collecting
+      - 先找/找工人/找岗位 或 LLM intent ∈ search_* → 执行 pending_interruption
+      - 其他 → 重复确认；累计 1 次仍未识别则丢弃草稿，避免死循环
+    """
+    content = (msg.content or "").strip()
+    userid = msg.from_user
+    intent = intent_result.intent
+
+    # 取消草稿（强规则 cancel 或显式“取消草稿”）
+    if _is_cancel(content, intent_result) or "取消草稿" in content:
+        upload_service.clear_pending_upload(session)
+        return [_reply(userid, PENDING_CANCELLED_REPLY)]
+
+    # 继续发布
+    resume_keywords = ("继续发布", "继续填", "继续", "接着发", "接着")
+    if any(p in content for p in resume_keywords):
+        session.pending_interruption = None
+        session.conflict_followup_rounds = 0
+        session.active_flow = "upload_collecting"
+        awaiting = session.awaiting_field
+        field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
+        return [_reply(userid, CONFLICT_RESUME_FMT.format(field_name=field_name))]
+
+    # 执行 pending_interruption
+    interruption = session.pending_interruption or {}
+    proceed_keywords = ("先找", "找工人", "找岗位", "看简历", "看岗位", "看看")
+    triggered_by_keyword = any(p in content for p in proceed_keywords)
+    triggered_by_intent = intent in ("search_job", "search_worker")
+    if triggered_by_intent or triggered_by_keyword:
+        # 用 pending_interruption 复原 IntentResult，避免重新调 LLM
+        new_intent_name = (
+            interruption.get("intent")
+            or (intent if intent in ("search_job", "search_worker", "upload_job", "upload_resume", "upload_and_search") else "search_job")
+        )
+        new_intent_result = IntentResult(
+            intent=new_intent_name,
+            structured_data=dict(interruption.get("structured_data") or {}),
+            criteria_patch=list(interruption.get("criteria_patch") or []),
+            confidence=1.0,
+        )
+        forwarded_text = (interruption.get("raw_text") or "").strip() or content
+        forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
+
+        # 清掉 pending 草稿和 interruption 后再分发
+        upload_service.clear_pending_upload(session)
+        forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
+        return [_reply(userid, CONFLICT_PROCEED_ACK)] + forwarded
+
+    # 死循环防护
+    session.conflict_followup_rounds += 1
+    if session.conflict_followup_rounds >= 2:
+        upload_service.clear_pending_upload(session)
+        return [_reply(userid, CONFLICT_DEAD_LOOP_REPLY)]
+
+    awaiting = session.awaiting_field
+    field_name = _field_display_name(awaiting) if awaiting else "字段"
+    new_intent_in_interruption = interruption.get("intent", "")
+    new_kind = _new_kind_text(new_intent_in_interruption)
+    kind = "简历" if session.pending_upload_intent == "upload_resume" else "岗位"
+    return [_reply(
+        userid,
+        CONFLICT_REPROMPT_FMT.format(
+            kind=kind, field_name=field_name, new_kind=new_kind,
+        ),
+    )]
+
+
+def _enter_upload_conflict(
+    intent_result: IntentResult,
+    msg: WeComMessage,
+    session: SessionState,
+) -> list[ReplyMessage]:
+    """从 upload_collecting 进入 upload_conflict（spec §9.6）。
+
+    瘦身保存 pending_interruption；保留 pending_upload，让用户决定后再分发。
+    """
+    session.active_flow = "upload_conflict"
+    session.pending_interruption = {
+        "intent": intent_result.intent,
+        "structured_data": dict(intent_result.structured_data or {}),
+        "criteria_patch": list(intent_result.criteria_patch or []),
+        "raw_text": msg.content or "",
+    }
+    session.conflict_followup_rounds = 0
+
+    awaiting = session.awaiting_field
+    field_name = _field_display_name(awaiting) if awaiting else "字段"
+    kind = "简历" if session.pending_upload_intent == "upload_resume" else "岗位"
+    new_kind = _new_kind_text(intent_result.intent)
+
+    log_event(
+        "upload_pending_conflict",
+        userid=msg.from_user,
+        old_flow="upload_collecting",
+        new_intent=intent_result.intent,
+    )
+    return [_reply(
+        msg.from_user,
+        CONFLICT_PROMPT_FMT.format(
+            kind=kind, field_name=field_name, new_kind=new_kind,
+        ),
+    )]
+
+
+def _new_kind_text(new_intent: str) -> str:
+    if new_intent == "search_worker":
+        return "找工人"
+    if new_intent == "search_job":
+        return "找岗位"
+    if new_intent == "upload_job":
+        return "发新岗位"
+    if new_intent == "upload_resume":
+        return "发新简历"
+    if new_intent == "upload_and_search":
+        return "发新内容并找匹配"
+    return "新流程"
+
+
+def _is_new_business_intent(
+    intent_result: IntentResult, session: SessionState,
+) -> bool:
+    """判定 LLM 抽到的意图是否构成“切到新业务流程”（spec §9.6）。
+
+    1. search_job / search_worker → 必判 True
+    2. upload_* 且与 pending_upload_intent 不同 → True
+    3. 其余按 field patch 处理（同 origin_intent 即使覆盖既有字段也是 patch）
+    """
+    intent = intent_result.intent
+    if intent in ("search_job", "search_worker"):
+        return True
+    if intent in ("upload_job", "upload_resume", "upload_and_search"):
+        if intent != session.pending_upload_intent:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 各意图 handler
 # ---------------------------------------------------------------------------
 
@@ -294,6 +598,12 @@ def _handle_upload(
         session=session,
         db=db,
     )
+    # Stage C1：upload_service 已自行维护 active_flow（保存草稿→upload_collecting；
+    # 清空草稿→idle）。这里仅兜底确保 active_flow 与 pending 状态一致。
+    if session.pending_upload_intent:
+        session.active_flow = "upload_collecting"
+    else:
+        session.active_flow = "idle"
     return [_reply(msg.from_user, result.reply_text)]
 
 
@@ -304,7 +614,15 @@ def _handle_upload_and_search(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
-    """上传后顺带检索一次。仅在上传成功时才接着检索。"""
+    """上传后顺带检索一次。仅在上传成功时才接着检索。
+
+    Stage C1（spec §9.2.1）：
+    - 入库成功后必跑搜索；不论 0 命中还是有结果都写 last_criteria。
+    - 有结果 → active_flow=search_active；0 命中 → active_flow=idle，保留 last_criteria。
+    """
+    # 入库前用 structured_data 构造对侧搜索 criteria，避免 process_upload 清空 pending 后丢字段
+    upload_structured = dict(intent_result.structured_data or {})
+
     upload_result = upload_service.process_upload(
         user_ctx=user_ctx,
         intent_result=intent_result,
@@ -317,17 +635,17 @@ def _handle_upload_and_search(
     replies: list[ReplyMessage] = [_reply(msg.from_user, upload_result.reply_text)]
 
     if not upload_result.success:
-        # 追问 / 审核拒绝 / 字段缺失 → 不继续检索
+        # 追问（pending 已设）/ 审核拒绝 / 字段缺失 → 不继续检索；
+        # active_flow 由 upload_service 内部维护：缺字段 → upload_collecting；max rounds → idle
+        if session.pending_upload_intent:
+            session.active_flow = "upload_collecting"
+        else:
+            session.active_flow = "idle"
         return replies
 
-    # upload_and_search 的方向：
-    #   - 工人：search_job（找工作）— 用简历字段映射成 city/job_category
-    #   - 厂家/中介：search_worker（找工人）— 直接用 city/job_category
-    # _resolve_search_direction 按角色兜底即可（传 None）
+    # 入库成功：active_flow 由 _run_search 根据搜索结果再修正
     direction = _resolve_search_direction(None, user_ctx, session)
-    criteria = _build_upload_and_search_criteria(
-        intent_result.structured_data or {}, direction,
-    )
+    criteria = _build_upload_and_search_criteria(upload_structured, direction)
     if criteria:
         session.search_criteria = {**session.search_criteria, **criteria}
 
@@ -335,8 +653,20 @@ def _handle_upload_and_search(
         None, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
     )
-    if search_result is not None and search_result.reply_text:
+    if search_result is None:
+        # 搜索 handler 抛错；保持入库成功语义，active_flow 已在 _run_search 回到 idle
+        return replies
+
+    # spec §9.2.1：0 命中也要追加“暂未找到”，并保持 active_flow=idle；
+    # 有结果时 _run_search 已将 active_flow 推进到 search_active。
+    if search_result.reply_text:
         replies.append(_reply(msg.from_user, search_result.reply_text))
+    log_event(
+        "upload_completed_with_search",
+        userid=msg.from_user,
+        entity_id=upload_result.entity_id,
+        search_result_count=search_result.result_count,
+    )
     return replies
 
 
@@ -422,6 +752,11 @@ def _handle_show_more(
     db: Session,
 ) -> list[ReplyMessage]:
     result = search_service.show_more(session, user_ctx, db)
+    # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
+    if session.candidate_snapshot is not None:
+        session.active_flow = "search_active"
+    else:
+        session.active_flow = "idle"
     return [_reply(
         msg.from_user,
         result.reply_text,
@@ -634,75 +969,51 @@ def _merge_other_upload_fields(
     return merged_any
 
 
-def _handle_pending_upload(
-    content: str,
+def _handle_field_patch(
     intent_result: IntentResult,
     msg: WeComMessage,
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
-) -> list[ReplyMessage] | None:
-    """Stage A 上传草稿守卫：返回 None 表示放行到正常 dispatch。
+) -> list[ReplyMessage]:
+    """upload_collecting 字段补全分支（spec §9.2 / §9.5）。
 
-    顺序：
-      1. timeout 检查
-      2. cancel 检查
-      3. 字段补全（无字段则提示，不调用搜索）
+    Stage C1：以 ``failed_patch_rounds`` 作为 max rounds 主退出依据。
+    抽取顺序：structured_data → criteria_patch → 正则。
+    递增 failed_patch_rounds 的条件：
+      1. 三层都没拿到 awaiting_field 的有效值，且没有补到其他有效上传字段。
+      2. （理论上）抽到值但范围非法 — 实际由 intent_service 规整层提前丢弃。
     """
     userid = msg.from_user
-
-    # 1. 过期检查
-    if upload_service.is_pending_upload_expired(session):
-        was_patch = _looks_like_upload_patch(content)
-        upload_service.clear_pending_upload(session)
-        if was_patch:
-            return [_reply(userid, PENDING_EXPIRED_REPLY)]
-        # 否则放行到正常 dispatch
-        return None
-
-    # 2. cancel 强规则
-    if _is_cancel(content, intent_result):
-        upload_service.clear_pending_upload(session)
-        return [_reply(userid, PENDING_CANCELLED_REPLY)]
-
-    # 3. 字段补全
+    raw_text = msg.content or ""
     awaiting = session.awaiting_field
-    raw_text = content or ""
 
     awaiting_value = None
     if awaiting:
         awaiting_value = _extract_field_value(awaiting, intent_result, raw_text)
 
     if awaiting and not _is_empty(awaiting_value):
-        # 补到了 awaiting_field：merge 主字段
+        # 补到了 awaiting_field：merge 主字段，重置 failed_patch_rounds
         pending = dict(session.pending_upload or {})
         pending[awaiting] = awaiting_value
         session.pending_upload = pending
-        # 顺带合并本轮其它有效上传字段
         _merge_other_upload_fields(session, intent_result)
+        session.failed_patch_rounds = 0
         return _commit_pending_or_followup(msg, user_ctx, session, db)
 
-    # 没补到 awaiting_field：尝试合并其它有效上传字段
+    # 未补 awaiting，但合入了其它有效字段 → 不算失败补字段
     other_merged = _merge_other_upload_fields(session, intent_result)
     if other_merged:
+        session.failed_patch_rounds = 0
         return _commit_pending_or_followup(msg, user_ctx, session, db)
 
-    # Stage B P2-1：chitchat 不消耗追问计数（spec §9.8）。
-    # upload_collecting 中遇到 chitchat 应保留 pending、回闲聊文本 + 提醒未完成事项，
-    # 不动 follow_up_rounds / failed_patch_rounds，避免 "你好" "谢谢" 把草稿挤掉。
-    if intent_result.intent == "chitchat":
-        field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
-        text = (
-            f"{_chitchat_text(user_ctx)}\n\n"
-            f"您当前还在发布岗位/简历，请补充{field_name}，或发送 /取消 放弃草稿。"
-        )
-        return [_reply(userid, text)]
-
-    # 既没补 awaiting_field 也没补其它字段，且不是 chitchat：让 max rounds 计数前进，
-    # 避免用户答非所问无限刷请求把陈旧草稿挂着。Stage A §3.4 “沿用 follow_up_rounds”。
-    if session.follow_up_rounds >= upload_service.MAX_FOLLOW_UP_ROUNDS:
+    # 真正的“答非所问”：累计 failed_patch_rounds，>=2 退出
+    session.failed_patch_rounds += 1
+    if session.failed_patch_rounds >= 2:
         upload_service.clear_pending_upload(session)
         return [_reply(userid, PENDING_MAX_ROUNDS_REPLY)]
+
+    # 同时维护旧的 follow_up_rounds 作为兼容计数器（spec §2.6 “保留”）
     conversation_service.increment_follow_up(session)
     field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
     return [_reply(userid, PENDING_NO_FIELD_REPLY_FMT.format(field_name=field_name))]
@@ -781,12 +1092,23 @@ def _run_search(
     direction = _resolve_search_direction(intent, user_ctx, session)
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
     if direction == "search_job":
-        return search_service.search_jobs(
+        result = search_service.search_jobs(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
-    return search_service.search_workers(
-        composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
-    )
+    else:
+        result = search_service.search_workers(
+            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+        )
+
+    # Stage C1（spec §2.8 / §9.2.1）：不论命中与否，只要 criteria 有效就写 last_criteria；
+    # 并按是否生成 candidate_snapshot 推进 active_flow。
+    if search_service.has_effective_search_criteria(composed):
+        session.last_criteria = dict(composed)
+    if session.candidate_snapshot is not None:
+        session.active_flow = "search_active"
+    else:
+        session.active_flow = "idle"
+    return result
 
 
 # ---------------------------------------------------------------------------
