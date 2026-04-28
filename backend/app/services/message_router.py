@@ -733,10 +733,20 @@ def _handle_follow_up(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
-    # 把 patch 合并进 session.search_criteria；若 digest 变化会自动清快照
-    conversation_service.merge_criteria_patch(
-        session, intent_result.criteria_patch or [],
-    )
+    # Bug 5：follow_up 走"全量 criteria"语义。
+    # LLM 在 prompt 里看得到 current_criteria + 用户这一句，应当输出"应用本句变更后
+    # 的完整 criteria 快照"放进 structured_data。这样彻底消解了 add/update 二元选择
+    # 带来的歧义（"换成 X" 不再可能被识别为 add 而叠加）。
+    #
+    # 兼容降级：structured_data 为空时回落到旧的 criteria_patch 合并路径，避免提示词
+    # 灰度期间或 LLM 偶发漂移导致 follow_up 完全失效。
+    full_criteria = intent_result.structured_data or {}
+    if full_criteria:
+        conversation_service.replace_criteria(session, full_criteria)
+    else:
+        conversation_service.merge_criteria_patch(
+            session, intent_result.criteria_patch or [],
+        )
 
     # Stage B P1-1：同 _handle_search，不在默认合并前因 search_criteria 为空短路。
     # _run_search 会跑 _apply_default_criteria（含 worker 简历兜底），再交给

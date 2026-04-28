@@ -24,8 +24,14 @@ from app.tasks.common import log_event
 logger = logging.getLogger(__name__)
 
 # intent 抽取提示词版本：随 prompts.py 改动一起 bump，便于日志回溯。
+# v2.3 (Bug 5)：follow_up 输出全量 criteria 快照（structured_data），干掉
+#               criteria_patch 的 add/update 二元歧义；后端走 replace_criteria。
+# v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
+#               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
 # v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
-INTENT_PROMPT_VERSION = "v2.1"
+# v2.4 (Bug 6)：补角色意图护栏 + 城市短追问确定性兜底，避免 worker 找工作
+#               被误判为发岗位，或"北京有吗"沿用旧城市。
+INTENT_PROMPT_VERSION = "v2.4"
 
 # ---------------------------------------------------------------------------
 # §17.2 命令集 — 固定别名归并表
@@ -176,6 +182,108 @@ _SALARY_MIN = 500
 _SALARY_MAX = 200_000
 _AGE_MIN = 14
 _AGE_MAX = 80
+
+# Bug 4：搜索 / follow_up 上 expected_* → city / job_category 的兜底重映射。
+# 即使 prompt 已明确，仍保留服务端兜底以应对 LLM 漂移；不做反向映射（上传简历
+# 时 LLM 输出 city 是它自己的事，由上传规整逻辑决定，不在这层强行改写）。
+_SEARCH_INTENTS = frozenset({"search_job", "search_worker", "follow_up"})
+_SEARCH_FIELD_REMAP = {
+    "expected_cities": "city",
+    "expected_job_categories": "job_category",
+}
+
+_SEARCH_MISSING_FIELDS = frozenset({
+    "city", "job_category", "salary_floor_monthly",
+})
+
+_WORKER_SEARCH_SIGNALS = (
+    "找", "想找", "找个", "找份", "求职", "工作", "岗位", "活", "上班",
+    "想做", "能做", "有吗", "有没有",
+)
+
+_JOB_POSTING_SIGNALS = (
+    "招聘", "招工", "招人", "急招", "招募", "招几个", "招一", "招两",
+    "招二", "招三", "招四", "招五", "要人", "缺人",
+)
+
+_CITY_ADD_SIGNALS = ("也行", "也可以", "都行", "加上", "加一个", "还看")
+_CITY_REPLACE_SIGNALS = ("换成", "改成", "只看", "看看", "看下", "有吗", "有没有")
+_CITY_FOLLOW_UP_MAX_LEN = 12
+
+# Bug 4：城市字典归一缓存（短名 / aliases → 规范名）。
+# 进程级 lazy load；admin 改 dict_city.aliases 后需重启或调用 _clear_city_lookup_cache()
+# 才生效。dict_city 表内容稳定（340 城），不为这点写监听器。
+_CITY_LOOKUP_CACHE: dict[str, str] | None = None
+_COMMON_CITY_ALIASES: dict[str, str] = {
+    "北京": "北京市", "北京市": "北京市",
+    "上海": "上海市", "上海市": "上海市",
+    "广州": "广州市", "广州市": "广州市",
+    "深圳": "深圳市", "深圳市": "深圳市",
+    "苏州": "苏州市", "苏州市": "苏州市",
+    "昆山": "昆山市", "昆山市": "昆山市",
+    "无锡": "无锡市", "无锡市": "无锡市",
+    "南京": "南京市", "南京市": "南京市",
+    "杭州": "杭州市", "杭州市": "杭州市",
+    "宁波": "宁波市", "宁波市": "宁波市",
+    "合肥": "合肥市", "合肥市": "合肥市",
+    "重庆": "重庆市", "重庆市": "重庆市",
+    "成都": "成都市", "成都市": "成都市",
+    "天津": "天津市", "天津市": "天津市",
+    "武汉": "武汉市", "武汉市": "武汉市",
+    "西安": "西安市", "西安市": "西安市",
+    "郑州": "郑州市", "郑州市": "郑州市",
+    "青岛": "青岛市", "青岛市": "青岛市",
+    "济南": "济南市", "济南市": "济南市",
+    "厦门": "厦门市", "厦门市": "厦门市",
+    "福州": "福州市", "福州市": "福州市",
+    "长沙": "长沙市", "长沙市": "长沙市",
+}
+
+
+def _get_city_lookup() -> dict[str, str]:
+    """加载 dict_city：name + short_name + aliases 都映射到规范名 (name)。
+
+    DB 不可用（如某些 unit test 环境）时返回空 dict 且不缓存，下次调用再重试。
+    """
+    global _CITY_LOOKUP_CACHE
+    if _CITY_LOOKUP_CACHE is not None:
+        return _CITY_LOOKUP_CACHE
+    try:
+        from app.db import SessionLocal
+        from app.models import DictCity
+        with SessionLocal() as db:
+            rows = db.query(DictCity).filter(DictCity.enabled == 1).all()
+        mapping: dict[str, str] = {}
+        for c in rows:
+            if not c.name:
+                continue
+            mapping.setdefault(c.name, c.name)
+            if c.short_name:
+                mapping.setdefault(c.short_name, c.name)
+            for alias in (c.aliases or []):
+                if isinstance(alias, str) and alias.strip():
+                    mapping.setdefault(alias.strip(), c.name)
+        _CITY_LOOKUP_CACHE = mapping
+        return mapping
+    except Exception as exc:  # noqa: BLE001 — 兜底容错，DB 异常不应阻塞 intent 流
+        logger.warning("intent_service: load city dict failed: %s", exc)
+        return {}
+
+
+def _clear_city_lookup_cache() -> None:
+    """供测试 / 运营改完 dict_city 后清缓存。"""
+    global _CITY_LOOKUP_CACHE
+    _CITY_LOOKUP_CACHE = None
+
+
+def _normalize_city_value(value):
+    """单个城市值归一：dict_city 短名 / aliases → 规范名。无映射保留原值。"""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return text
+    return _get_city_lookup().get(text) or _COMMON_CITY_ALIASES.get(text, text)
 
 
 # ---------------------------------------------------------------------------
@@ -362,18 +470,29 @@ def _sanitize_intent_result(result: IntentResult, role: str) -> IntentResult:
     result.criteria_patch = clean_patches
 
     # 清洗 missing_fields：只保留允许的必填字段，排除敏感软字段
+    # Bug 4：搜索 intent 把 expected_* 重映射，避免追问"期望城市"但 session.search_criteria
+    # 已有 city 时 _compute_search_missing 比不上的死循环。
+    search_intent = result.intent in _SEARCH_INTENTS
     allowed_missing = JOB_REQUIRED_FIELDS | RESUME_REQUIRED_FIELDS
-    clean_missing = [
-        f for f in result.missing_fields
-        if f in allowed_missing and f not in SENSITIVE_SOFT_FIELDS
-    ]
+    clean_missing: list[str] = []
+    seen_missing: set[str] = set()
+    for f in result.missing_fields:
+        target = _SEARCH_FIELD_REMAP.get(f, f) if search_intent else f
+        if target not in allowed_missing or target in SENSITIVE_SOFT_FIELDS:
+            continue
+        if target in seen_missing:
+            continue
+        seen_missing.add(target)
+        clean_missing.append(target)
     result.missing_fields = clean_missing
 
     # Stage B：字段规整层（类型/范围/同义词归并），详见 §3.2。
     result.structured_data = _normalize_structured_data(
         result.structured_data, role, result.intent,
     )
-    result.criteria_patch = _normalize_criteria_patch(result.criteria_patch)
+    result.criteria_patch = _normalize_criteria_patch(
+        result.criteria_patch, result.intent,
+    )
 
     return result
 
@@ -450,9 +569,18 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
     # 列表型字段
     if field in {"city", "expected_cities"}:
         items = _normalize_string_list(value)
+        # Bug 4：dict_city 短名/aliases → 规范名，避免 JSON_CONTAINS 字面量比对漏召回
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            n = _normalize_city_value(item)
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            normalized.append(n)
         if force_list:
-            return items
-        return items[0] if items else None
+            return normalized
+        return normalized[0] if normalized else None
 
     if field in {"job_category", "expected_job_categories"}:
         items = _normalize_string_list(value)
@@ -487,6 +615,9 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
     - 上传场景（upload_*）：list 字段归一为 str（与 Job/Resume 列定义对齐，
       但 expected_* 仍保留 list；它们在 Resume 表里就是 JSON list）。
     - 搜索场景（search_*/follow_up）：city / job_category 始终落 list。
+    - Bug 4：搜索 intent 上 LLM 误把值塞到 expected_cities / expected_job_categories
+      时（broker /找工人 时高发），重映射到 city / job_category，避免 _query_resumes
+      读不到字段直接 0 召回。
     - 非法 int / 不在范围 → 字段直接丢弃，避免污染下游查询或入库。
     - salary_ceiling < salary_floor → 丢弃 ceiling 并记 warning。
     """
@@ -494,6 +625,30 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
         return {}
 
     upload_intent = intent in ("upload_job", "upload_resume", "upload_and_search")
+    search_intent = intent in _SEARCH_INTENTS
+
+    # Bug 4：搜索 intent 把 expected_* 重映射到 canonical 搜索字段。
+    # 同名键已存在时合并而非覆盖（保 LLM 同时给两份的边界情形）。
+    if search_intent:
+        remapped: dict = {}
+        for key, raw in data.items():
+            target = _SEARCH_FIELD_REMAP.get(key, key)
+            if target in remapped:
+                # 合并 list；标量直接保留首次出现的值
+                existing = remapped[target]
+                if isinstance(existing, list) and isinstance(raw, list):
+                    for v in raw:
+                        if v not in existing:
+                            existing.append(v)
+                # 其余情况以已有值为准，避免覆盖更结构化的输入
+            else:
+                remapped[target] = raw
+            if key != target:
+                logger.warning(
+                    "intent_service: remap search field %s -> %s (intent=%s)",
+                    key, target, intent,
+                )
+        data = remapped
 
     out: dict = {}
     for key, raw in data.items():
@@ -540,20 +695,35 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
     return out
 
 
-def _normalize_criteria_patch(patches: list[dict]) -> list[dict]:
+def _normalize_criteria_patch(
+    patches: list[dict],
+    intent: str | None = None,
+) -> list[dict]:
     """对 criteria_patch 做与 structured_data 一致的字段规整。
 
     搜索路径上的 patch field 几乎都属于 list 型（city / job_category / expected_*），
     因此统一按 force_list=True 处理；标量字段（如 salary_floor_monthly / age）保持标量。
     op == "remove" 且 value 为 None 时不再额外规整 value。
+
+    Bug 4：搜索 intent 上把 patch.field 的 expected_* 重映射到 city / job_category。
+    intent 缺省（旧调用方）保持原行为不动。
     """
     if not patches:
         return []
+    search_intent = intent in _SEARCH_INTENTS
     out: list[dict] = []
     for patch in patches:
         field = patch.get("field")
         op = patch.get("op")
         value = patch.get("value")
+
+        if search_intent and field in _SEARCH_FIELD_REMAP:
+            mapped = _SEARCH_FIELD_REMAP[field]
+            logger.warning(
+                "intent_service: remap patch field %s -> %s (intent=%s)",
+                field, mapped, intent,
+            )
+            field = mapped
 
         if field not in _ALL_VALID_KEYS:
             continue

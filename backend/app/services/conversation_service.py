@@ -182,6 +182,29 @@ def merge_criteria_patch(session: SessionState, patches: list[dict]) -> bool:
     return False
 
 
+def replace_criteria(session: SessionState, new_criteria: dict) -> bool:
+    """用 ``new_criteria`` 全量替换 ``session.search_criteria``。
+
+    Bug 5：follow_up 改为"输出全量 criteria"语义后调用此函数，避免
+    `criteria_patch` 的 add/update 二选一引入歧义（"换成 X" 被 LLM 标成 add 后
+    城市叠加而不是替换）。merge_criteria_patch 仍保留供其他场景使用。
+
+    Returns:
+        True 如果 criteria 实际发生了变化（需要清空快照）。
+    """
+    old_digest = compute_query_digest(session.search_criteria)
+    # 拷贝避免外部 mutate；空 dict 也合法（用户可能想清条件，由调用方决定语义）
+    session.search_criteria = dict(new_criteria or {})
+    new_digest = compute_query_digest(session.search_criteria)
+
+    if new_digest != old_digest:
+        session.candidate_snapshot = None
+        session.shown_items = []
+        session.updated_at = datetime.now(timezone.utc).isoformat()
+        return True
+    return False
+
+
 def compute_query_digest(criteria: dict) -> str:
     """对 search_criteria 计算稳定的摘要（SHA256 前 12 位）。"""
     if not criteria:

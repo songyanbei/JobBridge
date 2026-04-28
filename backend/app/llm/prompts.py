@@ -11,6 +11,15 @@ Token 预算：每个 prompt 上方标注 input/output token 上限。
 # Intent Extraction Prompt
 # ---------------------------------------------------------------------------
 
+# v2.3 2026-04-28
+# Bug 5：follow_up 改为"输出全量 criteria 快照"语义，消解 criteria_patch
+# 的 add/update 二元歧义（"换成 X" 误标 add 导致城市叠加而不是替换）。
+# 详见 backend/app/services/conversation_service.py:replace_criteria
+# 与 docs/keyword-rules-audit.md §6.2。
+# v2.2 2026-04-28
+# Bug 4：明确"搜索/follow_up 一律落 city / job_category，禁止使用 expected_*"，
+# 加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot；
+# 详见 backend/app/services/intent_service.py:_normalize_structured_data 的字段重映射兜底。
 # v2.1 2026-04-26
 # Stage B：补充工种 closed enum + few-shot 用于稳定类目映射；
 # 详见 docs/multi-turn-upload-stage-b-implementation.md §3.1。
@@ -76,10 +85,28 @@ INTENT_SYSTEM_PROMPT = """\
 - gender (str)：性别（男/女）
 - age (int)：年龄
 
-检索条件中 city、job_category、expected_cities、expected_job_categories 统一按 list[str] 存储，即便只有 1 个值也存列表。
+字段使用约束（务必遵守，**违反会导致检索召回为 0**）：
+- 搜索 / follow_up（intent ∈ {{search_job, search_worker, follow_up}}）：城市一律落到 city，工种一律落到 job_category，**禁止使用 expected_cities / expected_job_categories**（即便用户角色是 broker、即便在找工人）。两者均为 list[str]，单值也存列表。
+- 上传简历（intent=upload_resume）：城市落到 expected_cities，工种落到 expected_job_categories，list[str]。
+- 上传岗位（intent ∈ {{upload_job, upload_and_search}}）：城市落到 city（标量 str），工种落到 job_category（标量 str）。
+- 城市值统一输出"规范名"（带"市"，如 苏州市 / 北京市 / 昆山市），不要输出短名"苏州"/"北京"。
 
-## criteria_patch 语义
-当用户在多轮对话中修改或补充条件时，生成 criteria_patch 列表：
+## follow_up 输出规则（**强约束**，避免 add/update 歧义）
+
+当 intent=follow_up 时：
+- **structured_data 必须输出"应用本轮变更后的完整 criteria 快照"**，包含本句没动的字段（从"当前累积检索条件"原样保留）。这是后端真正使用的字段。
+- criteria_patch 留空 `[]`。后端不会读它，不要再用 add/update 语义去描述变更。
+- 用户表达"换成 X / 改成 X / 只看 X" 等替换语义 → 在 structured_data 里直接给替换后的新值。
+- 用户表达"X 也行 / 还看 X / 加上 X" 等叠加语义 → 在 structured_data 里给原值并上新值后的列表。
+- 裸值（如用户只说"苏州"）默认按替换处理。
+
+举例（current_criteria 为 city=["北京市"]）：
+- 用户说"换成苏州" → structured_data.city = ["苏州市"]（替换）
+- 用户说"苏州也行" → structured_data.city = ["北京市", "苏州市"]（叠加）
+
+## criteria_patch 语义（仅 search_* / upload_* 使用，follow_up 不用）
+
+当用户首次提交搜索/上传请求时，生成 criteria_patch 列表用于追踪本轮抽取到的字段（与 structured_data 同步）：
 - add：仅用于列表型字段（如 city），做去重追加
 - update：替换标量字段或整个列表
 - remove：若给定 value 则从列表移除该值；若 value 为 null 则删除整个字段
@@ -118,10 +145,11 @@ INTENT_SYSTEM_PROMPT = """\
 用户消息: "我们苏州工业园区招电子厂普工20人，5500-6500包吃住，顺便帮我找几个合适的工人"
 {{"intent": "upload_and_search", "structured_data": {{"city": "苏州市", "district": "工业园区", "job_category": "电子厂", "headcount": 20, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "provide_meal": true, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.93}}
 
-示例4 - 多轮追问修正:
+示例4 - 多轮追问修正（**structured_data 给完整快照，不用 criteria_patch**）:
 对话历史: 用户之前搜"苏州电子厂5000以上"
+当前累积检索条件: {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000}}
 用户消息: "薪资再高点，6000以上，昆山也行"
-{{"intent": "follow_up", "structured_data": {{}}, "criteria_patch": [{{"op": "update", "field": "salary_floor_monthly", "value": 6000}}, {{"op": "add", "field": "city", "value": ["昆山市"]}}], "missing_fields": [], "confidence": 0.88}}
+{{"intent": "follow_up", "structured_data": {{"city": ["苏州市", "昆山市"], "job_category": ["电子厂"], "salary_floor_monthly": 6000}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.88}}
 
 示例5 - 边界输入:
 用户消息: "😊"
@@ -134,6 +162,26 @@ INTENT_SYSTEM_PROMPT = """\
 示例7 - 工种同义词归并（物流仓储）:
 用户消息: "苏州找打包分拣，5000+，包住"
 {{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["物流仓储"], "salary_floor_monthly": 5000, "provide_housing": true}}, "criteria_patch": [{{"op": "update", "field": "city", "value": ["苏州市"]}}, {{"op": "update", "field": "job_category", "value": ["物流仓储"]}}, {{"op": "update", "field": "salary_floor_monthly", "value": 5000}}, {{"op": "update", "field": "provide_housing", "value": true}}], "missing_fields": [], "confidence": 0.88}}
+
+示例8 - 中介找工人（角色=broker，**搜索条件必须用 city / job_category，不要用 expected_*；missing_fields 也用 city**）:
+用户消息: "机械厂普工"
+{{"intent": "search_worker", "structured_data": {{"job_category": ["普工"]}}, "criteria_patch": [{{"op": "update", "field": "job_category", "value": ["普工"]}}], "missing_fields": ["city"], "confidence": 0.85}}
+
+示例9 - 中介找工人 follow_up 补城市（**structured_data 给完整快照，含 job_category；规范名"苏州市"**）:
+对话历史: 用户之前发了"机械厂普工"
+当前累积检索条件: {{"job_category": ["普工"]}}
+用户消息: "苏州"
+{{"intent": "follow_up", "structured_data": {{"city": ["苏州市"], "job_category": ["普工"]}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.88}}
+
+示例10 - "换成 X" 替换语义（**新值替换原 city；不是 add 追加**）:
+当前累积检索条件: {{"city": ["北京市"], "job_category": ["普工"]}}
+用户消息: "换成苏州"
+{{"intent": "follow_up", "structured_data": {{"city": ["苏州市"], "job_category": ["普工"]}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.9}}
+
+示例11 - "X 也行" 叠加语义（**新值并入原 city 列表**）:
+当前累积检索条件: {{"city": ["北京市"], "job_category": ["普工"]}}
+用户消息: "苏州也行"
+{{"intent": "follow_up", "structured_data": {{"city": ["北京市", "苏州市"], "job_category": ["普工"]}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.9}}
 """
 
 INTENT_USER_TEMPLATE = """\
