@@ -19,6 +19,14 @@ export default defineConfig({
       '/admin': {
         target: 'http://localhost:8000',
         changeOrigin: true,
+        bypass(req) {
+          const accept = req.headers.accept || ''
+          const method = (req.method || 'GET').toUpperCase()
+          const isApi =
+            accept.includes('application/json') ||
+            !['GET', 'HEAD'].includes(method)
+          if (!isApi) return req.url
+        },
       },
       '/api/events': {
         target: 'http://localhost:8000',

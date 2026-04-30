@@ -103,7 +103,7 @@ watch(
   () => props.modelValue,
   (v) => {
     if (!v) return
-    const snap = props.detail.fields || props.detail || {}
+    const snap = props.detail.extracted_fields || {}
     for (const k of Object.keys(form)) delete form[k]
     Object.assign(form, snap)
   },

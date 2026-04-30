@@ -352,10 +352,6 @@ textarea {
   border: 1px solid color-mix(in oklab, var(--danger) 25%, transparent);
 }
 
-.jb-lowconf-row {
-  background: var(--danger-weak);
-}
-
 /* ============================================================
    Element Plus surface polish
    ============================================================ */

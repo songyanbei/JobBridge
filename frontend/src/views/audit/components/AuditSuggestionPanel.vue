@@ -46,7 +46,7 @@ const props = defineProps({
 })
 
 const rules = computed(() => {
-  const r = props.detail.triggered_rules || props.detail.rules || []
+  const r = props.detail.trigger_rules || []
   return Array.isArray(r) ? r : []
 })
 

@@ -51,7 +51,7 @@
               <span>#{{ item.id }}</span>
             </div>
             <div class="queue-item-sub jb-muted">
-              {{ item.summary || item.title || item.submitter_name || '--' }}
+              {{ item.extracted_brief || item.owner_userid || '--' }}
             </div>
             <div v-if="item.locked_by" class="jb-warning-text queue-lock-hint">
               🔒 {{ item.locked_by }}
@@ -91,7 +91,7 @@
               <div class="submitter-bar">
                 <span class="jb-muted">提交者：</span>
                 <el-link @click="historyVisible = true">
-                  {{ detail.submitter_name || detail.submitter_userid || '--' }}
+                  {{ detail.owner_userid || '--' }}
                 </el-link>
                 <span v-if="submitter7d.length" class="jb-muted">
                   (7天内 {{ submitter7d.length }} 条)
@@ -111,31 +111,10 @@
                 <ImagePreview v-if="images.length" :images="images" style="margin-top: 8px" />
               </el-col>
               <el-col :span="10">
-                <div class="section-title">B LLM 抽取字段</div>
-                <el-table
-                  :data="extractedRows"
-                  size="small"
-                  border
-                  :row-class-name="rowClassLowConfidence"
-                >
-                  <el-table-column prop="field" label="字段" width="110" />
-                  <el-table-column prop="value" label="值" />
-                  <el-table-column
-                    v-if="hasConfidence"
-                    label=""
-                    width="52"
-                    align="center"
-                  >
-                    <template #default="{ row }">
-                      <span class="conf-dot" :class="confClass(row.confidence)" />
-                    </template>
-                  </el-table-column>
-                </el-table>
+                <div class="section-title">B 风险与建议</div>
+                <AuditSuggestionPanel :detail="detail" />
               </el-col>
             </el-row>
-
-            <div class="section-title" style="margin-top: 14px">C 审核建议</div>
-            <AuditSuggestionPanel :detail="detail" />
           </div>
 
           <div class="action-bar">
@@ -203,7 +182,7 @@
           </template>
         </el-table-column>
         <el-table-column prop="id" label="ID" width="90" />
-        <el-table-column prop="summary" label="摘要" show-overflow-tooltip />
+        <el-table-column prop="extracted_brief" label="摘要" show-overflow-tooltip />
         <el-table-column prop="risk_level" label="风险" width="90">
           <template #default="{ row }">
             <el-tag
@@ -216,7 +195,7 @@
             <span v-else class="jb-muted">--</span>
           </template>
         </el-table-column>
-        <el-table-column prop="submitter_name" label="提交者" width="120" />
+        <el-table-column prop="owner_userid" label="提交者" width="120" />
         <el-table-column prop="created_at" label="提交时间" width="160">
           <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
         </el-table-column>
@@ -399,29 +378,8 @@ const batchTitle = computed(() =>
 
 // --- derived detail displays ---
 const rawFields = computed(() => {
-  const raw = detail.value.raw || detail.value.original_content || detail.value.content || {}
-  if (typeof raw === 'string') return { 内容: raw }
-  if (typeof raw !== 'object' || raw === null) return {}
-  return raw
-})
-
-const extractedRows = computed(() => {
-  const extracted = detail.value.extracted || detail.value.fields || {}
-  const confidence = detail.value.field_confidence || {}
-  const rows = []
-  for (const [field, value] of Object.entries(extracted || {})) {
-    rows.push({
-      field,
-      value: typeof value === 'object' ? JSON.stringify(value) : value,
-      confidence: confidence[field] ?? null,
-    })
-  }
-  return rows
-})
-
-const hasConfidence = computed(() => {
-  const fc = detail.value.field_confidence
-  return fc && Object.keys(fc).length > 0
+  const raw = detail.value.raw_text
+  return raw ? { 内容: raw } : {}
 })
 
 const images = computed(() => {
@@ -453,20 +411,6 @@ const canBatch = computed(() => activeTab.value === 'pending' && selectedRows.va
 function isSelfLocked(item) {
   const me = authStore.admin?.username
   return !!me && item.locked_by === me
-}
-
-function confClass(v) {
-  if (v === null || v === undefined) return 'conf-dot--na'
-  if (v >= 0.85) return 'conf-dot--green'
-  if (v >= 0.6) return 'conf-dot--yellow'
-  return 'conf-dot--red'
-}
-
-function rowClassLowConfidence({ row }) {
-  if (!hasConfidence.value) return ''
-  if (row.confidence === null || row.confidence === undefined) return ''
-  if (row.confidence < 0.6) return 'jb-lowconf-row'
-  return ''
 }
 
 async function loadQueue() {
@@ -995,23 +939,4 @@ onUnmounted(() => {
   border-radius: 6px;
 }
 
-.conf-dot {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--line);
-}
-.conf-dot--green {
-  background: var(--el-color-success);
-}
-.conf-dot--yellow {
-  background: var(--el-color-warning);
-}
-.conf-dot--red {
-  background: var(--el-color-danger);
-}
-.conf-dot--na {
-  background: var(--line);
-}
 </style>
