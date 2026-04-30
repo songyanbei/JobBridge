@@ -91,12 +91,12 @@ criteria 里没有这两个键 → [has_effective_search_criteria](../backend/ap
 
 ## 结论先行
 
-后端共 **15 处**用关键词 / 同义词 / 字面量短语做业务分支判断的地方。其中：
+后端共 **16 处**用关键词 / 同义词 / 字面量短语做业务分支判断的地方。其中：
 
 | 数量 | 类别 | 风险 | 说明 |
 |---|---|---|---|
 | 9 | **封闭枚举**（命令、操作 op、角色、字段元数据） | LOW | 取值空间天然有限，无漏词概念 |
-| 3 | **半开放（已有兜底）** | MEDIUM | 工种 / 城市同义词，依赖运维同步，但有 LLM/字典/子串包含等多层兜底 |
+| 4 | **半开放（已有兜底）** | MEDIUM | 工种 / 城市同义词 / 阶段一临时对话信号，依赖运维同步或后续 dialogue_act 接管 |
 | 3 | **开放集且关键路径上**（cancel / proceed / resume / patch 启发式） | **HIGH** | 用户自然语言的二元/三元选择，漏词导致流程错位、草稿污染、死循环防护误触发 |
 
 3 个 HIGH 项都集中在 [message_router.py](../backend/app/services/message_router.py) 的多轮上传流程，是这次最值得重构的部分。
@@ -156,6 +156,19 @@ criteria 里没有这两个键 → [has_effective_search_criteria](../backend/ap
 - **漏词后果**：LOW —— 走错分支只影响过期提醒文案，不影响数据。最坏情况是漏掉提醒，用户感受不到差异。
 - **风险等级**：MEDIUM（按位置归类），**实际影响 LOW**。
 - **推荐改进**：可不动；如要清理，把 `_KNOWN_CITIES` 替换成查 `dict_city`。
+
+### 2.4 Bug 6 阶段一临时对话信号
+
+- **位置**：[intent_service.py](../backend/app/services/intent_service.py) v2.4 常量区
+- **规则**：
+  - `_WORKER_SEARCH_SIGNALS`：worker 找岗位信号，如“找 / 想找 / 求职 / 工作 / 有吗”
+  - `_JOB_POSTING_SIGNALS`：岗位发布信号，如“招聘 / 招工 / 急招 / 要人 / 缺人”
+  - `_CITY_ADD_SIGNALS`：城市追加信号，如“也行 / 也可以 / 加上 / 还看”
+  - `_CITY_REPLACE_SIGNALS`：城市替换信号，如“换成 / 改成 / 只看 / 有吗”
+- **触发场景**：阶段一兜底 worker 搜索 intent 误判、城市短追问替换/追加语义等事故链路。
+- **漏词后果**：MEDIUM —— 漏词可能让 LLM 重新主导判断，导致 worker 找工作被误判为发布岗位，或“北京有吗”沿用旧条件。
+- **当前定位**：这是允许存在的**临时护栏**，不是长期方案。它和 [dialogue-intent-extraction-current-state.md](dialogue-intent-extraction-current-state.md) 中的 `dialogue_act` / `merge_hint` / reducer 目标有明确接替关系。
+- **推荐改进**：进入阶段二后由 `DialogueParseResult` + reducer 接管，保留这些 tuple 只作为低优先级 fallback；不得继续无限扩词表。
 
 ---
 
