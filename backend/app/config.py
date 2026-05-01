@@ -3,7 +3,7 @@
 所有配置通过 pydantic-settings 从 .env 或环境变量加载。
 其它模块统一 `from app.config import settings` 使用。
 """
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -100,6 +100,52 @@ class Settings(BaseSettings):
     # ---- Phase 1（dialogue-intent-extraction-phased-plan §1.3）：搜索 awaiting TTL ----
     # 搜索追问的字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。
     search_awaiting_ttl_seconds: int = 600
+
+    # ---- 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParse v2 灰度 ----
+    # 默认全部 off：代码 / 配置 / 单测就位但不影响生产路由；上线后由 .env 切换。
+    # mode=shadow：legacy 主路由 + 按 sample_rate 旁路调 v2 写日志；
+    # mode=dual_read：白名单 / hash 桶命中的 userid 走 v2 派生路由；
+    # mode=off：完全走 legacy（classify_dialogue 退化为 classify_intent 包装）。
+    dialogue_v2_mode: str = "off"  # off / shadow / dual_read
+    dialogue_v2_shadow_sample_rate: float = 0.05
+    dialogue_v2_userid_whitelist: str = ""  # CSV
+    dialogue_v2_hash_buckets: int = 0  # 0..100；0 = 不启用 hash 桶
+    # 「北京有吗」歧义策略：clarify 反问 / replace 直接换城市
+    ambiguous_city_query_policy: str = "clarify"
+    # 关键字段（city/job_category/salary_*）低置信度时强制反问
+    low_confidence_threshold: float = 0.6
+
+    @property
+    def dialogue_v2_userid_whitelist_set(self) -> set[str]:
+        """解析 ``dialogue_v2_userid_whitelist`` 为 set；空字符串视为不启用。"""
+        return {
+            u.strip()
+            for u in (self.dialogue_v2_userid_whitelist or "").split(",")
+            if u.strip()
+        }
+
+    @field_validator("dialogue_v2_hash_buckets")
+    @classmethod
+    def _validate_dialogue_v2_hash_buckets(cls, v: int) -> int:
+        """夹紧 [0, 100]，避免 .env 配错（如 200）导致全量灰度（adversarial review I14）。"""
+        if v < 0:
+            return 0
+        if v > 100:
+            return 100
+        return v
+
+    @field_validator("dialogue_v2_mode")
+    @classmethod
+    def _validate_dialogue_v2_mode(cls, v: str) -> str:
+        """允许值：off / shadow / dual_read。非法值回退 off。"""
+        v = (v or "").strip()
+        return v if v in {"off", "shadow", "dual_read"} else "off"
+
+    @field_validator("ambiguous_city_query_policy")
+    @classmethod
+    def _validate_ambiguous_city_query_policy(cls, v: str) -> str:
+        v = (v or "").strip()
+        return v if v in {"clarify", "replace"} else "clarify"
 
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"

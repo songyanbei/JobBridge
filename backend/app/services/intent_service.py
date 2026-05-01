@@ -295,7 +295,32 @@ def classify_intent(
     user_msg_id: str | None = None,
     session_hint: dict | None = None,
 ) -> IntentResult:
-    """识别用户意图，按 显式命令 → show_more → LLM 的优先级。
+    """识别用户意图（legacy 入口）。
+
+    阶段二（dialogue-intent-extraction-phased-plan §2）起，此函数退化为
+    _classify_intent_legacy 的薄包装；新链路统一走 classify_dialogue 入口。
+    保留这个名字是为了向后兼容 admin / 老代码 import，**不再带 v2 分支**，
+    避免 v2 路径回退时递归。
+    """
+    return _classify_intent_legacy(
+        text=text,
+        role=role,
+        history=history,
+        current_criteria=current_criteria,
+        user_msg_id=user_msg_id,
+        session_hint=session_hint,
+    )
+
+
+def _classify_intent_legacy(
+    text: str,
+    role: str,
+    history: list[dict] | None = None,
+    current_criteria: dict | None = None,
+    user_msg_id: str | None = None,
+    session_hint: dict | None = None,
+) -> IntentResult:
+    """legacy 内核（阶段一行为）：显式命令 → show_more → LLM IntentExtractor.extract。
 
     Phase 7：LLM 调用结构化打点（``llm_call``）含
     provider / model / prompt_version / input_tokens / output_tokens /
@@ -303,9 +328,8 @@ def classify_intent(
     parse_failed 不再 raise，而是回落到 chitchat 以保持调用方（message_router）
     的现有容错路径；status 会反映真实失败类型以便运维分析。
 
-    Stage C1（spec §2.11）：``session_hint`` 仅作为占位形参，便于 prompt 后续
-    携带 active_flow / awaiting_field 等状态机信息。当前 provider 不消费它，
-    只在结构化日志里记录键名，避免一次性扩大 prompt 改动面。
+    阶段二 classify_dialogue 在 v2 fallback 路径上**直接调用本函数内核**，
+    避免回到带 v2 分支的入口产生递归。
     """
     stripped = text.strip()
 
@@ -922,3 +946,173 @@ def _legacy_compute_missing(frame: str, criteria: dict) -> list[str]:
             placeholder = "|".join(sorted(required_any))
             missing.append(placeholder)
     return missing
+
+
+# ---------------------------------------------------------------------------
+# 阶段二：classify_dialogue（dialogue-intent-extraction-phased-plan §2.3）
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import random as _random
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class DialogueRouteResult:
+    """classify_dialogue 返回值。
+
+    source 取值（与 phased-plan §2.3 对齐）：
+    - legacy：mode=off / shadow 主路由，或 dual_read 但用户未命中白名单/桶
+    - v2_shadow：mode=shadow 旁路调 v2，但主路由仍走 legacy（仅写日志）
+    - v2_dual_read：dual_read 命中且 v2 解析成功，主路由走 v2 派生
+    - v2_fallback_legacy：dual_read 命中但 v2 解析失败，已回退到 legacy
+    """
+    intent_result: IntentResult
+    decision: object | None  # DialogueDecision 类型，避免循环 import
+    source: str
+
+
+def _hash_to_bucket(userid: str, total_buckets: int = 100) -> int:
+    """userid → 0..99 桶号；与 dialogue_v2_hash_buckets 对比决定是否命中灰度。"""
+    if not userid or total_buckets <= 0:
+        return total_buckets  # 永不命中
+    h = _hashlib.md5(userid.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % total_buckets
+
+
+def _is_dual_read_target(userid: str) -> bool:
+    if not userid:
+        return False
+    if userid in settings.dialogue_v2_userid_whitelist_set:
+        return True
+    buckets = getattr(settings, "dialogue_v2_hash_buckets", 0) or 0
+    if buckets <= 0:
+        return False
+    return _hash_to_bucket(userid) < buckets
+
+
+def classify_dialogue(
+    text: str,
+    role: str,
+    history: list[dict] | None = None,
+    *,
+    session=None,
+    user_msg_id: str | None = None,
+    userid: str | None = None,
+) -> DialogueRouteResult:
+    """阶段二统一意图入口。按 dialogue_v2_mode 决定走 legacy / shadow / dual_read。
+
+    依赖 SessionState（不强制类型注解避免循环 import）：用于 build_session_hint /
+    reducer 读 awaiting / merge policy。session=None 时一律走 legacy（避免破坏
+    没有 session 的旧调用点）。
+
+    实现要点：
+    - mode=off：直接走 _classify_intent_legacy，零 v2 调用。
+    - mode=shadow：legacy 主路由 + 按 sample_rate 旁路调 v2 写日志（仅日志）。
+    - mode=dual_read：白名单 / hash 桶命中走 v2 派生；未命中走 legacy。
+    - 任何 v2 失败（NotImplementedError / LLMParseError / 任意异常）都 fallback
+      到 _classify_intent_legacy 内核（**不**再调本函数自身或 classify_intent）。
+    """
+    from app.services.dialogue_compat import decision_to_intent_result
+    from app.services.dialogue_reducer import reduce as _reduce
+
+    stripped = text.strip()
+    current_criteria = (
+        dict(getattr(session, "search_criteria", {}) or {}) if session else None
+    )
+    session_hint = build_session_hint(session) if session else None
+
+    mode = getattr(settings, "dialogue_v2_mode", "off")
+
+    # off：legacy 直通
+    if mode == "off":
+        ir = _classify_intent_legacy(
+            text=stripped, role=role, history=history,
+            current_criteria=current_criteria,
+            user_msg_id=user_msg_id, session_hint=session_hint,
+        )
+        return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
+
+    # shadow：legacy 主路由 + 按采样率旁路 v2
+    if mode == "shadow":
+        ir = _classify_intent_legacy(
+            text=stripped, role=role, history=history,
+            current_criteria=current_criteria,
+            user_msg_id=user_msg_id, session_hint=session_hint,
+        )
+        sample_rate = getattr(settings, "dialogue_v2_shadow_sample_rate", 0.0) or 0.0
+        if sample_rate > 0 and _random.random() < sample_rate and session is not None:
+            try:
+                extractor = get_intent_extractor()
+                parse = extractor.extract_dialogue(
+                    text=stripped, role=role, history=history,
+                    current_criteria=current_criteria,
+                    session_hint=session_hint,
+                )
+                decision = _reduce(parse, session, role, raw_text=stripped)
+                log_event(
+                    "dialogue_v2_legacy_diff",
+                    user_msg_id=user_msg_id,
+                    legacy_intent=ir.intent,
+                    dialogue_act=decision.dialogue_act,
+                    resolved_frame=decision.resolved_frame,
+                    route_intent=decision.route_intent,
+                    needs_clarification=bool(decision.clarification),
+                    confidence=parse.confidence,
+                )
+            except Exception as exc:
+                log_event(
+                    "dialogue_v2_parse_error",
+                    user_msg_id=user_msg_id,
+                    error=str(exc)[:200],
+                    error_type=type(exc).__name__,
+                )
+        return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
+
+    # dual_read：命中目标用户走 v2，未命中走 legacy
+    if mode == "dual_read" and session is not None and _is_dual_read_target(userid or ""):
+        try:
+            extractor = get_intent_extractor()
+            parse = extractor.extract_dialogue(
+                text=stripped, role=role, history=history,
+                current_criteria=current_criteria,
+                session_hint=session_hint,
+            )
+            decision = _reduce(parse, session, role, raw_text=stripped)
+            ir = decision_to_intent_result(decision, session)
+            log_event(
+                "dialogue_v2_decision",
+                user_msg_id=user_msg_id,
+                dialogue_act=decision.dialogue_act,
+                resolved_frame=decision.resolved_frame,
+                route_intent=decision.route_intent,
+                state_transition=decision.state_transition,
+                needs_clarification=bool(decision.clarification),
+                confidence=parse.confidence,
+            )
+            return DialogueRouteResult(
+                intent_result=ir, decision=decision, source="v2_dual_read",
+            )
+        except Exception as exc:
+            log_event(
+                "dialogue_v2_fallback_to_legacy",
+                user_msg_id=user_msg_id,
+                error=str(exc)[:200],
+                error_type=type(exc).__name__,
+            )
+            ir = _classify_intent_legacy(
+                text=stripped, role=role, history=history,
+                current_criteria=current_criteria,
+                user_msg_id=user_msg_id, session_hint=session_hint,
+            )
+            return DialogueRouteResult(
+                intent_result=ir, decision=None, source="v2_fallback_legacy",
+            )
+
+    # dual_read 未命中 / 非法 mode：legacy
+    ir = _classify_intent_legacy(
+        text=stripped, role=role, history=history,
+        current_criteria=current_criteria,
+        user_msg_id=user_msg_id, session_hint=session_hint,
+    )
+    return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")

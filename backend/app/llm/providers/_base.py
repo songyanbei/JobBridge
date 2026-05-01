@@ -8,7 +8,7 @@ import logging
 import httpx
 
 from app.core.exceptions import LLMParseError
-from app.llm.base import IntentResult, RerankResult
+from app.llm.base import DialogueParseResult, IntentResult, RerankResult
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +16,20 @@ logger = logging.getLogger(__name__)
 VALID_INTENTS = frozenset({
     "upload_job", "upload_resume", "search_job", "search_worker",
     "upload_and_search", "follow_up", "show_more", "command", "chitchat",
+})
+
+# 阶段二（dialogue-intent-extraction-phased-plan §2.1.1）：DialogueParseResult 闭集。
+VALID_DIALOGUE_ACTS = frozenset({
+    "start_search", "modify_search", "answer_missing_slot",
+    "show_more", "start_upload", "cancel", "reset",
+    "resolve_conflict", "chitchat",
+})
+VALID_FRAME_HINTS = frozenset({
+    "job_search", "candidate_search", "job_upload", "resume_upload", "none",
+})
+VALID_MERGE_HINT_VALUES = frozenset({"replace", "add", "remove", "unknown"})
+VALID_CONFLICT_ACTIONS = frozenset({
+    "cancel_draft", "resume_pending_upload", "proceed_with_new",
 })
 
 
@@ -110,6 +124,89 @@ def parse_intent_response(raw: str) -> IntentResult:
     except Exception as exc:
         logger.warning("IntentExtractor: failed to build IntentResult: %s, falling back", exc)
         return _intent_fallback(raw)
+
+
+def parse_dialogue_response(raw: str) -> DialogueParseResult:
+    """从 LLM 原始输出中解析 DialogueParseResult（阶段二）。
+
+    解析失败抛 LLMParseError；字段级偏差走软兜底（unknown act → chitchat 等），
+    与 parse_intent_response 保持一致，使 classify_dialogue 能可靠 fallback 到 legacy。
+    """
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning("DialogueParse: JSON decode failed (%s)", exc)
+        raise LLMParseError("dialogue_json_decode_failed")
+
+    if not isinstance(data, dict):
+        logger.warning("DialogueParse: top-level value is not a dict")
+        raise LLMParseError("dialogue_not_a_dict")
+
+    dialogue_act = data.get("dialogue_act", "chitchat")
+    if not isinstance(dialogue_act, str) or dialogue_act not in VALID_DIALOGUE_ACTS:
+        logger.warning("DialogueParse: unknown dialogue_act '%s', falling back to chitchat",
+                       dialogue_act)
+        dialogue_act = "chitchat"
+
+    frame_hint = data.get("frame_hint", "none")
+    if not isinstance(frame_hint, str) or frame_hint not in VALID_FRAME_HINTS:
+        frame_hint = "none"
+
+    slots_delta = data.get("slots_delta", {})
+    if not isinstance(slots_delta, dict):
+        slots_delta = {}
+    else:
+        # LLM 偶尔会把字段值塞成 {"$gt":...}/{"op":"..."} 等结构；这些非法 shape 让下游
+        # _normalize_structured_data 对未识别字段直接 passthrough（写入 search_criteria
+        # 后被 SQLAlchemy 用作字面值），存在 SQL 失败风险。
+        # 这里只允许：scalar / list / None；其它一律 drop。
+        _SCALAR = (str, int, float, bool, type(None))
+        slots_delta = {
+            k: v
+            for k, v in slots_delta.items()
+            if isinstance(k, str) and (
+                isinstance(v, _SCALAR) or isinstance(v, list)
+            )
+        }
+
+    raw_merge = data.get("merge_hint", {}) or {}
+    merge_hint: dict = {}
+    if isinstance(raw_merge, dict):
+        for k, v in raw_merge.items():
+            if isinstance(k, str) and isinstance(v, str) and v in VALID_MERGE_HINT_VALUES:
+                merge_hint[k] = v
+
+    needs_clar = data.get("needs_clarification", False)
+    needs_clar = bool(needs_clar) if isinstance(needs_clar, (bool, int)) else False
+
+    confidence = data.get("confidence", 0.0)
+    try:
+        confidence = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    conflict_action = data.get("conflict_action")
+    if conflict_action is not None:
+        if not isinstance(conflict_action, str) or conflict_action not in VALID_CONFLICT_ACTIONS:
+            conflict_action = None
+    # 仅在 resolve_conflict 时保留 conflict_action，其它情况强制清空
+    if dialogue_act != "resolve_conflict":
+        conflict_action = None
+
+    try:
+        return DialogueParseResult(
+            dialogue_act=dialogue_act,
+            frame_hint=frame_hint,
+            slots_delta=slots_delta,
+            merge_hint=merge_hint,
+            needs_clarification=needs_clar,
+            confidence=confidence,
+            conflict_action=conflict_action,
+            raw_response=raw,
+        )
+    except Exception as exc:
+        logger.warning("DialogueParse: failed to build DialogueParseResult: %s", exc)
+        raise LLMParseError(f"dialogue_build_failed: {exc}")
 
 
 def _rerank_fallback(raw: str) -> RerankResult:

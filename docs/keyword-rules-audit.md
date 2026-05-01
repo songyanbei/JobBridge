@@ -312,4 +312,48 @@ criteria 里没有这两个键 → [has_effective_search_criteria](../backend/ap
 
 ---
 
+## 阶段二接管说明（2026-05-01）
+
+dialogue-intent-extraction-phased-plan §2 阶段二已落地（`DialogueParseResult` /
+`DialogueDecision` / reducer / dual_read 模式）。本节记录三个 HIGH 风险项的接管状态：
+
+### HIGH 项接管：cancel / proceed / resume
+
+dual_read 路径下由 `DialogueParseResult.dialogue_act` 接管，关键词列表降级为 fallback：
+
+- `dialogue_act = cancel`：`§3.1` 自然语言 cancel 表达由 LLM 解析；`/取消` 仍走斜杠命令。
+- `dialogue_act = resolve_conflict + conflict_action ∈ {cancel_draft,
+  resume_pending_upload, proceed_with_new}`：接管 `§3.2 proceed_keywords` 与
+  `§3.3 resume_keywords` 在 `upload_conflict` 状态下的语义。
+- `dialogue_act = reset`：接管 `/重新找` 等清空搜索条件的自然表达。
+
+**优先级（phased-plan §2.5.5）**：显式斜杠命令 / 后端状态约束（`upload_conflict`
+闭集词）> reducer 裁决 > LLM `dialogue_act` > keyword fallback。
+
+阶段二**保留**关键词列表本身：
+
+- `_is_cancel` / `proceed_keywords` / `resume_keywords` 三组不删，仅作 fallback；
+- `_route_upload_conflict` 中闭集短语「继续发布 / 取消草稿 / 先找工人」是产品
+  给定的有限选项集，**不属于「关键词膨胀」**，长期保留。
+
+阶段四 primary 模式落地后，HIGH 项中**开放式中文兜底词表**全部删除（详见
+phased-plan §4.1.3）。
+
+### MEDIUM 项接管计划
+
+`§2.3 _WORKER_SEARCH_SIGNALS / _JOB_POSTING_SIGNALS` 已在阶段一接入 worker 搜索护栏；
+阶段二 dual_read 路径下由 reducer 配合 LLM 接管，但护栏仍保留作为**兜底**。
+`_CITY_ADD_SIGNALS / _CITY_REPLACE_SIGNALS` 在仓库内为死代码，阶段二**不接入**也**不删除**，
+留待阶段四统一删除（phased-plan §4.1.3）。
+
+### 默认配置（产品确认）
+
+- `dialogue_v2_mode = off`：代码 / 配置 / 测试就位，但生产仍走 legacy；
+  上线后由 .env 切到 shadow / dual_read。
+- `ambiguous_city_query_policy = clarify`：「北京有吗 + 已有西安」反问，不默认替换。
+- `low_confidence_threshold = 0.6`：关键字段（city / job_category / salary_*）
+  低于此置信度时强制 `needs_clarification=true`。
+
+---
+
 *本文档由对当前 main 分支代码的全量扫描生成。*

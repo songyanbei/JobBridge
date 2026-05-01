@@ -482,3 +482,46 @@ class TestDoubaoReranker:
             rnk.rerank("test", candidates=[{"id": 1}], role="worker")
         assert getattr(excinfo.value, "input_tokens", None) == 80
         assert getattr(excinfo.value, "output_tokens", None) == 0
+
+
+# ---------------------------------------------------------------------------
+# 阶段二：parse_dialogue_response（adversarial review C4 防护）
+# ---------------------------------------------------------------------------
+
+class TestParseDialogueResponse:
+    """slots_delta 值类型校验：dict/复杂结构必须被 drop，避免后续写入 search_criteria 后
+    SQL 阶段才崩。"""
+
+    def test_drops_dict_values_in_slots_delta(self):
+        from app.llm.providers._base import parse_dialogue_response
+        raw = json.dumps({
+            "dialogue_act": "modify_search",
+            "frame_hint": "job_search",
+            "slots_delta": {"city": ["北京市"], "pay_type": {"$gt": "x"}},
+            "merge_hint": {},
+            "confidence": 0.9,
+        })
+        result = parse_dialogue_response(raw)
+        # city 保留，pay_type 的 dict 值被 drop
+        assert result.slots_delta == {"city": ["北京市"]}
+
+    def test_keeps_scalar_and_list_values(self):
+        from app.llm.providers._base import parse_dialogue_response
+        raw = json.dumps({
+            "dialogue_act": "start_search",
+            "frame_hint": "job_search",
+            "slots_delta": {
+                "city": ["北京市"],
+                "salary_floor_monthly": 2500,
+                "is_long_term": True,
+                "pay_type": "月薪",
+            },
+            "merge_hint": {},
+            "confidence": 0.9,
+        })
+        result = parse_dialogue_response(raw)
+        assert result.slots_delta["city"] == ["北京市"]
+        assert result.slots_delta["salary_floor_monthly"] == 2500
+        assert result.slots_delta["is_long_term"] is True
+        assert result.slots_delta["pay_type"] == "月薪"
+

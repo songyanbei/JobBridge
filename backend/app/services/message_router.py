@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.config import settings as _settings_module
 from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
 from app.models import Resume
@@ -43,6 +44,7 @@ from app.services.intent_service import (
     _SALARY_MAX,
     _SALARY_MIN,
     _legacy_compute_missing,
+    classify_dialogue,
     classify_intent,
 )
 from app.services.user_service import UserContext
@@ -92,6 +94,54 @@ CONFLICT_REPROMPT_FMT = (
 CONFLICT_DEAD_LOOP_REPLY = "未识别您的选择，已为您丢弃草稿。如需继续操作请整段重新发送。"
 CONFLICT_RESUME_FMT = "好的，继续。请告诉我具体的{field_name}。"
 CONFLICT_PROCEED_ACK = "草稿已丢弃，正在为您处理新请求。"
+
+# 阶段二（dialogue-intent-extraction-phased-plan §2.1.4）：clarification 反问模板。
+# 不依赖 LLM 文案；按 clarification.kind 渲染稳定文本，便于断言和回归。
+_V2_CLAR_CITY_REPLACE_OR_ADD = (
+    "您是只看{new_city}，还是{old_city}和{new_city}都看？\n"
+    "回复：只看{new_city} / {old_city}和{new_city}都看"
+)
+_V2_CLAR_CITY_REPLACE_OR_ADD_FALLBACK = (
+    "您是只看新城市，还是新旧城市都看？\n"
+    "回复：只看新城市 / 新旧都看"
+)
+_V2_CLAR_LOW_CONFIDENCE = (
+    "您的需求我没太确定，方便再描述一下吗？比如想找哪个城市、什么类型的工作。"
+)
+_V2_CLAR_FRAME_CONFLICT = (
+    "您当前还有未完成的草稿，是要继续完成草稿，还是先做新请求？"
+)
+_V2_CLAR_ROLE_NO_PERMISSION = (
+    "当前账号不支持该操作。如需调整，请联系运营或先切换角色。"
+)
+_V2_CLAR_DEFAULT = "请再说得具体一些，方便我帮您处理。"
+
+
+def _render_v2_clarification(clarification: dict, session: SessionState) -> str:
+    """按 clarification.kind 渲染反问文案。"""
+    clar = clarification or {}
+    kind = clar.get("kind") or ""
+    if kind == "city_replace_or_add":
+        # 优先使用 reducer 携带的 new_value / old_value（具体城市名）；
+        # 退化到 session.search_criteria.city + 通用文案。
+        old_list = clar.get("old_value")
+        if not old_list:
+            old_list = (session.search_criteria or {}).get("city") or []
+        new_list = clar.get("new_value") or []
+        if isinstance(old_list, list) and old_list and isinstance(new_list, list) and new_list:
+            old_city = "、".join(str(v) for v in old_list)
+            new_city = "、".join(str(v) for v in new_list)
+            return _V2_CLAR_CITY_REPLACE_OR_ADD.format(
+                old_city=old_city, new_city=new_city,
+            )
+        return _V2_CLAR_CITY_REPLACE_OR_ADD_FALLBACK
+    if kind == "low_confidence":
+        return _V2_CLAR_LOW_CONFIDENCE
+    if kind == "frame_conflict":
+        return _V2_CLAR_FRAME_CONFLICT
+    if kind == "role_no_permission":
+        return _V2_CLAR_ROLE_NO_PERMISSION
+    return _V2_CLAR_DEFAULT
 
 # Stage A：cancel 强规则（§9.3 / §3.4）。
 # 完整句匹配 → 直接判 cancel；句首匹配 → 判 cancel。
@@ -203,25 +253,75 @@ def _handle_text(
         conversation_service.save_session(userid, session)
         return [_reply(userid, welcome)]
 
-    # 先把当前用户消息写入 history，再让 classify_intent 看到完整上下文
+    # 先把当前用户消息写入 history，再让 LLM 看到完整上下文
     conversation_service.record_history(session, "user", content)
 
-    # 统一意图分类（命令 / show_more / LLM 三级）
-    # Stage C1（spec §2.11）：构造 session_hint 占位下发；provider 暂不消费。
-    session_hint = intent_service.build_session_hint(session)
-    try:
-        intent_result = classify_intent(
-            text=content,
-            role=user_ctx.role,
-            history=session.history,
-            current_criteria=session.search_criteria,
-            user_msg_id=msg.msg_id,
-            session_hint=session_hint,
-        )
-    except Exception as exc:
-        logger.exception("message_router: classify_intent failed: %s", exc)
-        conversation_service.save_session(userid, session)
-        return [_reply(userid, SYSTEM_BUSY_REPLY)]
+    # 阶段二（dialogue-intent-extraction-phased-plan §2.3）：
+    # mode=off 时直接走 legacy classify_intent 路径，保持已有调用点 / 测试兼容；
+    # mode=shadow / dual_read 时走 classify_dialogue 入口，里面再决定要不要旁路 v2。
+    v2_mode = getattr(_settings_module, "dialogue_v2_mode", "off")
+    decision = None  # type: ignore[assignment]
+    source = "legacy"
+
+    if v2_mode == "off":
+        # session_hint 只在 legacy 路径下需要在此处构造；classify_dialogue 内部会自己构造。
+        session_hint = intent_service.build_session_hint(session)
+        try:
+            intent_result = classify_intent(
+                text=content,
+                role=user_ctx.role,
+                history=session.history,
+                current_criteria=session.search_criteria,
+                user_msg_id=msg.msg_id,
+                session_hint=session_hint,
+            )
+        except Exception as exc:
+            logger.exception("message_router: classify_intent failed: %s", exc)
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, SYSTEM_BUSY_REPLY)]
+    else:
+        try:
+            route = classify_dialogue(
+                text=content,
+                role=user_ctx.role,
+                history=session.history,
+                session=session,
+                user_msg_id=msg.msg_id,
+                userid=userid,
+            )
+        except Exception as exc:
+            logger.exception("message_router: classify_dialogue failed: %s", exc)
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, SYSTEM_BUSY_REPLY)]
+        intent_result = route.intent_result
+        decision = route.decision
+        source = route.source
+
+        # 阶段二 v2 分支：dual_read 命中
+        if source == "v2_dual_read" and decision is not None:
+            from app.services.dialogue_applier import apply_awaiting_ops, apply_decision
+            # awaiting_ops 必须在所有 v2 分支上执行（包括 clarification / 冲突短路），
+            # 否则被消费的 awaiting 字段会僵尸保留（adversarial review C1/I15）。
+            apply_awaiting_ops(decision, session)
+            if decision.clarification:
+                # 直接渲染反问，不走 _route_*
+                reply_text = _render_v2_clarification(decision.clarification, session)
+                conversation_service.record_history(session, "assistant", reply_text)
+                conversation_service.save_session(userid, session)
+                return [_reply(userid, reply_text)]
+            # enter_upload_conflict：直接调现成的 _enter_upload_conflict
+            # 既写状态又生成 CONFLICT_PROMPT_FMT，避免在 applier 里复制冲突文案逻辑。
+            if decision.state_transition == "enter_upload_conflict":
+                replies = _enter_upload_conflict(intent_result, msg, session)
+                if replies:
+                    conversation_service.record_history(
+                        session, "assistant", replies[0].content,
+                    )
+                conversation_service.save_session(userid, session)
+                return replies
+            # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
+            # 重复调用也是幂等的：consume_search_awaiting 对已消费字段是 no-op）。
+            apply_decision(decision, session, msg=msg, intent_result=intent_result)
 
     intent = intent_result.intent
 

@@ -205,6 +205,117 @@ INTENT_USER_TEMPLATE = """\
 """
 
 # ---------------------------------------------------------------------------
+# 阶段二 Dialogue Parse Prompt（DialogueParseResult v2）
+# ---------------------------------------------------------------------------
+
+# v0.1 2026-05-01：dialogue-intent-extraction-phased-plan §2.1.1 首版。
+# Token 预算: input < 2200 tokens, output < 400 tokens（比 INTENT v2.6 略松，
+# 因为额外要带 dialogue_act / frame_hint / merge_hint / conflict_action 字段）。
+DIALOGUE_PARSE_PROMPT_V2 = """\
+你是一个蓝领招聘撮合平台的对话理解助手。
+
+## 你的任务
+把用户消息解析成结构化对话理解结果（DialogueParseResult），仅做语言理解，
+不做最终业务裁决（merge_policy / 落 session 等由后端 reducer 决定）。
+
+## 输出格式
+严格输出 JSON，不允许 markdown code block（禁止 ```json 包裹），不允许 JSON 之外的任何文本。
+
+## 输出字段（按此顺序输出）
+- dialogue_act：本轮对话行为，仅允许下列闭集：
+  start_search / modify_search / answer_missing_slot / show_more /
+  start_upload / cancel / reset / resolve_conflict / chitchat
+- frame_hint：本轮候选业务对象，仅允许：
+  job_search / candidate_search / job_upload / resume_upload / none
+- slots_delta：本轮抽到的字段（dict）。字段名必须用 canonical key（与 v2.6 INTENT prompt 一致：
+  city / job_category / salary_floor_monthly / pay_type / headcount /
+  is_long_term / gender_required / district / salary_ceiling_monthly /
+  provide_meal / provide_housing / age / age_min / age_max 等）。
+  搜索 / follow_up 一律用 city / job_category，禁止 expected_*。
+- merge_hint：dict[字段名 -> replace|add|remove|unknown]。**仅当用户文本明确表达
+  替换 / 追加 / 删除 时才输出对应值；裸值 / 模糊表达统一输出 unknown。**
+  - 「换成 X / 改成 X / 只看 X / 不看原来的」 → replace
+  - 「X 也行 / X 也可以 / 加上 X / 还看 X」 → add
+  - 「不要 X / 去掉 X」 → remove
+  - 「X / X 有吗 / X 有没有 / 裸值 / 表述模糊」 → unknown
+- needs_clarification：bool。仅在你确实无法确定本轮意图、且 reducer 必然需要反问时给 true。
+- confidence：0.0-1.0 的整体置信度。
+- conflict_action：仅 dialogue_act=resolve_conflict 时输出，闭集：
+  cancel_draft / resume_pending_upload / proceed_with_new；其它情况输出 null。
+
+## 当前用户角色
+{role}
+- worker（工人）：通常 frame=job_search；resume_upload 仅在显式表达提交简历时使用。
+- factory（厂家）：通常 frame=candidate_search 或 job_upload。
+- broker（中介）：可同时使用 search/upload；按文本字面意图选 frame。
+
+## 最近对话历史
+{history}
+
+## 当前累积搜索条件（current_criteria）
+{current_criteria}
+
+## 当前会话状态（session_hint，结构化）
+{session_hint}
+
+## 重要约束
+1. **不**输出 merge_policy；后端 reducer 决定最终 replace/add。LLM 只给 merge_hint。
+2. **不**写 session、不输出 active_flow。frame_hint 只是候选信号，后端会按
+   active_flow 优先裁决冲突（例如上传草稿中说"先找工人"会走 resolve_conflict 路径）。
+3. answer_missing_slot 仅适用于「上一轮系统在追问字段，本轮用户给单值补槽」。
+   如果本轮已经能独立 start_search / modify_search，应优先 start_search / modify_search。
+4. **resolve_conflict 仅在 active_flow=upload_conflict 上下文中有意义**；
+   其它情况禁止输出 resolve_conflict。
+5. 所有不在闭集的字段 / 值都不要输出。
+
+## 输出示例
+
+示例 1（worker 找工作 happy path）：
+用户消息：西安，想找个饭店的服务员的工作
+{{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["西安市"], "job_category": ["餐饮"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 2（worker 已有西安搜索条件，本轮裸数值补薪资）：
+用户消息：2500
+{{"dialogue_act": "answer_missing_slot", "frame_hint": "job_search", "slots_delta": {{"salary_floor_monthly": 2500}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.9, "conflict_action": null}}
+
+示例 3（worker 已有西安搜索条件，本轮裸城市表达）：
+用户消息：北京有吗
+{{"dialogue_act": "modify_search", "frame_hint": "job_search", "slots_delta": {{"city": ["北京市"]}}, "merge_hint": {{"city": "unknown"}}, "needs_clarification": false, "confidence": 0.85, "conflict_action": null}}
+
+示例 4（worker 已有西安搜索条件，明确替换）：
+用户消息：换成苏州
+{{"dialogue_act": "modify_search", "frame_hint": "job_search", "slots_delta": {{"city": ["苏州市"]}}, "merge_hint": {{"city": "replace"}}, "needs_clarification": false, "confidence": 0.92, "conflict_action": null}}
+
+示例 5（broker 找工人，明确追加城市）：
+用户消息：苏州也可以
+{{"dialogue_act": "modify_search", "frame_hint": "candidate_search", "slots_delta": {{"city": ["苏州市"]}}, "merge_hint": {{"city": "add"}}, "needs_clarification": false, "confidence": 0.9, "conflict_action": null}}
+
+示例 6（active_flow=upload_collecting 中说"先找工人"——LLM 给出 frame_hint，后端会接管为 upload_conflict）：
+用户消息：先帮我找个普工
+{{"dialogue_act": "start_search", "frame_hint": "candidate_search", "slots_delta": {{"job_category": ["普工"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.9, "conflict_action": null}}
+
+示例 7（active_flow=upload_conflict 中用户回"取消草稿"）：
+用户消息：取消草稿吧
+{{"dialogue_act": "resolve_conflict", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": "cancel_draft"}}
+
+示例 8（active_flow=upload_conflict 中用户回"继续发布"）：
+用户消息：继续发布
+{{"dialogue_act": "resolve_conflict", "frame_hint": "job_upload", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": "resume_pending_upload"}}
+
+示例 9（worker 错把发岗位写出来——后端会再校正；这里仅按字面解析）：
+用户消息：我想招个服务员
+{{"dialogue_act": "start_upload", "frame_hint": "job_upload", "slots_delta": {{"job_category": ["餐饮"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.55, "conflict_action": null}}
+
+示例 10（无法理解 / 闲聊）：
+用户消息：你好
+{{"dialogue_act": "chitchat", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.6, "conflict_action": null}}
+"""
+
+DIALOGUE_USER_TEMPLATE = """\
+用户消息: {text}
+"""
+
+# ---------------------------------------------------------------------------
 # Rerank Prompt
 # ---------------------------------------------------------------------------
 
@@ -282,6 +393,10 @@ PROMPT_VERSION = INTENT_PROMPT_VERSION
 PROMPT_DATE = "2026-05-01"
 RERANK_PROMPT_VERSION = "v2.0"
 
+# 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。
+# 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。
+DIALOGUE_PROMPT_VERSION = "v0.1"
+
 
 def build_criteria_snapshot_meta() -> dict:
     """构建 criteria_snapshot 中的 prompt 版本元数据。
@@ -291,6 +406,7 @@ def build_criteria_snapshot_meta() -> dict:
     return {
         "intent_prompt_version": INTENT_PROMPT_VERSION,
         "rerank_prompt_version": RERANK_PROMPT_VERSION,
+        "dialogue_prompt_version": DIALOGUE_PROMPT_VERSION,
     }
 
 INTENT_INPUT_TOKEN_BUDGET = 2000

@@ -1,6 +1,6 @@
-"""Phase 1 golden dialogue case runner。
+"""Phase 1/2 golden dialogue case runner。
 
-设计目标（详见 docs/dialogue-intent-extraction-phased-plan.md §1.4.bis）：
+设计目标（详见 docs/dialogue-intent-extraction-phased-plan.md §1.4.bis / §2.5）：
 
 1. 用 mock LLM 驱动整条 message_router → intent_service → upload_service /
    search_service 链路，避免在 case 里手写一长串 monkeypatch；
@@ -9,7 +9,11 @@
 3. 阶段一只断言可观测、稳定的字段——`intent` / `search_criteria` / handler 入口 /
    是否触发 SQL 检索 / awaiting 队列状态。文案不进主断言。
 
-阶段二再扩 `dialogue_act` / `resolved_frame` / `clarification.kind` 等字段。
+阶段二扩展（dialogue-intent-extraction-phased-plan §2）：
+- turn 可选 ``mock_v2``：注入 DialogueParseResult；存在则走 v2_dual_read 路径，
+  否则走 legacy（mock_llm 注入 IntentResult）。
+- turn 可选 ``v2_mode``：覆盖默认 mode（默认 case 顶层 ``mode``，case 默认 ``off``）。
+- expect 新增键见 ``_KNOWN_EXPECT_KEYS``。
 """
 from __future__ import annotations
 
@@ -17,9 +21,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.llm.base import IntentResult
+from app.llm.base import DialogueParseResult, IntentResult
 from app.schemas.conversation import SessionState
 from app.services import intent_service, message_router
+from app.services.intent_service import DialogueRouteResult
 from app.services.user_service import UserContext
 from app.wecom.callback import WeComMessage
 
@@ -84,6 +89,11 @@ class _SearchCallSpy:
 def run_dialogue_case(case: dict) -> dict:
     """执行一条 golden case，返回每轮收集到的 trace。
 
+    阶段二增加：
+    - turn 可选 ``mock_v2``：DialogueParseResult 替身；命中后走 v2_dual_read。
+    - case 顶层可选 ``v2_mode``：覆盖默认 ``off``；turn 也可单独覆盖。
+    - case 顶层可选 ``ambiguous_city_query_policy``：覆盖默认配置。
+
     trace 形态：
         {
             "turns": [
@@ -95,6 +105,17 @@ def run_dialogue_case(case: dict) -> dict:
                     "ran_search": bool,
                     "handler": str,
                     "reply": str,
+                    "needs_clarification": bool,
+                    "legacy_missing": list[str],
+                    # 阶段二新增：
+                    "dialogue_act": str | None,
+                    "resolved_frame": str | None,
+                    "resolved_merge_policy": dict,
+                    "clarification_kind": str | None,
+                    "clarification_options": list[str] | None,
+                    "source": str,            # legacy / v2_shadow / v2_dual_read / v2_fallback_legacy
+                    "state_transition": str,
+                    "final_search_criteria": dict,
                 },
                 ...
             ],
@@ -112,54 +133,84 @@ def run_dialogue_case(case: dict) -> dict:
     spy = _SearchCallSpy()
     trace_turns: list[dict] = []
 
-    # 把 mock LLM 容器从 _golden_mocks 提到外层，便于 trace 里读取本轮 mock_llm.intent
     mock_intent_result_holder: dict[str, IntentResult] = {}
+    mock_v2_holder: dict[str, DialogueParseResult | None] = {"value": None}
+    last_decision_holder: dict[str, Any] = {"value": None}
+    last_source_holder: dict[str, str] = {"value": "legacy"}
 
-    # Mock：identify_or_register / load_session / save_session / search_service
-    with _golden_mocks(user_ctx, session, spy, mock_intent_result_holder) as mocks:
+    case_mode = (case.get("v2_mode") or "off").strip()
+    case_policy = case.get("ambiguous_city_query_policy")
+    case_low_conf_threshold = case.get("low_confidence_threshold")
+
+    with _golden_mocks(
+        user_ctx, session, spy,
+        mock_intent_result_holder, mock_v2_holder,
+        last_decision_holder, last_source_holder,
+    ) as mocks:
         prev_search_calls = 0
-        for idx, turn in enumerate(case["turns"]):
-            mocks["set_mock_llm"](turn["mock_llm"])
-            handler_marker = {"name": ""}
-            mocks["mark_handler"](handler_marker)
+        from app.config import settings as _settings
+        original_mode = getattr(_settings, "dialogue_v2_mode", "off")
+        original_policy = getattr(_settings, "ambiguous_city_query_policy", "clarify")
+        original_threshold = getattr(_settings, "low_confidence_threshold", 0.6)
+        try:
+            for idx, turn in enumerate(case["turns"]):
+                mocks["set_mock_llm"](turn["mock_llm"])
+                mocks["set_mock_v2"](turn.get("mock_v2"))
+                # turn 级别覆盖（不写则继承 case，case 不写则保持原 settings）
+                turn_mode = (turn.get("v2_mode") or case_mode or "off").strip()
+                _settings.dialogue_v2_mode = turn_mode
+                if case_policy is not None:
+                    _settings.ambiguous_city_query_policy = case_policy
+                if case_low_conf_threshold is not None:
+                    _settings.low_confidence_threshold = float(case_low_conf_threshold)
 
-            msg = _build_msg(turn["user"], idx)
-            replies = message_router.process(msg, db=mocks["db"])
+                handler_marker = {"name": ""}
+                mocks["mark_handler"](handler_marker)
+                last_decision_holder["value"] = None
+                last_source_holder["value"] = "legacy"
 
-            cur_search_calls = len(spy.jobs_calls) + len(spy.workers_calls)
-            reply_text = replies[0].content if replies else ""
-            replied_intent = replies[0].intent if replies and replies[0].intent else None
-            # 派生 needs_clarification：阶段一没有真正的 clarification 通道，
-            # "信息还不够完整" 是 missing 追问而非 clarification（后者要等阶段二）。
-            # 阶段一固定 False；fixture 显式断言这一点，避免 Phase 2 落 clarification
-            # 后忘记升级 fixture。
-            needs_clarification = False
-            # 派生 expected_legacy_missing：用 turn 末态的 search_criteria 跑 legacy schema
-            # 重算，验证后端按 schema 重算 missing 与 fixture 期望一致。
-            # 使用 reply 的 intent（即 sanitize 后的最终 intent），而不是 mock 原始 intent，
-            # 这样 worker 护栏纠正后 (upload_job → search_job) 也能取到正确 frame。
-            frame = _frame_for_intent(replied_intent)
-            if frame:
-                legacy_missing = intent_service._legacy_compute_missing(
-                    frame, dict(session.search_criteria or {}),
-                )
-            else:
-                legacy_missing = []
-            trace_turns.append({
-                "intent": (
-                    replies[0].intent if replies and replies[0].intent
-                    else None
-                ),
-                "search_criteria": dict(session.search_criteria or {}),
-                "awaiting_fields": list(session.awaiting_fields or []),
-                "awaiting_frame": session.awaiting_frame,
-                "ran_search": cur_search_calls > prev_search_calls,
-                "handler": handler_marker["name"],
-                "reply": reply_text,
-                "needs_clarification": needs_clarification,
-                "legacy_missing": legacy_missing,
-            })
-            prev_search_calls = cur_search_calls
+                msg = _build_msg(turn["user"], idx)
+                replies = message_router.process(msg, db=mocks["db"])
+
+                cur_search_calls = len(spy.jobs_calls) + len(spy.workers_calls)
+                reply_text = replies[0].content if replies else ""
+                replied_intent = replies[0].intent if replies and replies[0].intent else None
+                # 派生 needs_clarification：v2 路径下 decision.clarification 非空 = True
+                decision = last_decision_holder["value"]
+                needs_clarification = bool(getattr(decision, "clarification", None))
+                clar = getattr(decision, "clarification", None) or {}
+                # 派生 expected_legacy_missing
+                frame = _frame_for_intent(replied_intent)
+                if frame:
+                    legacy_missing = intent_service._legacy_compute_missing(
+                        frame, dict(session.search_criteria or {}),
+                    )
+                else:
+                    legacy_missing = []
+                trace_turns.append({
+                    "intent": replied_intent,
+                    "search_criteria": dict(session.search_criteria or {}),
+                    "awaiting_fields": list(session.awaiting_fields or []),
+                    "awaiting_frame": session.awaiting_frame,
+                    "ran_search": cur_search_calls > prev_search_calls,
+                    "handler": handler_marker["name"],
+                    "reply": reply_text,
+                    "needs_clarification": needs_clarification,
+                    "legacy_missing": legacy_missing,
+                    "dialogue_act": getattr(decision, "dialogue_act", None),
+                    "resolved_frame": getattr(decision, "resolved_frame", None),
+                    "resolved_merge_policy": dict(getattr(decision, "resolved_merge_policy", {}) or {}),
+                    "clarification_kind": clar.get("kind") if clar else None,
+                    "clarification_options": list(clar.get("options") or []) if clar else None,
+                    "source": last_source_holder["value"],
+                    "state_transition": getattr(decision, "state_transition", "none"),
+                    "final_search_criteria": dict(getattr(decision, "final_search_criteria", {}) or {}),
+                })
+                prev_search_calls = cur_search_calls
+        finally:
+            _settings.dialogue_v2_mode = original_mode
+            _settings.ambiguous_city_query_policy = original_policy
+            _settings.low_confidence_threshold = original_threshold
 
     return {"turns": trace_turns, "session": session, "spy": spy}
 
@@ -174,22 +225,93 @@ def _frame_for_intent(intent: str | None) -> str | None:
 
 
 @contextmanager
-def _golden_mocks(user_ctx, session, spy, mock_intent_result_holder):
-    """统一打桩：避免每条 case 重复 patch。"""
+def _golden_mocks(
+    user_ctx, session, spy, mock_intent_result_holder,
+    mock_v2_holder=None, last_decision_holder=None, last_source_holder=None,
+):
+    """统一打桩：避免每条 case 重复 patch。
+
+    阶段二（dialogue-intent-extraction-phased-plan §2.5）：
+    - 当 turn 提供 mock_v2 + dialogue_v2_mode != off 时，走 v2_dual_read 路径，
+      让 reducer / compat / applier 真实运行；
+    - 否则走 legacy（_sanitize_intent_result 仍然跑，与生产路径对齐）；
+    - last_decision_holder / last_source_holder 用于 trace 回读。
+    """
     from unittest.mock import MagicMock
+    from app.services.dialogue_compat import decision_to_intent_result
+    from app.services.dialogue_reducer import reduce as _reduce
+
+    if mock_v2_holder is None:
+        mock_v2_holder = {"value": None}
+    if last_decision_holder is None:
+        last_decision_holder = {"value": None}
+    if last_source_holder is None:
+        last_source_holder = {"value": "legacy"}
 
     db = MagicMock()
 
     def set_mock_llm(payload: dict) -> None:
         mock_intent_result_holder["value"] = IntentResult(**payload)
 
-    def fake_classify(text, role, history=None, current_criteria=None,
-                      user_msg_id=None, session_hint=None):
+    def set_mock_v2(payload):
+        if payload is None:
+            mock_v2_holder["value"] = None
+        elif isinstance(payload, dict) and payload.get("_raise"):
+            # 用 dict {"_raise": True} 显式模拟 v2 解析失败 → fallback 测试
+            mock_v2_holder["value"] = "_raise"
+        else:
+            mock_v2_holder["value"] = DialogueParseResult(**payload)
+
+    def _legacy_intent_result(text, role):
         # Phase 1 worker 搜索护栏要在这里也跑 sanitize（与生产路径对齐）
         from app.services.intent_service import _sanitize_intent_result
         result = mock_intent_result_holder["value"]
         result_copy = result.model_copy(deep=True)
         return _sanitize_intent_result(result_copy, role, raw_text=text.strip())
+
+    def fake_classify_dialogue(text, role, history=None, *, session=None,
+                               user_msg_id=None, userid=None):
+        from app.config import settings as _settings
+        mode = getattr(_settings, "dialogue_v2_mode", "off")
+        v2_payload = mock_v2_holder.get("value")
+
+        # 优先用 mock_v2 + mode=dual_read 走 v2 路径
+        if mode == "dual_read" and v2_payload is not None and session is not None:
+            # 显式模拟 v2 解析失败 → fallback
+            if v2_payload == "_raise":
+                last_source_holder["value"] = "v2_fallback_legacy"
+                return DialogueRouteResult(
+                    intent_result=_legacy_intent_result(text, role),
+                    decision=None, source="v2_fallback_legacy",
+                )
+            try:
+                decision = _reduce(
+                    v2_payload, session, role, raw_text=text.strip(),
+                )
+                ir = decision_to_intent_result(decision, session)
+                last_decision_holder["value"] = decision
+                last_source_holder["value"] = "v2_dual_read"
+                return DialogueRouteResult(
+                    intent_result=ir, decision=decision, source="v2_dual_read",
+                )
+            except Exception:
+                # fallback 到 legacy
+                last_source_holder["value"] = "v2_fallback_legacy"
+                return DialogueRouteResult(
+                    intent_result=_legacy_intent_result(text, role),
+                    decision=None, source="v2_fallback_legacy",
+                )
+
+        # legacy 路径（mode=off / shadow / dual_read 未提供 mock_v2）
+        last_source_holder["value"] = "legacy"
+        return DialogueRouteResult(
+            intent_result=_legacy_intent_result(text, role),
+            decision=None, source="legacy",
+        )
+
+    def fake_classify(text, role, history=None, current_criteria=None,
+                      user_msg_id=None, session_hint=None):
+        return _legacy_intent_result(text, role)
 
     handler_holder: dict[str, dict] = {}
 
@@ -224,6 +346,7 @@ def _golden_mocks(user_ctx, session, spy, mock_intent_result_holder):
     _swap(message_router.conversation_service, "save_session",
           lambda *a, **k: None)
     _swap(message_router, "classify_intent", fake_classify)
+    _swap(message_router, "classify_dialogue", fake_classify_dialogue)
     _swap(message_router.search_service, "search_jobs", spy.fake_search_jobs)
     _swap(message_router.search_service, "search_workers", spy.fake_search_workers)
     _swap(message_router.search_service, "has_effective_search_criteria",
@@ -239,6 +362,7 @@ def _golden_mocks(user_ctx, session, spy, mock_intent_result_holder):
         yield {
             "db": db,
             "set_mock_llm": set_mock_llm,
+            "set_mock_v2": set_mock_v2,
             "mark_handler": mark_handler,
         }
     finally:
@@ -269,6 +393,15 @@ _KNOWN_EXPECT_KEYS = frozenset({
     "should_ask_missing",
     "handler",
     "needs_clarification",
+    # 阶段二（dialogue-intent-extraction-phased-plan §2）新增
+    "dialogue_act",
+    "resolved_frame",
+    "resolved_merge_policy",
+    "clarification_kind",
+    "clarification_options",
+    "source",
+    "state_transition",
+    "final_search_criteria",
 })
 
 
@@ -338,6 +471,49 @@ def assert_turn(trace_turn: dict, expect: dict, label: str = "") -> None:
         assert actual_missing == want_missing, (
             f"{prefix}legacy_missing={actual_missing} "
             f"!= expect={want_missing}"
+        )
+
+    # 阶段二字段断言
+    if "dialogue_act" in expect:
+        assert trace_turn["dialogue_act"] == expect["dialogue_act"], (
+            f"{prefix}dialogue_act={trace_turn['dialogue_act']} "
+            f"!= expect={expect['dialogue_act']}"
+        )
+    if "resolved_frame" in expect:
+        assert trace_turn["resolved_frame"] == expect["resolved_frame"], (
+            f"{prefix}resolved_frame={trace_turn['resolved_frame']} "
+            f"!= expect={expect['resolved_frame']}"
+        )
+    if "resolved_merge_policy" in expect:
+        assert trace_turn["resolved_merge_policy"] == expect["resolved_merge_policy"], (
+            f"{prefix}resolved_merge_policy={trace_turn['resolved_merge_policy']} "
+            f"!= expect={expect['resolved_merge_policy']}"
+        )
+    if "clarification_kind" in expect:
+        assert trace_turn["clarification_kind"] == expect["clarification_kind"], (
+            f"{prefix}clarification_kind={trace_turn['clarification_kind']} "
+            f"!= expect={expect['clarification_kind']}"
+        )
+    if "clarification_options" in expect:
+        actual_opts = sorted(trace_turn["clarification_options"] or [])
+        want_opts = sorted(expect["clarification_options"] or [])
+        assert actual_opts == want_opts, (
+            f"{prefix}clarification_options={actual_opts} != expect={want_opts}"
+        )
+    if "source" in expect:
+        assert trace_turn["source"] == expect["source"], (
+            f"{prefix}source={trace_turn['source']} != expect={expect['source']}"
+        )
+    if "state_transition" in expect:
+        assert trace_turn["state_transition"] == expect["state_transition"], (
+            f"{prefix}state_transition={trace_turn['state_transition']} "
+            f"!= expect={expect['state_transition']}"
+        )
+    if "final_search_criteria" in expect:
+        actual_fc = _normalize_criteria_for_compare(trace_turn["final_search_criteria"])
+        want_fc = _normalize_criteria_for_compare(expect["final_search_criteria"])
+        assert actual_fc == want_fc, (
+            f"{prefix}final_search_criteria={actual_fc} != expect={want_fc}"
         )
 
 

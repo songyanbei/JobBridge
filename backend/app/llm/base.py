@@ -4,6 +4,7 @@
 切换供应商只需在 llm/__init__.py 的工厂函数里改注册。
 """
 from abc import ABC, abstractmethod
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -44,6 +45,55 @@ class IntentResult(BaseModel):
     )
     # Phase 7：token 用量（OpenAI 兼容响应的 usage.prompt_tokens / completion_tokens），
     # 由 provider 从响应体提取并回填；解析失败 / 无 usage 时保持 None。
+    input_tokens: int | None = Field(default=None, description="prompt_tokens")
+    output_tokens: int | None = Field(default=None, description="completion_tokens")
+
+
+class DialogueParseResult(BaseModel):
+    """阶段二 LLM 解析层 DTO（对应 docs/dialogue-intent-extraction-phased-plan §2.1.1）。
+
+    LLM 只输出语言理解结果，不输出最终 merge_policy / 不写 session。
+    后端裁决通过 dialogue_reducer.reduce 把本结构映射成 DialogueDecision。
+    """
+
+    dialogue_act: Literal[
+        "start_search",
+        "modify_search",
+        "answer_missing_slot",
+        "show_more",
+        "start_upload",
+        "cancel",
+        "reset",
+        "resolve_conflict",
+        "chitchat",
+    ] = Field(..., description="本轮对话行为")
+    frame_hint: Literal[
+        "job_search",
+        "candidate_search",
+        "job_upload",
+        "resume_upload",
+        "none",
+    ] = Field(default="none", description="本轮候选业务对象，仅作信号，不写 session")
+    slots_delta: dict = Field(default_factory=dict, description="本轮抽到的字段变化")
+    merge_hint: dict[str, Literal["replace", "add", "remove", "unknown"]] = Field(
+        default_factory=dict,
+        description=(
+            "对 slots_delta 中 list 字段的合并意图："
+            "明确表达替换 / 追加 / 删除 时给 replace/add/remove，"
+            "裸值 / 模糊表达统一 unknown，由后端 reducer 决策"
+        ),
+    )
+    needs_clarification: bool = Field(default=False, description="是否需要反问澄清")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    conflict_action: Literal[
+        "cancel_draft",
+        "resume_pending_upload",
+        "proceed_with_new",
+    ] | None = Field(
+        default=None,
+        description="仅 dialogue_act=resolve_conflict 时出现",
+    )
+    raw_response: str = Field(default="", description="LLM 原始输出（调试 & 日志用）")
     input_tokens: int | None = Field(default=None, description="prompt_tokens")
     output_tokens: int | None = Field(default=None, description="completion_tokens")
 
@@ -105,6 +155,26 @@ class IntentExtractor(ABC):
             IntentResult
         """
         ...
+
+    def extract_dialogue(
+        self,
+        text: str,
+        role: str,
+        history: list[dict] | None = None,
+        current_criteria: dict | None = None,
+        session_hint: dict | None = None,
+    ) -> "DialogueParseResult":
+        """阶段二新增：解析为 DialogueParseResult。
+
+        默认实现 raise NotImplementedError；旧 provider 不强制实现。
+        生产路径在 dialogue_v2_mode != off 时才会调用本方法；
+        遇到 NotImplementedError / LLMParseError 时由 classify_dialogue 回退到
+        _classify_intent_legacy 内核（避免递归），见 phased-plan §2.3。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement extract_dialogue; "
+            "set dialogue_v2_mode=off or upgrade the provider."
+        )
 
 
 class Reranker(ABC):
