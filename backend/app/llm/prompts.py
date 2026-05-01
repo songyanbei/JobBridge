@@ -99,10 +99,12 @@ INTENT_SYSTEM_PROMPT = """\
 - 用户表达"换成 X / 改成 X / 只看 X" 等替换语义 → 在 structured_data 里直接给替换后的新值。
 - 用户表达"X 也行 / 还看 X / 加上 X" 等叠加语义 → 在 structured_data 里给原值并上新值后的列表。
 - 裸值（如用户只说"苏州"）默认按替换处理。
+- **"X 有吗 / X 有没有 / X 怎么样"** 这类带歧义的探询（用户问某地/某工种是否有岗位/简历），当 current_criteria 已含同字段不同值时 → **按替换处理**（不要叠加）。例如已有 city=["西安市"]，用户说"北京有吗" → structured_data.city = ["北京市"]，**禁止**输出 ["西安市", "北京市"]。
 
 举例（current_criteria 为 city=["北京市"]）：
 - 用户说"换成苏州" → structured_data.city = ["苏州市"]（替换）
 - 用户说"苏州也行" → structured_data.city = ["北京市", "苏州市"]（叠加）
+- 用户说"苏州有吗" → structured_data.city = ["苏州市"]（替换，不叠加）
 
 ## criteria_patch 语义（仅 search_* / upload_* 使用，follow_up 不用）
 
@@ -125,6 +127,15 @@ INTENT_SYSTEM_PROMPT = """\
 
 ## 当前累积检索条件
 {current_criteria}
+
+## 当前会话状态片段（结构化，仅作信号）
+{session_hint}
+说明：
+- active_flow：后端当前所处状态机（idle / search_active / upload_collecting / upload_conflict）。
+- awaiting_fields：搜索流程上一轮请用户补的字段队列；如果用户本轮只发裸值（如"2500"、"2 个人"），优先把它落到队列首个语义匹配的字段。
+- awaiting_frame：awaiting_fields 所属的搜索 frame（job_search / candidate_search）；不要跨 frame 消费。
+- pending_upload_intent / pending_upload：上传草稿正在收集字段；与搜索流程互不复用。
+- search_criteria：跨轮累计的搜索条件，follow_up 时用作快照基线。
 
 ## fallback 规则
 - 无法确定意图 → intent="chitchat", confidence=0.0
@@ -182,6 +193,11 @@ INTENT_SYSTEM_PROMPT = """\
 当前累积检索条件: {{"city": ["北京市"], "job_category": ["普工"]}}
 用户消息: "苏州也行"
 {{"intent": "follow_up", "structured_data": {{"city": ["北京市", "苏州市"], "job_category": ["普工"]}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.9}}
+
+示例12 - "X 有吗" 探询语义（**当 current_criteria 已有不同 city 时按替换处理；禁止叠加**）:
+当前累积检索条件: {{"city": ["西安市"], "job_category": ["餐饮"], "salary_floor_monthly": 2500}}
+用户消息: "北京有吗"
+{{"intent": "follow_up", "structured_data": {{"city": ["北京市"], "job_category": ["餐饮"], "salary_floor_monthly": 2500}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.85}}
 """
 
 INTENT_USER_TEMPLATE = """\
@@ -240,9 +256,30 @@ RERANK_USER_TEMPLATE = """\
 # 常量汇总（便于测试和外部引用）
 # ---------------------------------------------------------------------------
 
-PROMPT_VERSION = "v2.1"
-PROMPT_DATE = "2026-04-26"
-INTENT_PROMPT_VERSION = "v2.1"
+# intent prompt 版本：每次改 INTENT_SYSTEM_PROMPT 内容（含 few-shot）都必须 bump，
+# 否则 message_router 落 conversation_log.criteria_snapshot.prompt_version 会错记
+# 旧版本，回溯排查时被误导。intent_service.classify_intent 的 llm_call 日志也读这里。
+#
+# v2.6 (Phase 1 + LLM drift 修复)：明确 "X 有吗 / X 有没有" 在 current_criteria
+#                  已含同字段不同值时按替换处理（与"换成 X / 裸值"一致），并加示例 12
+#                  锁住"北京有吗"不再被错误叠加成 ["西安市","北京市"]。
+# v2.5 (Phase 1)：system prompt 注入 session_hint 结构化片段（active_flow /
+#                  awaiting_fields / awaiting_frame / search_criteria 摘要），
+#                  + worker 搜索护栏（worker + 找工/求职信号 + 无发布信号 →
+#                  强制 intent=search_job）。
+# v2.4 (Bug 6)：补角色意图护栏 + 城市短追问确定性兜底，避免 worker 找工作
+#               被误判为发岗位，或"北京有吗"沿用旧城市。
+# v2.3 (Bug 5)：follow_up 输出全量 criteria 快照（structured_data），干掉
+#               criteria_patch 的 add/update 二元歧义；后端走 replace_criteria。
+# v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
+#               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
+# v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
+INTENT_PROMPT_VERSION = "v2.6"
+
+# PROMPT_VERSION 是给 conversation_log.criteria_snapshot 用的"对话快照版本"，
+# 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
+PROMPT_VERSION = INTENT_PROMPT_VERSION
+PROMPT_DATE = "2026-05-01"
 RERANK_PROMPT_VERSION = "v2.0"
 
 

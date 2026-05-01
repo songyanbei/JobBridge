@@ -235,6 +235,9 @@ def reset_search(session: SessionState) -> None:
         session.current_intent = None
         # Stage C1：无 pending 时，/重新找 收敛为 idle；有 pending 时保留 upload_collecting
         session.active_flow = "idle"
+    # Phase 1（dialogue-intent-extraction-phased-plan §1.1.2）：搜索 awaiting
+    # 是搜索流程私有的临时状态；reset_search 必须连同清掉，避免下一轮的裸值落到旧字段。
+    clear_search_awaiting(session)
     # history 清空（固定策略）
     session.history = []
 
@@ -366,6 +369,8 @@ def set_broker_direction(
     session.search_criteria = {}
     session.candidate_snapshot = None
     session.shown_items = []
+    # Phase 1：方向切换 = 进入新搜索 frame；旧 frame 的 awaiting 队列必须清空。
+    clear_search_awaiting(session)
     if not session.pending_upload_intent:
         session.follow_up_rounds = 0
         # Stage C1：无 pending 时，方向切换后回 idle，等待下一次搜索把 active_flow 推进
@@ -381,3 +386,69 @@ def increment_follow_up(session: SessionState) -> int:
     """累加追问轮数，返回新的轮数。"""
     session.follow_up_rounds += 1
     return session.follow_up_rounds
+
+
+# ---------------------------------------------------------------------------
+# Phase 1：搜索 awaiting 物化（dialogue-intent-extraction-phased-plan §1.3）
+# ---------------------------------------------------------------------------
+
+def set_search_awaiting(
+    session: SessionState,
+    fields: list[str],
+    frame: str,
+    ttl_seconds: int | None = None,
+) -> None:
+    """记录搜索追问的字段 FIFO 队列 + 过期时间 + 所属 frame。
+
+    覆盖式写入：每次 _handle_search 重新计算 missing 时整体替换队列。
+    与上传草稿的 awaiting_field 完全独立，不会互相污染。
+    """
+    from app.config import settings
+
+    if ttl_seconds is None:
+        ttl_seconds = getattr(settings, "search_awaiting_ttl_seconds", 600)
+
+    session.awaiting_fields = list(fields or [])
+    session.awaiting_frame = frame if session.awaiting_fields else None
+    if session.awaiting_fields:
+        expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        session.awaiting_expires_at = expires.isoformat()
+    else:
+        session.awaiting_expires_at = None
+
+
+def is_search_awaiting_expired(session: SessionState) -> bool:
+    """判断搜索 awaiting 是否已过期。无队列或无过期时间视为不可用。"""
+    if not session.awaiting_fields:
+        return True
+    if not session.awaiting_expires_at:
+        return True
+    try:
+        expires_dt = datetime.fromisoformat(session.awaiting_expires_at)
+    except (ValueError, TypeError):
+        return True
+    return datetime.now(timezone.utc) > expires_dt
+
+
+def consume_search_awaiting(
+    session: SessionState,
+    accepted_fields: list[str] | None,
+) -> None:
+    """从队列移除已被消费的字段；队列空时清空 awaiting_frame / awaiting_expires_at。"""
+    if not session.awaiting_fields:
+        return
+    if not accepted_fields:
+        return
+    accepted_set = set(accepted_fields)
+    remaining = [f for f in session.awaiting_fields if f not in accepted_set]
+    session.awaiting_fields = remaining
+    if not remaining:
+        session.awaiting_frame = None
+        session.awaiting_expires_at = None
+
+
+def clear_search_awaiting(session: SessionState) -> None:
+    """搜索成功 / cancel / 进入上传 / 切流时清空搜索 awaiting。"""
+    session.awaiting_fields = []
+    session.awaiting_frame = None
+    session.awaiting_expires_at = None

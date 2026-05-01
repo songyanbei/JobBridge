@@ -88,6 +88,7 @@ class IntentExtractor(ABC):
         role: str,
         history: list[dict] | None = None,
         current_criteria: dict | None = None,
+        session_hint: dict | None = None,
     ) -> IntentResult:
         """解析一条用户消息。
 
@@ -96,6 +97,9 @@ class IntentExtractor(ABC):
             role: 用户角色 (worker / factory / broker)
             history: 最近 N 轮对话历史 [{"role":"user","content":"..."}, ...]
             current_criteria: 当前会话的累积检索条件（多轮 merge 用）
+            session_hint: 当前会话状态摘要（active_flow / awaiting_fields / search_criteria 等）；
+                Phase 1 起 provider 应把它结构化拼入 system prompt，未实现的旧
+                provider 可忽略不报错。
 
         Returns:
             IntentResult

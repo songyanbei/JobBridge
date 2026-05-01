@@ -20,6 +20,7 @@ from app.llm.providers._base import (
     format_candidates,
     format_criteria,
     format_history,
+    format_session_hint,
     parse_intent_response,
     parse_rerank_response,
 )
@@ -72,11 +73,13 @@ class QwenIntentExtractor(IntentExtractor):
         role: str,
         history: list[dict] | None = None,
         current_criteria: dict | None = None,
+        session_hint: dict | None = None,
     ) -> IntentResult:
         system_prompt = INTENT_SYSTEM_PROMPT.format(
             role=role,
             history=format_history(history),
             current_criteria=format_criteria(current_criteria),
+            session_hint=format_session_hint(session_hint),
         )
         user_prompt = INTENT_USER_TEMPLATE.format(text=text)
 

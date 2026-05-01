@@ -17,9 +17,19 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        # Stage B 2026-04-26: bump to v2.1，prompt 加 closed-enum job_category + few-shot 同义词归并
-        assert prompts.PROMPT_VERSION == "v2.1"
-        assert prompts.PROMPT_DATE == "2026-04-26"
+        # Phase 1 2026-05-01: bump to v2.6，prompt 加 "X 有吗" replace 约束 + 示例 12，
+        # 并把 INTENT_PROMPT_VERSION 与 PROMPT_VERSION 锁成同一来源，避免 drift。
+        assert prompts.PROMPT_VERSION == "v2.6"
+        assert prompts.INTENT_PROMPT_VERSION == "v2.6"
+        # PROMPT_VERSION 必须等于 INTENT_PROMPT_VERSION（一次 prompt 修订一组版本号）
+        assert prompts.PROMPT_VERSION == prompts.INTENT_PROMPT_VERSION
+        assert prompts.PROMPT_DATE == "2026-05-01"
+
+    def test_intent_service_version_aliases_prompts(self):
+        """intent_service.INTENT_PROMPT_VERSION 必须从 prompts 单一来源取，
+        防止两份常量回到 v2.1 vs v2.6 不一致状态（reviewer P3）。"""
+        from app.services import intent_service
+        assert intent_service.INTENT_PROMPT_VERSION is prompts.INTENT_PROMPT_VERSION
 
     def test_token_budget_constants(self):
         assert prompts.INTENT_INPUT_TOKEN_BUDGET == 2000

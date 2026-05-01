@@ -39,7 +39,12 @@ from app.services import (
     upload_service,
     user_service,
 )
-from app.services.intent_service import classify_intent
+from app.services.intent_service import (
+    _SALARY_MAX,
+    _SALARY_MIN,
+    _legacy_compute_missing,
+    classify_intent,
+)
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -602,6 +607,9 @@ def _handle_upload(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
+    # Phase 1：进入上传流程时清搜索 awaiting，避免上传草稿的裸值（如 headcount 的 "2"）
+    # 与搜索 awaiting 的薪资字段（"2500"）混淆。
+    conversation_service.clear_search_awaiting(session)
     result = upload_service.process_upload(
         user_ctx=user_ctx,
         intent_result=intent_result,
@@ -628,10 +636,13 @@ def _handle_upload_and_search(
 ) -> list[ReplyMessage]:
     """上传后顺带检索一次。仅在上传成功时才接着检索。
 
+    Phase 1：进入此路径同时也清搜索 awaiting，避免与上传 awaiting 互相污染。
+
     Stage C1（spec §9.2.1）：
     - 入库成功后必跑搜索；不论 0 命中还是有结果都写 last_criteria。
     - 有结果 → active_flow=search_active；0 命中 → active_flow=idle，保留 last_criteria。
     """
+    conversation_service.clear_search_awaiting(session)
     # 入库前用 structured_data 构造对侧搜索 criteria，避免 process_upload 清空 pending 后丢字段
     upload_structured = dict(intent_result.structured_data or {})
 
@@ -695,18 +706,44 @@ def _handle_search(
     if new_criteria:
         session.search_criteria = {**session.search_criteria, **new_criteria}
 
-    # Bug 1 修复：合并后再判 missing。LLM 在短文本上会把已知字段错误地标进
-    # missing_fields（如用户说"西安有吗"时，session 已有 job_category="餐饮"
-    # 但 LLM 仍标 job_category 为 missing），需要按合并后的 session.search_criteria
-    # 复核——已填字段从 missing 里剔除。详见 _compute_search_missing。
-    missing = _compute_search_missing(intent_result, session)
+    # Phase 1（dialogue-intent-extraction-phased-plan §1.1.3）：frame 校正后，
+    # 用临时 legacy schema 重算 missing，不直接信任 LLM 的 missing_fields。
+    # 旧 _compute_search_missing 仍保留作为 fallback：当 frame 不属于搜索 frame
+    # 时（极罕见）退回旧逻辑。
+    #
+    # Stage B P1-1 兼容：worker "看看新岗位" 这类 structured_data 与 LLM missing 都为空、
+    # 完全靠简历兜底默认条件的场景，仍按 LLM 走（让 _run_search → _apply_default_criteria
+    # 注入 worker 简历的 expected_cities / expected_job_categories）。否则会被 legacy
+    # 强制要求 city + job_category 而错失资源。
+    frame = _search_frame_for_intent(intent_result.intent)
+    if frame:
+        llm_missing = list(intent_result.missing_fields or [])
+        relies_on_defaults = (not new_criteria) and (not llm_missing)
+        if relies_on_defaults:
+            missing = _compute_search_missing(intent_result, session)
+        else:
+            missing = _legacy_compute_missing(frame, session.search_criteria)
+            # 过滤掉 candidate_search 的"city|job_category"组合占位，转成单字段 city
+            # 让追问文案更自然（任一即可，但用户视角下提示最常见的"城市"即可触发）。
+            missing = [m if "|" not in m else "city" for m in missing]
+    else:
+        missing = _compute_search_missing(intent_result, session)
+
     if missing:
+        # Phase 1（§1.1.2）：写入搜索 awaiting，下一轮裸值优先按字段类型落槽。
+        if frame:
+            conversation_service.set_search_awaiting(
+                session, missing, frame=frame,
+            )
         return [_reply(
             msg.from_user,
             _missing_follow_up_text(missing),
             intent=intent_result.intent,
             criteria_snapshot=_snapshot_meta(session),
         )]
+
+    # missing 为空：清搜索 awaiting，进入实际检索
+    conversation_service.clear_search_awaiting(session)
 
     # Stage B P1-1：不能在默认合并前用 session.search_criteria 是否为空短路；
     # 否则 worker "看看新岗位" 这类空 structured_data 场景永远进不到
@@ -733,6 +770,14 @@ def _handle_follow_up(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
+    # Phase 1（dialogue-intent-extraction-phased-plan §1.4）：搜索 awaiting 兜底。
+    # 当 LLM 没抽出任何字段、且当前文本是裸值（如 "2500"）时，把裸值落到 awaiting
+    # 队列里第一个语义匹配的字段。LLM 已抽出有效字段时不进这条路径。
+    raw_text = (msg.content or "").strip()
+    awaiting_consumed = _maybe_consume_search_awaiting_with_bare_value(
+        intent_result, raw_text, session,
+    )
+
     # Bug 5：follow_up 走"全量 criteria"语义。
     # LLM 在 prompt 里看得到 current_criteria + 用户这一句，应当输出"应用本句变更后
     # 的完整 criteria 快照"放进 structured_data。这样彻底消解了 add/update 二元选择
@@ -747,6 +792,16 @@ def _handle_follow_up(
         conversation_service.merge_criteria_patch(
             session, intent_result.criteria_patch or [],
         )
+
+    # Phase 1：消费 awaiting 字段（无论从 LLM 还是裸值兜底来）
+    accepted_keys: list[str] = []
+    if awaiting_consumed:
+        accepted_keys.extend(awaiting_consumed)
+    for k in (full_criteria or {}).keys():
+        if k in (session.awaiting_fields or []):
+            accepted_keys.append(k)
+    if accepted_keys:
+        conversation_service.consume_search_awaiting(session, accepted_keys)
 
     # Stage B P1-1：同 _handle_search，不在默认合并前因 search_criteria 为空短路。
     # _run_search 会跑 _apply_default_criteria（含 worker 简历兜底），再交给
@@ -1098,6 +1153,111 @@ def _field_display_name(field: str) -> str:
 # 工具函数
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 1：搜索 awaiting helper（dialogue-intent-extraction-phased-plan §1.4）
+# ---------------------------------------------------------------------------
+
+# job_search 视角下「askable + 有数值范围可校验」的搜索字段。Phase 1 仅 salary。
+# 范围复用 intent_service._SALARY_MIN/_MAX，保证与 _normalize_int_field 一致，
+# 避免裸值在两层用不同区间产生不一致裁决（plan §1.4 显式要求复用/对齐）。
+_SEARCH_AWAITING_INT_RANGES = {
+    "salary_floor_monthly": (_SALARY_MIN, _SALARY_MAX),
+    "salary_ceiling_monthly": (_SALARY_MIN, _SALARY_MAX),
+}
+
+
+def _search_frame_for_intent(intent: str | None) -> str | None:
+    """search_job/follow_up → job_search；search_worker → candidate_search。"""
+    if intent == "search_job":
+        return "job_search"
+    if intent == "search_worker":
+        return "candidate_search"
+    return None
+
+
+def _maybe_consume_search_awaiting_with_bare_value(
+    intent_result: IntentResult,
+    raw_text: str,
+    session: SessionState,
+) -> list[str]:
+    """裸值兜底落槽：当 LLM 没抽出有效字段时，按 awaiting 队列字段类型匹配裸值。
+
+    返回成功消费的字段列表，并把「应用本轮变更后的完整 criteria 快照」写入
+    ``intent_result.structured_data``。
+
+    关键：必须输出 **完整快照**（既有 search_criteria + 新落的 slot），不能只
+    返回 partial。下游 ``_handle_follow_up`` 会调 ``replace_criteria`` 全量替换
+    session.search_criteria；如果这里只塞 ``{salary_floor_monthly: 2500}``，
+    旧的 city/job_category 会被擦掉，正中阶段一要修的"2500 补薪资"场景。
+    详见 dialogue-intent-extraction-phased-plan §1.4 "全量快照" 约定，与
+    follow_up 的 LLM 输出契约保持一致。
+
+    遵守 §1.4：
+      1. awaiting 必须有效（非空 + 未过期）
+      2. LLM 已抽出有效 slots_delta 时优先 LLM，不进入裸值兜底
+      3. 仅匹配「类型 + 范围」合法的字段，避免 "2500" 被误塞 headcount
+      4. 候选字段限定于 awaiting_frame 自身的搜索可追问字段
+    """
+    # awaiting 已过期或为空：直接清空，避免污染本轮
+    if conversation_service.is_search_awaiting_expired(session):
+        if session.awaiting_fields or session.awaiting_expires_at:
+            conversation_service.clear_search_awaiting(session)
+        return []
+
+    # LLM 已抽出有效字段（且不是空 dict）→ 不进入裸值兜底
+    if intent_result.structured_data:
+        return []
+
+    text = (raw_text or "").strip()
+    if not text:
+        return []
+
+    # 限定到当前 awaiting_frame：跨 frame 隔离（详见 §1.4）
+    awaiting_frame = session.awaiting_frame
+    if awaiting_frame not in ("job_search", "candidate_search"):
+        return []
+
+    # 按字段类型匹配裸值；当前 Phase 1 仅支持薪资字段（最常见的"2500"场景）。
+    # headcount 故意不进入：搜索流程不应出现，避免与上传草稿的 awaiting_field 冲突。
+    accepted: list[str] = []
+    chosen_field: str | None = None
+    chosen_value: int | None = None
+    for field in list(session.awaiting_fields or []):
+        rng = _SEARCH_AWAITING_INT_RANGES.get(field)
+        if not rng:
+            continue
+        try:
+            value = int(text)
+        except ValueError:
+            continue
+        lo, hi = rng
+        if value < lo or value > hi:
+            continue
+        chosen_field = field
+        chosen_value = value
+        accepted.append(field)
+        # 一次裸值最多落一个字段
+        break
+
+    if accepted and chosen_field is not None:
+        # 全量快照 = 既有 search_criteria 浅拷贝 + 新落的字段。
+        # follow_up 主路径会用此 dict 调 replace_criteria，所以这里必须把旧
+        # city/job_category/salary 等条件原样保留，避免裸值补槽擦掉上下文。
+        snapshot = dict(session.search_criteria or {})
+        snapshot[chosen_field] = chosen_value
+        intent_result.structured_data = snapshot
+        # 仅观测：不带 userid，避免与正式 userid 字段冲突。如未来需要按用户聚合，
+        # 由调用方在 message_router._handle_follow_up 内层补上 msg.from_user。
+        log_event(
+            "search_awaiting_consumed_bare",
+            role=session.role,
+            frame=awaiting_frame,
+            accepted_fields=accepted,
+            raw_value=text,
+        )
+    return accepted
+
+
 def _run_search(
     intent: str | None,
     criteria: dict,
@@ -1140,6 +1300,8 @@ def _run_search(
         session.active_flow = "search_active"
     else:
         session.active_flow = "idle"
+    # Phase 1（§1.1.2）：搜索真正执行后清搜索 awaiting，避免下一轮裸值再被旧队列吃掉。
+    conversation_service.clear_search_awaiting(session)
     return result
 
 

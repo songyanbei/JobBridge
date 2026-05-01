@@ -15,23 +15,20 @@ from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm import get_intent_extractor
 from app.llm.base import IntentResult
 from app.llm.prompts import (
+    INTENT_PROMPT_VERSION,
     JOB_REQUIRED_FIELDS,
     RESUME_REQUIRED_FIELDS,
+    SEARCH_JOB_MIN_FIELDS,
     SENSITIVE_SOFT_FIELDS,
 )
 from app.tasks.common import log_event
 
 logger = logging.getLogger(__name__)
 
-# intent 抽取提示词版本：随 prompts.py 改动一起 bump，便于日志回溯。
-# v2.3 (Bug 5)：follow_up 输出全量 criteria 快照（structured_data），干掉
-#               criteria_patch 的 add/update 二元歧义；后端走 replace_criteria。
-# v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
-#               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
-# v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
-# v2.4 (Bug 6)：补角色意图护栏 + 城市短追问确定性兜底，避免 worker 找工作
-#               被误判为发岗位，或"北京有吗"沿用旧城市。
-INTENT_PROMPT_VERSION = "v2.4"
+# INTENT_PROMPT_VERSION 单一来源是 app.llm.prompts；这里通过 import 直接复用，
+# 避免本文件与 prompts.py 里的版本号双写时 drift（reviewer P3：曾出现过两份
+# 版本号不一致，导致 message_router 落库的 prompt_version 与实际 prompt 不匹配）。
+# 完整版本变更日志见 prompts.py 头部。
 
 # ---------------------------------------------------------------------------
 # §17.2 命令集 — 固定别名归并表
@@ -341,6 +338,7 @@ def classify_intent(
             role=role,
             history=history,
             current_criteria=current_criteria,
+            session_hint=session_hint,
         )
     except LLMTimeout:
         status = "timeout"
@@ -386,8 +384,8 @@ def classify_intent(
     # parse_failed 的 fallback result 不需要再 sanitize（全空结构）
     if parse_failed:
         return result
-    # Step 4: 校验和清洗
-    return _sanitize_intent_result(result, role)
+    # Step 4: 校验和清洗（含 Phase 1 worker 搜索护栏）
+    return _sanitize_intent_result(result, role, raw_text=stripped)
 
 
 # ---------------------------------------------------------------------------
@@ -444,8 +442,64 @@ def _match_show_more(text: str) -> bool:
     return False
 
 
-def _sanitize_intent_result(result: IntentResult, role: str) -> IntentResult:
-    """校验 LLM 返回结果，清洗不合法的字段和 patch。"""
+def _hits_worker_search_signal(text: str) -> bool:
+    """worker 角色 + 找工/求职信号命中。Phase 1 worker 搜索护栏。"""
+    if not text:
+        return False
+    return any(s in text for s in _WORKER_SEARCH_SIGNALS)
+
+
+def _hits_job_posting_signal(text: str) -> bool:
+    """招聘 / 发岗位信号命中。Phase 1 worker 搜索护栏的反向排除条件。"""
+    if not text:
+        return False
+    return any(s in text for s in _JOB_POSTING_SIGNALS)
+
+
+def _should_force_worker_search(role: str, text: str, intent: str) -> bool:
+    """worker 角色把 LLM 误判的 upload_job 强制纠回 search_job。
+
+    判据（详见 dialogue-intent-extraction-phased-plan §1.1）：
+    1. role == "worker"
+    2. intent == "upload_job"（worker 永远不能发布岗位）
+    3. 文本命中 _WORKER_SEARCH_SIGNALS（找/想找/求职/工作/打工/上班 等）
+    4. 不命中 _JOB_POSTING_SIGNALS（招聘/招工/招人 等显式发布信号）
+    """
+    if role != "worker":
+        return False
+    if intent != "upload_job":
+        return False
+    if not _hits_worker_search_signal(text):
+        return False
+    if _hits_job_posting_signal(text):
+        return False
+    return True
+
+
+def _sanitize_intent_result(
+    result: IntentResult,
+    role: str,
+    raw_text: str = "",
+) -> IntentResult:
+    """校验 LLM 返回结果，清洗不合法的字段和 patch。
+
+    Phase 1（dialogue-intent-extraction-phased-plan §1.1）：worker 搜索护栏 ——
+    worker + 搜索信号 + 无发布信号但 LLM 误判为 upload_job 时，强制纠回 search_job，
+    避免 worker 找工作被错误追问 pay_type / headcount。
+    """
+    # Phase 1：worker 搜索护栏（在字段清洗前先把 intent 纠正）
+    if _should_force_worker_search(role, raw_text, result.intent):
+        logger.warning(
+            "intent_service: worker search guardrail corrects intent "
+            "upload_job -> search_job (text=%r)",
+            raw_text,
+        )
+        result.intent = "search_job"
+        # upload_job 路径下 LLM 通常输出标量 city / job_category 与 headcount / pay_type；
+        # 把可复用搜索字段保留，发布相关字段交由后续 _normalize_structured_data 在
+        # search_intent 分支按 list 强制；非搜索字段会被合法字段集合自然 drop。
+        # missing_fields 强制清空，由后端按搜索 schema 重算。
+        result.missing_fields = []
     # 清洗 structured_data：移除未知 key
     clean_data = {}
     for k, v in result.structured_data.items():
@@ -763,14 +817,108 @@ def _normalize_criteria_patch(
 def build_session_hint(session) -> dict:
     """根据当前 session 构造给 LLM 的 session_hint。
 
-    C1 仅作为占位 helper，让上游可以稳定调用；provider 暂不消费。
-    后续 prompt 若需要把 active_flow / awaiting_field 拼进去，由 provider 按需读取。
+    Phase 1（dialogue-intent-extraction-phased-plan §1.1）：在 C1 占位 hint 之上
+    补 awaiting_fields / awaiting_frame / awaiting_expires_at 与 search_criteria 摘要，
+    让 provider 把会话状态以结构化键值拼进 system prompt。
     """
     if session is None:
         return {}
+    pending_upload = dict(getattr(session, "pending_upload", {}) or {})
+    search_criteria = dict(getattr(session, "search_criteria", {}) or {})
     return {
         "active_flow": getattr(session, "active_flow", None),
+        # 上传草稿追问字段（保留旧契约）
         "awaiting_field": getattr(session, "awaiting_field", None),
         "pending_upload_intent": getattr(session, "pending_upload_intent", None),
-        "pending_upload": dict(getattr(session, "pending_upload", {}) or {}),
+        "pending_upload": pending_upload,
+        # Phase 1 新增：搜索 awaiting + 当前累积 search_criteria 摘要
+        "awaiting_fields": list(getattr(session, "awaiting_fields", []) or []),
+        "awaiting_frame": getattr(session, "awaiting_frame", None),
+        "awaiting_expires_at": getattr(session, "awaiting_expires_at", None),
+        "search_criteria": search_criteria,
+        "broker_direction": getattr(session, "broker_direction", None),
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 1：临时 legacy schema helpers（dialogue-intent-extraction-phased-plan §1.3.bis）
+#
+# 不新建 schema 文件；按 frame 包一层 helper：
+#   - job_search:        required_all = {city, job_category}
+#   - candidate_search:  required_any = {city, job_category}（任一即可）
+#   - job_upload:        required_all = JOB_REQUIRED_FIELDS
+#   - resume_upload:     required_all = RESUME_REQUIRED_FIELDS
+#
+# 阶段三用统一 slot schema 替换时只换内部实现，调用方不动。
+# ---------------------------------------------------------------------------
+
+# job_search 视角下 search_service._query_jobs 真正消费的字段
+_LEGACY_JOB_SEARCH_FIELDS = frozenset({
+    "city", "job_category", "salary_floor_monthly",
+    "is_long_term", "gender_required", "age",
+})
+
+# candidate_search 视角下 search_service._query_resumes 真正消费的字段
+_LEGACY_CANDIDATE_SEARCH_FIELDS = frozenset({
+    "city", "job_category", "salary_ceiling_monthly", "gender", "age",
+})
+
+
+def _legacy_required(frame: str) -> tuple[frozenset[str], frozenset[str]]:
+    """返回 (required_all, required_any)。required_any 中任一字段命中即视为满足。"""
+    if frame == "job_search":
+        return (SEARCH_JOB_MIN_FIELDS, frozenset())
+    if frame == "candidate_search":
+        return (frozenset(), frozenset({"city", "job_category"}))
+    if frame == "job_upload":
+        return (JOB_REQUIRED_FIELDS, frozenset())
+    if frame == "resume_upload":
+        return (RESUME_REQUIRED_FIELDS, frozenset())
+    return (frozenset(), frozenset())
+
+
+def _legacy_valid_fields(frame: str) -> frozenset[str]:
+    """frame 的合法字段集合（仅用于 reducer 校验，搜索 frame 与 SQL 消费集对齐）。"""
+    if frame == "job_search":
+        return _LEGACY_JOB_SEARCH_FIELDS
+    if frame == "candidate_search":
+        return _LEGACY_CANDIDATE_SEARCH_FIELDS
+    if frame == "job_upload":
+        return _VALID_JOB_KEYS
+    if frame == "resume_upload":
+        return _VALID_RESUME_KEYS
+    return frozenset()
+
+
+def _legacy_compute_missing(frame: str, criteria: dict) -> list[str]:
+    """按 (required_all, required_any) 算 missing。
+
+    - required_all 中尚未填值的字段全部进 missing；
+    - required_any 整组都未填值时给一个组合占位（用元素 sorted 拼接），
+      只要任一字段已填则不进 missing；
+    - 「已填」语义：非 None / 非空字符串 / 非空列表 / 非空 dict（0/False 都算已填）。
+    """
+    criteria = criteria or {}
+    required_all, required_any = _legacy_required(frame)
+
+    def _filled(field: str) -> bool:
+        if field not in criteria:
+            return False
+        v = criteria[field]
+        if v is None:
+            return False
+        if isinstance(v, (str, list, dict)) and not v:
+            return False
+        return True
+
+    missing: list[str] = []
+    for f in sorted(required_all):
+        if not _filled(f):
+            missing.append(f)
+
+    if required_any:
+        if not any(_filled(f) for f in required_any):
+            # 用 "+" 拼接占位，避免上游误以为是单个字段；阶段三 schema 阶段会被替换
+            placeholder = "|".join(sorted(required_any))
+            missing.append(placeholder)
+    return missing

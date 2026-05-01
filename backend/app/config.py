@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     # ---- CORS ----
     cors_origins: str = ""  # 逗号分隔的允许域名列表，为空时开发环境允许全部，生产环境拒绝全部
 
+    # ---- Phase 1（dialogue-intent-extraction-phased-plan §1.3）：搜索 awaiting TTL ----
+    # 搜索追问的字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。
+    search_awaiting_ttl_seconds: int = 600
+
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"
     daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送

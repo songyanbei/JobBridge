@@ -71,6 +71,23 @@ class SessionState(BaseModel):
         description="upload_conflict 已经追问确认的轮数；超过 1 轮后清草稿回 idle 防死循环",
     )
 
+    # ---- Phase 1（dialogue-intent-extraction-phased-plan §1.3）：搜索 awaiting 物化 ----
+    # 搜索流程因为缺字段追问时，把缺失字段写入 FIFO 队列，下一轮裸值优先按字段类型落槽。
+    # 与上传草稿的 awaiting_field 完全独立（避免 search/upload 交叉污染）；旧 Redis
+    # session 反序列化全部走默认值。
+    awaiting_fields: list[str] = Field(
+        default_factory=list,
+        description="搜索追问的字段 FIFO 队列；按写入顺序消费，消费后从队列移除",
+    )
+    awaiting_frame: str | None = Field(
+        default=None,
+        description="awaiting_fields 所属的 frame：job_search / candidate_search；用于跨 frame 隔离",
+    )
+    awaiting_expires_at: str | None = Field(
+        default=None,
+        description="搜索 awaiting 过期时间 ISO 8601 UTC；过期后裸值不再按补槽处理",
+    )
+
 
 class CriteriaPatch(BaseModel):
     """多轮对话的 criteria 增量更新指令。"""

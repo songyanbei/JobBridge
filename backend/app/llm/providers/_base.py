@@ -176,6 +176,43 @@ def format_criteria(current_criteria: dict | None) -> str:
     return json.dumps(current_criteria, ensure_ascii=False, indent=2)
 
 
+# Phase 1：session_hint 中真正对 LLM 有意义的键。其它字段（如 raw timestamp）
+# 不进 prompt，避免把 prompt 拉长又抢占 token 预算。
+_SESSION_HINT_KEYS_FOR_PROMPT = (
+    "active_flow",
+    "awaiting_fields",
+    "awaiting_frame",
+    "awaiting_field",
+    "pending_upload_intent",
+    "search_criteria",
+    "broker_direction",
+)
+
+
+def format_session_hint(session_hint: dict | None) -> str:
+    """把 session_hint 渲染为 prompt 用的结构化键值文本。
+
+    Phase 1（dialogue-intent-extraction-phased-plan §1.1）：保持 JSON 结构而非
+    长篇自然语言，避免拼装出歧义文本干扰 LLM 抽取。空字段直接返回"无"。
+    """
+    if not session_hint:
+        return "无"
+    compact: dict = {}
+    for key in _SESSION_HINT_KEYS_FOR_PROMPT:
+        if key not in session_hint:
+            continue
+        value = session_hint[key]
+        # 空 list / 空 dict / None / 空串：跳过，减少噪声
+        if value is None:
+            continue
+        if isinstance(value, (list, dict, str)) and not value:
+            continue
+        compact[key] = value
+    if not compact:
+        return "无"
+    return json.dumps(compact, ensure_ascii=False, indent=2)
+
+
 def format_candidates(candidates: list[dict]) -> str:
     """将候选列表格式化为 prompt 中的文本。"""
     if not candidates:
