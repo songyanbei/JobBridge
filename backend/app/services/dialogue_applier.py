@@ -76,6 +76,11 @@ def apply_decision(
         session.candidate_snapshot = None
         session.shown_items = []
         conversation_service.clear_search_awaiting(session)
+        # PR4 codex review 第三轮：本轮写入即一致地把 active_flow 落到 idle。
+        # 之前依赖下一轮 load 时 _self_heal_active_flow line 93 把
+        # search_active + 无 candidate_snapshot 修成 idle —— 链路没问题，
+        # 但本轮处理结束 session 仍是 search_active，与「写入即一致」状态机口径不符。
+        session.active_flow = "idle"
         return ApplyResult(transition_executed="reset_search")
 
     if transition == "clear_pending_upload":

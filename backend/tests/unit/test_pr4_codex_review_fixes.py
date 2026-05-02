@@ -268,6 +268,42 @@ class TestP1_1_V2CancelResetReply:
         assert replies[0].content == RESET_SEARCH_SUCCESS
         assert replies[0].content != RESET_SEARCH_EMPTY
 
+    def test_v2_reset_apply_decision_sets_active_flow_idle_in_same_turn(self):
+        """codex review 第三轮：reset_search 在本轮 apply_decision 后 active_flow 必须
+        立即落 idle，不依赖下一轮 load 时的 _self_heal_active_flow 修复。
+
+        与「写入即一致」状态机口径对齐：apply_decision 是状态写入入口，应该一次性
+        把所有相关字段都写到目标态。
+        """
+        from app.services.dialogue_applier import apply_decision
+        from app.services.dialogue_reducer import DialogueDecision
+
+        s = SessionState(
+            role="worker",
+            active_flow="search_active",
+            search_criteria={"city": ["西安市"]},
+            shown_items=["job-1"],
+        )
+        decision = DialogueDecision(
+            dialogue_act="reset",
+            resolved_frame="none",
+            accepted_slots_delta={},
+            resolved_merge_policy={},
+            final_search_criteria={},
+            missing_slots=[],
+            route_intent="command",
+            clarification=None,
+            state_transition="reset_search",
+            awaiting_ops=[],
+        )
+        apply_decision(decision, s)
+        # 本轮写入即一致：所有 reset 相关字段都落到目标态
+        assert s.search_criteria == {}
+        assert s.candidate_snapshot is None
+        assert s.shown_items == []
+        # 关键：active_flow 必须立即落 idle，不留给下一轮 self-heal
+        assert s.active_flow == "idle"
+
     def test_v2_cancel_in_idle_no_pending_returns_no_draft(self):
         """边界：v2 cancel 在 idle 且无 pending → 仍按 pre-state 给「无草稿可取消」（与 legacy 对齐）。"""
         from app.services.message_router import _route_v2_cancel_reset
