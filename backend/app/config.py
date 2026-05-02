@@ -33,7 +33,12 @@ class DialoguePolicy(BaseModel):
 
     v2_mode: Literal["off", "shadow", "dual_read", "primary"] = "off"
     """v2 灰度模式。off=纯 legacy；shadow=旁路写日志；dual_read=白名单/桶命中走 v2；
-    primary=阶段四 PR3 接通的主路径模式（命中 primary_rollout_percentage 桶走 v2）。"""
+    primary=阶段四 PR3 接通的主路径模式（命中 primary_rollout_percentage 桶走 v2）。
+
+    **PR2 阶段注意**：``primary`` 已加入合法值集，但 classify_dialogue 还没有
+    primary 分支（PR3 接通）。当前若设 v2_mode=primary，classify_dialogue 会
+    落入「未匹配模式 → legacy」兜底分支，行为等价 off。设此值不会破坏任何路径，
+    只是不会启用 primary 灰度行为。"""
 
     shadow_sample_rate: float = 0.05
     """shadow 模式旁路调 v2 的采样率，0..1。"""
@@ -302,12 +307,16 @@ class Settings(BaseSettings):
 
         # 2. 旧 env 名：pydantic-settings 因为 dialogue_v2_mode 不再是字段，
         # 不会自动加载 DIALOGUE_V2_MODE；这里直接读 os.environ 兜底。
+        # 与 model_config.case_sensitive=False 契约对齐：upper / lower 都尝试
+        # （Linux/Mac 上 os.environ 是 case-sensitive，pre-PR2 时 pydantic-settings
+        # 会自动 case-insensitive 匹配字段，PR2 后我们必须手动覆盖两种大小写）。
         for old, new in _LEGACY_DIALOGUE_FIELD_MAP.items():
-            env_name = old.upper()
-            env_value = os.environ.get(env_name)
-            if env_value is not None:
-                # 旧 env > 新 env / 旧 kwarg：env 总是覆盖
-                policy_data[new] = env_value
+            for candidate in (old.upper(), old.lower()):
+                env_value = os.environ.get(candidate)
+                if env_value is not None:
+                    # 旧 env > 新 env / 旧 kwarg：env 总是覆盖
+                    policy_data[new] = env_value
+                    break
 
         if policy_data:
             data["dialogue_policy"] = policy_data

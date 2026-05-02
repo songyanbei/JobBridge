@@ -203,6 +203,18 @@ class TestLegacyEnvCompat:
             assert s.dialogue_v2_mode == "dual_read"
             assert s.dialogue_policy.v2_mode == "dual_read"
 
+    def test_lowercase_env_var_compat(self):
+        """Linux/Mac 上 os.environ 是 case-sensitive，但 model_config.case_sensitive=False
+        要求支持任意大小写。Pre-PR2 时 pydantic-settings 会自动匹配 lowercase 字段名;
+        PR2 hook 必须手动覆盖 upper/lower 两种大小写以保契约。
+        """
+        with _patched_env(
+            DIALOGUE_V2_MODE=None,  # 清空 uppercase 同名
+            **{"dialogue_v2_mode": "dual_read"},  # 仅设 lowercase
+        ):
+            s = Settings()
+            assert s.dialogue_v2_mode == "dual_read"
+
 
 # ---------------------------------------------------------------------------
 # 4. dev_rollout / golden runner 的 monkeypatch 模式仍工作
