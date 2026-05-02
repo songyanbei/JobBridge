@@ -3,8 +3,91 @@
 所有配置通过 pydantic-settings 从 .env 或环境变量加载。
 其它模块统一 `from app.config import settings` 使用。
 """
-from pydantic import field_validator, model_validator
+import os
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# ---------------------------------------------------------------------------
+# 阶段四 PR2（dialogue-intent-extraction-phased-plan §4.1.5）：
+# 把对话策略类配置收敛到嵌套 DialoguePolicy 子结构。
+# 旧顶层字段（dialogue_v2_mode 等）通过 @property + setter 向后转发，0 调用方改动。
+# 旧 env 变量（DIALOGUE_V2_MODE 等）通过 _legacy_dialogue_env_to_policy
+# model_validator 在构造前 hook 进 dialogue_policy，**旧名优先级 > 新名**
+# （plan §4.1.5「旧名作为唯一权威源不变，新名只是补充」）。阶段五移除旧名。
+# ---------------------------------------------------------------------------
+
+
+class DialoguePolicy(BaseModel):
+    """对话策略子配置（阶段四 PR2 引入）。
+
+    PR2 阶段：旧顶层字段名仍是权威环境变量来源；本类提供结构化命名空间，
+    供新代码读取（settings.dialogue_policy.v2_mode）。
+    PR3 阶段：新增 primary_rollout_percentage 接通 primary 灰度桶。
+    阶段五：旧顶层字段统一移除，本类成为唯一来源。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    v2_mode: Literal["off", "shadow", "dual_read", "primary"] = "off"
+    """v2 灰度模式。off=纯 legacy；shadow=旁路写日志；dual_read=白名单/桶命中走 v2；
+    primary=阶段四 PR3 接通的主路径模式（命中 primary_rollout_percentage 桶走 v2）。"""
+
+    shadow_sample_rate: float = 0.05
+    """shadow 模式旁路调 v2 的采样率，0..1。"""
+
+    userid_whitelist: str = ""
+    """dual_read 命中白名单（CSV）。"""
+
+    hash_buckets: int = 0
+    """dual_read 灰度 hash 桶数，0..100；0 = 不启用。"""
+
+    primary_rollout_percentage: int = 0
+    """阶段四 PR3 占位：primary 模式 hash 桶比例 0..100；0 = 不启用 primary。"""
+
+    ambiguous_city_query_policy: Literal["clarify", "replace"] = "clarify"
+    """「北京有吗」歧义策略：clarify 反问 / replace 直接换城市。"""
+
+    low_confidence_threshold: float = 0.6
+    """关键字段（city/job_category/salary_*）低置信度时强制反问的阈值。"""
+
+    search_awaiting_ttl_seconds: int = 600
+    """搜索追问字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。"""
+
+    @field_validator("v2_mode", mode="before")
+    @classmethod
+    def _coerce_v2_mode(cls, v):
+        v = (str(v) if v is not None else "").strip()
+        return v if v in {"off", "shadow", "dual_read", "primary"} else "off"
+
+    @field_validator("hash_buckets", "primary_rollout_percentage", mode="before")
+    @classmethod
+    def _clamp_pct(cls, v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(100, v))
+
+    @field_validator("ambiguous_city_query_policy", mode="before")
+    @classmethod
+    def _coerce_acqp(cls, v):
+        v = (str(v) if v is not None else "").strip()
+        return v if v in {"clarify", "replace"} else "clarify"
+
+
+# 旧顶层 env 名 → DialoguePolicy 字段名
+_LEGACY_DIALOGUE_FIELD_MAP = {
+    "dialogue_v2_mode": "v2_mode",
+    "dialogue_v2_shadow_sample_rate": "shadow_sample_rate",
+    "dialogue_v2_userid_whitelist": "userid_whitelist",
+    "dialogue_v2_hash_buckets": "hash_buckets",
+    "ambiguous_city_query_policy": "ambiguous_city_query_policy",
+    "low_confidence_threshold": "low_confidence_threshold",
+    "search_awaiting_ttl_seconds": "search_awaiting_ttl_seconds",
+}
 
 
 class Settings(BaseSettings):
@@ -13,6 +96,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # 阶段四 PR2：支持 DIALOGUE_POLICY__V2_MODE 这类嵌套环境变量名。
+        env_nested_delimiter="__",
     )
 
     # ---- 应用 ----
@@ -97,55 +182,136 @@ class Settings(BaseSettings):
     # ---- CORS ----
     cors_origins: str = ""  # 逗号分隔的允许域名列表，为空时开发环境允许全部，生产环境拒绝全部
 
-    # ---- Phase 1（dialogue-intent-extraction-phased-plan §1.3）：搜索 awaiting TTL ----
-    # 搜索追问的字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。
-    search_awaiting_ttl_seconds: int = 600
+    # ---- 阶段四 PR2（dialogue-intent-extraction-phased-plan §4.1.5）：对话策略子结构 ----
+    # 默认全部走 DialoguePolicy 默认值：代码 / 配置 / 单测就位但不影响生产路由;
+    # 上线后由 .env 切换。详见 DialoguePolicy 类与 _legacy_dialogue_env_to_policy
+    # 文件顶部说明。**旧顶层字段名（dialogue_v2_mode 等）通过 @property + setter
+    # 转发**，保持 0 调用方改动；旧 env 名（DIALOGUE_V2_MODE 等）由
+    # _legacy_dialogue_env_to_policy 在构造前 hook 进 dialogue_policy。
+    dialogue_policy: DialoguePolicy = Field(default_factory=DialoguePolicy)
 
-    # ---- 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParse v2 灰度 ----
-    # 默认全部 off：代码 / 配置 / 单测就位但不影响生产路由；上线后由 .env 切换。
-    # mode=shadow：legacy 主路由 + 按 sample_rate 旁路调 v2 写日志；
-    # mode=dual_read：白名单 / hash 桶命中的 userid 走 v2 派生路由；
-    # mode=off：完全走 legacy（classify_dialogue 退化为 classify_intent 包装）。
-    dialogue_v2_mode: str = "off"  # off / shadow / dual_read
-    dialogue_v2_shadow_sample_rate: float = 0.05
-    dialogue_v2_userid_whitelist: str = ""  # CSV
-    dialogue_v2_hash_buckets: int = 0  # 0..100；0 = 不启用 hash 桶
-    # 「北京有吗」歧义策略：clarify 反问 / replace 直接换城市
-    ambiguous_city_query_policy: str = "clarify"
-    # 关键字段（city/job_category/salary_*）低置信度时强制反问
-    low_confidence_threshold: float = 0.6
+    # 旧顶层字段 → dialogue_policy 转发（向后兼容；阶段五移除）
+    @property
+    def dialogue_v2_mode(self) -> str:
+        return self.dialogue_policy.v2_mode
+
+    @dialogue_v2_mode.setter
+    def dialogue_v2_mode(self, value) -> None:
+        # 经 DialoguePolicy.v2_mode 的 mode="before" validator 校验非法值会回落 off
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"v2_mode": DialoguePolicy._coerce_v2_mode(value)},
+        )
+
+    @property
+    def dialogue_v2_shadow_sample_rate(self) -> float:
+        return self.dialogue_policy.shadow_sample_rate
+
+    @dialogue_v2_shadow_sample_rate.setter
+    def dialogue_v2_shadow_sample_rate(self, value: float) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"shadow_sample_rate": float(value)},
+        )
+
+    @property
+    def dialogue_v2_userid_whitelist(self) -> str:
+        return self.dialogue_policy.userid_whitelist
+
+    @dialogue_v2_userid_whitelist.setter
+    def dialogue_v2_userid_whitelist(self, value: str) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"userid_whitelist": str(value or "")},
+        )
+
+    @property
+    def dialogue_v2_hash_buckets(self) -> int:
+        return self.dialogue_policy.hash_buckets
+
+    @dialogue_v2_hash_buckets.setter
+    def dialogue_v2_hash_buckets(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"hash_buckets": DialoguePolicy._clamp_pct(value)},
+        )
+
+    @property
+    def ambiguous_city_query_policy(self) -> str:
+        return self.dialogue_policy.ambiguous_city_query_policy
+
+    @ambiguous_city_query_policy.setter
+    def ambiguous_city_query_policy(self, value: str) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "ambiguous_city_query_policy": DialoguePolicy._coerce_acqp(value),
+            },
+        )
+
+    @property
+    def low_confidence_threshold(self) -> float:
+        return self.dialogue_policy.low_confidence_threshold
+
+    @low_confidence_threshold.setter
+    def low_confidence_threshold(self, value: float) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"low_confidence_threshold": float(value)},
+        )
+
+    @property
+    def search_awaiting_ttl_seconds(self) -> int:
+        return self.dialogue_policy.search_awaiting_ttl_seconds
+
+    @search_awaiting_ttl_seconds.setter
+    def search_awaiting_ttl_seconds(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"search_awaiting_ttl_seconds": int(value)},
+        )
 
     @property
     def dialogue_v2_userid_whitelist_set(self) -> set[str]:
-        """解析 ``dialogue_v2_userid_whitelist`` 为 set；空字符串视为不启用。"""
+        """解析 dialogue_policy.userid_whitelist 为 set；空字符串视为不启用。"""
         return {
             u.strip()
-            for u in (self.dialogue_v2_userid_whitelist or "").split(",")
+            for u in (self.dialogue_policy.userid_whitelist or "").split(",")
             if u.strip()
         }
 
-    @field_validator("dialogue_v2_hash_buckets")
+    @model_validator(mode="before")
     @classmethod
-    def _validate_dialogue_v2_hash_buckets(cls, v: int) -> int:
-        """夹紧 [0, 100]，避免 .env 配错（如 200）导致全量灰度（adversarial review I14）。"""
-        if v < 0:
-            return 0
-        if v > 100:
-            return 100
-        return v
+    def _legacy_dialogue_env_to_policy(cls, data):
+        """阶段四 PR2 兼容层：把旧顶层字段名 / 旧 env 名映射到 dialogue_policy。
 
-    @field_validator("dialogue_v2_mode")
-    @classmethod
-    def _validate_dialogue_v2_mode(cls, v: str) -> str:
-        """允许值：off / shadow / dual_read。非法值回退 off。"""
-        v = (v or "").strip()
-        return v if v in {"off", "shadow", "dual_read"} else "off"
+        优先级（plan §4.1.5「旧名作为唯一权威源不变，新名只是补充」）：
+          旧 env > 旧 kwarg > 新 env / 新 kwarg
 
-    @field_validator("ambiguous_city_query_policy")
-    @classmethod
-    def _validate_ambiguous_city_query_policy(cls, v: str) -> str:
-        v = (v or "").strip()
-        return v if v in {"clarify", "replace"} else "clarify"
+        旧 env 名（如 DIALOGUE_V2_MODE）在 PR2 仍是权威来源；新 env 名
+        （DIALOGUE_POLICY__V2_MODE）由 pydantic-settings env_nested_delimiter
+        原生支持。两者同时设置时旧名生效；阶段五移除旧名。
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # 解析当前 dialogue_policy（可能来自 nested env、构造 kwarg、或缺省）
+        policy_data = data.pop("dialogue_policy", None)
+        if hasattr(policy_data, "model_dump"):
+            policy_data = policy_data.model_dump()
+        if not isinstance(policy_data, dict):
+            policy_data = {}
+
+        # 1. 旧 kwarg 名：构造 Settings(dialogue_v2_mode="x") 这类用法
+        for old, new in _LEGACY_DIALOGUE_FIELD_MAP.items():
+            if old in data:
+                policy_data[new] = data.pop(old)
+
+        # 2. 旧 env 名：pydantic-settings 因为 dialogue_v2_mode 不再是字段，
+        # 不会自动加载 DIALOGUE_V2_MODE；这里直接读 os.environ 兜底。
+        for old, new in _LEGACY_DIALOGUE_FIELD_MAP.items():
+            env_name = old.upper()
+            env_value = os.environ.get(env_name)
+            if env_value is not None:
+                # 旧 env > 新 env / 旧 kwarg：env 总是覆盖
+                policy_data[new] = env_value
+
+        if policy_data:
+            data["dialogue_policy"] = policy_data
+        return data
 
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"

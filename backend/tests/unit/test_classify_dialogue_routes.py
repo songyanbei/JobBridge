@@ -185,8 +185,14 @@ def test_dialogue_v2_hash_buckets_clamped_to_100(restore_settings):
 
 def test_dialogue_v2_mode_validator_rejects_invalid(restore_settings):
     from app.config import Settings
-    s = Settings(dialogue_v2_mode="primary")  # 阶段四才允许，阶段二应回退 off
-    assert s.dialogue_v2_mode == "off"
+    # 阶段四 PR2：primary 已添加为合法占位（PR3 接通灰度桶后才生效）。
+    # 其它非法值仍回退 off。
+    s = Settings(dialogue_v2_mode="primary")
+    assert s.dialogue_v2_mode == "primary"
+    s2 = Settings(dialogue_v2_mode="bogus")
+    assert s2.dialogue_v2_mode == "off"
+    s3 = Settings(dialogue_v2_mode="")
+    assert s3.dialogue_v2_mode == "off"
 
 
 def test_session_none_always_legacy(restore_settings):
