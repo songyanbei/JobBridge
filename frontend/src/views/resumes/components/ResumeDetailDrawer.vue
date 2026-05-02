@@ -10,16 +10,18 @@
       <el-descriptions :column="2" border>
         <el-descriptions-item label="ID">{{ detail.id }}</el-descriptions-item>
         <el-descriptions-item label="版本">v{{ detail.version }}</el-descriptions-item>
-        <el-descriptions-item label="姓名">
-          <el-input v-if="editing" v-model="form.display_name" @input="markDirty" />
-          <span v-else>{{ detail.display_name }}</span>
-        </el-descriptions-item>
+
+        <!-- ---- 工人（owner）信息 ---- -->
+        <el-descriptions-item label="姓名">{{ detail.owner_display_name || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="电话">{{ detail.owner_phone || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="工人 ID" :span="2">{{ detail.owner_userid }}</el-descriptions-item>
+
         <el-descriptions-item label="性别">
           <el-select v-if="editing" v-model="form.gender" @change="markDirty">
-            <el-option label="男" value="male" />
-            <el-option label="女" value="female" />
+            <el-option label="男" value="男" />
+            <el-option label="女" value="女" />
           </el-select>
-          <span v-else>{{ detail.gender === 'male' ? '男' : detail.gender === 'female' ? '女' : '--' }}</span>
+          <span v-else>{{ detail.gender || '--' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="年龄">
           <el-input-number
@@ -31,13 +33,26 @@
           />
           <span v-else>{{ detail.age }}</span>
         </el-descriptions-item>
+        <el-descriptions-item label="期望薪资下限">
+          <el-input-number
+            v-if="editing"
+            v-model="form.salary_expect_floor_monthly"
+            :min="0"
+            @change="markDirty"
+          />
+          <span v-else>{{ detail.salary_expect_floor_monthly ? detail.salary_expect_floor_monthly + ' 元/月' : '--' }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="工期偏好">
+          <span v-if="detail.accept_long_term && detail.accept_short_term">长期 / 短期都接受</span>
+          <span v-else-if="detail.accept_long_term">长期</span>
+          <span v-else-if="detail.accept_short_term">短期</span>
+          <span v-else>--</span>
+        </el-descriptions-item>
         <el-descriptions-item label="期望城市" :span="2">
-          <el-input v-if="editing" v-model="form.expected_cities" @input="markDirty" />
-          <span v-else>{{ detail.expected_cities }}</span>
+          <span>{{ Array.isArray(detail.expected_cities) ? detail.expected_cities.join('、') : (detail.expected_cities || '--') }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="期望工种" :span="2">
-          <el-input v-if="editing" v-model="form.expected_job_categories" @input="markDirty" />
-          <span v-else>{{ detail.expected_job_categories }}</span>
+          <span>{{ Array.isArray(detail.expected_job_categories) ? detail.expected_job_categories.join('、') : (detail.expected_job_categories || '--') }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="审核状态">
           <el-tag
@@ -51,6 +66,9 @@
           <span :class="`jb-${ttlLevel(detail.expires_at)}-text`">
             {{ formatDateTime(detail.expires_at) }}
           </span>
+        </el-descriptions-item>
+        <el-descriptions-item v-if="detail.raw_text" label="原始描述" :span="2">
+          <span style="white-space: pre-wrap">{{ detail.raw_text }}</span>
         </el-descriptions-item>
       </el-descriptions>
 
@@ -139,11 +157,9 @@ function startEdit() {
   if (!detail.value) return
   for (const k of Object.keys(form)) delete form[k]
   Object.assign(form, {
-    display_name: detail.value.display_name,
     gender: detail.value.gender,
     age: detail.value.age,
-    expected_cities: detail.value.expected_cities,
-    expected_job_categories: detail.value.expected_job_categories,
+    salary_expect_floor_monthly: detail.value.salary_expect_floor_monthly,
   })
   editing.value = true
   dirty.value = false

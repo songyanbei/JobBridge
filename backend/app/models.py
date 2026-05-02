@@ -26,6 +26,7 @@ class User(Base):
     )
     display_name = sa.Column(sa.String(64), nullable=True, comment="展示昵称")
     company = sa.Column(sa.String(128), nullable=True, comment="公司名")
+    address = sa.Column(sa.String(255), nullable=True, comment="公司/经营地址")
     contact_person = sa.Column(sa.String(64), nullable=True, comment="联系人姓名")
     phone = sa.Column(sa.String(32), nullable=True, comment="联系电话")
     can_search_jobs = sa.Column(mysql.TINYINT(display_width=1), nullable=False, server_default=sa.text("0"), comment="能否检索岗位")
@@ -74,6 +75,7 @@ class Job(Base):
 
     # ---- 软匹配字段（§7.1）----
     district = sa.Column(sa.String(32), nullable=True, comment="区县（细粒度）")
+    address = sa.Column(sa.String(255), nullable=True, comment="岗位详细工作地址（街道+门牌）")
     salary_ceiling_monthly = sa.Column(sa.Integer, nullable=True, comment="月综合收入上限")
     provide_meal = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包吃")
     provide_housing = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包住")

@@ -9,14 +9,53 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from sqlalchemy.orm import Session as _Session
+
 from app.api.deps import get_db, require_admin_password_changed as require_admin
 from app.core.csv_export import rows_to_csv_bytes
 from app.core.responses import ok, paged
-from app.models import AdminUser
+from app.models import AdminUser, User
 from app.schemas.job import JobRead
 from app.services import job_admin_service
 
 router = APIRouter(prefix="/admin/jobs", tags=["admin-jobs"])
+
+
+def _enrich_with_owner(db: _Session, jobs: list) -> dict[str, dict]:
+    """根据 jobs 的 owner_userid 集合一次性查 user 表，返回 {userid: {phone, ...}}。
+
+    用于在 admin 接口里给岗位详情/列表附带发布者信息（电话、公司、联系人、公司地址等）。
+    分配给运营/管理员，三层数据隔离逻辑由专用的对外接口（wecom/miniprogram）负责，
+    本接口默认全字段返回。
+    """
+    owner_ids = list({j.owner_userid for j in jobs if j.owner_userid})
+    if not owner_ids:
+        return {}
+    rows = (
+        db.query(
+            User.external_userid, User.phone, User.company,
+            User.contact_person, User.address, User.role, User.display_name,
+        )
+        .filter(User.external_userid.in_(owner_ids))
+        .all()
+    )
+    return {
+        r[0]: {
+            "owner_phone": r[1],
+            "owner_company": r[2],
+            "owner_contact_person": r[3],
+            "owner_address": r[4],
+            "owner_role": r[5],
+            "owner_display_name": r[6],
+        }
+        for r in rows
+    }
+
+
+def _job_to_dict(job, owner_map: dict[str, dict]) -> dict:
+    item = JobRead.model_validate(job).model_dump(mode="json")
+    item.update(owner_map.get(job.owner_userid, {}))
+    return item
 
 
 class JobEditRequest(BaseModel):
@@ -82,7 +121,8 @@ def list_jobs(
         salary_min, salary_max,
     )
     rows, total = job_admin_service.list_jobs(db, filters, page, size, sort)
-    return paged([JobRead.model_validate(r).model_dump(mode="json") for r in rows], total, page, size)
+    owner_map = _enrich_with_owner(db, rows)
+    return paged([_job_to_dict(r, owner_map) for r in rows], total, page, size)
 
 
 @router.get("/export", summary="岗位导出 CSV")
@@ -110,8 +150,10 @@ def export_jobs(
         salary_min, salary_max,
     )
     rows = job_admin_service.export_rows(db, filters, sort)
+    owner_map = _enrich_with_owner(db, rows)
     headers = [
-        "id", "owner_userid", "city", "district", "job_category",
+        "id", "owner_userid", "owner_company", "owner_contact_person", "owner_phone",
+        "city", "district", "address", "job_category",
         "salary_floor_monthly", "salary_ceiling_monthly", "pay_type",
         "headcount", "gender_required", "age_min", "age_max", "is_long_term",
         "audit_status", "audit_reason", "delist_reason",
@@ -119,8 +161,11 @@ def export_jobs(
     ]
     body = []
     for r in rows:
+        ow = owner_map.get(r.owner_userid, {})
         body.append([
-            r.id, r.owner_userid, r.city, r.district, r.job_category,
+            r.id, r.owner_userid,
+            ow.get("owner_company"), ow.get("owner_contact_person"), ow.get("owner_phone"),
+            r.city, r.district, r.address, r.job_category,
             r.salary_floor_monthly, r.salary_ceiling_monthly, r.pay_type,
             r.headcount, r.gender_required, r.age_min, r.age_max, r.is_long_term,
             r.audit_status, r.audit_reason, r.delist_reason,
@@ -140,7 +185,8 @@ def get_job(
     _: AdminUser = Depends(require_admin),
 ):
     job = job_admin_service.get_job(db, job_id)
-    return ok(JobRead.model_validate(job).model_dump(mode="json"))
+    owner_map = _enrich_with_owner(db, [job])
+    return ok(_job_to_dict(job, owner_map))
 
 
 @router.put("/{job_id}", summary="岗位编辑（带 version 乐观锁）")
@@ -151,7 +197,8 @@ def update_job(
     current: AdminUser = Depends(require_admin),
 ):
     job = job_admin_service.update_job(db, job_id, req.version, req.fields, current.username)
-    return ok(JobRead.model_validate(job).model_dump(mode="json"))
+    owner_map = _enrich_with_owner(db, [job])
+    return ok(_job_to_dict(job, owner_map))
 
 
 @router.post("/{job_id}/delist", summary="岗位下架")

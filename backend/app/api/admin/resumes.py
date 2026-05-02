@@ -9,14 +9,39 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from sqlalchemy.orm import Session as _Session
+
 from app.api.deps import get_db, require_admin_password_changed as require_admin
 from app.core.csv_export import rows_to_csv_bytes
 from app.core.responses import ok, paged
-from app.models import AdminUser
+from app.models import AdminUser, User
 from app.schemas.resume import ResumeRead
 from app.services import resume_admin_service
 
 router = APIRouter(prefix="/admin/resumes", tags=["admin-resumes"])
+
+
+def _enrich_with_owner(db: _Session, resumes: list) -> dict[str, dict]:
+    """根据 resumes 的 owner_userid 集合一次性查 user 表，返回 {userid: {phone, display_name}}。
+
+    用于在 admin 接口里给简历详情/列表附带工人信息（电话、姓名）。
+    三层数据隔离逻辑由对外接口（wecom/miniprogram）负责，本接口默认全字段返回。
+    """
+    owner_ids = list({r.owner_userid for r in resumes if r.owner_userid})
+    if not owner_ids:
+        return {}
+    rows = (
+        db.query(User.external_userid, User.phone, User.display_name)
+        .filter(User.external_userid.in_(owner_ids))
+        .all()
+    )
+    return {r[0]: {"owner_phone": r[1], "owner_display_name": r[2]} for r in rows}
+
+
+def _resume_to_dict(resume, owner_map: dict[str, dict]) -> dict:
+    item = ResumeRead.model_validate(resume).model_dump(mode="json")
+    item.update(owner_map.get(resume.owner_userid, {}))
+    return item
 
 
 class ResumeEditRequest(BaseModel):
@@ -71,7 +96,8 @@ def list_resumes(
         audit_status, owner_userid, created_from, created_to,
     )
     rows, total = resume_admin_service.list_resumes(db, filters, page, size, sort)
-    return paged([ResumeRead.model_validate(r).model_dump(mode="json") for r in rows], total, page, size)
+    owner_map = _enrich_with_owner(db, rows)
+    return paged([_resume_to_dict(r, owner_map) for r in rows], total, page, size)
 
 
 @router.get("/export", summary="简历导出 CSV")
@@ -94,8 +120,10 @@ def export_resumes(
         audit_status, owner_userid, created_from, created_to,
     )
     rows = resume_admin_service.export_rows(db, filters, sort)
+    owner_map = _enrich_with_owner(db, rows)
     headers = [
-        "id", "owner_userid", "gender", "age",
+        "id", "owner_userid", "owner_display_name", "owner_phone",
+        "gender", "age",
         "expected_cities", "expected_job_categories",
         "salary_expect_floor_monthly",
         "accept_long_term", "accept_short_term",
@@ -104,8 +132,11 @@ def export_resumes(
     ]
     body = []
     for r in rows:
+        ow = owner_map.get(r.owner_userid, {})
         body.append([
-            r.id, r.owner_userid, r.gender, r.age,
+            r.id, r.owner_userid,
+            ow.get("owner_display_name"), ow.get("owner_phone"),
+            r.gender, r.age,
             r.expected_cities, r.expected_job_categories,
             r.salary_expect_floor_monthly,
             r.accept_long_term, r.accept_short_term,
@@ -126,7 +157,8 @@ def get_resume(
     _: AdminUser = Depends(require_admin),
 ):
     r = resume_admin_service.get_resume(db, resume_id)
-    return ok(ResumeRead.model_validate(r).model_dump(mode="json"))
+    owner_map = _enrich_with_owner(db, [r])
+    return ok(_resume_to_dict(r, owner_map))
 
 
 @router.put("/{resume_id}", summary="简历编辑（带 version 乐观锁）")
@@ -137,7 +169,8 @@ def update_resume(
     current: AdminUser = Depends(require_admin),
 ):
     r = resume_admin_service.update_resume(db, resume_id, req.version, req.fields, current.username)
-    return ok(ResumeRead.model_validate(r).model_dump(mode="json"))
+    owner_map = _enrich_with_owner(db, [r])
+    return ok(_resume_to_dict(r, owner_map))
 
 
 @router.post("/{resume_id}/delist", summary="简历下架")

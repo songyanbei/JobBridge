@@ -31,7 +31,7 @@ _SORT_WHITELIST = {
 }
 
 _EDIT_WHITELIST = {
-    "city", "district", "job_category", "job_sub_category",
+    "city", "district", "address", "job_category", "job_sub_category",
     "salary_floor_monthly", "salary_ceiling_monthly",
     "pay_type", "headcount", "gender_required",
     "age_min", "age_max", "is_long_term",

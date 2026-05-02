@@ -50,15 +50,27 @@
       </template>
 
       <el-table-column prop="id" label="ID" width="80" sortable="custom" />
-      <el-table-column prop="display_name" label="姓名" width="100" />
-      <el-table-column prop="gender" label="性别" width="60">
+      <el-table-column label="姓名" width="100">
+        <template #default="{ row }">{{ row.owner_display_name || '--' }}</template>
+      </el-table-column>
+      <el-table-column label="电话" width="130">
+        <template #default="{ row }">{{ row.owner_phone || '--' }}</template>
+      </el-table-column>
+      <el-table-column prop="gender" label="性别" width="60" />
+      <el-table-column prop="age" label="年龄" width="60" />
+      <el-table-column label="期望工种" show-overflow-tooltip min-width="160">
         <template #default="{ row }">
-          {{ row.gender === 'male' ? '男' : row.gender === 'female' ? '女' : '--' }}
+          {{ Array.isArray(row.expected_job_categories) ? row.expected_job_categories.join('、') : row.expected_job_categories }}
         </template>
       </el-table-column>
-      <el-table-column prop="age" label="年龄" width="60" />
-      <el-table-column prop="expected_job_categories" label="期望工种" show-overflow-tooltip />
-      <el-table-column prop="expected_cities" label="期望城市" show-overflow-tooltip />
+      <el-table-column label="期望城市" show-overflow-tooltip min-width="160">
+        <template #default="{ row }">
+          {{ Array.isArray(row.expected_cities) ? row.expected_cities.join('、') : row.expected_cities }}
+        </template>
+      </el-table-column>
+      <el-table-column label="期望薪资" width="100">
+        <template #default="{ row }">{{ row.salary_expect_floor_monthly ? row.salary_expect_floor_monthly + '+' : '--' }}</template>
+      </el-table-column>
       <el-table-column prop="audit_status" label="审核" width="90">
         <template #default="{ row }">
           <el-tag

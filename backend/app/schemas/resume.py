@@ -127,6 +127,10 @@ class ResumeRead(BaseModel):
     version: int
     extra: dict | None = None
 
+    # ---- 工人（owner）信息：admin 后台展示用，由 router 层 join 注入 ----
+    owner_phone: str | None = None
+    owner_display_name: str | None = None
+
     model_config = {"from_attributes": True}
 
 

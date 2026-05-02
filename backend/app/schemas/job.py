@@ -102,6 +102,7 @@ class JobRead(BaseModel):
 
     # 软匹配
     district: str | None = None
+    address: str | None = None
     salary_ceiling_monthly: int | None = None
     provide_meal: bool | None = None
     provide_housing: bool | None = None
@@ -143,6 +144,14 @@ class JobRead(BaseModel):
 
     version: int
     extra: dict | None = None
+
+    # ---- 发布者（owner）信息：admin 后台展示用，由 router 层 join 注入 ----
+    owner_phone: str | None = None
+    owner_company: str | None = None
+    owner_contact_person: str | None = None
+    owner_address: str | None = None
+    owner_role: str | None = None
+    owner_display_name: str | None = None
 
     model_config = {"from_attributes": True}
 

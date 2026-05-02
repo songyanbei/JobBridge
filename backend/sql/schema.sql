@@ -42,6 +42,7 @@ CREATE TABLE `user` (
     `role`               ENUM('worker','factory','broker') NOT NULL       COMMENT '角色：工人/厂家/中介',
     `display_name`       VARCHAR(64)     DEFAULT NULL                     COMMENT '展示昵称',
     `company`            VARCHAR(128)    DEFAULT NULL                     COMMENT '公司名（厂家/中介填写）',
+    `address`            VARCHAR(255)    DEFAULT NULL                     COMMENT '公司/经营地址（厂家/中介填写）',
     `contact_person`     VARCHAR(64)     DEFAULT NULL                     COMMENT '联系人姓名',
     `phone`              VARCHAR(32)     DEFAULT NULL                     COMMENT '联系电话（工人侧不对外展示）',
     `can_search_jobs`    TINYINT(1)      NOT NULL DEFAULT 0               COMMENT '能否检索岗位（中介双向标记）',
@@ -78,6 +79,7 @@ CREATE TABLE `job` (
 
     -- ---- 软匹配字段（§7.1）----
     `district`                 VARCHAR(32)     DEFAULT NULL                  COMMENT '区县（细粒度）',
+    `address`                  VARCHAR(255)    DEFAULT NULL                  COMMENT '岗位详细工作地址（街道+门牌，区县另见 district）',
     `salary_ceiling_monthly`   INT             DEFAULT NULL                  COMMENT '月综合收入上限',
     `provide_meal`             TINYINT(1)      DEFAULT NULL                  COMMENT '包吃',
     `provide_housing`          TINYINT(1)      DEFAULT NULL                  COMMENT '包住',

@@ -17,17 +17,17 @@
       <el-descriptions :column="2" border>
         <el-descriptions-item label="ID">{{ detail.id }}</el-descriptions-item>
         <el-descriptions-item label="版本">v{{ detail.version }}</el-descriptions-item>
-        <el-descriptions-item label="标题" :span="2">
-          <el-input v-if="editing" v-model="form.title" @input="markDirty" />
-          <span v-else>{{ detail.title }}</span>
-        </el-descriptions-item>
         <el-descriptions-item label="城市">
           <el-input v-if="editing" v-model="form.city" @input="markDirty" />
           <span v-else>{{ detail.city }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="区县">
           <el-input v-if="editing" v-model="form.district" @input="markDirty" />
-          <span v-else>{{ detail.district }}</span>
+          <span v-else>{{ detail.district || '--' }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="详细地址" :span="2">
+          <el-input v-if="editing" v-model="form.address" @input="markDirty" placeholder="街道+门牌（区县另填）" />
+          <span v-else>{{ detail.address || '--' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="工种">
           <el-input v-if="editing" v-model="form.job_category" @input="markDirty" />
@@ -35,12 +35,11 @@
         </el-descriptions-item>
         <el-descriptions-item label="支付方式">
           <el-select v-if="editing" v-model="form.pay_type" @change="markDirty">
-            <el-option label="日结" value="daily" />
-            <el-option label="月结" value="monthly" />
+            <el-option label="月薪" value="月薪" />
+            <el-option label="时薪" value="时薪" />
+            <el-option label="计件" value="计件" />
           </el-select>
-          <span v-else>
-            {{ detail.pay_type === 'daily' ? '日结' : detail.pay_type === 'monthly' ? '月结' : '--' }}
-          </span>
+          <span v-else>{{ detail.pay_type || '--' }}</span>
         </el-descriptions-item>
         <el-descriptions-item label="薪资下限">
           <el-input-number
@@ -71,12 +70,21 @@
         <el-descriptions-item label="下架原因">
           {{ detail.delist_reason || '--' }}
         </el-descriptions-item>
-        <el-descriptions-item label="发布人">{{ detail.owner_userid }}</el-descriptions-item>
         <el-descriptions-item label="到期时间">
           <span :class="`jb-${ttlLevel(detail.expires_at)}-text`">
             {{ formatDateTime(detail.expires_at) }}
           </span>
         </el-descriptions-item>
+        <el-descriptions-item label="发布人 ID">{{ detail.owner_userid }}</el-descriptions-item>
+
+        <!-- ---- 发布方信息 ---- -->
+        <el-descriptions-item label="发布方角色">
+          {{ { factory: '厂家', broker: '中介', worker: '工人' }[detail.owner_role] || '--' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="联系人">{{ detail.owner_contact_person || detail.owner_display_name || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="联系电话">{{ detail.owner_phone || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="所属公司" :span="2">{{ detail.owner_company || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="公司地址" :span="2">{{ detail.owner_address || '--' }}</el-descriptions-item>
       </el-descriptions>
 
       <ImagePreview
@@ -172,9 +180,9 @@ function startEdit() {
   if (!detail.value) return
   for (const k of Object.keys(form)) delete form[k]
   Object.assign(form, {
-    title: detail.value.title,
     city: detail.value.city,
     district: detail.value.district,
+    address: detail.value.address,
     job_category: detail.value.job_category,
     pay_type: detail.value.pay_type,
     salary_floor_monthly: detail.value.salary_floor_monthly,

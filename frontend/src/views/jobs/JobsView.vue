@@ -59,18 +59,25 @@
       </template>
 
       <el-table-column prop="id" label="ID" width="80" sortable="custom" />
-      <el-table-column prop="title" label="标题" show-overflow-tooltip />
       <el-table-column prop="city" label="城市" width="90" />
-      <el-table-column prop="job_category" label="工种" width="120" />
-      <el-table-column prop="pay_type" label="支付" width="80">
-        <template #default="{ row }">
-          {{ row.pay_type === 'daily' ? '日结' : row.pay_type === 'monthly' ? '月结' : '--' }}
-        </template>
-      </el-table-column>
+      <el-table-column prop="district" label="区县" width="100" show-overflow-tooltip />
+      <el-table-column prop="address" label="详细地址" min-width="200" show-overflow-tooltip />
+      <el-table-column prop="job_category" label="工种" width="100" />
+      <el-table-column prop="pay_type" label="支付" width="80" />
       <el-table-column label="薪资" width="140">
         <template #default="{ row }">
           {{ row.salary_floor_monthly || '-' }} ~ {{ row.salary_ceiling_monthly || '-' }}
         </template>
+      </el-table-column>
+      <el-table-column label="发布方" width="180" show-overflow-tooltip>
+        <template #default="{ row }">
+          <span v-if="row.owner_company">{{ row.owner_company }}</span>
+          <span v-else-if="row.owner_role === 'broker'" class="jb-muted">中介 · {{ row.owner_display_name || row.owner_userid }}</span>
+          <span v-else class="jb-muted">{{ row.owner_display_name || row.owner_userid }}</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="联系电话" width="130">
+        <template #default="{ row }">{{ row.owner_phone || '--' }}</template>
       </el-table-column>
       <el-table-column prop="audit_status" label="审核" width="90">
         <template #default="{ row }">
