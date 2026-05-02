@@ -199,3 +199,89 @@ def test_session_none_always_legacy(restore_settings):
             "西安找服务员", "worker", history=[], session=None, userid="u-test-1",
         )
     assert result.source == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# codex review P4：phased-plan §2.3 三类事件齐全（dialogue_v2_parse 独立）
+# ---------------------------------------------------------------------------
+
+def _captured_log_events(monkeypatch):
+    """patch app.tasks.common.log_event 捕获事件列表。intent_service 通过
+    `from app.tasks.common import log_event` 在模块级别绑定，所以也得 patch
+    intent_service.log_event。"""
+    captured: list[tuple[str, dict]] = []
+
+    def _fake(event_type: str, **kwargs):
+        captured.append((event_type, kwargs))
+
+    import app.tasks.common as _common
+    monkeypatch.setattr(_common, "log_event", _fake)
+    monkeypatch.setattr(intent_service, "log_event", _fake)
+    return captured
+
+
+def test_dual_read_emits_dialogue_v2_parse_then_decision(restore_settings, monkeypatch):
+    """dual_read 路径：先发 dialogue_v2_parse，再发 dialogue_v2_decision。"""
+    settings.dialogue_v2_mode = "dual_read"
+    settings.dialogue_v2_userid_whitelist = "u-test-1"
+    settings.dialogue_v2_hash_buckets = 0
+
+    captured = _captured_log_events(monkeypatch)
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    assert result.source == "v2_dual_read"
+    types = [t for t, _ in captured]
+    assert "dialogue_v2_parse" in types
+    assert "dialogue_v2_decision" in types
+    # 顺序：parse 必须在 decision 之前
+    assert types.index("dialogue_v2_parse") < types.index("dialogue_v2_decision")
+    parse_kwargs = next(kw for t, kw in captured if t == "dialogue_v2_parse")
+    # 字段：dialogue_act / frame_hint / slots_delta_keys / merge_hint_keys / mode / prompt_version
+    assert parse_kwargs["dialogue_act"] == "start_search"
+    assert parse_kwargs["frame_hint"] == "job_search"
+    assert parse_kwargs["mode"] == "dual_read"
+    assert parse_kwargs["prompt_version"]  # 非空字符串
+    assert isinstance(parse_kwargs["slots_delta_keys"], list)
+
+
+def test_shadow_emits_dialogue_v2_parse_then_legacy_diff(restore_settings, monkeypatch):
+    """shadow 路径：旁路调 v2 时也要先发 dialogue_v2_parse，再发 dialogue_v2_legacy_diff。"""
+    settings.dialogue_v2_mode = "shadow"
+    settings.dialogue_v2_shadow_sample_rate = 1.0  # 100% 采样
+
+    captured = _captured_log_events(monkeypatch)
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    types = [t for t, _ in captured]
+    assert "dialogue_v2_parse" in types
+    assert "dialogue_v2_legacy_diff" in types
+    assert types.index("dialogue_v2_parse") < types.index("dialogue_v2_legacy_diff")
+    parse_kwargs = next(kw for t, kw in captured if t == "dialogue_v2_parse")
+    assert parse_kwargs["mode"] == "shadow"
+
+
+def test_v2_parse_failure_does_not_emit_parse_event(restore_settings, monkeypatch):
+    """parse 失败应只发 dialogue_v2_fallback_to_legacy（dual_read）/
+    dialogue_v2_parse_error（shadow），不应发 dialogue_v2_parse。"""
+    settings.dialogue_v2_mode = "dual_read"
+    settings.dialogue_v2_userid_whitelist = "u-test-1"
+    settings.dialogue_v2_hash_buckets = 0
+
+    captured = _captured_log_events(monkeypatch)
+    extractor = _FakeExtractor(raise_v2=LLMParseError("boom"))
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    types = [t for t, _ in captured]
+    assert "dialogue_v2_parse" not in types
+    assert "dialogue_v2_fallback_to_legacy" in types

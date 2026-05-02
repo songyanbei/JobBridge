@@ -15,6 +15,7 @@ from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm import get_intent_extractor
 from app.llm.base import IntentResult
 from app.llm.prompts import (
+    DIALOGUE_PROMPT_VERSION,
     INTENT_PROMPT_VERSION,
     JOB_REQUIRED_FIELDS,
     RESUME_REQUIRED_FIELDS,
@@ -980,6 +981,40 @@ def _hash_to_bucket(userid: str, total_buckets: int = 100) -> int:
     return int(h[:8], 16) % total_buckets
 
 
+def _emit_dialogue_v2_parse(
+    parse,
+    *,
+    user_msg_id: str | None,
+    mode: str,
+) -> None:
+    """phased-plan §2.3 三类事件之一：dialogue_v2_parse（成功 parse 的原始字段）。
+
+    与 dialogue_v2_decision / dialogue_v2_legacy_diff 解耦，便于分析师独立追踪：
+    - parse 成功率 / dialogue_act 分布（只需要 dialogue_v2_parse）
+    - decision 分布（dialogue_v2_decision，含 reducer 裁决后 state_transition）
+    - shadow 与 legacy 的差异（dialogue_v2_legacy_diff，含 legacy_intent 对照）
+
+    在 dual_read 与 shadow 两条路径上都先发本事件，再发各自的 decision/diff。
+    parse 失败会走 dialogue_v2_parse_error / dialogue_v2_fallback_to_legacy，
+    本函数不消费失败路径。
+    """
+    log_event(
+        "dialogue_v2_parse",
+        user_msg_id=user_msg_id,
+        mode=mode,
+        dialogue_act=parse.dialogue_act,
+        frame_hint=parse.frame_hint,
+        slots_delta_keys=sorted(parse.slots_delta.keys()) if parse.slots_delta else [],
+        merge_hint_keys=sorted(parse.merge_hint.keys()) if parse.merge_hint else [],
+        needs_clarification=bool(parse.needs_clarification),
+        confidence=parse.confidence,
+        conflict_action=parse.conflict_action,
+        prompt_version=DIALOGUE_PROMPT_VERSION,
+        input_tokens=parse.input_tokens,
+        output_tokens=parse.output_tokens,
+    )
+
+
 def _is_dual_read_target(userid: str) -> bool:
     if not userid:
         return False
@@ -1067,6 +1102,8 @@ def classify_dialogue(
                     current_criteria=current_criteria,
                     session_hint=session_hint,
                 )
+                # phased-plan §2.3 三类事件之一：先发 parse 再发 diff，解耦观测维度
+                _emit_dialogue_v2_parse(parse, user_msg_id=user_msg_id, mode="shadow")
                 decision = _reduce(parse, session, role, raw_text=stripped)
                 log_event(
                     "dialogue_v2_legacy_diff",
@@ -1096,6 +1133,8 @@ def classify_dialogue(
                 current_criteria=current_criteria,
                 session_hint=session_hint,
             )
+            # phased-plan §2.3 三类事件之一：先发 parse 再发 decision，解耦观测维度
+            _emit_dialogue_v2_parse(parse, user_msg_id=user_msg_id, mode="dual_read")
             decision = _reduce(parse, session, role, raw_text=stripped)
             ir = decision_to_intent_result(decision, session)
             log_event(
