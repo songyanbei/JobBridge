@@ -69,16 +69,37 @@ class _SearchCallSpy:
 
     jobs_calls: list[dict] = field(default_factory=list)
     workers_calls: list[dict] = field(default_factory=list)
+    jobs_results: list[dict] = field(default_factory=list)
+    workers_results: list[dict] = field(default_factory=list)
+    current_jobs_reply_text: str = "[mock-jobs-result]"
+    current_workers_reply_text: str = "[mock-workers-result]"
+
+    def set_responses(self, payload: dict | None) -> None:
+        payload = payload or {}
+        self.current_jobs_reply_text = payload.get("jobs_reply_text", "[mock-jobs-result]")
+        self.current_workers_reply_text = payload.get(
+            "workers_reply_text", "[mock-workers-result]",
+        )
 
     def fake_search_jobs(self, criteria, raw_query, session, user_ctx, db, **_kw):
         from types import SimpleNamespace
         self.jobs_calls.append(dict(criteria))
-        return SimpleNamespace(reply_text="[mock-jobs-result]")
+        reply_text = self.current_jobs_reply_text
+        self.jobs_results.append({
+            "criteria": dict(criteria),
+            "reply_text": reply_text,
+        })
+        return SimpleNamespace(reply_text=reply_text)
 
     def fake_search_workers(self, criteria, raw_query, session, user_ctx, db, **_kw):
         from types import SimpleNamespace
         self.workers_calls.append(dict(criteria))
-        return SimpleNamespace(reply_text="[mock-workers-result]")
+        reply_text = self.current_workers_reply_text
+        self.workers_results.append({
+            "criteria": dict(criteria),
+            "reply_text": reply_text,
+        })
+        return SimpleNamespace(reply_text=reply_text)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +177,7 @@ def run_dialogue_case(case: dict) -> dict:
             for idx, turn in enumerate(case["turns"]):
                 mocks["set_mock_llm"](turn["mock_llm"])
                 mocks["set_mock_v2"](turn.get("mock_v2"))
+                mocks["set_mock_search"](turn.get("mock_search"))
                 # turn 级别覆盖（不写则继承 case，case 不写则保持原 settings）
                 turn_mode = (turn.get("v2_mode") or case_mode or "off").strip()
                 _settings.dialogue_v2_mode = turn_mode
@@ -269,6 +291,9 @@ def _golden_mocks(
             mock_v2_holder["value"] = "_raise"
         else:
             mock_v2_holder["value"] = DialogueParseResult(**payload)
+
+    def set_mock_search(payload):
+        spy.set_responses(payload)
 
     def _legacy_intent_result(text, role):
         # Phase 1 worker 搜索护栏要在这里也跑 sanitize（与生产路径对齐）
@@ -396,6 +421,7 @@ def _golden_mocks(
             "db": db,
             "set_mock_llm": set_mock_llm,
             "set_mock_v2": set_mock_v2,
+            "set_mock_search": set_mock_search,
             "mark_handler": mark_handler,
         }
     finally:
