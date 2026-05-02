@@ -163,12 +163,12 @@ criteria 里没有这两个键 → [has_effective_search_criteria](../backend/ap
 - **规则**：
   - `_WORKER_SEARCH_SIGNALS`：worker 找岗位信号，如“找 / 想找 / 求职 / 工作 / 有吗”
   - `_JOB_POSTING_SIGNALS`：岗位发布信号，如“招聘 / 招工 / 急招 / 要人 / 缺人”
-  - `_CITY_ADD_SIGNALS`：城市追加信号，如“也行 / 也可以 / 加上 / 还看”
-  - `_CITY_REPLACE_SIGNALS`：城市替换信号，如“换成 / 改成 / 只看 / 有吗”
+  - ~~`_CITY_ADD_SIGNALS`~~：**Phase 4 (PR1) 已删除**（自阶段一引入起全仓库 0 引用，纯历史死代码）。
+  - ~~`_CITY_REPLACE_SIGNALS`~~：**Phase 4 (PR1) 已删除**（同上，0 引用死代码）。
 - **触发场景**：阶段一兜底 worker 搜索 intent 误判、城市短追问替换/追加语义等事故链路。
 - **漏词后果**：MEDIUM —— 漏词可能让 LLM 重新主导判断，导致 worker 找工作被误判为发布岗位，或“北京有吗”沿用旧条件。
-- **当前定位**：这是允许存在的**临时护栏**，不是长期方案。它和 [dialogue-intent-extraction-current-state.md](dialogue-intent-extraction-current-state.md) 中的 `dialogue_act` / `merge_hint` / reducer 目标有明确接替关系。
-- **推荐改进**：进入阶段二后由 `DialogueParseResult` + reducer 接管，保留这些 tuple 只作为低优先级 fallback；不得继续无限扩词表。
+- **当前定位（Phase 4 PR1 起）**：`_WORKER_SEARCH_SIGNALS / _JOB_POSTING_SIGNALS` 通过 `_apply_worker_intent_guard` 抽离，**仅 `_classify_intent_legacy` 内核调用**（fallback-only）。v2 主路径（`classify_dialogue` 的 dual_read / primary 派生）由 `DialogueParseResult` + reducer 接管，结构性禁止误调用本护栏。
+- **推荐改进**：保留作为 legacy fallback 的最后安全网，不再扩词表；阶段五 dual_read 完全下线后再考虑随 `_classify_intent_legacy` 一同退场。
 
 ---
 
@@ -343,8 +343,10 @@ phased-plan §4.1.3）。
 
 `§2.3 _WORKER_SEARCH_SIGNALS / _JOB_POSTING_SIGNALS` 已在阶段一接入 worker 搜索护栏；
 阶段二 dual_read 路径下由 reducer 配合 LLM 接管，但护栏仍保留作为**兜底**。
-`_CITY_ADD_SIGNALS / _CITY_REPLACE_SIGNALS` 在仓库内为死代码，阶段二**不接入**也**不删除**，
-留待阶段四统一删除（phased-plan §4.1.3）。
+**Phase 4 (PR1) 更新**：这两组信号通过 `_apply_worker_intent_guard` 拆离 `_sanitize_intent_result`，
+仅 `_classify_intent_legacy` 内核（legacy fallback-only）调用；v2 主路径不再依赖。
+`_CITY_ADD_SIGNALS / _CITY_REPLACE_SIGNALS` **Phase 4 (PR1) 已删除**——这两组在仓库内
+始终是死代码（自阶段一引入起 0 引用），按 phased-plan §4.1.3 直接清理。
 
 ### 默认配置（产品确认）
 

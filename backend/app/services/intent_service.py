@@ -187,6 +187,11 @@ _SEARCH_MISSING_FIELDS = frozenset({
     "city", "job_category", "salary_floor_monthly",
 })
 
+# Phase 4 (PR1)：worker 搜索护栏的两组信号 — **fallback-only**。
+# v2 主路径（DialogueParseResult → reducer）由 prompt + reducer 在结构上保证
+# worker 不会落 upload_job；这两组常量仅作 _classify_intent_legacy 内核兜底，
+# 用于 LLM 漂移导致 worker 角色被错判 upload_job 时强制纠回 search_job。
+# 详见 docs/dialogue-intent-extraction-phased-plan.md §4.1.3。
 _WORKER_SEARCH_SIGNALS = (
     "找", "想找", "找个", "找份", "求职", "工作", "岗位", "活", "上班",
     "想做", "能做", "有吗", "有没有",
@@ -197,8 +202,8 @@ _JOB_POSTING_SIGNALS = (
     "招二", "招三", "招四", "招五", "要人", "缺人",
 )
 
-_CITY_ADD_SIGNALS = ("也行", "也可以", "都行", "加上", "加一个", "还看")
-_CITY_REPLACE_SIGNALS = ("换成", "改成", "只看", "看看", "看下", "有吗", "有没有")
+# Phase 4 (PR1)：删除 _CITY_ADD_SIGNALS / _CITY_REPLACE_SIGNALS（自阶段一引入起
+# 全仓库 0 引用，属于历史死代码，不影响任何路径行为）。
 _CITY_FOLLOW_UP_MAX_LEN = 12
 
 # Bug 4：城市字典归一缓存（短名 / aliases → 规范名）。
@@ -402,8 +407,12 @@ def _classify_intent_legacy(
     # parse_failed 的 fallback result 不需要再 sanitize（全空结构）
     if parse_failed:
         return result
-    # Step 4: 校验和清洗（含 Phase 1 worker 搜索护栏）
-    return _sanitize_intent_result(result, role, raw_text=stripped)
+    # Step 4: 校验和清洗。Phase 4 (PR1) 显式两步：
+    #   1. _apply_worker_intent_guard：worker upload_job → search_job 的 fallback 护栏
+    #      （v2 主路径不会调用，由此结构性禁止误调用）
+    #   2. _sanitize_common：schema 派生的字段清洗（v2 派生路径如需可单独调用）
+    result = _apply_worker_intent_guard(result, role, raw_text=stripped)
+    return _sanitize_common(result, role)
 
 
 # ---------------------------------------------------------------------------
@@ -461,14 +470,14 @@ def _match_show_more(text: str) -> bool:
 
 
 def _hits_worker_search_signal(text: str) -> bool:
-    """worker 角色 + 找工/求职信号命中。Phase 1 worker 搜索护栏。"""
+    """worker + 找工/求职信号命中。**Phase 4 (PR1)：fallback-only**。"""
     if not text:
         return False
     return any(s in text for s in _WORKER_SEARCH_SIGNALS)
 
 
 def _hits_job_posting_signal(text: str) -> bool:
-    """招聘 / 发岗位信号命中。Phase 1 worker 搜索护栏的反向排除条件。"""
+    """招聘 / 发岗位信号命中。**Phase 4 (PR1)：fallback-only**。"""
     if not text:
         return False
     return any(s in text for s in _JOB_POSTING_SIGNALS)
@@ -482,6 +491,9 @@ def _should_force_worker_search(role: str, text: str, intent: str) -> bool:
     2. intent == "upload_job"（worker 永远不能发布岗位）
     3. 文本命中 _WORKER_SEARCH_SIGNALS（找/想找/求职/工作/打工/上班 等）
     4. 不命中 _JOB_POSTING_SIGNALS（招聘/招工/招人 等显式发布信号）
+
+    **Phase 4 (PR1)**：仅 _classify_intent_legacy 内核（经 _apply_worker_intent_guard）
+    调用；v2 主路径不依赖此护栏。
     """
     if role != "worker":
         return False
@@ -494,18 +506,18 @@ def _should_force_worker_search(role: str, text: str, intent: str) -> bool:
     return True
 
 
-def _sanitize_intent_result(
+def _apply_worker_intent_guard(
     result: IntentResult,
     role: str,
-    raw_text: str = "",
+    raw_text: str,
 ) -> IntentResult:
-    """校验 LLM 返回结果，清洗不合法的字段和 patch。
+    """worker 误判 upload_job → search_job 的强制纠正。**Phase 4：fallback-only**。
 
-    Phase 1（dialogue-intent-extraction-phased-plan §1.1）：worker 搜索护栏 ——
-    worker + 搜索信号 + 无发布信号但 LLM 误判为 upload_job 时，强制纠回 search_job，
-    避免 worker 找工作被错误追问 pay_type / headcount。
+    Phase 4 (PR1) 从 _sanitize_intent_result 抽离：让 _classify_intent_legacy 内核
+    显式两步处理（先纠 intent，再做字段清洗），并在 v2 主路径上结构性禁止误调用。
+    v2 主链路（classify_dialogue 的 dual_read / primary 派生路径）由 prompt + reducer
+    接管 worker 误判，**不**调用本函数。
     """
-    # Phase 1：worker 搜索护栏（在字段清洗前先把 intent 纠正）
     if _should_force_worker_search(role, raw_text, result.intent):
         logger.warning(
             "intent_service: worker search guardrail corrects intent "
@@ -513,11 +525,28 @@ def _sanitize_intent_result(
             raw_text,
         )
         result.intent = "search_job"
-        # upload_job 路径下 LLM 通常输出标量 city / job_category 与 headcount / pay_type；
+        # upload_job 路径下 LLM 通常输出标量 city / job_category 与 headcount / pay_type;
         # 把可复用搜索字段保留，发布相关字段交由后续 _normalize_structured_data 在
         # search_intent 分支按 list 强制；非搜索字段会被合法字段集合自然 drop。
         # missing_fields 强制清空，由后端按搜索 schema 重算。
         result.missing_fields = []
+    return result
+
+
+def _sanitize_common(result: IntentResult, role: str) -> IntentResult:
+    """schema 派生的字段清洗（structured_data / criteria_patch / missing_fields 归一）。
+
+    Phase 4 (PR1) 从 _sanitize_intent_result 抽离：**不**包含 worker 搜索护栏。
+    legacy 路径继续由 _sanitize_intent_result 包装器一次性串起 worker guard + 本函数。
+
+    **当前未被任何 v2 派生路径调用**：v2 走 reducer + slot_schema.validate_slots_delta
+    已内置等价清洗，dialogue_compat/dialogue_reducer/dialogue_applier 都不调本函数。
+    后续 PR3 评估若 v2 派生 IntentResult 需要本函数同款清洗时再接通；接通前请保持
+    现状以避免重复清洗或语义偏移。
+
+    注意：本函数 in-place mutate 输入 result（structured_data / criteria_patch /
+    missing_fields 直接赋值到原对象）。调用方若要保留原 result，请先 copy。
+    """
     # 清洗 structured_data：移除未知 key
     clean_data = {}
     for k, v in result.structured_data.items():
@@ -567,6 +596,26 @@ def _sanitize_intent_result(
     )
 
     return result
+
+
+def _sanitize_intent_result(
+    result: IntentResult,
+    role: str,
+    raw_text: str = "",
+) -> IntentResult:
+    """legacy 入口的字段清洗 wrapper：worker 护栏 + schema 派生清洗。
+
+    Phase 4 (PR1)：保留旧名作为向后兼容入口（test_intent_service / test_phase1 /
+    golden runner / dev_rollout 测试均按此名调用）。内部组合两步：
+
+    1. _apply_worker_intent_guard：worker 误判 upload_job → search_job 的 fallback 护栏。
+    2. _sanitize_common：schema 派生的字段清洗 / 类型规整。
+
+    v2 主路径（classify_dialogue dual_read / primary 派生）**不**调用本 wrapper；
+    需要等价清洗时直接调 _sanitize_common。
+    """
+    result = _apply_worker_intent_guard(result, role, raw_text)
+    return _sanitize_common(result, role)
 
 
 # ---------------------------------------------------------------------------

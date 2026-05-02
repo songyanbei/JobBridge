@@ -5,8 +5,10 @@ import pytest
 
 from app.llm.base import IntentResult
 from app.services.intent_service import (
+    _apply_worker_intent_guard,
     _match_command,
     _match_show_more,
+    _sanitize_common,
     _sanitize_intent_result,
     classify_intent,
 )
@@ -155,3 +157,76 @@ class TestClassifyIntent:
         result = classify_intent("苏州找电子厂", "worker")
         assert result.intent == "search_job"
         mock_extractor.extract.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 (PR1)：sanitize 拆分 — worker 护栏 vs 字段清洗的结构化隔离
+# ---------------------------------------------------------------------------
+
+
+class TestPhase4SanitizeSplit:
+    """验证 _sanitize_common 与 _apply_worker_intent_guard 拆分后的边界。
+
+    阶段 4 (PR1)：worker 搜索护栏从 _sanitize_intent_result 抽离为独立函数，
+    v2 主路径不会触发护栏；legacy 路径继续通过 _sanitize_intent_result 包装器
+    或 _classify_intent_legacy 显式两步调用保留护栏。
+    """
+
+    def test_sanitize_common_does_not_apply_worker_guard(self):
+        """_sanitize_common 单独调用时不会把 upload_job 纠回 search_job（v2 路径语义）。
+
+        关键不变量：v2 主路径若调本函数，worker + search 信号 + upload_job 文本
+        不会被静默纠正；intent 保留 LLM 原值，由 reducer 与 schema 接管裁决。
+        """
+        result = IntentResult(
+            intent="upload_job",
+            structured_data={"city": "西安市", "job_category": "餐饮"},
+            confidence=0.8,
+        )
+        sanitized = _sanitize_common(result, "worker")
+        # v2 路径不依赖 worker 护栏：intent 保持 LLM 原值
+        assert sanitized.intent == "upload_job"
+
+    def test_apply_worker_intent_guard_corrects_in_isolation(self):
+        """_apply_worker_intent_guard 单独调用时按判据纠正 intent 并清空 missing。"""
+        result = IntentResult(
+            intent="upload_job",
+            structured_data={"city": "西安市"},
+            missing_fields=["pay_type", "headcount"],
+            confidence=0.8,
+        )
+        guarded = _apply_worker_intent_guard(
+            result, role="worker", raw_text="西安想找个饭店服务员的工作",
+        )
+        assert guarded.intent == "search_job"
+        assert guarded.missing_fields == []
+
+    def test_apply_worker_intent_guard_no_op_for_factory(self):
+        """factory 角色不触发 worker 护栏，intent 不变。"""
+        result = IntentResult(
+            intent="upload_job",
+            structured_data={"city": "苏州市"},
+            confidence=0.9,
+        )
+        guarded = _apply_worker_intent_guard(
+            result, role="factory", raw_text="想找人来做",
+        )
+        assert guarded.intent == "upload_job"
+
+    def test_legacy_wrapper_still_applies_worker_guard(self):
+        """_sanitize_intent_result 包装器在 legacy 路径上仍触发护栏（向后兼容）。"""
+        result = IntentResult(
+            intent="upload_job",
+            structured_data={"city": "西安市", "job_category": "餐饮"},
+            missing_fields=["pay_type", "headcount"],
+            confidence=0.8,
+        )
+        sanitized = _sanitize_intent_result(
+            result, role="worker", raw_text="西安想找个饭店服务员的工作",
+        )
+        # legacy 包装器 = worker guard + sanitize_common
+        assert sanitized.intent == "search_job"
+        assert sanitized.missing_fields == []
+        # 城市 / 工种被搜索分支强制为 list（与 Phase 1 测试断言一致）
+        assert sanitized.structured_data["city"] == ["西安市"]
+        assert sanitized.structured_data["job_category"] == ["餐饮"]
