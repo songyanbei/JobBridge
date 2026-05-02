@@ -333,15 +333,17 @@ def test_mode_primary_hit_rollout_routes_to_v2_primary(restore_settings):
     assert result.decision.dialogue_act == "start_search"
 
 
-def test_mode_primary_miss_rollout_falls_through_to_dual_read(restore_settings):
-    """primary 未命中（0%）但用户在 dual_read 白名单 → fallthrough 到 v2_dual_read。
+def test_mode_primary_miss_rollout_falls_to_legacy_not_dual_read(restore_settings):
+    """codex review 修订（PR4 P2-1）：primary 未命中桶 → **直接 legacy**，
+    不 fallthrough 到 dual_read（即便用户在 dual_read 白名单内）。
 
-    plan §4.1.6：5% primary 期间 dual_read 仍在 95% 用户上积累影子比对数据;
-    100% primary 后再下线 dual_read。
+    与 phased-plan §4.1.1「primary mode：新 DTO 是 source of truth，不再
+    dual-read 切换」+ §4.1.6「立即回滚到 dual-read」（mode 切换语义）一致。
+    回滚通过 dialogue_v2_mode 切换驱动，不通过 primary 内部 fallthrough。
     """
     settings.dialogue_v2_mode = "primary"
     _set_primary_rollout(0)  # 0% → 永不命中 primary
-    settings.dialogue_v2_userid_whitelist = "u-test-1"
+    settings.dialogue_v2_userid_whitelist = "u-test-1"  # 即便在 dual_read 白名单
     settings.dialogue_v2_hash_buckets = 0
     extractor = _FakeExtractor()
     s = _session()
@@ -349,8 +351,25 @@ def test_mode_primary_miss_rollout_falls_through_to_dual_read(restore_settings):
         result = classify_dialogue(
             "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
         )
-    assert result.source == "v2_dual_read"
-    assert result.decision is not None
+    # 不再 fallthrough 到 v2_dual_read
+    assert result.source == "legacy"
+    assert result.decision is None
+
+
+def test_mode_dual_read_not_invoked_in_primary_mode(restore_settings):
+    """primary 模式下 dual_read 桶 / 白名单都不生效（必须显式切 mode=dual_read）。"""
+    settings.dialogue_v2_mode = "primary"
+    _set_primary_rollout(0)
+    settings.dialogue_v2_userid_whitelist = ""
+    settings.dialogue_v2_hash_buckets = 100  # dual_read 桶设满
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-anybody",
+        )
+    # primary 模式不评估 dual_read 桶，未命中 primary → legacy
+    assert result.source == "legacy"
 
 
 def test_mode_primary_miss_all_buckets_falls_to_legacy(restore_settings):

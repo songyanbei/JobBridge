@@ -452,11 +452,26 @@ def _reduce_main(
             resolved_frame, sorted(dropped),
         )
 
+    pending_clarification: dict | None = None
+
+    # 4.2b（codex review P1-3 修复）：drop 后无有效字段 + 本轮需要业务动作 → clarify。
+    # 与 phased-plan §5「失败模式」对齐：避免脏 parse 静默继续旧搜索条件。
+    # 业务动作 act 集合：start_search / modify_search / answer_missing_slot / start_upload。
+    # cancel / reset / show_more / chitchat / resolve_conflict 等非业务动作不触发。
+    _BUSINESS_ACTS = {
+        "start_search", "modify_search", "answer_missing_slot", "start_upload",
+    }
+    if dropped and not accepted and act in _BUSINESS_ACTS:
+        pending_clarification = {
+            "kind": "dropped_slots_no_valid",
+            "ambiguous_field": None,
+            "options": sorted(dropped),
+        }
+
     # 4.3 决定 resolved_merge_policy（仅对 accepted 中存在的 key）
     old_criteria = dict(session.search_criteria or {})
     resolved_policy: dict[str, str] = {}
     final_criteria = dict(old_criteria)
-    pending_clarification: dict | None = None
     for field, new_value in accepted.items():
         old_value = old_criteria.get(field)
         policy, clar = _resolve_merge_policy(
@@ -490,8 +505,16 @@ def _reduce_main(
             }
             forced_low_conf = True
 
-    # 4.6 needs_clarification 输出位 + 派生 route_intent
-    needs_clar = pending_clarification is not None or parse_result.needs_clarification
+    # 4.5b（codex review P1-2 修复）：透传 LLM needs_clarification=True 信号。
+    # 之前 needs_clar 变量算了但未使用，导致 LLM 显式请求澄清时被静默丢弃，
+    # 系统继续按 follow_up 用旧条件执行（plan §3.3：reducer 可覆盖 LLM 的
+    # needs_clarification，但反过来 LLM 已要求澄清时也必须生成 decision.clarification）。
+    if pending_clarification is None and parse_result.needs_clarification:
+        pending_clarification = {
+            "kind": "llm_requested",
+            "ambiguous_field": None,
+            "options": [],
+        }
 
     # 4.7 awaiting_ops（声明式，applier 物化）
     awaiting_ops: list[dict] = []

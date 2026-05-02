@@ -114,6 +114,16 @@ _V2_CLAR_FRAME_CONFLICT = (
 _V2_CLAR_ROLE_NO_PERMISSION = (
     "当前账号不支持该操作。如需调整，请联系运营或先切换角色。"
 )
+# codex review 修订（PR4 P1-2）：LLM 显式 needs_clarification=True 但 reducer 自身
+# 没决定具体 clarify kind 时，用通用文案让用户提供更多信息。
+_V2_CLAR_LLM_REQUESTED = (
+    "您的描述我没完全理解，方便再说得具体一些吗？比如城市、岗位类型、薪资期望等。"
+)
+# codex review 修订（PR4 P1-3）：脏 slots_delta 全被 schema drop 掉但本轮需要业务动作时,
+# 不再静默继续旧搜索条件，反问让用户重新表达。
+_V2_CLAR_DROPPED_SLOTS_NO_VALID = (
+    "您说的字段我没识别出来，方便用更标准的方式再描述一次吗？比如城市、工种、薪资。"
+)
 _V2_CLAR_DEFAULT = "请再说得具体一些，方便我帮您处理。"
 
 
@@ -141,6 +151,10 @@ def _render_v2_clarification(clarification: dict, session: SessionState) -> str:
         return _V2_CLAR_FRAME_CONFLICT
     if kind == "role_no_permission":
         return _V2_CLAR_ROLE_NO_PERMISSION
+    if kind == "llm_requested":
+        return _V2_CLAR_LLM_REQUESTED
+    if kind == "dropped_slots_no_valid":
+        return _V2_CLAR_DROPPED_SLOTS_NO_VALID
     return _V2_CLAR_DEFAULT
 
 # Stage A：cancel 强规则（§9.3 / §3.4）。
@@ -339,6 +353,30 @@ def _handle_text(
                 replies = _route_v2_resolve_conflict(
                     decision, msg, user_ctx, session, db,
                 )
+                if replies:
+                    conversation_service.record_history(
+                        session, "assistant", replies[0].content,
+                    )
+                conversation_service.save_session(userid, session)
+                return replies
+            # codex review 修订（PR4 P1-1）：cancel / reset 走专用 handler，**不再
+            # 落到下面的通用 command 路由**。原因：v2 reducer 把 cancel/reset 翻译为
+            # state_transition=clear_pending_upload/reset_search，applier 会先清 session,
+            # 再走通用 command handler 时 command_service 看到的已经是清空后 session,
+            # 反向输出「当前没有可取消/可清空」。专用 handler 在 apply_decision **之前**
+            # 快照 pre-state，apply_decision **之后** 基于 pre-state 渲染准确文案 short-return。
+            if decision.dialogue_act in {"cancel", "reset"}:
+                pre_state = {
+                    "had_pending_upload": bool(session.pending_upload_intent),
+                    "had_search_state": bool(
+                        session.search_criteria
+                        or session.candidate_snapshot is not None
+                        or session.shown_items
+                    ),
+                    "active_flow": session.active_flow,
+                }
+                apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                replies = _route_v2_cancel_reset(decision, pre_state, msg, session)
                 if replies:
                     conversation_service.record_history(
                         session, "assistant", replies[0].content,
@@ -739,6 +777,68 @@ def _route_v2_resolve_conflict(
     logger.warning(
         "_route_v2_resolve_conflict: unexpected transition=%s, falling back to UNKNOWN",
         transition,
+    )
+    return [_reply(userid, FALLBACK_REPLY)]
+
+
+def _route_v2_cancel_reset(
+    decision,
+    pre_state: dict,
+    msg: WeComMessage,
+    session: SessionState,
+) -> list[ReplyMessage]:
+    """阶段四 PR4 codex review P1-1 修复：v2 cancel / reset 专用 handler。
+
+    与 _route_v2_resolve_conflict 同模式：调用方先 apply_decision 物化 session 状态,
+    本函数基于 **pre-apply 快照** 渲染准确文案。**不**走通用 command 路由,
+    避免 command_service 看到的已经是清空后 session 反向输出「当前没有可取消」。
+
+    cancel：
+    - pre-apply 有 pending_upload_intent → 「已取消，岗位草稿已丢弃。」
+    - pre-apply 无 pending_upload → 「当前没有可取消的草稿。」（与 legacy 行为对齐）
+
+    reset：
+    - pre-apply 有 pending_upload + 有 search_state → 「搜索条件已重置；您仍在发布{kind}」
+    - pre-apply 有 pending_upload 但无 search_state → 「您仍在发布{kind}（缺{field}）」
+      （与 legacy _handle_reset_search 同形）
+    - pre-apply 有 search_state（无 pending）→ 「已帮您清空当前搜索条件和结果」
+    - pre-apply 无 search_state 也无 pending → 「当前没有可清空的搜索条件。」
+    """
+    userid = msg.from_user
+    act = decision.dialogue_act
+
+    if act == "cancel":
+        if pre_state.get("had_pending_upload"):
+            return [_reply(userid, command_service.CANCEL_PENDING_OK)]
+        return [_reply(userid, command_service.CANCEL_PENDING_NO_DRAFT)]
+
+    if act == "reset":
+        had_pending = pre_state.get("had_pending_upload")
+        had_search = pre_state.get("had_search_state")
+        # pending 草稿存在时优先给「仍在发布」提示（与 legacy _handle_reset_search 对齐）
+        if had_pending:
+            kind = (
+                "简历"
+                if session.pending_upload_intent == "upload_resume"
+                else "岗位"
+            )
+            from app.services.upload_service import _FIELD_DISPLAY_NAMES
+            field_name = _FIELD_DISPLAY_NAMES.get(
+                session.awaiting_field, session.awaiting_field or "字段",
+            )
+            return [_reply(
+                userid,
+                command_service.RESET_SEARCH_PENDING_FMT.format(
+                    kind=kind, field_name=field_name,
+                ),
+            )]
+        if not had_search:
+            return [_reply(userid, command_service.RESET_SEARCH_EMPTY)]
+        return [_reply(userid, command_service.RESET_SEARCH_SUCCESS)]
+
+    # 兜底（理论上不该走到这里）
+    logger.warning(
+        "_route_v2_cancel_reset: unexpected dialogue_act=%s", act,
     )
     return [_reply(userid, FALLBACK_REPLY)]
 

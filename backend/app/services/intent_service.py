@@ -956,13 +956,13 @@ from dataclasses import dataclass as _dataclass
 class DialogueRouteResult:
     """classify_dialogue 返回值。
 
-    source 取值（与 phased-plan §2.3 / §4.1.6 对齐）：
-    - legacy：mode=off / shadow 主路由，或 dual_read / primary 未命中任何桶
+    source 取值（与 phased-plan §2.3 / §4.1.1 / §4.1.6 对齐）：
+    - legacy：mode=off / shadow 主路由，或 dual_read / primary 未命中桶
     - v2_shadow：mode=shadow 旁路调 v2，但主路由仍走 legacy（仅写日志）
-    - v2_dual_read：dual_read（或 primary 未命中 primary 桶但命中 dual_read 桶/白名单）
-      命中且 v2 解析成功，主路由走 v2 派生
+    - v2_dual_read：mode=dual_read 且命中白名单/桶，v2 解析成功（**仅 dual_read 模式产生**;
+      primary 模式未命中不 fallthrough 到 dual_read）
     - v2_fallback_legacy：dual_read 命中但 v2 解析失败，已回退到 legacy
-    - v2_primary（阶段四 PR3）：primary 模式命中 primary_rollout_percentage hash 桶，
+    - v2_primary（阶段四 PR3）：mode=primary 且命中 primary_rollout_percentage hash 桶，
       v2 解析成功，主路由走 v2 派生
     - v2_primary_fallback_legacy（阶段四 PR3）：primary 命中但 v2 解析失败，已回退到 legacy
     """
@@ -1184,8 +1184,11 @@ def classify_dialogue(
                 )
         return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
 
-    # primary（阶段四 PR3）：primary_rollout_percentage hash 桶命中走 v2 主链路；
-    # 未命中 fallthrough 到下面的 dual_read 分支（保留 95% 用户的 v2 观察窗口）。
+    # primary（阶段四 PR3 codex review 修订）：primary 是 v2 source of truth。
+    # primary_rollout_percentage hash 桶决定灰度比例；**未命中桶直接走 legacy**，
+    # 不 fallthrough 到 dual_read。回滚通过 mode 切换驱动（dialogue_v2_mode=primary
+    # → dual_read / off），不通过 primary 内部 fallthrough。详见 phased-plan §4.1.1
+    # 「不再 dual-read 切换」+ §4.1.6「立即回滚到 dual-read」（mode 切换语义）。
     if mode == "primary" and session is not None:
         percentage = getattr(settings, "dialogue_policy", None)
         percentage = (
@@ -1223,10 +1226,11 @@ def classify_dialogue(
                 return DialogueRouteResult(
                     intent_result=ir, decision=None, source="v2_primary_fallback_legacy",
                 )
-        # 未命中 primary 桶 → 继续按 dual_read 规则评估（保留 dual_read 灰度窗口）
+        # 未命中 primary 桶 → 直接 legacy（**不**fallthrough 到 dual_read）
 
-    # dual_read（含 primary fallthrough）：命中目标用户走 v2，未命中走 legacy
-    if mode in {"dual_read", "primary"} and session is not None and _is_dual_read_target(userid or ""):
+    # dual_read：命中目标用户走 v2，未命中走 legacy。仅在 mode=dual_read 时评估;
+    # primary 模式未命中不再 fallthrough 到此处（codex review 修订）。
+    if mode == "dual_read" and session is not None and _is_dual_read_target(userid or ""):
         try:
             ir, decision = _classify_dialogue_v2(
                 text=stripped, role=role, history=history,

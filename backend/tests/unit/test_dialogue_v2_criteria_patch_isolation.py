@@ -32,6 +32,9 @@ def restore_dialogue_settings():
         "dialogue_v2_mode": settings.dialogue_v2_mode,
         "dialogue_v2_userid_whitelist": settings.dialogue_v2_userid_whitelist,
         "dialogue_v2_hash_buckets": settings.dialogue_v2_hash_buckets,
+        # 必须纳入还原集（test_v2_primary_path_uses_reducer_decision_not_patch_ops
+        # 会设 acqp=replace，否则会污染 test_dialogue_reducer_schema_driven 的状态）
+        "ambiguous_city_query_policy": settings.ambiguous_city_query_policy,
     }
     pct = settings.dialogue_policy.primary_rollout_percentage
     yield
