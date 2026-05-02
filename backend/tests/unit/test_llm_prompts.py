@@ -17,17 +17,18 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        # Phase 1 2026-05-01: bump to v2.6，prompt 加 "X 有吗" replace 约束 + 示例 12，
-        # 并把 INTENT_PROMPT_VERSION 与 PROMPT_VERSION 锁成同一来源，避免 drift。
-        assert prompts.PROMPT_VERSION == "v2.6"
-        assert prompts.INTENT_PROMPT_VERSION == "v2.6"
+        # 阶段四 PR3 2026-05-02: bump to v2.7，criteria_patch 收口 — prompt 明确字段
+        # 已废弃，所有 intent 输出 [];  v2 派生路径由 reducer + slot_schema 接管字段
+        # 裁决，不再消费 op 语义；legacy 路径仍兼容空 patch 走 merge_criteria_patch no-op。
+        assert prompts.PROMPT_VERSION == "v2.7"
+        assert prompts.INTENT_PROMPT_VERSION == "v2.7"
         # PROMPT_VERSION 必须等于 INTENT_PROMPT_VERSION（一次 prompt 修订一组版本号）
         assert prompts.PROMPT_VERSION == prompts.INTENT_PROMPT_VERSION
-        assert prompts.PROMPT_DATE == "2026-05-01"
+        assert prompts.PROMPT_DATE == "2026-05-02"
 
     def test_intent_service_version_aliases_prompts(self):
         """intent_service.INTENT_PROMPT_VERSION 必须从 prompts 单一来源取，
-        防止两份常量回到 v2.1 vs v2.6 不一致状态（reviewer P3）。"""
+        防止两份常量回到 v2.1 vs v2.7 不一致状态（reviewer P3）。"""
         from app.services import intent_service
         assert intent_service.INTENT_PROMPT_VERSION is prompts.INTENT_PROMPT_VERSION
 

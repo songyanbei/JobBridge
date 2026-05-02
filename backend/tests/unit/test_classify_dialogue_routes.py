@@ -72,9 +72,13 @@ def restore_settings():
         "dialogue_v2_userid_whitelist": settings.dialogue_v2_userid_whitelist,
         "dialogue_v2_hash_buckets": settings.dialogue_v2_hash_buckets,
     }
+    primary_pct = settings.dialogue_policy.primary_rollout_percentage
     yield
     for k, v in snapshot.items():
         setattr(settings, k, v)
+    settings.dialogue_policy = settings.dialogue_policy.model_copy(
+        update={"primary_rollout_percentage": primary_pct},
+    )
 
 
 def test_mode_off_returns_legacy(restore_settings):
@@ -291,3 +295,117 @@ def test_v2_parse_failure_does_not_emit_parse_event(restore_settings, monkeypatc
     types = [t for t, _ in captured]
     assert "dialogue_v2_parse" not in types
     assert "dialogue_v2_fallback_to_legacy" in types
+
+
+# ---------------------------------------------------------------------------
+# 阶段四 PR3：primary 分支灰度入口测试
+#
+# 关键不变量：
+# 1. mode=primary + 命中 primary_rollout_percentage 桶 → source=v2_primary
+# 2. mode=primary + 未命中 primary 桶 + 在 dual_read 白名单 → source=v2_dual_read
+#    （fallthrough 到 dual_read 既有逻辑，保留 95% 用户的 v2 观察窗口）
+# 3. mode=primary + 未命中任何桶 / 白名单 → source=legacy
+# 4. mode=primary + 命中 primary 桶 + v2 抛异常 → source=v2_primary_fallback_legacy
+# ---------------------------------------------------------------------------
+
+
+def _set_primary_rollout(percentage: int) -> None:
+    """设置 primary_rollout_percentage（PR2 嵌套字段，无顶层 setter）。"""
+    settings.dialogue_policy = settings.dialogue_policy.model_copy(
+        update={"primary_rollout_percentage": percentage},
+    )
+
+
+def test_mode_primary_hit_rollout_routes_to_v2_primary(restore_settings):
+    """primary 桶命中 → source=v2_primary（与 dual_read 共用 v2 派生路径）。"""
+    settings.dialogue_v2_mode = "primary"
+    settings.dialogue_v2_userid_whitelist = ""
+    settings.dialogue_v2_hash_buckets = 0
+    _set_primary_rollout(100)  # 100% → 任何 userid 都命中
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-anybody",
+        )
+    assert result.source == "v2_primary"
+    assert result.decision is not None
+    assert result.decision.dialogue_act == "start_search"
+
+
+def test_mode_primary_miss_rollout_falls_through_to_dual_read(restore_settings):
+    """primary 未命中（0%）但用户在 dual_read 白名单 → fallthrough 到 v2_dual_read。
+
+    plan §4.1.6：5% primary 期间 dual_read 仍在 95% 用户上积累影子比对数据;
+    100% primary 后再下线 dual_read。
+    """
+    settings.dialogue_v2_mode = "primary"
+    _set_primary_rollout(0)  # 0% → 永不命中 primary
+    settings.dialogue_v2_userid_whitelist = "u-test-1"
+    settings.dialogue_v2_hash_buckets = 0
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    assert result.source == "v2_dual_read"
+    assert result.decision is not None
+
+
+def test_mode_primary_miss_all_buckets_falls_to_legacy(restore_settings):
+    """primary 未命中 + 不在 dual_read 白名单/桶 → source=legacy（最终兜底）。"""
+    settings.dialogue_v2_mode = "primary"
+    _set_primary_rollout(0)
+    settings.dialogue_v2_userid_whitelist = "u-other"  # 不含本测用户
+    settings.dialogue_v2_hash_buckets = 0
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    assert result.source == "legacy"
+    assert result.decision is None
+
+
+def test_mode_primary_v2_exception_falls_back_to_legacy(restore_settings):
+    """primary 命中但 v2 抛异常 → source=v2_primary_fallback_legacy + 不抛 500。
+
+    严格约束：fallback 只调 _classify_intent_legacy 内核（已是非递归内核），
+    不调 classify_intent 顶层入口；避免 primary 路径产生递归。
+    """
+    settings.dialogue_v2_mode = "primary"
+    _set_primary_rollout(100)
+    settings.dialogue_v2_userid_whitelist = ""
+    settings.dialogue_v2_hash_buckets = 0
+    extractor = _FakeExtractor(raise_v2=LLMParseError("boom"))
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        result = classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    assert result.source == "v2_primary_fallback_legacy"
+    assert result.decision is None
+    # legacy 内核派生的 IntentResult 仍然有效
+    assert result.intent_result.intent == "search_job"
+
+
+def test_mode_primary_emits_dialogue_v2_primary_route_event(restore_settings, monkeypatch):
+    """primary 命中桶时必须 emit dialogue_v2_primary_route 埋点供大盘观察。"""
+    settings.dialogue_v2_mode = "primary"
+    _set_primary_rollout(100)
+    settings.dialogue_v2_userid_whitelist = ""
+    settings.dialogue_v2_hash_buckets = 0
+
+    captured = _captured_log_events(monkeypatch)
+    extractor = _FakeExtractor()
+    s = _session()
+    with patch.object(intent_service, "get_intent_extractor", return_value=extractor):
+        classify_dialogue(
+            "西安找服务员", "worker", history=[], session=s, userid="u-test-1",
+        )
+    types = [t for t, _ in captured]
+    assert "dialogue_v2_primary_route" in types
+    primary_kwargs = next(kw for t, kw in captured if t == "dialogue_v2_primary_route")
+    assert primary_kwargs["percentage"] == 100

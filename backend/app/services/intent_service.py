@@ -956,11 +956,15 @@ from dataclasses import dataclass as _dataclass
 class DialogueRouteResult:
     """classify_dialogue 返回值。
 
-    source 取值（与 phased-plan §2.3 对齐）：
-    - legacy：mode=off / shadow 主路由，或 dual_read 但用户未命中白名单/桶
+    source 取值（与 phased-plan §2.3 / §4.1.6 对齐）：
+    - legacy：mode=off / shadow 主路由，或 dual_read / primary 未命中任何桶
     - v2_shadow：mode=shadow 旁路调 v2，但主路由仍走 legacy（仅写日志）
-    - v2_dual_read：dual_read 命中且 v2 解析成功，主路由走 v2 派生
+    - v2_dual_read：dual_read（或 primary 未命中 primary 桶但命中 dual_read 桶/白名单）
+      命中且 v2 解析成功，主路由走 v2 派生
     - v2_fallback_legacy：dual_read 命中但 v2 解析失败，已回退到 legacy
+    - v2_primary（阶段四 PR3）：primary 模式命中 primary_rollout_percentage hash 桶，
+      v2 解析成功，主路由走 v2 派生
+    - v2_primary_fallback_legacy（阶段四 PR3）：primary 命中但 v2 解析失败，已回退到 legacy
     """
     intent_result: IntentResult
     decision: object | None  # DialogueDecision 类型，避免循环 import
@@ -1020,6 +1024,61 @@ def _is_dual_read_target(userid: str) -> bool:
     return _hash_to_bucket(userid) < buckets
 
 
+def _is_primary_rollout_target(userid: str, percentage: int) -> bool:
+    """阶段四 PR3：primary 模式 hash 桶灰度命中判定。
+
+    与 _is_dual_read_target 共享 _hash_to_bucket（同一 userid 的 bucket 号一致），
+    但用独立的 percentage 阈值，让 primary 灰度（5/25/50/100%）独立于 dual_read 桶
+    （dialogue_v2_hash_buckets）。userid 为空 / percentage<=0 一律不命中。
+    """
+    if not userid or percentage <= 0:
+        return False
+    return _hash_to_bucket(userid) < percentage
+
+
+def _classify_dialogue_v2(
+    *,
+    text: str,
+    role: str,
+    history,
+    current_criteria,
+    session,
+    session_hint,
+    user_msg_id,
+    mode: str,
+):
+    """v2 主路径调用 + reducer + compat 派生（dual_read / primary 共用）。
+
+    返回 (intent_result, decision)。任意异常（NotImplementedError / LLMParseError /
+    其它）由调用方 try/except 兜底降级到 _classify_intent_legacy 内核。
+    """
+    from app.services.dialogue_compat import decision_to_intent_result
+    from app.services.dialogue_reducer import reduce as _reduce
+
+    extractor = get_intent_extractor()
+    parse = extractor.extract_dialogue(
+        text=text, role=role, history=history,
+        current_criteria=current_criteria,
+        session_hint=session_hint,
+    )
+    # phased-plan §2.3 三类事件之一：先发 parse 再发 decision，解耦观测维度
+    _emit_dialogue_v2_parse(parse, user_msg_id=user_msg_id, mode=mode)
+    decision = _reduce(parse, session, role, raw_text=text)
+    ir = decision_to_intent_result(decision, session)
+    log_event(
+        "dialogue_v2_decision",
+        user_msg_id=user_msg_id,
+        mode=mode,
+        dialogue_act=decision.dialogue_act,
+        resolved_frame=decision.resolved_frame,
+        route_intent=decision.route_intent,
+        state_transition=decision.state_transition,
+        needs_clarification=bool(decision.clarification),
+        confidence=parse.confidence,
+    )
+    return ir, decision
+
+
 def classify_dialogue(
     text: str,
     role: str,
@@ -1029,7 +1088,7 @@ def classify_dialogue(
     user_msg_id: str | None = None,
     userid: str | None = None,
 ) -> DialogueRouteResult:
-    """阶段二统一意图入口。按 dialogue_v2_mode 决定走 legacy / shadow / dual_read。
+    """阶段二/四统一意图入口。按 dialogue_v2_mode 决定走 legacy / shadow / dual_read / primary。
 
     依赖 SessionState（不强制类型注解避免循环 import）：用于 build_session_hint /
     reducer 读 awaiting / merge policy。session=None 时一律走 legacy（避免破坏
@@ -1039,10 +1098,17 @@ def classify_dialogue(
     - mode=off：直接走 _classify_intent_legacy，零 v2 调用。
     - mode=shadow：legacy 主路由 + 按 sample_rate 旁路调 v2 写日志（仅日志）。
     - mode=dual_read：白名单 / hash 桶命中走 v2 派生；未命中走 legacy。
+    - mode=primary（阶段四 PR3）：primary_rollout_percentage hash 桶命中走 v2 主链路；
+      未命中**fallthrough 到 dual_read 既有逻辑**（保留 95% 用户的 v2 观察窗口，
+      shadow 数据持续积累；100% primary 后再下线 dual_read）。
     - 任何 v2 失败（NotImplementedError / LLMParseError / 任意异常）都 fallback
-      到 _classify_intent_legacy 内核（**不**再调本函数自身或 classify_intent）。
+      到 _classify_intent_legacy 内核（**不**再调本函数自身或 classify_intent，
+      避免在 primary 路径里产生递归）。
     """
-    from app.services.dialogue_compat import decision_to_intent_result
+    # v2 派生主路径（dual_read / primary）委托给 _classify_dialogue_v2 helper（内部
+    # 自带 dialogue_compat / dialogue_reducer lazy import）；shadow 分支仍 inline 调
+    # _reduce 因为它发的是 dialogue_v2_legacy_diff 事件，与 helper 的 dialogue_v2_decision
+    # 不同源；保留此 import 仅给 shadow 分支用。
     from app.services.dialogue_reducer import reduce as _reduce
 
     stripped = text.strip()
@@ -1118,28 +1184,55 @@ def classify_dialogue(
                 )
         return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
 
-    # dual_read：命中目标用户走 v2，未命中走 legacy
-    if mode == "dual_read" and session is not None and _is_dual_read_target(userid or ""):
+    # primary（阶段四 PR3）：primary_rollout_percentage hash 桶命中走 v2 主链路；
+    # 未命中 fallthrough 到下面的 dual_read 分支（保留 95% 用户的 v2 观察窗口）。
+    if mode == "primary" and session is not None:
+        percentage = getattr(settings, "dialogue_policy", None)
+        percentage = (
+            percentage.primary_rollout_percentage if percentage is not None else 0
+        )
+        if _is_primary_rollout_target(userid or "", percentage):
+            log_event(
+                "dialogue_v2_primary_route",
+                user_msg_id=user_msg_id,
+                percentage=percentage,
+            )
+            try:
+                ir, decision = _classify_dialogue_v2(
+                    text=stripped, role=role, history=history,
+                    current_criteria=current_criteria,
+                    session=session, session_hint=session_hint,
+                    user_msg_id=user_msg_id, mode="primary",
+                )
+                return DialogueRouteResult(
+                    intent_result=ir, decision=decision, source="v2_primary",
+                )
+            except Exception as exc:
+                log_event(
+                    "dialogue_v2_fallback_to_legacy",
+                    user_msg_id=user_msg_id,
+                    source="v2_primary",
+                    error=str(exc)[:200],
+                    error_type=type(exc).__name__,
+                )
+                ir = _classify_intent_legacy(
+                    text=stripped, role=role, history=history,
+                    current_criteria=current_criteria,
+                    user_msg_id=user_msg_id, session_hint=session_hint,
+                )
+                return DialogueRouteResult(
+                    intent_result=ir, decision=None, source="v2_primary_fallback_legacy",
+                )
+        # 未命中 primary 桶 → 继续按 dual_read 规则评估（保留 dual_read 灰度窗口）
+
+    # dual_read（含 primary fallthrough）：命中目标用户走 v2，未命中走 legacy
+    if mode in {"dual_read", "primary"} and session is not None and _is_dual_read_target(userid or ""):
         try:
-            extractor = get_intent_extractor()
-            parse = extractor.extract_dialogue(
+            ir, decision = _classify_dialogue_v2(
                 text=stripped, role=role, history=history,
                 current_criteria=current_criteria,
-                session_hint=session_hint,
-            )
-            # phased-plan §2.3 三类事件之一：先发 parse 再发 decision，解耦观测维度
-            _emit_dialogue_v2_parse(parse, user_msg_id=user_msg_id, mode="dual_read")
-            decision = _reduce(parse, session, role, raw_text=stripped)
-            ir = decision_to_intent_result(decision, session)
-            log_event(
-                "dialogue_v2_decision",
-                user_msg_id=user_msg_id,
-                dialogue_act=decision.dialogue_act,
-                resolved_frame=decision.resolved_frame,
-                route_intent=decision.route_intent,
-                state_transition=decision.state_transition,
-                needs_clarification=bool(decision.clarification),
-                confidence=parse.confidence,
+                session=session, session_hint=session_hint,
+                user_msg_id=user_msg_id, mode="dual_read",
             )
             return DialogueRouteResult(
                 intent_result=ir, decision=decision, source="v2_dual_read",
@@ -1148,6 +1241,7 @@ def classify_dialogue(
             log_event(
                 "dialogue_v2_fallback_to_legacy",
                 user_msg_id=user_msg_id,
+                source="v2_dual_read",
                 error=str(exc)[:200],
                 error_type=type(exc).__name__,
             )
@@ -1160,7 +1254,7 @@ def classify_dialogue(
                 intent_result=ir, decision=None, source="v2_fallback_legacy",
             )
 
-    # dual_read 未命中 / 非法 mode：legacy
+    # dual_read / primary 未命中 / 非法 mode：legacy
     ir = _classify_intent_legacy(
         text=stripped, role=role, history=history,
         current_criteria=current_criteria,

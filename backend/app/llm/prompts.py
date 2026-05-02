@@ -106,12 +106,15 @@ INTENT_SYSTEM_PROMPT = """\
 - 用户说"苏州也行" → structured_data.city = ["北京市", "苏州市"]（叠加）
 - 用户说"苏州有吗" → structured_data.city = ["苏州市"]（替换，不叠加）
 
-## criteria_patch 语义（仅 search_* / upload_* 使用，follow_up 不用）
+## criteria_patch（**v2.7 起已废弃，统一输出 `[]`**）
 
-当用户首次提交搜索/上传请求时，生成 criteria_patch 列表用于追踪本轮抽取到的字段（与 structured_data 同步）：
-- add：仅用于列表型字段（如 city），做去重追加
-- update：替换标量字段或整个列表
-- remove：若给定 value 则从列表移除该值；若 value 为 null 则删除整个字段
+阶段四 PR3：后端 v2 链路（DialogueParseResult → reducer → DialogueDecision）由
+slot_schema + reducer 接管字段裁决，**不再消费 criteria_patch 的 op 语义**。
+所有 intent 一律输出 `criteria_patch: []`。
+
+历史上 criteria_patch 用 add/update/remove op 描述本轮变更，但已被证明会引入
+「换成 X 被错合并成 add」等歧义事故（见 fdeb18d Bug 5 修复）。请**只通过
+structured_data**表达本轮抽取到的字段，**不要再用 op 语义**。
 
 ## 必填字段（仅以下字段允许出现在 missing_fields 中）
 
@@ -144,9 +147,9 @@ INTENT_SYSTEM_PROMPT = """\
 
 ## few-shot 示例
 
-示例1 - 工人找岗位:
+示例1 - 工人找岗位（criteria_patch 一律空 `[]`，下同）:
 用户消息: "苏州找电子厂的活，5000以上，包吃住"
-{{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000, "provide_meal": true, "provide_housing": true}}, "criteria_patch": [{{"op": "update", "field": "city", "value": ["苏州市"]}}, {{"op": "update", "field": "job_category", "value": ["电子厂"]}}, {{"op": "update", "field": "salary_floor_monthly", "value": 5000}}, {{"op": "update", "field": "provide_meal", "value": true}}, {{"op": "update", "field": "provide_housing", "value": true}}], "missing_fields": [], "confidence": 0.92}}
+{{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000, "provide_meal": true, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.92}}
 
 示例2 - 厂家发布岗位:
 用户消息: "我们苏州吴中区电子厂招普工30人，月薪5500-6500，包吃住，两班倒"
@@ -172,11 +175,11 @@ INTENT_SYSTEM_PROMPT = """\
 
 示例7 - 工种同义词归并（物流仓储）:
 用户消息: "苏州找打包分拣，5000+，包住"
-{{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["物流仓储"], "salary_floor_monthly": 5000, "provide_housing": true}}, "criteria_patch": [{{"op": "update", "field": "city", "value": ["苏州市"]}}, {{"op": "update", "field": "job_category", "value": ["物流仓储"]}}, {{"op": "update", "field": "salary_floor_monthly", "value": 5000}}, {{"op": "update", "field": "provide_housing", "value": true}}], "missing_fields": [], "confidence": 0.88}}
+{{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["物流仓储"], "salary_floor_monthly": 5000, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.88}}
 
 示例8 - 中介找工人（角色=broker，**搜索条件必须用 city / job_category，不要用 expected_*；missing_fields 也用 city**）:
 用户消息: "机械厂普工"
-{{"intent": "search_worker", "structured_data": {{"job_category": ["普工"]}}, "criteria_patch": [{{"op": "update", "field": "job_category", "value": ["普工"]}}], "missing_fields": ["city"], "confidence": 0.85}}
+{{"intent": "search_worker", "structured_data": {{"job_category": ["普工"]}}, "criteria_patch": [], "missing_fields": ["city"], "confidence": 0.85}}
 
 示例9 - 中介找工人 follow_up 补城市（**structured_data 给完整快照，含 job_category；规范名"苏州市"**）:
 对话历史: 用户之前发了"机械厂普工"
@@ -425,6 +428,11 @@ RERANK_USER_TEMPLATE = """\
 # 否则 message_router 落 conversation_log.criteria_snapshot.prompt_version 会错记
 # 旧版本，回溯排查时被误导。intent_service.classify_intent 的 llm_call 日志也读这里。
 #
+# v2.7 (阶段四 PR3)：criteria_patch 收口 — prompt 明确该字段已废弃，
+#                  所有 intent 一律输出 `criteria_patch: []`；删示例 1/7/8 中残留的
+#                  op-style 输出。后端 v2 派生路径（dual_read / primary）由 reducer
+#                  + slot_schema 接管字段裁决，不再消费 op 语义；legacy 路径仍兼容
+#                  IntentResult.criteria_patch=[] 走 merge_criteria_patch no-op。
 # v2.6 (Phase 1 + LLM drift 修复)：明确 "X 有吗 / X 有没有" 在 current_criteria
 #                  已含同字段不同值时按替换处理（与"换成 X / 裸值"一致），并加示例 12
 #                  锁住"北京有吗"不再被错误叠加成 ["西安市","北京市"]。
@@ -439,12 +447,12 @@ RERANK_USER_TEMPLATE = """\
 # v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
 #               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
 # v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
-INTENT_PROMPT_VERSION = "v2.6"
+INTENT_PROMPT_VERSION = "v2.7"
 
 # PROMPT_VERSION 是给 conversation_log.criteria_snapshot 用的"对话快照版本"，
 # 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
 PROMPT_VERSION = INTENT_PROMPT_VERSION
-PROMPT_DATE = "2026-05-01"
+PROMPT_DATE = "2026-05-02"
 RERANK_PROMPT_VERSION = "v2.0"
 
 # 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。

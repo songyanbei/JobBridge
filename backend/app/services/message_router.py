@@ -297,8 +297,11 @@ def _handle_text(
         decision = route.decision
         source = route.source
 
-        # 阶段二 v2 分支：dual_read 命中
-        if source == "v2_dual_read" and decision is not None:
+        # 阶段二 v2 分支：dual_read 命中 / 阶段四 PR3 primary 命中
+        # 共用 v2 派生路径：apply_awaiting_ops + clarification 短路 + state_transition
+        # 消费 + apply_decision。fallback 路径（v2_fallback_legacy / v2_primary_fallback_legacy）
+        # 走下面的 legacy 路由，与 source=="legacy" 等价处理。
+        if source in {"v2_dual_read", "v2_primary"} and decision is not None:
             from app.services.dialogue_applier import apply_awaiting_ops, apply_decision
             # awaiting_ops 必须在所有 v2 分支上执行（包括 clarification / 冲突短路），
             # 否则被消费的 awaiting 字段会僵尸保留（adversarial review C1/I15）。
