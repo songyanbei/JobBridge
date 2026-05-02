@@ -27,6 +27,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.dialogue import slot_schema
 from app.llm.base import DialogueParseResult
 from app.schemas.conversation import SessionState
 from app.services import conversation_service
@@ -45,16 +46,13 @@ logger = logging.getLogger(__name__)
 # 常量
 # ---------------------------------------------------------------------------
 
-_KEY_FIELDS_FOR_LOW_CONFIDENCE = frozenset({
-    "city", "job_category", "salary_floor_monthly", "salary_ceiling_monthly",
-})
+# 阶段三：低置信度兜底关心的关键字段集合从 slot_schema 派生（hard + askable
+# 的 search frame 字段），避免硬编码与 schema drift。
+def _key_fields_for_low_confidence() -> frozenset[str]:
+    return slot_schema.key_fields_for_low_confidence()
 
-# 角色 → 该角色合法的 frame
-_ROLE_FRAME_PERMISSIONS: dict[str, frozenset[str]] = {
-    "worker": frozenset({"job_search", "resume_upload"}),
-    "factory": frozenset({"candidate_search", "job_upload"}),
-    "broker": frozenset({"job_search", "candidate_search", "job_upload"}),
-}
+
+# 角色权限映射：阶段三委托 slot_schema.check_role_permission，本文件不再保留常量。
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +104,8 @@ def _has_search_context(session: SessionState) -> bool:
 
 
 def _is_role_allowed(role: str, frame: str) -> bool:
-    """角色权限校验。frame=none 一律允许（chitchat / cancel / reset 等）。"""
-    if frame == "none":
-        return True
-    allowed = _ROLE_FRAME_PERMISSIONS.get(role, frozenset())
-    return frame in allowed
+    """角色权限校验（阶段三委托 slot_schema.check_role_permission）。"""
+    return slot_schema.check_role_permission(role, frame)
 
 
 def _validate_and_normalize_slots(
@@ -118,18 +113,18 @@ def _validate_and_normalize_slots(
 ) -> tuple[dict, list[str]]:
     """按 frame 合法字段集过滤 + 用 intent_service 归一化函数清洗。
 
+    阶段三流程：
+    1. slot_schema.remap_synonyms 把 expected_* 等同义字段先归并到 canonical key
+       （吸收 intent_service._SEARCH_FIELD_REMAP 的兼容兜底语义）；
+    2. slot_schema.validate_slots_delta 按 fields_for(frame) 做合法字段过滤；
+    3. _normalize_structured_data 走既有归一化函数（city/job_category/int range）。
+
     返回 (accepted, dropped_field_names)。
     """
     if not slots_delta:
         return {}, []
-    valid = _legacy_valid_fields(frame)
-    accepted_raw: dict = {}
-    dropped: list[str] = []
-    for k, v in slots_delta.items():
-        if k not in valid:
-            dropped.append(k)
-            continue
-        accepted_raw[k] = v
+    remapped = slot_schema.remap_synonyms(frame, slots_delta)
+    accepted_raw, dropped = slot_schema.validate_slots_delta(frame, remapped)
     # 用 _normalize_structured_data 复用归一化（city / job_category / int range）。
     # intent 仅决定 force_list 行为：搜索用 list，上传用标量。
     pseudo_intent = _frame_to_intent(frame)
@@ -150,12 +145,17 @@ def _frame_to_intent(frame: str) -> str:
 
 
 def _resolve_merge_policy(
+    frame: str,
     field: str,
     new_value,
     old_value,
     merge_hint: dict,
 ) -> tuple[Literal["replace", "add", "remove"], dict | None]:
     """对单字段决策最终 merge_policy。
+
+    阶段三：默认策略由 ``slot_schema.default_merge_policy(frame, field, has_old)``
+    提供，reducer 只在 schema 返回 ``clarify`` 时叠加业务规则（city 字段叠
+    ``ambiguous_city_query_policy``）。LLM 明确 hint 优先级最高。
 
     返回 (policy, clarification_or_none)。clarification 不为 None 表示需要反问。
     """
@@ -170,18 +170,17 @@ def _resolve_merge_policy(
     if not has_old:
         return "replace", None
 
-    # 3) 有旧值 + hint=unknown / 缺失 → 按 list 字段歧义策略
-    is_list_field = field in {"city", "job_category"}
-    if not is_list_field:
-        # 非 list 字段（如 salary_floor_monthly）默认 replace
-        return "replace", None
+    # 3) 有旧值 + hint=unknown / 缺失 → 走 schema 声明的 default_merge
+    schema_policy = slot_schema.default_merge_policy(frame, field, has_old)
+    if schema_policy in ("replace", "add"):
+        return schema_policy, None
 
+    # schema_policy == "clarify"：默认要反问，按字段叠加业务策略
     if field == "city":
-        # 「北京有吗 + 已有西安」歧义
-        policy = getattr(settings, "ambiguous_city_query_policy", "clarify")
-        if policy == "replace":
+        # 「北京有吗 + 已有西安」歧义：受 settings.ambiguous_city_query_policy 控制
+        cfg = getattr(settings, "ambiguous_city_query_policy", "clarify")
+        if cfg == "replace":
             return "replace", None
-        # clarify：把 old / new 城市附在 clarification 上，便于反问文案具体化
         return "replace", {
             "kind": "city_replace_or_add",
             "ambiguous_field": "city",
@@ -190,7 +189,7 @@ def _resolve_merge_policy(
             "new_value": list(new_value) if isinstance(new_value, list) else [new_value],
         }
 
-    # job_category 多值场景较少，默认 replace
+    # 其它声明 clarify 但还没业务策略的字段（schema 后续可能扩展）：保守 replace
     return "replace", None
 
 
@@ -461,7 +460,8 @@ def _reduce_main(
     for field, new_value in accepted.items():
         old_value = old_criteria.get(field)
         policy, clar = _resolve_merge_policy(
-            field, new_value, old_value, parse_result.merge_hint or {},
+            resolved_frame, field, new_value, old_value,
+            parse_result.merge_hint or {},
         )
         if clar is not None and pending_clarification is None:
             pending_clarification = clar
@@ -480,7 +480,7 @@ def _reduce_main(
     # 4.5 置信度兜底：低 confidence + 触及关键字段 → 强制反问
     forced_low_conf = False
     if pending_clarification is None:
-        touches_key = bool(_KEY_FIELDS_FOR_LOW_CONFIDENCE & set(accepted.keys()))
+        touches_key = bool(_key_fields_for_low_confidence() & set(accepted.keys()))
         threshold = getattr(settings, "low_confidence_threshold", 0.6)
         if (parse_result.confidence < threshold) and touches_key:
             pending_clarification = {

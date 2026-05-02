@@ -104,27 +104,18 @@ _SHOW_MORE_PATTERNS: list[str] = [
 # 合法 canonical key 集合（用于校验 criteria_patch / structured_data）
 # ---------------------------------------------------------------------------
 
-_VALID_JOB_KEYS = frozenset({
-    "city", "job_category", "salary_floor_monthly", "pay_type", "headcount",
-    "gender_required", "is_long_term", "district", "salary_ceiling_monthly",
-    "provide_meal", "provide_housing", "dorm_condition", "shift_pattern",
-    "work_hours", "accept_couple", "accept_student", "accept_minority",
-    "height_required", "experience_required", "education_required",
-    "rebate", "employment_type", "contract_type", "min_duration",
-    "job_sub_category", "age_min", "age_max",
-})
+# 阶段三 P2：合法字段集合的真源已迁移到 app.dialogue.slot_schema。
+# 这里保留常量名（外部兼容）但**只是 bootstrap 默认值**：模块底部的
+# _bootstrap_field_constants_from_schema() 会在所有定义就绪后用 schema 派生
+# 覆盖这些 globals。这样：
+#  - 修 schema 立刻反映到运行时 _normalize_structured_data 的过滤集；
+#  - schema 内的 display 占位字段（如 job_title）不会被 silently dropped；
+#  - 模块内部 bare-name 引用（_ALL_VALID_KEYS / _LIST_FIELDS 等）正常生效。
+# 阶段四清理时直接删这一段，所有引用走 slot_schema 即可。
 
-_VALID_RESUME_KEYS = frozenset({
-    "expected_cities", "expected_job_categories", "salary_expect_floor_monthly",
-    "gender", "age", "accept_long_term", "accept_short_term",
-    "expected_districts", "height", "weight", "education", "work_experience",
-    "accept_night_shift", "accept_standing_work", "accept_overtime",
-    "accept_outside_province", "couple_seeking_together",
-    "has_health_certificate", "ethnicity", "available_from",
-    "has_tattoo", "taboo",
-})
-
-_ALL_VALID_KEYS = _VALID_JOB_KEYS | _VALID_RESUME_KEYS
+_VALID_JOB_KEYS: frozenset[str] = frozenset()  # bootstrap-overridden
+_VALID_RESUME_KEYS: frozenset[str] = frozenset()  # bootstrap-overridden
+_ALL_VALID_KEYS: frozenset[str] = frozenset()  # bootstrap-overridden
 
 _VALID_PATCH_OPS = frozenset({"add", "update", "remove"})
 
@@ -165,11 +156,13 @@ _JOB_CATEGORY_SYNONYMS: dict[str, str] = {
     "烘焙": "食品厂", "糕点": "食品厂",
 }
 
-_LIST_FIELDS = frozenset({
+# 阶段三 P2：_LIST_FIELDS / _INT_FIELDS 也由 schema 派生（bootstrap 覆盖）。
+# 这里仍声明默认值，避免本模块底部 bootstrap 之前就被引用而抛 NameError。
+_LIST_FIELDS: frozenset[str] = frozenset({
     "city", "job_category", "expected_cities", "expected_job_categories",
 })
 
-_INT_FIELDS = frozenset({
+_INT_FIELDS: frozenset[str] = frozenset({
     "salary_floor_monthly", "salary_ceiling_monthly",
     "salary_expect_floor_monthly", "headcount", "age",
     "age_min", "age_max",
@@ -877,76 +870,28 @@ def build_session_hint(session) -> dict:
 # 阶段三用统一 slot schema 替换时只换内部实现，调用方不动。
 # ---------------------------------------------------------------------------
 
-# job_search 视角下 search_service._query_jobs 真正消费的字段
-_LEGACY_JOB_SEARCH_FIELDS = frozenset({
-    "city", "job_category", "salary_floor_monthly",
-    "is_long_term", "gender_required", "age",
-})
-
-# candidate_search 视角下 search_service._query_resumes 真正消费的字段
-_LEGACY_CANDIDATE_SEARCH_FIELDS = frozenset({
-    "city", "job_category", "salary_ceiling_monthly", "gender", "age",
-})
-
+# 阶段三：所有 frame → 字段集 / 必填集 / missing 算法收口到
+# app.dialogue.slot_schema。这里三个 _legacy_* helper 保留外部签名，
+# 内部改为调 schema，方便阶段二/阶段三/阶段四调用方零改动。
+# 旧 _LEGACY_JOB_SEARCH_FIELDS / _LEGACY_CANDIDATE_SEARCH_FIELDS 常量
+# 已迁移到 slot_schema 内部组装；本文件不再保留。
 
 def _legacy_required(frame: str) -> tuple[frozenset[str], frozenset[str]]:
-    """返回 (required_all, required_any)。required_any 中任一字段命中即视为满足。"""
-    if frame == "job_search":
-        return (SEARCH_JOB_MIN_FIELDS, frozenset())
-    if frame == "candidate_search":
-        return (frozenset(), frozenset({"city", "job_category"}))
-    if frame == "job_upload":
-        return (JOB_REQUIRED_FIELDS, frozenset())
-    if frame == "resume_upload":
-        return (RESUME_REQUIRED_FIELDS, frozenset())
-    return (frozenset(), frozenset())
+    """返回 (required_all, required_any)（阶段三委托 slot_schema.required_for）。"""
+    from app.dialogue import slot_schema as _ss
+    return _ss.required_for(frame)
 
 
 def _legacy_valid_fields(frame: str) -> frozenset[str]:
-    """frame 的合法字段集合（仅用于 reducer 校验，搜索 frame 与 SQL 消费集对齐）。"""
-    if frame == "job_search":
-        return _LEGACY_JOB_SEARCH_FIELDS
-    if frame == "candidate_search":
-        return _LEGACY_CANDIDATE_SEARCH_FIELDS
-    if frame == "job_upload":
-        return _VALID_JOB_KEYS
-    if frame == "resume_upload":
-        return _VALID_RESUME_KEYS
-    return frozenset()
+    """frame 的合法字段集合（阶段三委托 slot_schema.fields_for）。"""
+    from app.dialogue import slot_schema as _ss
+    return _ss.fields_for(frame)
 
 
 def _legacy_compute_missing(frame: str, criteria: dict) -> list[str]:
-    """按 (required_all, required_any) 算 missing。
-
-    - required_all 中尚未填值的字段全部进 missing；
-    - required_any 整组都未填值时给一个组合占位（用元素 sorted 拼接），
-      只要任一字段已填则不进 missing；
-    - 「已填」语义：非 None / 非空字符串 / 非空列表 / 非空 dict（0/False 都算已填）。
-    """
-    criteria = criteria or {}
-    required_all, required_any = _legacy_required(frame)
-
-    def _filled(field: str) -> bool:
-        if field not in criteria:
-            return False
-        v = criteria[field]
-        if v is None:
-            return False
-        if isinstance(v, (str, list, dict)) and not v:
-            return False
-        return True
-
-    missing: list[str] = []
-    for f in sorted(required_all):
-        if not _filled(f):
-            missing.append(f)
-
-    if required_any:
-        if not any(_filled(f) for f in required_any):
-            # 用 "+" 拼接占位，避免上游误以为是单个字段；阶段三 schema 阶段会被替换
-            placeholder = "|".join(sorted(required_any))
-            missing.append(placeholder)
-    return missing
+    """按 (required_all, required_any) 算 missing（阶段三委托 slot_schema）。"""
+    from app.dialogue import slot_schema as _ss
+    return _ss.compute_missing_slots(frame, criteria)
 
 
 # ---------------------------------------------------------------------------
@@ -1173,3 +1118,33 @@ def classify_dialogue(
         user_msg_id=user_msg_id, session_hint=session_hint,
     )
     return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
+
+
+# ---------------------------------------------------------------------------
+# 阶段三 P1+P2：用 slot_schema 覆盖字段权威清单 globals
+#
+# 必须在 _normalize_city_value / _normalize_job_category_value 等 schema 依赖
+# 的归一化函数都已定义后再执行（schema build 时通过 lazy import 引用本模块）。
+# ---------------------------------------------------------------------------
+
+
+def _bootstrap_field_constants_from_schema() -> None:
+    """schema 是字段权威清单的真源；本函数在 import 末尾把 globals 覆盖。
+
+    这样：
+    - _ALL_VALID_KEYS 包含 schema 中的 display 占位（如 job_title），不再被
+      _normalize_structured_data 第 ~734 行的过滤器 silently drop（P1）；
+    - 修改 schema 立刻反映到运行时（_VALID_JOB_KEYS / _LIST_FIELDS 等）（P2）；
+    - _SEARCH_FIELD_REMAP 与 schema synonyms_in 同源。
+    """
+    from app.dialogue import slot_schema as _ss
+    g = globals()
+    g["_VALID_JOB_KEYS"] = _ss.fields_for("job_upload")
+    g["_VALID_RESUME_KEYS"] = _ss.fields_for("resume_upload")
+    g["_ALL_VALID_KEYS"] = _ss.all_valid_fields()
+    g["_LIST_FIELDS"] = _ss.list_fields()
+    g["_INT_FIELDS"] = _ss.int_fields()
+    g["_SEARCH_FIELD_REMAP"] = _ss.search_synonyms()
+
+
+_bootstrap_field_constants_from_schema()

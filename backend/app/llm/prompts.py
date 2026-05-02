@@ -208,10 +208,13 @@ INTENT_USER_TEMPLATE = """\
 # 阶段二 Dialogue Parse Prompt（DialogueParseResult v2）
 # ---------------------------------------------------------------------------
 
+# v0.2 2026-05-02：dialogue-intent-extraction-phased-plan §3 schema-driven 字段清单。
+#                    字段段落 {slot_field_spec} 在 import 时由 slot_schema 一次性渲染，
+#                    避免 prompt 与代码 drift。fallback 字符串保留以应对 schema 渲染失败。
 # v0.1 2026-05-01：dialogue-intent-extraction-phased-plan §2.1.1 首版。
 # Token 预算: input < 2200 tokens, output < 400 tokens（比 INTENT v2.6 略松，
 # 因为额外要带 dialogue_act / frame_hint / merge_hint / conflict_action 字段）。
-DIALOGUE_PARSE_PROMPT_V2 = """\
+_DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 你是一个蓝领招聘撮合平台的对话理解助手。
 
 ## 你的任务
@@ -227,11 +230,11 @@ DIALOGUE_PARSE_PROMPT_V2 = """\
   start_upload / cancel / reset / resolve_conflict / chitchat
 - frame_hint：本轮候选业务对象，仅允许：
   job_search / candidate_search / job_upload / resume_upload / none
-- slots_delta：本轮抽到的字段（dict）。字段名必须用 canonical key（与 v2.6 INTENT prompt 一致：
-  city / job_category / salary_floor_monthly / pay_type / headcount /
-  is_long_term / gender_required / district / salary_ceiling_monthly /
-  provide_meal / provide_housing / age / age_min / age_max 等）。
-  搜索 / follow_up 一律用 city / job_category，禁止 expected_*。
+- slots_delta：本轮抽到的字段（dict）。字段名必须用 canonical key，按 frame 分组如下：
+
+{slot_field_spec}
+
+  搜索 / follow_up 一律用 city / job_category，禁止 expected_*（reducer 也会自动归并）。
 - merge_hint：dict[字段名 -> replace|add|remove|unknown]。**仅当用户文本明确表达
   替换 / 追加 / 删除 时才输出对应值；裸值 / 模糊表达统一输出 unknown。**
   - 「换成 X / 改成 X / 只看 X / 不看原来的」 → replace
@@ -310,6 +313,57 @@ DIALOGUE_PARSE_PROMPT_V2 = """\
 用户消息：你好
 {{"dialogue_act": "chitchat", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.6, "conflict_action": null}}
 """
+
+
+_DIALOGUE_PARSE_PROMPT_V2_FALLBACK_SPEC = (
+    "  city / job_category / salary_floor_monthly / pay_type / headcount /\n"
+    "  is_long_term / gender_required / district / salary_ceiling_monthly /\n"
+    "  provide_meal / provide_housing / age / age_min / age_max 等"
+)
+
+
+def _render_dialogue_parse_prompt_v2() -> str:
+    """渲染 schema-driven 字段清单注入 prompt 模板。
+
+    schema 渲染失败时回退到 v0.1 等价的硬编码字段说明，避免 import-time 硬错或
+    线上 LLM 调用拿到空字段段落。
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    spec: str
+    try:
+        from app.dialogue import slot_schema as _ss
+        spec = _ss.render_prompt_field_spec()
+        if not spec.strip():
+            raise RuntimeError("empty slot_field_spec")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("prompts: render slot_field_spec failed: %s", exc)
+        spec = _DIALOGUE_PARSE_PROMPT_V2_FALLBACK_SPEC
+    return _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE.replace(
+        "{slot_field_spec}", spec,
+    )
+
+
+# 阶段三：DIALOGUE_PARSE_PROMPT_V2 走模块级 __getattr__ 懒加载，避免与
+# slot_schema → intent_service → prompts 形成 import-time 循环依赖。
+# 首次访问时渲染并缓存；providers 在 request 时拿到的字符串与启动期同（schema
+# 注册表本身只构建一次）。
+_DIALOGUE_PARSE_PROMPT_V2_CACHE: str | None = None
+
+
+def __getattr__(name: str):  # pragma: no cover - py3.7+ module __getattr__
+    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
+    if name == "DIALOGUE_PARSE_PROMPT_V2":
+        if _DIALOGUE_PARSE_PROMPT_V2_CACHE is None:
+            _DIALOGUE_PARSE_PROMPT_V2_CACHE = _render_dialogue_parse_prompt_v2()
+        return _DIALOGUE_PARSE_PROMPT_V2_CACHE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _reset_dialogue_parse_prompt_v2_cache_for_tests() -> None:
+    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
+    _DIALOGUE_PARSE_PROMPT_V2_CACHE = None
+
 
 DIALOGUE_USER_TEMPLATE = """\
 用户消息: {text}
@@ -395,7 +449,9 @@ RERANK_PROMPT_VERSION = "v2.0"
 
 # 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。
 # 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。
-DIALOGUE_PROMPT_VERSION = "v0.1"
+# v0.2 (Stage 3)：字段清单段落改为启动期由 slot_schema 渲染（一次性）；fallback 文案保留。
+# v0.1 2026-05-01：DialogueParseResult v2 首版（hard-coded 字段清单）。
+DIALOGUE_PROMPT_VERSION = "v0.2"
 
 
 def build_criteria_snapshot_meta() -> dict:

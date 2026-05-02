@@ -1694,8 +1694,28 @@ def _compute_search_missing(
     return result
 
 
-def _missing_follow_up_text(missing: list[str]) -> str:
+def _missing_follow_up_text(missing: list[str], frame: str | None = None) -> str:
+    """搜索流程缺字段追问文案，由 slot_schema 模板驱动（阶段三 P2）。
+
+    schema 渲染失败时回退到 upload_service._FIELD_DISPLAY_NAMES + 内联模板，
+    避免 schema 不可用时线上回复变空白。
+    """
     from app.services.upload_service import _FIELD_DISPLAY_NAMES  # 局部 import 避免 api 层循环
+    if not missing:
+        return ""
+    # frame 兜底：搜索场景默认按 job_search 查 display_name
+    effective_frame = frame or "job_search"
+    try:
+        from app.dialogue import slot_schema as _ss
+        text = _ss.render_missing_followup(
+            missing, effective_frame, context="search",
+            fallback_display=_FIELD_DISPLAY_NAMES,
+        )
+        if text:
+            return text
+    except Exception:  # noqa: BLE001
+        pass
+    # fallback：与阶段二行为对齐
     names = [_FIELD_DISPLAY_NAMES.get(f, f) for f in missing]
     if len(names) <= 2:
         return f"信息还不够完整，请补充：{'、'.join(names)}。"

@@ -335,13 +335,44 @@ def _check_required_fields(data: dict, required: frozenset) -> list[str]:
     return missing
 
 
-def _generate_followup_text(missing: list[str]) -> str:
-    """生成追问文本。1-2 个字段合并成一句，3+ 列表式引导。"""
+def _generate_followup_text(missing: list[str], frame: str | None = None) -> str:
+    """生成上传草稿追问文本。schema-driven（阶段三 P2）。
+
+    schema 渲染失败时回退到原 inline + list 拼接，避免线上回复变空白。
+    frame 缺省时按 missing 字段名兜底推断（含 expected_* 判定为 resume_upload，
+    否则 job_upload）。
+    """
+    if not missing:
+        return ""
+    if frame is None:
+        frame = _infer_upload_frame(missing)
+    try:
+        from app.dialogue import slot_schema as _ss
+        text = _ss.render_missing_followup(
+            missing, frame, context="upload",
+            fallback_display=_FIELD_DISPLAY_NAMES,
+        )
+        if text:
+            return text
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("upload_service: slot_schema render_missing_followup failed: %s", exc)
+    # fallback：阶段一/二的拼接行为
     names = [_FIELD_DISPLAY_NAMES.get(f, f) for f in missing]
     if len(names) <= 2:
         return f"还需要您补充一下：{'和'.join(names)}，方便我帮您处理。"
     lines = "\n".join(f"- {n}" for n in names)
     return f"还缺少以下信息，请补充：\n{lines}"
+
+
+def _infer_upload_frame(missing: list[str]) -> str | None:
+    if not missing:
+        return None
+    for f in missing:
+        if f.startswith("expected_") or f in {
+            "salary_expect_floor_monthly", "education", "work_experience",
+        }:
+            return "resume_upload"
+    return "job_upload"
 
 
 def _read_ttl_days(entity_type: str, db: Session) -> int:
