@@ -1024,6 +1024,24 @@ def classify_dialogue(
 
     mode = getattr(settings, "dialogue_v2_mode", "off")
 
+    # 阶段二（dialogue-intent-extraction-phased-plan §2.5.5）优先级硬约束：
+    # 显式斜杠命令 > 后端状态约束 > reducer > LLM dialogue_act > keyword fallback。
+    # 在 mode != off 的所有 v2 路径上，必须先尝试 _match_command / _match_show_more
+    # 命中后短路返回，确保 /取消 /帮助 等显式命令最高优先级，不被 LLM 业务意图劫持
+    # （codex review P2 防回归）。
+    if mode != "off":
+        cmd_result = _match_command(stripped)
+        if cmd_result is not None:
+            cmd, args = cmd_result
+            data: dict = {"command": cmd}
+            if args:
+                data["args"] = args
+            ir = IntentResult(intent="command", structured_data=data, confidence=1.0)
+            return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
+        if _match_show_more(stripped):
+            ir = IntentResult(intent="show_more", confidence=1.0)
+            return DialogueRouteResult(intent_result=ir, decision=None, source="legacy")
+
     # off：legacy 直通
     if mode == "off":
         ir = _classify_intent_legacy(

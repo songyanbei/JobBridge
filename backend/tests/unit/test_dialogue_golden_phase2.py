@@ -15,8 +15,10 @@ from tests.fixtures.dialogue_golden import (
     active_flow_conflict_upload_to_search,
     awaiting_expired_no_pollution,
     broker_machinery_to_suzhou_replace_v2,
+    cancel_during_upload_v2,
     llm_json_parse_failure_fallback,
     low_confidence_clarify,
+    resolve_conflict_three_actions,
     role_permission_worker_upload,
     worker_xian_to_beijing_clarify,
     worker_xian_to_beijing_replace_v2,
@@ -38,6 +40,11 @@ from tests.fixtures.dialogue_golden.runner import (
         llm_json_parse_failure_fallback.CASE,
         low_confidence_clarify.CASE,
         awaiting_expired_no_pollution.CASE,
+        # codex review P3 防回归：phased-plan §2.5.5 必测项
+        cancel_during_upload_v2.CASE,
+        resolve_conflict_three_actions.CASE_CANCEL,
+        resolve_conflict_three_actions.CASE_RESUME,
+        resolve_conflict_three_actions.CASE_PROCEED,
     ],
     ids=lambda c: c["id"],
 )

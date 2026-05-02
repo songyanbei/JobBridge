@@ -319,6 +319,21 @@ def _handle_text(
                     )
                 conversation_service.save_session(userid, session)
                 return replies
+            # resolve_conflict（dialogue-intent-extraction-phased-plan §2.1.8）：
+            # codex review P1 防回归。compat 派生的 IntentResult(intent="command")
+            # 缺 structured_data.command，会落到 UNKNOWN_COMMAND；这里直接按
+            # state_transition 渲染对应 ack 文案 / 派发 pending_interruption，
+            # 不走通用 command 路由。
+            if decision.dialogue_act == "resolve_conflict":
+                replies = _route_v2_resolve_conflict(
+                    decision, msg, user_ctx, session, db,
+                )
+                if replies:
+                    conversation_service.record_history(
+                        session, "assistant", replies[0].content,
+                    )
+                conversation_service.save_session(userid, session)
+                return replies
             # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
             # 重复调用也是幂等的：consume_search_awaiting 对已消费字段是 no-op）。
             apply_decision(decision, session, msg=msg, intent_result=intent_result)
@@ -650,6 +665,67 @@ def _enter_upload_conflict(
             kind=kind, field_name=field_name, new_kind=new_kind,
         ),
     )]
+
+
+def _route_v2_resolve_conflict(
+    decision,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """阶段二 v2 dual_read 下处理 resolve_conflict（codex review P1 修复）。
+
+    state_transition 已由 applier 写入 session（clear_pending_upload /
+    resume_upload_collecting / apply_pending_interruption），这里只负责按
+    transition 类型生成回复 + 派发 pending_interruption。
+
+    与 legacy `_route_upload_conflict` 区别：legacy 用 keyword 推断用户意图；
+    这里直接信任 LLM 输出的 conflict_action（reducer 已映射成 transition）。
+    """
+    userid = msg.from_user
+    transition = decision.state_transition
+
+    # cancel_draft：草稿已被 applier 清掉，复用 PENDING_CANCELLED_REPLY 文案
+    if transition == "clear_pending_upload":
+        return [_reply(userid, PENDING_CANCELLED_REPLY)]
+
+    # resume_pending_upload：active_flow 已被 applier 改回 upload_collecting，
+    # 渲染 CONFLICT_RESUME_FMT 让用户继续补字段
+    if transition == "resume_upload_collecting":
+        awaiting = session.awaiting_field
+        field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
+        return [_reply(userid, CONFLICT_RESUME_FMT.format(field_name=field_name))]
+
+    # proceed_with_new：取出 pending_interruption 作为新意图派发
+    if transition == "apply_pending_interruption":
+        interruption = dict(session.pending_interruption or {})
+        new_intent_name = (
+            interruption.get("intent")
+            or "search_job"  # 安全 fallback
+        )
+        new_intent_result = IntentResult(
+            intent=new_intent_name,
+            structured_data=dict(interruption.get("structured_data") or {}),
+            criteria_patch=list(interruption.get("criteria_patch") or []),
+            confidence=1.0,
+        )
+        forwarded_text = (interruption.get("raw_text") or "").strip() or msg.content
+        forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
+
+        # 清草稿和 pending_interruption（applier 只清了 active_flow）
+        upload_service.clear_pending_upload(session)
+        session.pending_interruption = None
+
+        forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
+        return [_reply(userid, CONFLICT_PROCEED_ACK)] + forwarded
+
+    # 兜底（理论上不该走到这里 —— reducer 不会输出其它 transition for resolve_conflict）
+    logger.warning(
+        "_route_v2_resolve_conflict: unexpected transition=%s, falling back to UNKNOWN",
+        transition,
+    )
+    return [_reply(userid, FALLBACK_REPLY)]
 
 
 def _new_kind_text(new_intent: str) -> str:

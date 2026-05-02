@@ -272,8 +272,33 @@ def _golden_mocks(
     def fake_classify_dialogue(text, role, history=None, *, session=None,
                                user_msg_id=None, userid=None):
         from app.config import settings as _settings
+        from app.services.intent_service import _match_command, _match_show_more
         mode = getattr(_settings, "dialogue_v2_mode", "off")
         v2_payload = mock_v2_holder.get("value")
+
+        # 阶段二（dialogue-intent-extraction-phased-plan §2.5.5）：mode != off 时
+        # 显式斜杠命令最高优先级，与生产 classify_dialogue 行为对齐
+        if mode != "off":
+            stripped = text.strip()
+            cmd_result = _match_command(stripped)
+            if cmd_result is not None:
+                cmd, args = cmd_result
+                data: dict = {"command": cmd}
+                if args:
+                    data["args"] = args
+                ir = IntentResult(intent="command", structured_data=data, confidence=1.0)
+                last_decision_holder["value"] = None
+                last_source_holder["value"] = "legacy"
+                return DialogueRouteResult(
+                    intent_result=ir, decision=None, source="legacy",
+                )
+            if _match_show_more(stripped):
+                ir = IntentResult(intent="show_more", confidence=1.0)
+                last_decision_holder["value"] = None
+                last_source_holder["value"] = "legacy"
+                return DialogueRouteResult(
+                    intent_result=ir, decision=None, source="legacy",
+                )
 
         # 优先用 mock_v2 + mode=dual_read 走 v2 路径
         if mode == "dual_read" and v2_payload is not None and session is not None:
