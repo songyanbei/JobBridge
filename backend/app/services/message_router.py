@@ -325,6 +325,14 @@ def _handle_text(
             # state_transition 渲染对应 ack 文案 / 派发 pending_interruption，
             # 不走通用 command 路由。
             if decision.dialogue_act == "resolve_conflict":
+                # 关键：先调 applier 物化 state_transition（cancel_draft →
+                # clear_pending_upload / resume_pending_upload →
+                # resume_upload_collecting / proceed_with_new →
+                # apply_pending_interruption），再让 _route_v2_resolve_conflict
+                # 渲染对应文案（以及 proceed 路径消费 pending_interruption）。
+                # 否则 cancel/resume 只改回复但 session 状态不动，是真 bug
+                # （codex review 第二轮 P1）。
+                apply_decision(decision, session, msg=msg, intent_result=intent_result)
                 replies = _route_v2_resolve_conflict(
                     decision, msg, user_ctx, session, db,
                 )
@@ -676,28 +684,32 @@ def _route_v2_resolve_conflict(
 ) -> list[ReplyMessage]:
     """阶段二 v2 dual_read 下处理 resolve_conflict（codex review P1 修复）。
 
-    state_transition 已由 applier 写入 session（clear_pending_upload /
-    resume_upload_collecting / apply_pending_interruption），这里只负责按
-    transition 类型生成回复 + 派发 pending_interruption。
+    职责分工（调用前提：调用方已经先跑过 apply_decision）：
+    - applier：物化 state_transition 到 session（清/恢复 pending_upload、
+      切 active_flow、清 pending_interruption 等）。
+    - 本函数：只生成回复文案 + 在 proceed 路径上消费 pending_interruption
+      作为新意图派发。**不再重复修改 session 上传/冲突状态字段**。
 
-    与 legacy `_route_upload_conflict` 区别：legacy 用 keyword 推断用户意图；
+    与 legacy `_route_upload_conflict` 的区别：legacy 用 keyword 推断用户意图，
     这里直接信任 LLM 输出的 conflict_action（reducer 已映射成 transition）。
     """
     userid = msg.from_user
     transition = decision.state_transition
 
-    # cancel_draft：草稿已被 applier 清掉，复用 PENDING_CANCELLED_REPLY 文案
+    # cancel_draft：applier 已经清了 pending_upload + active_flow=idle +
+    # pending_interruption=None。这里只渲染回复文案。
     if transition == "clear_pending_upload":
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
-    # resume_pending_upload：active_flow 已被 applier 改回 upload_collecting，
-    # 渲染 CONFLICT_RESUME_FMT 让用户继续补字段
+    # resume_pending_upload：applier 已经把 active_flow 改回 upload_collecting +
+    # pending_interruption=None。这里读 awaiting_field 渲染 CONFLICT_RESUME_FMT。
     if transition == "resume_upload_collecting":
         awaiting = session.awaiting_field
         field_name = _field_display_name(awaiting) if awaiting else "需要的字段"
         return [_reply(userid, CONFLICT_RESUME_FMT.format(field_name=field_name))]
 
-    # proceed_with_new：取出 pending_interruption 作为新意图派发
+    # proceed_with_new：applier 设了 active_flow=idle 但保留 pending_interruption
+    # 给本函数读。读完后清 pending_interruption + clear_pending_upload，再派发新意图。
     if transition == "apply_pending_interruption":
         interruption = dict(session.pending_interruption or {})
         new_intent_name = (
@@ -713,7 +725,7 @@ def _route_v2_resolve_conflict(
         forwarded_text = (interruption.get("raw_text") or "").strip() or msg.content
         forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
 
-        # 清草稿和 pending_interruption（applier 只清了 active_flow）
+        # 消费 pending_interruption + 清草稿（applier 只清了 active_flow）
         upload_service.clear_pending_upload(session)
         session.pending_interruption = None
 

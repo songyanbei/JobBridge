@@ -205,6 +205,14 @@ def run_dialogue_case(case: dict) -> dict:
                     "source": last_source_holder["value"],
                     "state_transition": getattr(decision, "state_transition", "none"),
                     "final_search_criteria": dict(getattr(decision, "final_search_criteria", {}) or {}),
+                    # codex review 第二轮 P2：把 session 末态写进 trace，
+                    # 让 fixture 能锁定 active_flow / pending_upload_intent /
+                    # pending_interruption 真正被物化（不再只断言 decision 字段）
+                    "session_active_flow": session.active_flow,
+                    "session_pending_upload_intent": session.pending_upload_intent,
+                    "session_pending_upload_keys": sorted((session.pending_upload or {}).keys()),
+                    "session_pending_interruption_present": bool(session.pending_interruption),
+                    "session_awaiting_field": session.awaiting_field,
                 })
                 prev_search_calls = cur_search_calls
         finally:
@@ -427,6 +435,12 @@ _KNOWN_EXPECT_KEYS = frozenset({
     "source",
     "state_transition",
     "final_search_criteria",
+    # codex review 第二轮 P2：session 末态断言，确保 helper 真正物化状态
+    "session_active_flow",
+    "session_pending_upload_intent",
+    "session_pending_upload_keys",
+    "session_pending_interruption_present",
+    "session_awaiting_field",
 })
 
 
@@ -539,6 +553,35 @@ def assert_turn(trace_turn: dict, expect: dict, label: str = "") -> None:
         want_fc = _normalize_criteria_for_compare(expect["final_search_criteria"])
         assert actual_fc == want_fc, (
             f"{prefix}final_search_criteria={actual_fc} != expect={want_fc}"
+        )
+
+    # codex review 第二轮 P2：session 末态断言
+    if "session_active_flow" in expect:
+        assert trace_turn["session_active_flow"] == expect["session_active_flow"], (
+            f"{prefix}session_active_flow={trace_turn['session_active_flow']} "
+            f"!= expect={expect['session_active_flow']}"
+        )
+    if "session_pending_upload_intent" in expect:
+        assert trace_turn["session_pending_upload_intent"] == expect["session_pending_upload_intent"], (
+            f"{prefix}session_pending_upload_intent={trace_turn['session_pending_upload_intent']} "
+            f"!= expect={expect['session_pending_upload_intent']}"
+        )
+    if "session_pending_upload_keys" in expect:
+        actual_keys = sorted(trace_turn["session_pending_upload_keys"] or [])
+        want_keys = sorted(expect["session_pending_upload_keys"] or [])
+        assert actual_keys == want_keys, (
+            f"{prefix}session_pending_upload_keys={actual_keys} != expect={want_keys}"
+        )
+    if "session_pending_interruption_present" in expect:
+        assert trace_turn["session_pending_interruption_present"] == expect["session_pending_interruption_present"], (
+            f"{prefix}session_pending_interruption_present="
+            f"{trace_turn['session_pending_interruption_present']} "
+            f"!= expect={expect['session_pending_interruption_present']}"
+        )
+    if "session_awaiting_field" in expect:
+        assert trace_turn["session_awaiting_field"] == expect["session_awaiting_field"], (
+            f"{prefix}session_awaiting_field={trace_turn['session_awaiting_field']} "
+            f"!= expect={expect['session_awaiting_field']}"
         )
 
 

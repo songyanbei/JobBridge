@@ -55,6 +55,9 @@ CASE = {
                 # 主断言：source=legacy（确认没走 v2 路径）+ 不触发 SQL 检索。
                 "source": "legacy",
                 "should_run_search": False,
+                # codex review 第二轮 P2：/取消 必须真正清掉草稿
+                "session_pending_upload_intent": None,
+                "session_pending_upload_keys": [],
             },
         },
     ],

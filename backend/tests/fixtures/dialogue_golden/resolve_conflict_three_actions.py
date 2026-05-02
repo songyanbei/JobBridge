@@ -77,6 +77,12 @@ CASE_CANCEL = {
                 "dialogue_act": "resolve_conflict",
                 "state_transition": "clear_pending_upload",
                 "should_run_search": False,
+                # codex review 第二轮 P2：cancel_draft 必须真正清状态
+                "session_active_flow": "idle",
+                "session_pending_upload_intent": None,
+                "session_pending_upload_keys": [],
+                "session_pending_interruption_present": False,
+                "session_awaiting_field": None,
             },
         },
     ],
@@ -98,6 +104,16 @@ CASE_RESUME = {
                 "dialogue_act": "resolve_conflict",
                 "state_transition": "resume_upload_collecting",
                 "should_run_search": False,
+                # codex review 第二轮 P2：resume_pending_upload 必须把 active_flow
+                # 改回 upload_collecting + 清掉 pending_interruption；pending_upload
+                # 草稿保留（user 还要继续补 headcount）
+                "session_active_flow": "upload_collecting",
+                "session_pending_upload_intent": "upload_job",
+                "session_pending_upload_keys": [
+                    "city", "job_category", "pay_type", "salary_floor_monthly",
+                ],
+                "session_pending_interruption_present": False,
+                "session_awaiting_field": "headcount",
             },
         },
     ],
@@ -122,6 +138,12 @@ CASE_PROCEED = {
                 # 最终 handler 是 _handle_search
                 "handler": "_handle_search",
                 "should_run_search": True,
+                # codex review 第二轮 P2：proceed 后草稿被清，pending_interruption
+                # 也被消费清空；active_flow 由 _handle_search / _route_search_active
+                # 推进到 search_active
+                "session_pending_upload_intent": None,
+                "session_pending_upload_keys": [],
+                "session_pending_interruption_present": False,
             },
         },
     ],
