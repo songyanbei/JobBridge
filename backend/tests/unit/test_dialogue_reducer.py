@@ -383,3 +383,53 @@ class TestRolePermission:
         )
         d = reduce(parse, s, "broker")
         assert d.clarification is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 §5.0：post_search_action Literal 集合扩展兼容
+# ---------------------------------------------------------------------------
+
+
+class TestPhase5PostSearchActionLiteral:
+    """phased-plan §5.0.1 第 6 项：DialogueDecision.post_search_action 的 Literal
+    从 ``["none"]`` 扩到 7 个 action；reducer 默认仍输出 ``"none"``，但 DTO 必须
+    接受新值（5.1+ 由 post_search_reduce 替代输出）。
+    """
+
+    def test_default_value_is_none(self):
+        # reducer 默认产物的 post_search_action 仍是 "none"
+        s = _make_session(role="worker")
+        parse = _make_parse(dialogue_act="chitchat")
+        d = reduce(parse, s, "worker")
+        assert d.post_search_action == "none"
+
+    @pytest.mark.parametrize("action", [
+        "none",
+        "no_action",
+        "show_results",
+        "show_results_with_soft_pref_notice",
+        "auto_relax_and_retry",
+        "suggest_relaxation",
+        "ask_clarification",
+        "paginate_no_more",
+    ])
+    def test_dto_accepts_all_phase5_actions(self, action):
+        # 直接构造一个 DialogueDecision 验证 Literal 接受全部 7 + 1 个值
+        d = DialogueDecision(
+            dialogue_act="chitchat",
+            resolved_frame="none",
+            route_intent="chitchat",
+            post_search_action=action,
+        )
+        assert d.post_search_action == action
+
+    def test_dto_rejects_unknown_action(self):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            DialogueDecision(
+                dialogue_act="chitchat",
+                resolved_frame="none",
+                route_intent="chitchat",
+                post_search_action="totally_invalid",
+            )

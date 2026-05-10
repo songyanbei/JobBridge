@@ -1122,7 +1122,9 @@ def _handle_show_more(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
-    result = search_service.show_more(session, user_ctx, db)
+    # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]；本子阶段
+    # 解构后 outcome 暂不消费（5.1 才接通 post_search_reduce），保持逐字节等价。
+    result, _outcome = search_service.show_more(session, user_ctx, db)
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
@@ -1574,12 +1576,15 @@ def _run_search(
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
+    # Phase 5 §5.0：search_jobs/search_workers 现返回 tuple[SearchResult, SearchOutcome]；
+    # 本子阶段解构后 _outcome 暂不消费（5.1 起才接通 post_search_reduce），保持逐
+    # 字节等价旧路径。
     if direction == "search_job":
-        result = search_service.search_jobs(
+        result, _outcome = search_service.search_jobs(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
     else:
-        result = search_service.search_workers(
+        result, _outcome = search_service.search_workers(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
 

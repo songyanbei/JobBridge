@@ -90,8 +90,19 @@ class DialogueDecision(BaseModel):
     ] = "none"
     pending_interruption: dict | None = None
     awaiting_ops: list[dict] = Field(default_factory=list)
-    # Phase 5 兼容预留位，阶段二到阶段四固定 'none'，不参与路由
-    post_search_action: Literal["none"] = "none"
+    # Phase 5 §5.0：post_search_action Literal 集合从 ["none"] 扩到完整 7 个 action。
+    # 但本子阶段 reducer 默认仍输出 'none'（后续由 post_search_reduce 替代输出）；
+    # 5.0 message_router 不消费该字段，5.1 起才接通。
+    post_search_action: Literal[
+        "none",
+        "no_action",
+        "show_results",
+        "show_results_with_soft_pref_notice",
+        "auto_relax_and_retry",
+        "suggest_relaxation",
+        "ask_clarification",
+        "paginate_no_more",
+    ] = "none"
 
 
 # ---------------------------------------------------------------------------

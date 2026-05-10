@@ -8,7 +8,6 @@ Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 import logging
 import math
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -20,9 +19,30 @@ from app.llm import get_reranker
 from app.llm.base import RerankResult
 from app.models import Job, Resume, SystemConfig, User
 from app.schemas.conversation import SessionState
+# Phase 5 §5.0：DTO 中立模块迁移。本模块仍可作为 search_service.SearchResult 等旧名
+# 的访问入口（re-export），避免破坏 backend/tests/unit/test_search_service.py 等
+# 直接 from app.services.search_service import SearchResult 的调用方。
+from app.schemas.search import (
+    FallbackOutcome,
+    FallbackSuggestion,
+    SearchOutcome,
+    SearchResult,
+)
 from app.services import conversation_service, permission_service
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
+
+# 显式 re-export，让 mypy / IDE / runtime 都识别本模块仍提供这些名字。
+__all__ = [
+    "FallbackOutcome",
+    "FallbackSuggestion",
+    "SearchOutcome",
+    "SearchResult",
+    "search_jobs",
+    "search_workers",
+    "show_more",
+    "has_effective_search_criteria",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -137,36 +157,46 @@ def _rerank_with_logging(
     return result
 
 
-@dataclass
-class SearchResult:
-    reply_text: str
-    has_more: bool = False
-    result_count: int = 0
+# Phase 5 §5.0：SearchResult / FallbackSuggestion / FallbackOutcome 已迁到
+# app/schemas/search.py，本模块仅 import + re-export，调用方不感知。
 
 
-@dataclass(frozen=True)
-class FallbackSuggestion:
-    """激进放宽探查命中的方向（Bug 3）。
+# ---------------------------------------------------------------------------
+# SearchOutcome 构造 helper（Phase 5 §5.0）
+# ---------------------------------------------------------------------------
 
-    仅用于文案提示，不会自动用这个 criteria 返回结果——避免把不符原意的
-    岗位/简历当作"找到的"展示给用户。
+def _build_search_outcome(
+    *,
+    direction: str,
+    criteria_used: dict,
+    initial_count: int,
+    final_count: int,
+    desired_count: int,
+    applied_relax_step: str | None = None,
+    fallback_suggestions: list[FallbackSuggestion] | None = None,
+    has_more: bool = False,
+    snapshot_exhausted: bool = False,
+) -> SearchOutcome:
+    """构造 SearchOutcome；low_recall_threshold 默认等于 desired_count（top_n）。
+
+    5.0 子阶段产出该结构但 reducer 默认 no_action，本字段不会被实际消费；
+    5.1 起 reducer 才开始读取（见 phased-plan §5.0.1 第 3 项 / §5.2.1）。
     """
-    step: str           # _SUGGESTION_LABEL_* 中的 key
-    criteria: dict      # 探查时使用的 criteria（拷贝，外部不要 mutate）
-    count: int          # 该 criteria 下的候选数（≥1 才会进 suggestions）
-
-
-@dataclass
-class FallbackOutcome:
-    """fallback 步骤的结构化产物（Bug 3）。
-
-    - candidates：最终选用的候选列表（沿用既有"严格更优才采纳"语义）
-    - applied_step：哪一步被采纳；None 表示用原 criteria 命中或全部 0 召回
-    - suggestions：当 candidates 为空时探查到的激进放宽方向（已确认 ≥1）
-    """
-    candidates: list
-    applied_step: str | None = None
-    suggestions: list[FallbackSuggestion] = field(default_factory=list)
+    return SearchOutcome(
+        direction=direction,
+        criteria_used=dict(criteria_used or {}),
+        initial_count=initial_count,
+        final_count=final_count,
+        desired_count=desired_count,
+        low_recall_threshold=desired_count,
+        applied_relax_step=applied_relax_step,
+        fallback_suggestions=list(fallback_suggestions or []),
+        soft_pref_hits={},  # 5.4 才填充
+        has_more=has_more,
+        snapshot_exhausted=snapshot_exhausted,
+        available_relax_steps=[],  # 5.2 才填充
+        relax_probe_results=[],    # 5.2 才填充
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +210,18 @@ def search_jobs(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
-) -> SearchResult:
-    """工人/中介找岗位。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """工人/中介找岗位。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`，
+    本子阶段产出 SearchOutcome 但调用方解构后丢弃；5.1 起 message_router 才开始消费。
+    """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
 
     # 硬过滤
     candidates = _query_jobs(criteria, max_candidates, db)
+    initial_count = len(candidates)
 
     # Stage B（§3.4）：0 命中或低召回时按显式 fallback 步骤逐步放宽
     # Bug 3：fallback 返回 FallbackOutcome，记录采纳步骤 + 0 召回时的建议方向
@@ -200,16 +235,27 @@ def search_jobs(
 
     if not candidates:
         if outcome.suggestions:
-            return SearchResult(
+            sr = SearchResult(
                 reply_text=_format_no_match_with_suggestions_job(
                     criteria, outcome.suggestions,
                 ),
                 result_count=0,
             )
-        return SearchResult(
-            reply_text=NO_JOB_MATCH_REPLY,
-            result_count=0,
+        else:
+            sr = SearchResult(
+                reply_text=NO_JOB_MATCH_REPLY,
+                result_count=0,
+            )
+        so = _build_search_outcome(
+            direction="search_job",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
         )
+        return sr, so
 
     # 转为 dict 列表用于 rerank
     candidate_dicts = _jobs_to_dicts(candidates, db)
@@ -240,7 +286,17 @@ def search_jobs(
     # 取首批
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        return SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction="search_job",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+        )
+        return sr, so
 
     # 从候选中找到对应记录
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
@@ -261,11 +317,22 @@ def search_jobs(
         if notice:
             reply = f"{notice}\n\n{reply}"
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    so = _build_search_outcome(
+        direction="search_job",
+        criteria_used=criteria,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        applied_relax_step=outcome.applied_step,
+        fallback_suggestions=outcome.suggestions,
+        has_more=remaining > 0,
+    )
+    return sr, so
 
 
 def search_workers(
@@ -275,12 +342,16 @@ def search_workers(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
-) -> SearchResult:
-    """厂家/中介找工人。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """厂家/中介找工人。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
+    """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
 
     candidates = _query_resumes(criteria, max_candidates, db)
+    initial_count = len(candidates)
 
     if len(candidates) < top_n:
         outcome = _run_resume_fallback_steps(
@@ -292,16 +363,27 @@ def search_workers(
 
     if not candidates:
         if outcome.suggestions:
-            return SearchResult(
+            sr = SearchResult(
                 reply_text=_format_no_match_with_suggestions_resume(
                     criteria, outcome.suggestions,
                 ),
                 result_count=0,
             )
-        return SearchResult(
-            reply_text=NO_WORKER_MATCH_REPLY,
-            result_count=0,
+        else:
+            sr = SearchResult(
+                reply_text=NO_WORKER_MATCH_REPLY,
+                result_count=0,
+            )
+        so = _build_search_outcome(
+            direction="search_worker",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
         )
+        return sr, so
 
     candidate_dicts = _resumes_to_dicts(candidates)
 
@@ -326,7 +408,17 @@ def search_workers(
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        return SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction="search_worker",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+        )
+        return sr, so
 
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
@@ -346,29 +438,62 @@ def search_workers(
         if notice:
             reply = f"{notice}\n\n{reply}"
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    so = _build_search_outcome(
+        direction="search_worker",
+        criteria_used=criteria,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        applied_relax_step=outcome.applied_step,
+        fallback_suggestions=outcome.suggestions,
+        has_more=remaining > 0,
+    )
+    return sr, so
 
 
 def show_more(
     session: SessionState,
     user_ctx: UserContext,
     db: Session,
-) -> SearchResult:
-    """show_more：从快照取下一批，跳过失效条目。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """show_more：从快照取下一批，跳过失效条目。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
+    `SearchResult.reply_text` 完全保留旧文案（含"已经是所有匹配结果了..."兜底），
+    off / shadow 模式下逐字节等价 5.0 前的输出；on 模式下由 5.1 reducer + applier
+    根据 `SearchOutcome.snapshot_exhausted` 决定是否覆盖 reply。
+    """
+    is_job_search = _is_job_search(session, user_ctx)
+    direction = "search_job" if is_job_search else "search_worker"
+    top_n = _get_config_int("match.top_n", db, 3)
+
     if session.candidate_snapshot is None:
-        return SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
+        sr = SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used={},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+        )
+        return sr, so
 
     # 快照过期检查
     if conversation_service.invalidate_snapshot_if_expired(session):
-        return SearchResult(reply_text="搜索结果已过期，请重新搜索。")
-
-    top_n = _get_config_int("match.top_n", db, 3)
-    # 确定搜索方向
-    is_job_search = _is_job_search(session, user_ctx)
+        sr = SearchResult(reply_text="搜索结果已过期，请重新搜索。")
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used={},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+        )
+        return sr, so
 
     collected = []
     attempts = 0
@@ -402,10 +527,19 @@ def show_more(
         collected.extend(filtered)
 
     if not collected:
-        return SearchResult(
+        sr = SearchResult(
             reply_text="已经是所有匹配结果了。要不要调整条件重新搜索？",
             result_count=0,
         )
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=session.search_criteria or {},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+            snapshot_exhausted=True,  # 5.1 reducer 据此决定 paginate_no_more
+        )
+        return sr, so
 
     # 截断到 top_n
     collected = collected[:top_n]
@@ -417,11 +551,20 @@ def show_more(
     else:
         reply = _format_resume_results(collected, remaining)
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=has_more,
         result_count=len(collected),
     )
+    so = _build_search_outcome(
+        direction=direction,
+        criteria_used=session.search_criteria or {},
+        initial_count=len(collected),
+        final_count=len(collected),
+        desired_count=top_n,
+        has_more=has_more,
+    )
+    return sr, so
 
 
 # ---------------------------------------------------------------------------

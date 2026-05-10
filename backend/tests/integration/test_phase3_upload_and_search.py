@@ -154,7 +154,7 @@ class TestJobUploadAndSearch:
         session = SessionState(role="worker")
         criteria = {"city": ["苏州市"], "job_category": ["电子厂"]}
 
-        result = search_service.search_jobs(
+        result, _outcome = search_service.search_jobs(
             criteria, "苏州找电子厂", session, user_ctx, db,
         )
         assert result.result_count > 0

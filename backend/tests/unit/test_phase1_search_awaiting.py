@@ -232,11 +232,18 @@ class TestSearchAwaitingFlow:
             lambda *a, **k: None,
         )
         # 阻断真正 SQL 检索
-        sj = MagicMock(return_value=SimpleNamespace(reply_text="[mock]"))
+        # Phase 5 §5.0：search_jobs / search_workers 现返回 tuple[SearchResult, SearchOutcome]
+        sj = MagicMock(return_value=(
+            SimpleNamespace(reply_text="[mock]", has_more=False, result_count=1),
+            SimpleNamespace(),
+        ))
         monkeypatch.setattr(
             message_router.search_service, "search_jobs", sj,
         )
-        sw = MagicMock(return_value=SimpleNamespace(reply_text="[mock]"))
+        sw = MagicMock(return_value=(
+            SimpleNamespace(reply_text="[mock]", has_more=False, result_count=1),
+            SimpleNamespace(),
+        ))
         monkeypatch.setattr(
             message_router.search_service, "search_workers", sw,
         )

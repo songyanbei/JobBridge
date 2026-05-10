@@ -187,6 +187,9 @@ class Reranker(ABC):
         candidates: list[dict],
         role: str,
         top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
     ) -> RerankResult:
         """对候选集重排并生成回复。
 
@@ -195,6 +198,11 @@ class Reranker(ABC):
             candidates: SQL 硬过滤后的候选集（字典列表，含全部字段）
             role: 用户角色（决定回复视角和可见字段）
             top_n: 返回的 Top N 条数
+            soft_preferences: Phase 5 §5.0 预声明位（5.3 才会消费）。例如
+                ``{"provide_meal": True, "shift_pattern": "日班"}``。5.0/5.1/5.2
+                所有 provider 实现接收形参但忽略，确保后续接通时不破坏现有调用。
+            ranking_weights: Phase 5 §5.0 预声明位（5.3 才会消费）。例如
+                ``{"provide_meal": 0.3, "shift_pattern": 0.2}``。
 
         Returns:
             RerankResult

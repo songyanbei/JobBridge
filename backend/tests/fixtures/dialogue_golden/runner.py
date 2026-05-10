@@ -82,6 +82,7 @@ class _SearchCallSpy:
         )
 
     def fake_search_jobs(self, criteria, raw_query, session, user_ctx, db, **_kw):
+        # Phase 5 §5.0：search_service.search_jobs 现返回 tuple[SearchResult, SearchOutcome]
         from types import SimpleNamespace
         self.jobs_calls.append(dict(criteria))
         reply_text = self.current_jobs_reply_text
@@ -89,9 +90,27 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
-        return SimpleNamespace(reply_text=reply_text)
+        return (
+            SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
+            SimpleNamespace(
+                direction="search_job",
+                criteria_used=dict(criteria),
+                initial_count=1,
+                final_count=1,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=False,
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
 
     def fake_search_workers(self, criteria, raw_query, session, user_ctx, db, **_kw):
+        # Phase 5 §5.0：search_workers 现返回 tuple[SearchResult, SearchOutcome]
         from types import SimpleNamespace
         self.workers_calls.append(dict(criteria))
         reply_text = self.current_workers_reply_text
@@ -99,7 +118,24 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
-        return SimpleNamespace(reply_text=reply_text)
+        return (
+            SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
+            SimpleNamespace(
+                direction="search_worker",
+                criteria_used=dict(criteria),
+                initial_count=1,
+                final_count=1,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=False,
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

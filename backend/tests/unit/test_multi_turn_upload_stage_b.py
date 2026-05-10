@@ -392,8 +392,12 @@ class TestFixP1ResumeDefaultsReachSearch:
     ):
         # 模拟 worker 已有简历兜底
         mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
-        mock_search.return_value = search_service.SearchResult(
-            reply_text="为您找到 2 个匹配岗位", result_count=2,
+        # Phase 5 §5.0：tuple[SearchResult, SearchOutcome]
+        mock_search.return_value = (
+            search_service.SearchResult(
+                reply_text="为您找到 2 个匹配岗位", result_count=2,
+            ),
+            MagicMock(),
         )
         ctx = _ctx("worker")
         session = SessionState(role="worker")
@@ -414,8 +418,12 @@ class TestFixP1ResumeDefaultsReachSearch:
         self, mock_load, mock_search,
     ):
         mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
-        mock_search.return_value = search_service.SearchResult(
-            reply_text="为您找到 1 个匹配岗位", result_count=1,
+        # Phase 5 §5.0：tuple[SearchResult, SearchOutcome]
+        mock_search.return_value = (
+            search_service.SearchResult(
+                reply_text="为您找到 1 个匹配岗位", result_count=1,
+            ),
+            MagicMock(),
         )
         ctx = _ctx("worker")
         session = SessionState(role="worker")

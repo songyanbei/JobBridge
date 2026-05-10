@@ -190,7 +190,12 @@ class DoubaoReranker(Reranker):
         candidates: list[dict],
         role: str,
         top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
     ) -> RerankResult:
+        # Phase 5 §5.0：soft_preferences / ranking_weights 接收形参但忽略，5.3 才消费。
+        del soft_preferences, ranking_weights
         system_prompt = RERANK_SYSTEM_PROMPT.format(
             role=role,
             top_n=top_n,

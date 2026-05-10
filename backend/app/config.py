@@ -61,6 +61,13 @@ class DialoguePolicy(BaseModel):
     search_awaiting_ttl_seconds: int = 600
     """搜索追问字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。"""
 
+    post_search_policy_mode: Literal["off", "shadow", "on"] = "off"
+    """Phase 5 §5.0：结果感知二阶段裁决（post_search_reduce）的灰度模式。
+    off=不调 reducer，行为完全等价 5.0 前；
+    shadow=旁路调 reducer 写日志，不影响 reply；
+    on=按 PostSearchDecision.action 改写 reply / 触发 applier。
+    5.0 子阶段默认 off，message_router 暂不消费；5.1 起接通。"""
+
     @field_validator("v2_mode", mode="before")
     @classmethod
     def _coerce_v2_mode(cls, v):
@@ -81,6 +88,12 @@ class DialoguePolicy(BaseModel):
     def _coerce_acqp(cls, v):
         v = (str(v) if v is not None else "").strip()
         return v if v in {"clarify", "replace"} else "clarify"
+
+    @field_validator("post_search_policy_mode", mode="before")
+    @classmethod
+    def _coerce_psm(cls, v):
+        v = (str(v) if v is not None else "").strip()
+        return v if v in {"off", "shadow", "on"} else "off"
 
 
 # 旧顶层 env 名 → DialoguePolicy 字段名
@@ -267,6 +280,19 @@ class Settings(BaseSettings):
     def search_awaiting_ttl_seconds(self, value: int) -> None:
         self.dialogue_policy = self.dialogue_policy.model_copy(
             update={"search_awaiting_ttl_seconds": int(value)},
+        )
+
+    @property
+    def post_search_policy_mode(self) -> str:
+        """Phase 5 §5.0：post_search_reduce 灰度模式（off/shadow/on）。"""
+        return self.dialogue_policy.post_search_policy_mode
+
+    @post_search_policy_mode.setter
+    def post_search_policy_mode(self, value: str) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "post_search_policy_mode": DialoguePolicy._coerce_psm(value),
+            },
         )
 
     @property

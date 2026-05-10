@@ -244,7 +244,8 @@ class TestIntentDispatch:
         )
         search_result = MagicMock()
         search_result.reply_text = "3 个岗位"
-        mock_search.return_value = search_result
+        # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
+        mock_search.return_value = (search_result, MagicMock())
 
         replies = process(_msg(content="苏州找电子厂"), MagicMock())
         assert replies[0].content == "3 个岗位"
@@ -297,7 +298,8 @@ class TestIntentDispatch:
         mock_classify.return_value = IntentResult(intent="show_more", confidence=1.0)
         sr = MagicMock()
         sr.reply_text = "更多结果"
-        mock_show.return_value = sr
+        # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
+        mock_show.return_value = (sr, MagicMock())
 
         replies = process(_msg(content="更多"), MagicMock())
         assert replies[0].content == "更多结果"
@@ -334,7 +336,8 @@ class TestSearchDirectionResolution:
         )
         sr = MagicMock()
         sr.reply_text = "3 个岗位"
-        mock_search_jobs.return_value = sr
+        # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
+        mock_search_jobs.return_value = (sr, MagicMock())
 
         replies = process(_msg(content="帮工人找苏州电子厂"), MagicMock())
 
@@ -366,7 +369,8 @@ class TestSearchDirectionResolution:
         )
         sr = MagicMock()
         sr.reply_text = "3 位求职者"
-        mock_search_workers.return_value = sr
+        # Phase 5 §5.0：search_workers 现返回 tuple[SearchResult, SearchOutcome]
+        mock_search_workers.return_value = (sr, MagicMock())
 
         replies = process(_msg(content="苏州招电子厂工人"), MagicMock())
 
@@ -578,7 +582,8 @@ class TestSearchMissingRecheckIntegration:
         )
         sr = MagicMock()
         sr.reply_text = "1 个岗位"
-        mock_search.return_value = sr
+        # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
+        mock_search.return_value = (sr, MagicMock())
 
         replies = process(_msg(content="西安有吗"), MagicMock())
 
