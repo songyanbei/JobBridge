@@ -893,6 +893,92 @@ def render_clarification(
 # ---------------------------------------------------------------------------
 
 
+def relaxation_directions(
+    criteria: dict | None,
+    frame: str = "job_search",
+) -> list[dict]:
+    """Phase 5 §5.1：根据 criteria 当前形态产出 show_more 翻完时的"建议放宽方向"。
+
+    返回列表，每项含 ``dimension / hint_text / target_field`` 三个键，供
+    post_search_applier 渲染 paginate_no_more 文案。
+
+    形态分支（phased-plan §5.1.1 第 2 项）：
+    - 仅有 city + job_category：建议放宽薪资 / 换附近城市 / 切换工种大类。
+    - 已有 salary_floor_monthly：建议下调薪资 10% / 换城市。
+    - 已有 salary_floor_monthly + 软偏好（provide_meal / provide_housing 等）：
+      建议先去掉软偏好。
+
+    candidate_search 走对称结构（salary_ceiling_monthly 替代 salary_floor_monthly）。
+
+    本函数不读 SQL、不调任何外部模块——5.1 验收 #5"降级文案不依赖 LLM"硬约束。
+    """
+    c = criteria or {}
+    has_city = bool(c.get("city"))
+    has_category = bool(c.get("job_category"))
+    has_salary_floor = c.get("salary_floor_monthly") is not None
+    has_salary_ceiling = c.get("salary_ceiling_monthly") is not None
+    soft_pref_keys = ("provide_meal", "provide_housing", "shift_pattern",
+                      "dorm_condition", "accept_couple", "accept_student",
+                      "accept_minority")
+    has_soft_pref = any(c.get(k) is not None for k in soft_pref_keys)
+
+    directions: list[dict] = []
+
+    if frame == "candidate_search":
+        if has_soft_pref:
+            directions.append({
+                "dimension": "soft_pref",
+                "hint_text": "去掉「包吃住 / 班次」等偏好",
+                "target_field": "soft_pref",
+            })
+        if has_salary_ceiling:
+            directions.append({
+                "dimension": "salary_ceiling",
+                "hint_text": "放宽期望薪资上限",
+                "target_field": "salary_ceiling_monthly",
+            })
+        if has_city:
+            directions.append({
+                "dimension": "city",
+                "hint_text": "换其他城市",
+                "target_field": "city",
+            })
+        if has_category:
+            directions.append({
+                "dimension": "job_category",
+                "hint_text": "切换工种大类",
+                "target_field": "job_category",
+            })
+        return directions
+
+    # frame == "job_search" 默认分支
+    if has_soft_pref:
+        directions.append({
+            "dimension": "soft_pref",
+            "hint_text": "去掉「包吃住 / 班次」等偏好",
+            "target_field": "soft_pref",
+        })
+    if has_salary_floor:
+        directions.append({
+            "dimension": "salary_floor",
+            "hint_text": "下调月薪下限 10%",
+            "target_field": "salary_floor_monthly",
+        })
+    if has_city:
+        directions.append({
+            "dimension": "city",
+            "hint_text": "换附近城市",
+            "target_field": "city",
+        })
+    if has_category:
+        directions.append({
+            "dimension": "job_category",
+            "hint_text": "切换工种大类",
+            "target_field": "job_category",
+        })
+    return directions
+
+
 def render_prompt_field_spec() -> str:
     """生成 prompt 中 frame → 字段清单段落。
 

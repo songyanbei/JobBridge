@@ -137,6 +137,52 @@ class _SearchCallSpy:
             ),
         )
 
+    # Phase 5 §5.1：mock show_more 让 case 模拟翻完场景。
+    # case 顶层可设 ``mock_show_more={"snapshot_exhausted": True, ...}``，
+    # 由 runner 透传到这里。默认 snapshot_exhausted=False，模拟"还有更多结果"。
+    show_more_calls: list[dict] = field(default_factory=list)
+    current_show_more_outcome: dict = field(default_factory=lambda: {
+        "direction": "search_job",
+        "snapshot_exhausted": False,
+        "reply_text": "[mock-show-more]",
+    })
+
+    def set_show_more(self, payload: dict | None) -> None:
+        if not payload:
+            return
+        self.current_show_more_outcome = {
+            "direction": payload.get("direction", "search_job"),
+            "snapshot_exhausted": bool(payload.get("snapshot_exhausted", False)),
+            "reply_text": payload.get("reply_text", "[mock-show-more]"),
+        }
+
+    def fake_show_more(self, session, user_ctx, db, **_kw):
+        from types import SimpleNamespace
+        self.show_more_calls.append({
+            "search_criteria": dict(session.search_criteria or {}),
+        })
+        cfg = self.current_show_more_outcome
+        return (
+            SimpleNamespace(
+                reply_text=cfg["reply_text"], has_more=False, result_count=0,
+            ),
+            SimpleNamespace(
+                direction=cfg["direction"],
+                criteria_used=dict(session.search_criteria or {}),
+                initial_count=0,
+                final_count=0,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=cfg["snapshot_exhausted"],
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
+
 
 # ---------------------------------------------------------------------------
 # 主 runner
@@ -209,11 +255,13 @@ def run_dialogue_case(case: dict) -> dict:
         original_mode = getattr(_settings, "dialogue_v2_mode", "off")
         original_policy = getattr(_settings, "ambiguous_city_query_policy", "clarify")
         original_threshold = getattr(_settings, "low_confidence_threshold", 0.6)
+        original_psm = getattr(_settings, "post_search_policy_mode", "off")
         try:
             for idx, turn in enumerate(case["turns"]):
                 mocks["set_mock_llm"](turn["mock_llm"])
                 mocks["set_mock_v2"](turn.get("mock_v2"))
                 mocks["set_mock_search"](turn.get("mock_search"))
+                mocks["set_mock_show_more"](turn.get("mock_show_more"))
                 # turn 级别覆盖（不写则继承 case，case 不写则保持原 settings）
                 turn_mode = (turn.get("v2_mode") or case_mode or "off").strip()
                 _settings.dialogue_v2_mode = turn_mode
@@ -221,6 +269,10 @@ def run_dialogue_case(case: dict) -> dict:
                     _settings.ambiguous_city_query_policy = case_policy
                 if case_low_conf_threshold is not None:
                     _settings.low_confidence_threshold = float(case_low_conf_threshold)
+                # Phase 5 §5.1：post_search_policy_mode 由 case 顶层 / turn 级别覆盖
+                turn_psm = (turn.get("post_search_policy_mode")
+                            or case.get("post_search_policy_mode") or "off").strip()
+                _settings.post_search_policy_mode = turn_psm
 
                 handler_marker = {"name": ""}
                 mocks["mark_handler"](handler_marker)
@@ -271,12 +323,21 @@ def run_dialogue_case(case: dict) -> dict:
                     "session_pending_upload_keys": sorted((session.pending_upload or {}).keys()),
                     "session_pending_interruption_present": bool(session.pending_interruption),
                     "session_awaiting_field": session.awaiting_field,
+                    # Phase 5 §5.1：trace post_search_decision 的关键字段，
+                    # 让 fixture 能锁定 paginate_no_more 触发与 directions 内容。
+                    # 由 reply 文本反推：on 模式下 paginate_no_more 渲染的回复
+                    # 含特定 header；off / shadow 模式下 reply 仍是 search_result
+                    # 原文。
+                    "reply_includes_paginate_header": (
+                        "已经是所有匹配结果了。可以试试以下方向" in reply_text
+                    ),
                 })
                 prev_search_calls = cur_search_calls
         finally:
             _settings.dialogue_v2_mode = original_mode
             _settings.ambiguous_city_query_policy = original_policy
             _settings.low_confidence_threshold = original_threshold
+            _settings.post_search_policy_mode = original_psm
 
     return {"turns": trace_turns, "session": session, "spy": spy}
 
@@ -330,6 +391,9 @@ def _golden_mocks(
 
     def set_mock_search(payload):
         spy.set_responses(payload)
+
+    def set_mock_show_more(payload):
+        spy.set_show_more(payload)
 
     def _legacy_intent_result(text, role):
         # Phase 1 worker 搜索护栏要在这里也跑 sanitize（与生产路径对齐）
@@ -405,6 +469,20 @@ def _golden_mocks(
 
     def fake_classify(text, role, history=None, current_criteria=None,
                       user_msg_id=None, session_hint=None):
+        # Phase 5 §5.1：legacy 路径下 classify_intent 内部会先做斜杠命令 + show_more
+        # 同义语短路（intent_service.py 第 322-350 行），mock 也必须模拟，否则
+        # "更多 / 还有吗" 这类 fixture 会被吃成 chitchat。
+        from app.services.intent_service import _match_command, _match_show_more
+        stripped = (text or "").strip()
+        cmd_result = _match_command(stripped)
+        if cmd_result is not None:
+            cmd, args = cmd_result
+            data: dict = {"command": cmd}
+            if args:
+                data["args"] = args
+            return IntentResult(intent="command", structured_data=data, confidence=1.0)
+        if _match_show_more(stripped):
+            return IntentResult(intent="show_more", confidence=1.0)
         return _legacy_intent_result(text, role)
 
     handler_holder: dict[str, dict] = {}
@@ -443,6 +521,8 @@ def _golden_mocks(
     _swap(message_router, "classify_dialogue", fake_classify_dialogue)
     _swap(message_router.search_service, "search_jobs", spy.fake_search_jobs)
     _swap(message_router.search_service, "search_workers", spy.fake_search_workers)
+    # Phase 5 §5.1：mock show_more 让 case 模拟翻完场景
+    _swap(message_router.search_service, "show_more", spy.fake_show_more)
     _swap(message_router.search_service, "has_effective_search_criteria",
           lambda criteria: True)
     _swap(message_router, "_handle_follow_up",
@@ -458,6 +538,7 @@ def _golden_mocks(
             "set_mock_llm": set_mock_llm,
             "set_mock_v2": set_mock_v2,
             "set_mock_search": set_mock_search,
+            "set_mock_show_more": set_mock_show_more,
             "mark_handler": mark_handler,
         }
     finally:
@@ -503,6 +584,10 @@ _KNOWN_EXPECT_KEYS = frozenset({
     "session_pending_upload_keys",
     "session_pending_interruption_present",
     "session_awaiting_field",
+    # Phase 5 §5.1：post_search_decision 行为锁定
+    "reply_includes_paginate_header",
+    "reply_contains",
+    "reply_not_contains",
 })
 
 
@@ -645,6 +730,23 @@ def assert_turn(trace_turn: dict, expect: dict, label: str = "") -> None:
             f"{prefix}session_awaiting_field={trace_turn['session_awaiting_field']} "
             f"!= expect={expect['session_awaiting_field']}"
         )
+
+    # Phase 5 §5.1：reply 内容断言（精确匹配 paginate header 与子串）
+    if "reply_includes_paginate_header" in expect:
+        assert trace_turn["reply_includes_paginate_header"] == expect["reply_includes_paginate_header"], (
+            f"{prefix}reply_includes_paginate_header={trace_turn['reply_includes_paginate_header']} "
+            f"!= expect={expect['reply_includes_paginate_header']}; reply={trace_turn['reply']!r}"
+        )
+    if "reply_contains" in expect:
+        for needle in expect["reply_contains"]:
+            assert needle in trace_turn["reply"], (
+                f"{prefix}reply does not contain {needle!r}; reply={trace_turn['reply']!r}"
+            )
+    if "reply_not_contains" in expect:
+        for needle in expect["reply_not_contains"]:
+            assert needle not in trace_turn["reply"], (
+                f"{prefix}reply unexpectedly contains {needle!r}; reply={trace_turn['reply']!r}"
+            )
 
 
 def _normalize_criteria_for_compare(criteria: dict) -> dict:

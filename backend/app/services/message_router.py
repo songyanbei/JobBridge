@@ -1122,20 +1122,142 @@ def _handle_show_more(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
-    # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]；本子阶段
-    # 解构后 outcome 暂不消费（5.1 才接通 post_search_reduce），保持逐字节等价。
-    result, _outcome = search_service.show_more(session, user_ctx, db)
+    # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
+    result, outcome = search_service.show_more(session, user_ctx, db)
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
     else:
         session.active_flow = "idle"
-    return [_reply(
-        msg.from_user,
-        result.reply_text,
-        intent="show_more",
-        criteria_snapshot=_snapshot_meta(session),
-    )]
+
+    # Phase 5 §5.1：post_search_policy_mode 三模式分流。
+    # - off：直接用 result.reply_text，逐字节等价 5.0；
+    # - shadow：调 reducer 但只写日志，不影响 reply；
+    # - on：构造 PostSearchContext 调 applier 拿最终 reply。
+    # _handle_search / _handle_follow_up 暂不接通（5.1 reducer 在主搜索路径
+    # 永远输出 no_action，行为等价 off；5.2 接通后会触发 auto_relax_and_retry
+    # 等 action，那时再扩）。
+    return _post_search_dispatch(
+        msg=msg,
+        user_ctx=user_ctx,
+        session=session,
+        db=db,
+        search_result=result,
+        search_outcome=outcome,
+        legacy_intent="show_more",
+    )
+
+
+def _post_search_dispatch(
+    *,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+    search_result,  # SearchResult
+    search_outcome,  # SearchOutcome
+    legacy_intent: str,
+) -> list[ReplyMessage]:
+    """Phase 5 §5.1：post_search_policy_mode 三模式分流入口。
+
+    legacy_intent 用于 off / shadow 模式构造与 5.0 之前完全等价的 ReplyMessage
+    （含 intent / criteria_snapshot 字段），on 模式由 applier 自行渲染。
+    """
+    mode = _settings_module.dialogue_policy.post_search_policy_mode
+
+    if mode == "off":
+        return [_reply(
+            msg.from_user,
+            search_result.reply_text,
+            intent=legacy_intent,
+            criteria_snapshot=_snapshot_meta(session),
+        )]
+
+    # shadow / on 都需要构造 ctx + 调 reducer
+    from app.services.dialogue_reducer import DialogueDecision
+    from app.llm.base import DialogueParseResult
+    from app.services.post_search_applier import apply_post_search_decision
+    from app.services.post_search_reducer import (
+        PostSearchContext,
+        post_search_reduce,
+    )
+
+    # 5.1 不依赖 v2 解析（v2_dual_read 走 classify_dialogue），shadow 模式下
+    # parse_result / dialogue_decision 可以用空壳代理，reducer 5.1 不读它们。
+    parse_stub = DialogueParseResult(
+        dialogue_act="chitchat",
+        frame_hint="none",
+        slots_delta={},
+        merge_hint={},
+        needs_clarification=False,
+        confidence=0.0,
+    )
+    decision_stub = DialogueDecision(
+        dialogue_act="chitchat",
+        resolved_frame="none",
+        route_intent=legacy_intent,
+    )
+
+    ps_decision = post_search_reduce(
+        parse_result=parse_stub,
+        decision=decision_stub,
+        session=session,
+        search_outcome=search_outcome,
+        role=user_ctx.role,
+    )
+
+    if mode == "shadow":
+        # 5.1 验收 #2：shadow 只写日志，不影响 reply。
+        log_event(
+            "post_search_decision",
+            mode="shadow",
+            action=ps_decision.action,
+            reasoning=ps_decision.reasoning,
+            direction=search_outcome.direction,
+            snapshot_exhausted=search_outcome.snapshot_exhausted,
+        )
+        return [_reply(
+            msg.from_user,
+            search_result.reply_text,
+            intent=legacy_intent,
+            criteria_snapshot=_snapshot_meta(session),
+        )]
+
+    # mode == "on"
+    log_event(
+        "post_search_decision",
+        mode="on",
+        action=ps_decision.action,
+        reasoning=ps_decision.reasoning,
+        direction=search_outcome.direction,
+        snapshot_exhausted=search_outcome.snapshot_exhausted,
+    )
+    ctx = PostSearchContext(
+        decision=ps_decision,
+        search_result=search_result,
+        search_outcome=search_outcome,
+        parse_result=parse_stub,
+        dialogue_decision=decision_stub,
+        session=session,
+        msg=msg,
+        user_ctx=user_ctx,
+        db=db,
+        raw_query=msg.content or "",
+        role=user_ctx.role,
+        recursion_depth=0,
+    )
+    replies = apply_post_search_decision(ctx)
+    # applier 返回的 ReplyMessage 没有 intent / criteria_snapshot，由本函数补齐
+    # 以保持与旧路径同构（便于 worker 落库 / 监控大盘）。
+    enriched: list[ReplyMessage] = []
+    for r in replies:
+        if r.intent is None:
+            r = r.model_copy(update={
+                "intent": legacy_intent,
+                "criteria_snapshot": _snapshot_meta(session),
+            })
+        enriched.append(r)
+    return enriched
 
 
 # ---------------------------------------------------------------------------

@@ -130,6 +130,46 @@ def post_search_reduce(
     入参全部只读，不允许写 session / 调 LLM / 调 handler；副作用由
     message_router + post_search_applier 按返回值执行。
     """
-    # 5.0 默认实现：不读取任何字段，直接返回 no_action。
-    # 5.1+ 子阶段在这里加分支判断（按 phased-plan §5.1.1 / §5.2.1）。
-    return PostSearchDecision(action="no_action", reasoning="phase 5.0 stub")
+    # 5.1：show_more 翻完时输出 paginate_no_more + 具体降级建议方向。
+    decision_phase5_1 = _decide_paginate_no_more(search_outcome, session)
+    if decision_phase5_1 is not None:
+        return decision_phase5_1
+
+    # 5.2/5.3/5.4 接通点位（本子阶段不输出对应 action）。
+    return PostSearchDecision(action="no_action", reasoning="phase 5.1 default")
+
+
+# ---------------------------------------------------------------------------
+# 决策分支（5.1）
+# ---------------------------------------------------------------------------
+
+def _decide_paginate_no_more(
+    outcome: SearchOutcome,
+    session: SessionState,
+) -> PostSearchDecision | None:
+    """phased-plan §5.1.1 第 2 项：show_more 翻完时输出 paginate_no_more。
+
+    触发条件：``outcome.snapshot_exhausted=True``。其它条件返回 None 让上层走
+    后续分支（5.2/5.3/5.4 在此追加）。
+
+    suggested_directions 由 ``slot_schema.relaxation_directions(...)`` 渲染；
+    若 criteria 已极简（directions 为空），applier 会兜底使用静态文案
+    （phased-plan §失败模式落地）。
+    """
+    if not outcome.snapshot_exhausted:
+        return None
+
+    # 延迟 import 避免在 5.0 测试加载时引入 slot_schema 依赖
+    from app.dialogue import slot_schema
+
+    frame = (
+        "candidate_search" if outcome.direction == "search_worker" else "job_search"
+    )
+    directions = slot_schema.relaxation_directions(
+        session.search_criteria, frame=frame,
+    )
+    return PostSearchDecision(
+        action="paginate_no_more",
+        suggested_directions=directions,
+        reasoning=f"snapshot_exhausted; {len(directions)} relaxation direction(s)",
+    )
