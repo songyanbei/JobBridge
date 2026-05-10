@@ -244,8 +244,14 @@ class TestIntentDispatch:
         )
         search_result = MagicMock()
         search_result.reply_text = "3 个岗位"
-        # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
-        mock_search.return_value = (search_result, MagicMock())
+        # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]；
+        # 5.2 起 _run_search 会读 outcome.initial_count / low_recall_threshold
+        # 决定是否跑 _probe_relax_steps，必须给真实数值字段。
+        from app.schemas.search import SearchOutcome
+        mock_search.return_value = (search_result, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=999,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
 
         replies = process(_msg(content="苏州找电子厂"), MagicMock())
         assert replies[0].content == "3 个岗位"
@@ -299,7 +305,11 @@ class TestIntentDispatch:
         sr = MagicMock()
         sr.reply_text = "更多结果"
         # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
-        mock_show.return_value = (sr, MagicMock())
+        from app.schemas.search import SearchOutcome
+        mock_show.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=0,
+            final_count=0, desired_count=3, low_recall_threshold=3,
+        ))
 
         replies = process(_msg(content="更多"), MagicMock())
         assert replies[0].content == "更多结果"
@@ -337,7 +347,11 @@ class TestSearchDirectionResolution:
         sr = MagicMock()
         sr.reply_text = "3 个岗位"
         # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
-        mock_search_jobs.return_value = (sr, MagicMock())
+        from app.schemas.search import SearchOutcome
+        mock_search_jobs.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=999,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
 
         replies = process(_msg(content="帮工人找苏州电子厂"), MagicMock())
 
@@ -370,7 +384,11 @@ class TestSearchDirectionResolution:
         sr = MagicMock()
         sr.reply_text = "3 位求职者"
         # Phase 5 §5.0：search_workers 现返回 tuple[SearchResult, SearchOutcome]
-        mock_search_workers.return_value = (sr, MagicMock())
+        from app.schemas.search import SearchOutcome
+        mock_search_workers.return_value = (sr, SearchOutcome(
+            direction="search_worker", criteria_used={}, initial_count=999,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
 
         replies = process(_msg(content="苏州招电子厂工人"), MagicMock())
 
@@ -583,7 +601,11 @@ class TestSearchMissingRecheckIntegration:
         sr = MagicMock()
         sr.reply_text = "1 个岗位"
         # Phase 5 §5.0：search_jobs 现返回 tuple[SearchResult, SearchOutcome]
-        mock_search.return_value = (sr, MagicMock())
+        from app.schemas.search import SearchOutcome
+        mock_search.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=999,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
 
         replies = process(_msg(content="西安有吗"), MagicMock())
 

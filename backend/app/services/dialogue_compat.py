@@ -109,5 +109,10 @@ def decision_to_intent_result(
         # resolve_conflict 走 message_router 的冲突 handler，不走 _dispatch_intent。
         # 这里给一个安全 fallback，避免 message_router 拿到无 intent。
         return IntentResult(intent="command", confidence=1.0)
+    if act == "respond_relaxation_offer":
+        # Phase 5 §5.2：与 resolve_conflict 同样走 message_router short-circuit
+        # （_route_v2_relaxation_response），不进 _dispatch_intent；这里给安全
+        # fallback 避免上游兜底报错。
+        return IntentResult(intent="command", confidence=1.0)
 
     return IntentResult(intent="chitchat", confidence=0.0)

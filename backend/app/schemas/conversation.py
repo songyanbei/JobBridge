@@ -88,6 +88,26 @@ class SessionState(BaseModel):
         description="搜索 awaiting 过期时间 ISO 8601 UTC；过期后裸值不再按补槽处理",
     )
 
+    # ---- Phase 5 §5.2：跨 turn 放宽确认状态（独立于 upload_conflict 流程） ----
+    # 当 reducer 输出 ask_clarification 反问"要把薪资放宽 10% 吗"时，applier 把
+    # 待确认上下文写入此字段；下一轮用户回应（accept/reject）由
+    # _route_v2_relaxation_response 消费 + 清空。**完全独立**于 pending_interruption
+    # （upload_conflict 专用），两条流程零交叉。结构示例：
+    # {
+    #   "frame": "job_search",
+    #   "direction": "search_job",
+    #   "step": "relax_salary_10pct",
+    #   "original_criteria": {...},  # 主搜索时未放宽 criteria；execute_relaxed_search 第一参数
+    #   "relaxed_criteria": {...},   # 反问文案展示用，不参与二次检索（防二次放宽）
+    #   "raw_query": "...",          # 主搜索原文，二次 reranker 必须复用，不能用确认轮 msg.content
+    #   "user_msg_id": "...",
+    #   "expires_at": "...",
+    # }
+    pending_relaxation: dict | None = Field(
+        default=None,
+        description="Phase 5 §5.2：跨 turn 放宽确认上下文（与 pending_interruption 独立）",
+    )
+
 
 class CriteriaPatch(BaseModel):
     """多轮对话的 criteria 增量更新指令。"""

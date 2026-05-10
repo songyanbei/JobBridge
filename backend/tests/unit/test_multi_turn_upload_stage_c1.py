@@ -495,11 +495,16 @@ class TestUploadConflictResolution:
     def test_proceed_executes_pending_interruption(self, mock_search_workers):
         """先找工人：清 pending → 用 pending_interruption 重构 IntentResult →
         分发到 _handle_search → 实际调用 search_workers。"""
-        # Phase 5 §5.0：search_workers 现返回 tuple[SearchResult, SearchOutcome]
+        # Phase 5 §5.0/5.2：search_workers 现返回 tuple[SearchResult, SearchOutcome]；outcome 数值字段必须真实
+        from app.schemas.search import SearchOutcome as _SO
         _sr = search_service.SearchResult(
             reply_text="为您找到 1 位求职者", result_count=1, has_more=False,
         )
-        mock_search_workers.return_value = (_sr, MagicMock())
+        mock_search_workers.return_value = (
+            _sr,
+            _SO(direction="search_worker", criteria_used={}, initial_count=999,
+                final_count=1, desired_count=3, low_recall_threshold=3),
+        )
         # 给 _handle_search 一个有效 snapshot 让 active_flow 推进到 search_active
         def _populate_snapshot(*_args, **_kw):
             session = _args[2]
@@ -616,13 +621,15 @@ class TestUploadAndSearchPaths:
         mock_ttl.return_value = 30
         fake = MagicMock(); fake.id = 99
         mock_create.return_value = fake
-        # 0 命中（Phase 5 §5.0：tuple 解构）
+        # 0 命中（Phase 5 §5.0/5.2：tuple 解构 + outcome 数值字段真实）
+        from app.schemas.search import SearchOutcome as _SO
         mock_search.return_value = (
             search_service.SearchResult(
                 reply_text=search_service.NO_WORKER_MATCH_REPLY,
                 result_count=0, has_more=False,
             ),
-            MagicMock(),
+            _SO(direction="search_worker", criteria_used={}, initial_count=0,
+                final_count=0, desired_count=3, low_recall_threshold=3),
         )
         ctx = _ctx("factory")
         session = SessionState(role="factory", active_flow="idle")
@@ -670,12 +677,14 @@ class TestUploadAndSearchPaths:
                 created_at=datetime.now(timezone.utc).isoformat(),
                 expires_at=_future_iso(),
             )
-            # Phase 5 §5.0：tuple[SearchResult, SearchOutcome]
+            # Phase 5 §5.0/5.2：tuple[SearchResult, SearchOutcome]
+            from app.schemas.search import SearchOutcome as _SO
             return (
                 search_service.SearchResult(
                     reply_text="为您找到 2 位求职者", result_count=2, has_more=False,
                 ),
-                MagicMock(),
+                _SO(direction="search_worker", criteria_used={}, initial_count=999,
+                    final_count=2, desired_count=3, low_recall_threshold=3),
             )
         mock_search.side_effect = _populate
 
@@ -1082,12 +1091,14 @@ class TestUploadConflictKeywordPrecedence:
     @patch("app.services.message_router.search_service.search_workers")
     def test_continue_kanken_goes_to_proceed(self, mock_search):
         """'继续看看' — 含 proceed 关键词"看看"，应执行 pending_interruption。"""
-        # Phase 5 §5.0：tuple[SearchResult, SearchOutcome]
+        # Phase 5 §5.0/5.2：tuple[SearchResult, SearchOutcome]
+        from app.schemas.search import SearchOutcome as _SO
         mock_search.return_value = (
             search_service.SearchResult(
                 reply_text="为您找到 1 位求职者", result_count=1, has_more=False,
             ),
-            MagicMock(),
+            _SO(direction="search_worker", criteria_used={}, initial_count=999,
+                final_count=1, desired_count=3, low_recall_threshold=3),
         )
         def _populate(*args, **kw):
             args[2].candidate_snapshot = CandidateSnapshot(
@@ -1111,12 +1122,14 @@ class TestUploadConflictKeywordPrecedence:
     def test_cancel_prefix_with_proceed_keyword_goes_to_proceed(self, mock_search):
         """'算了，先找工人' — cancel 前缀 + proceed 关键词"先找"共存：proceed 优先；
         草稿在 proceed 路径里同样被清，但搜索意图被尊重。"""
-        # Phase 5 §5.0：tuple[SearchResult, SearchOutcome]
+        # Phase 5 §5.0/5.2：tuple[SearchResult, SearchOutcome]
+        from app.schemas.search import SearchOutcome as _SO
         mock_search.return_value = (
             search_service.SearchResult(
                 reply_text="为您找到 2 位求职者", result_count=2, has_more=False,
             ),
-            MagicMock(),
+            _SO(direction="search_worker", criteria_used={}, initial_count=999,
+                final_count=2, desired_count=3, low_recall_threshold=3),
         )
         def _populate(*args, **kw):
             args[2].candidate_snapshot = CandidateSnapshot(

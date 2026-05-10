@@ -152,14 +152,15 @@ class TestPaginateNoMore:
 
 
 class TestAskClarificationStub:
-    def test_renders_question_template(self):
+    def test_renders_question_directly(self):
+        # Phase 5.2：renderer 直接用 clarification.question（不再用模板包装）
+        # 因为 reducer 已经通过 slot_schema.relax_step_human_label 拼好了业务文案
         decision = PostSearchDecision(
             action="ask_clarification",
             clarification={"question": "要把薪资放宽 10% 重新搜索吗？"},
         )
         ctx = _make_ctx(decision=decision)
         replies = apply_post_search_decision(ctx)
-        assert "需要确认一下" in replies[0].content
         assert "要把薪资放宽 10% 重新搜索吗？" in replies[0].content
 
     def test_missing_question_falls_back_to_search_result(self):
@@ -182,10 +183,10 @@ class TestUnsupportedActionFallback:
     等本子阶段未实现的 action 时 applier fallback 到 no_action + 日志告警。"""
 
     @pytest.mark.parametrize("unsupported", [
+        # Phase 5.2 起 auto_relax_and_retry / suggest_relaxation 已真接通；
+        # 仅剩 show_results_with_soft_pref_notice / show_results 留给 5.4。
         "show_results_with_soft_pref_notice",
         "show_results",
-        "auto_relax_and_retry",
-        "suggest_relaxation",
     ])
     def test_unsupported_action_falls_back_to_no_action(self, unsupported, caplog):
         decision = PostSearchDecision(action=unsupported)

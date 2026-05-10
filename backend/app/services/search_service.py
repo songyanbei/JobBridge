@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from datetime import datetime, timezone
+from typing import Literal
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -838,6 +839,239 @@ def _run_resume_fallback_steps(
         applied_step=applied_step,
         suggestions=suggestions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 §5.2：放宽步骤探查 + 显式 step 二次检索
+# ---------------------------------------------------------------------------
+
+# 5.2 reducer 据此知道"哪些 step 还能放宽"；step 名与 _FALLBACK_NOTICE_* 对齐，
+# 避免再写一份内部常量。
+_RELAX_STEP_NAMES_JOB = ("relax_salary_10pct", "broaden_job_category", "drop_optional_filters")
+_RELAX_STEP_NAMES_RESUME = ("relax_salary_10pct", "broaden_job_category", "drop_optional_filters")
+
+
+def _compute_relaxed_criteria_job(original: dict, step: str) -> dict:
+    """phased-plan §5.2.1 第 4 项：按 step 名一次性算放宽后的 criteria。
+
+    与 _run_job_fallback_steps 内部分支语义一致；execute_relaxed_search 调本
+    helper 算一次，**不**让外部传入 relaxed_criteria（避免二次放宽风险）。
+    """
+    if step == "relax_salary_10pct":
+        salary = original.get("salary_floor_monthly")
+        if salary is None:
+            return dict(original)
+        out = dict(original)
+        out["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        return out
+    if step == "broaden_job_category":
+        broadened = _broaden_job_categories(original)
+        return broadened if broadened is not None else dict(original)
+    if step == "drop_optional_filters":
+        out = _strip_optional_filters(original, _OPTIONAL_HARD_FILTERS_JOB)
+        salary = original.get("salary_floor_monthly")
+        if salary is not None:
+            out["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        broadened = _broaden_job_categories(out)
+        if broadened is not None:
+            out = broadened
+        return out
+    return dict(original)
+
+
+def _compute_relaxed_criteria_resume(original: dict, step: str) -> dict:
+    """phased-plan §5.2.1 第 4 项：candidate_search 视角按 step 算放宽。"""
+    if step == "relax_salary_10pct":
+        salary = original.get("salary_ceiling_monthly")
+        if salary is None:
+            return dict(original)
+        out = dict(original)
+        out["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        return out
+    if step == "broaden_job_category":
+        broadened = _broaden_job_categories(original)
+        return broadened if broadened is not None else dict(original)
+    if step == "drop_optional_filters":
+        out = _strip_optional_filters(original, _OPTIONAL_HARD_FILTERS_RESUME)
+        salary = original.get("salary_ceiling_monthly")
+        if salary is not None:
+            out["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        broadened = _broaden_job_categories(out)
+        if broadened is not None:
+            out = broadened
+        return out
+    return dict(original)
+
+
+def _probe_relax_steps(
+    criteria: dict,
+    direction: str,
+    limit: int,
+    db: Session,
+) -> tuple[list[str], list[dict]]:
+    """phased-plan §5.2.3 search_service 行：探查每步放宽下的候选数。
+
+    返回 ``(available_step_names, probe_results)``：
+    - available_step_names：仍然适用的 step 名（如 salary 字段为 None 时
+      ``relax_salary_10pct`` 不进入）；
+    - probe_results：``[{"step": ..., "count": ...}, ...]`` 给 reducer 决策参考。
+
+    注意：本函数会跑 SQL，但只在低召回 / 0 召回时才被调用，且 limit 小（max_candidates）。
+    """
+    if direction == "search_job":
+        all_steps = _RELAX_STEP_NAMES_JOB
+        compute = _compute_relaxed_criteria_job
+        query_fn = _query_jobs
+    else:
+        all_steps = _RELAX_STEP_NAMES_RESUME
+        compute = _compute_relaxed_criteria_resume
+        query_fn = _query_resumes
+
+    available: list[str] = []
+    probes: list[dict] = []
+    for step in all_steps:
+        relaxed = compute(criteria, step)
+        if relaxed == criteria:
+            # 该 step 不会改变 criteria（如薪资字段缺失 → relax_salary_10pct 无效）
+            continue
+        candidates = query_fn(relaxed, limit, db)
+        available.append(step)
+        probes.append({"step": step, "count": len(candidates)})
+    return available, probes
+
+
+def execute_relaxed_search(
+    original_criteria: dict,
+    step: str,
+    *,
+    direction: Literal["search_job", "search_worker"],
+    raw_query: str,
+    session: SessionState,
+    user_ctx: UserContext,
+    db: Session,
+    user_msg_id: str | None = None,
+) -> tuple[SearchResult, SearchOutcome]:
+    """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
+
+    第一参数 **必须** 是 original_criteria（未放宽），由本函数内部按 step
+    **一次性** 计算放宽 criteria。**不允许** 调用方传 relaxed_criteria（会
+    导致二次放宽，详见 phased-plan §5.2.4 验收 #6 grep 守护）。
+
+    内部链路与 search_jobs/search_workers 一致：硬过滤 → reranker → 快照 →
+    权限过滤 → 文案渲染。**不再走** ``_run_*_fallback_steps`` 级联（reducer
+    第二轮已由 recursion_depth=1 守护，不允许再次输出 auto_relax_and_retry）。
+    """
+    if direction == "search_job":
+        relaxed = _compute_relaxed_criteria_job(original_criteria, step)
+    else:
+        relaxed = _compute_relaxed_criteria_resume(original_criteria, step)
+
+    top_n = _get_config_int("match.top_n", db, 3)
+    max_candidates = _get_config_int("match.max_candidates", db, 50)
+
+    if direction == "search_job":
+        candidates = _query_jobs(relaxed, max_candidates, db)
+    else:
+        candidates = _query_resumes(relaxed, max_candidates, db)
+    initial_count = len(candidates)
+
+    if not candidates:
+        # 二次检索仍然 0 命中（极少；用户已经接受放宽了，不再继续放宽）
+        notice_table = (
+            _FALLBACK_NOTICE_JOB if direction == "search_job"
+            else _FALLBACK_NOTICE_RESUME
+        )
+        notice = notice_table.get(step, "")
+        no_match_reply = (
+            NO_JOB_MATCH_REPLY if direction == "search_job"
+            else NO_WORKER_MATCH_REPLY
+        )
+        reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
+        sr = SearchResult(reply_text=reply, result_count=0)
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=relaxed,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=step,
+        )
+        return sr, so
+
+    if direction == "search_job":
+        candidate_dicts = _jobs_to_dicts(candidates, db)
+    else:
+        candidate_dicts = _resumes_to_dicts(candidates)
+
+    rerank_result = _rerank_with_logging(
+        query=raw_query,
+        candidates=candidate_dicts,
+        role=user_ctx.role,
+        top_n=top_n,
+        call_site=f"execute_relaxed_search:{direction}",
+        user_msg_id=user_msg_id,
+    )
+    ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    ranked_id_set = set(ranked_ids)
+    for c in candidate_dicts:
+        cid = str(c["id"])
+        if cid not in ranked_id_set:
+            ranked_ids.append(cid)
+
+    digest = conversation_service.compute_query_digest(relaxed)
+    conversation_service.save_snapshot(session, ranked_ids, digest)
+
+    first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
+    if not first_batch_ids:
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=relaxed,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=step,
+        )
+        return sr, so
+
+    id_to_dict = {str(c["id"]): c for c in candidate_dicts}
+    batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
+
+    if direction == "search_job":
+        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+    else:
+        owner_ids = list({r.get("owner_userid", "") for r in batch})
+        users_map = _build_users_map(owner_ids, db)
+        filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+
+    shown_ids = [str(r["id"]) for r in batch]
+    conversation_service.record_shown(session, shown_ids)
+
+    remaining = conversation_service.get_remaining_count(session)
+    if direction == "search_job":
+        reply = _format_job_results(filtered, remaining)
+        notice = _FALLBACK_NOTICE_JOB.get(step)
+    else:
+        reply = _format_resume_results(filtered, remaining)
+        notice = _FALLBACK_NOTICE_RESUME.get(step)
+    if notice:
+        reply = f"{notice}\n\n{reply}"
+
+    sr = SearchResult(
+        reply_text=reply,
+        has_more=remaining > 0,
+        result_count=len(filtered),
+    )
+    so = _build_search_outcome(
+        direction=direction,
+        criteria_used=relaxed,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        applied_relax_step=step,
+        has_more=remaining > 0,
+    )
+    return sr, so
 
 
 def _probe_job_suggestions(

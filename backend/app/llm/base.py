@@ -65,6 +65,10 @@ class DialogueParseResult(BaseModel):
         "cancel",
         "reset",
         "resolve_conflict",
+        # Phase 5 §5.2：放宽确认（独立于 resolve_conflict，后者仅用于
+        # upload_conflict 上下文）。系统上一轮反问"要把 X 放宽吗"且
+        # session.pending_relaxation 非空时，本轮用户回应解析为该 act。
+        "respond_relaxation_offer",
         "chitchat",
     ] = Field(..., description="本轮对话行为")
     frame_hint: Literal[
@@ -92,6 +96,12 @@ class DialogueParseResult(BaseModel):
     ] | None = Field(
         default=None,
         description="仅 dialogue_act=resolve_conflict 时出现",
+    )
+    # Phase 5 §5.2：放宽确认场景的用户响应（accept/reject）。与 conflict_action
+    # **独立**——前者属于 upload_conflict 流程，后者属于搜索放宽流程。
+    relaxation_response: Literal["accept", "reject"] | None = Field(
+        default=None,
+        description="仅 dialogue_act=respond_relaxation_offer 时出现",
     )
     raw_response: str = Field(default="", description="LLM 原始输出（调试 & 日志用）")
     input_tokens: int | None = Field(default=None, description="prompt_tokens")

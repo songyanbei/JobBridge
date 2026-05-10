@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from app.config import settings
 from app.schemas.conversation import SessionState
 from app.schemas.search import SearchOutcome, SearchResult
 
@@ -135,8 +136,13 @@ def post_search_reduce(
     if decision_phase5_1 is not None:
         return decision_phase5_1
 
-    # 5.2/5.3/5.4 接通点位（本子阶段不输出对应 action）。
-    return PostSearchDecision(action="no_action", reasoning="phase 5.1 default")
+    # 5.2：低召回 / 0 结果策略（initial_count < low_recall_threshold）。
+    decision_phase5_2 = _decide_zero_result(parse_result, decision, session, search_outcome)
+    if decision_phase5_2 is not None:
+        return decision_phase5_2
+
+    # 5.3/5.4 接通点位（本子阶段不输出对应 action）。
+    return PostSearchDecision(action="no_action", reasoning="phase 5.2 default")
 
 
 # ---------------------------------------------------------------------------
@@ -173,3 +179,121 @@ def _decide_paginate_no_more(
         suggested_directions=directions,
         reasoning=f"snapshot_exhausted; {len(directions)} relaxation direction(s)",
     )
+
+
+# 5.2 决策表只读取以下信号：
+# - 当前 turn accepted_slots_delta（来自 decision.accepted_slots_delta）
+# - session.awaiting_fields（仍在补槽 → 不放宽）
+# - parse_result.confidence（< low_confidence_threshold → suggest_relaxation）
+# - search_outcome.available_relax_steps（search_service 探查结果）
+#
+# **禁止**读取任何"历史 turn 的 dialogue_act 记忆"，phased-plan §5.2.4 验收 #9
+# 用 grep 守护这条约束。
+
+# search_service relax step 名 → 它会覆盖的 criteria 字段（用于"用户刚断言的字段
+# 不要悄悄被覆盖"判定）。
+_RELAX_STEP_TARGETS_JOB = {
+    "relax_salary_10pct": frozenset({"salary_floor_monthly"}),
+    "broaden_job_category": frozenset({"job_category"}),
+    "drop_optional_filters": frozenset({"gender_required", "is_long_term", "age"}),
+}
+_RELAX_STEP_TARGETS_RESUME = {
+    "relax_salary_10pct": frozenset({"salary_ceiling_monthly"}),
+    "broaden_job_category": frozenset({"job_category"}),
+    "drop_optional_filters": frozenset({"gender", "age"}),
+}
+
+
+def _decide_zero_result(
+    parse_result: "DialogueParseResult",
+    decision: "DialogueDecision",
+    session: SessionState,
+    outcome: SearchOutcome,
+) -> PostSearchDecision | None:
+    """phased-plan §5.2.1：低召回 / 0 结果策略决策表。
+
+    触发条件：``initial_count < low_recall_threshold``（覆盖 0 结果与 1~2 条
+    低召回，与 search_service.py:193 的 ``len(candidates) < top_n`` 行为一致）。
+
+    决策优先级（与 phased-plan §5.2.1 第 2 项对齐）：
+    1. 用户处于 awaiting_fields 中（仍在补槽）→ 返回 ``no_action`` 让用户先补齐
+    2. 当前 turn 的 confidence < low_confidence_threshold → ``suggest_relaxation``
+    3. 当前 turn accepted_slots_delta 触碰 relax 目标字段 → ``ask_clarification``
+       反问（不悄悄覆盖用户刚断言的值）
+    4. 默认 → ``auto_relax_and_retry`` 选第一个 available_relax_step
+    5. 没有任何可用 step → ``no_action``（让 search_service 默认 fallback 接管，
+       phased-plan §5.2.4 验收 #2 的"默认行为分支逐字节等价当前"）
+    """
+    if outcome.initial_count >= outcome.low_recall_threshold:
+        return None
+
+    # 规则 1：仍在补槽 → 不放宽
+    if session.awaiting_fields:
+        return PostSearchDecision(
+            action="no_action",
+            reasoning="user still in awaiting_fields; do not auto-relax",
+        )
+
+    # 规则 2：低置信度 → 给方向但不自动放宽
+    threshold = settings.low_confidence_threshold
+    if parse_result.confidence < threshold:
+        return PostSearchDecision(
+            action="suggest_relaxation",
+            suggested_directions=_relax_steps_to_directions(outcome),
+            reasoning=f"confidence {parse_result.confidence:.2f} < threshold {threshold}",
+        )
+
+    available = list(outcome.available_relax_steps or [])
+    if not available:
+        # 没有可用放宽方向：让 search_service 默认 fallback 接管（不输出非 no_action
+        # 决策，phased-plan §失败模式表）。
+        return PostSearchDecision(
+            action="no_action",
+            reasoning="no available relax steps; let legacy fallback handle",
+        )
+
+    # 规则 3：当前 turn slots_delta 触碰目标字段 → 反问
+    delta_keys = set((decision.accepted_slots_delta or {}).keys())
+    targets_table = (
+        _RELAX_STEP_TARGETS_JOB if outcome.direction == "search_job"
+        else _RELAX_STEP_TARGETS_RESUME
+    )
+    chosen_step = available[0]  # 默认采纳第一个可用 step
+    targets = targets_table.get(chosen_step, frozenset())
+    if delta_keys & targets:
+        # 用户刚断言了 relax 目标字段，不悄悄覆盖；反问让用户主动同意。
+        from app.dialogue import slot_schema
+        human_label = slot_schema.relax_step_human_label(chosen_step)
+        return PostSearchDecision(
+            action="ask_clarification",
+            relax_step=chosen_step,
+            clarification={
+                "kind": "relaxation_offer",
+                "question": f"原条件没找到匹配，要{human_label}重新搜索吗？",
+                "step": chosen_step,
+            },
+            reasoning=(
+                f"current turn slots_delta touched {sorted(delta_keys & targets)}; "
+                f"asking confirmation before applying step={chosen_step}"
+            ),
+        )
+
+    # 规则 4：默认自动放宽（与现有 _run_*_fallback_steps 第一步等价）
+    return PostSearchDecision(
+        action="auto_relax_and_retry",
+        relax_step=chosen_step,
+        reasoning=f"default auto-relax; step={chosen_step}",
+    )
+
+
+def _relax_steps_to_directions(outcome: SearchOutcome) -> list[dict]:
+    """把 available_relax_steps 转成 suggested_directions（同 paginate 结构）。"""
+    from app.dialogue import slot_schema
+    return [
+        {
+            "dimension": step,
+            "hint_text": slot_schema.relax_step_human_label(step),
+            "target_field": step,
+        }
+        for step in (outcome.available_relax_steps or [])
+    ]

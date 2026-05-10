@@ -90,22 +90,26 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
+        ov = self.current_search_outcome_overrides or {}
         return (
             SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
             SimpleNamespace(
                 direction="search_job",
                 criteria_used=dict(criteria),
-                initial_count=1,
-                final_count=1,
+                # Phase 5 §5.2：默认 initial_count=999 跳过 _run_search 的低召回 probe
+                # （probe 会跑真实 SQL，spy 上下文不能跑）。需要测低召回的 case
+                # 由 turn 级 mock_search_outcome 入口注入。
+                initial_count=int(ov.get("initial_count", 999)),
+                final_count=int(ov.get("final_count", 1)),
                 desired_count=3,
-                low_recall_threshold=3,
+                low_recall_threshold=int(ov.get("low_recall_threshold", 3)),
                 applied_relax_step=None,
                 fallback_suggestions=[],
-                soft_pref_hits={},
+                soft_pref_hits=dict(ov.get("soft_pref_hits", {}) or {}),
                 has_more=False,
-                snapshot_exhausted=False,
-                available_relax_steps=[],
-                relax_probe_results=[],
+                snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
+                available_relax_steps=list(ov.get("available_relax_steps", []) or []),
+                relax_probe_results=list(ov.get("relax_probe_results", []) or []),
             ),
         )
 
@@ -118,22 +122,23 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
+        ov = self.current_search_outcome_overrides or {}
         return (
             SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
             SimpleNamespace(
                 direction="search_worker",
                 criteria_used=dict(criteria),
-                initial_count=1,
-                final_count=1,
+                initial_count=int(ov.get("initial_count", 999)),
+                final_count=int(ov.get("final_count", 1)),
                 desired_count=3,
-                low_recall_threshold=3,
+                low_recall_threshold=int(ov.get("low_recall_threshold", 3)),
                 applied_relax_step=None,
                 fallback_suggestions=[],
-                soft_pref_hits={},
+                soft_pref_hits=dict(ov.get("soft_pref_hits", {}) or {}),
                 has_more=False,
-                snapshot_exhausted=False,
-                available_relax_steps=[],
-                relax_probe_results=[],
+                snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
+                available_relax_steps=list(ov.get("available_relax_steps", []) or []),
+                relax_probe_results=list(ov.get("relax_probe_results", []) or []),
             ),
         )
 
@@ -146,6 +151,15 @@ class _SearchCallSpy:
         "snapshot_exhausted": False,
         "reply_text": "[mock-show-more]",
     })
+    # Phase 5 §5.2：search outcome 注入位（每 turn 可覆盖默认 initial_count=999）
+    current_search_outcome_overrides: dict = field(default_factory=dict)
+    # Phase 5 §5.2：mock execute_relaxed_search 返回值
+    current_relaxed_search: dict = field(default_factory=lambda: {
+        "reply_text": "[mock-relaxed-result]",
+        "result_count": 1,
+        "applied_step": "relax_salary_10pct",
+    })
+    relaxed_search_calls: list[dict] = field(default_factory=list)
 
     def set_show_more(self, payload: dict | None) -> None:
         if not payload:
@@ -155,6 +169,67 @@ class _SearchCallSpy:
             "snapshot_exhausted": bool(payload.get("snapshot_exhausted", False)),
             "reply_text": payload.get("reply_text", "[mock-show-more]"),
         }
+
+    def set_search_outcome(self, payload: dict | None) -> None:
+        """Phase 5 §5.2：覆盖 fake_search_jobs/fake_search_workers 返回的 SearchOutcome
+        字段，让 case 模拟低召回 / 0 结果 / 软偏好命中等场景。"""
+        self.current_search_outcome_overrides = dict(payload or {})
+
+    def set_relaxed_search(self, payload: dict | None) -> None:
+        """Phase 5 §5.2：覆盖 fake_execute_relaxed_search 返回值。"""
+        if not payload:
+            return
+        self.current_relaxed_search = {
+            "reply_text": payload.get("reply_text", "[mock-relaxed-result]"),
+            "result_count": int(payload.get("result_count", 1)),
+            "applied_step": payload.get("applied_step", "relax_salary_10pct"),
+        }
+
+    def fake_execute_relaxed_search(
+        self, original_criteria, step, *,
+        direction, raw_query, session, user_ctx, db, user_msg_id=None,
+    ):
+        """Mock execute_relaxed_search；记录调用细节供断言使用。
+
+        放宽后默认 initial_count=999 跳过二次 reducer 的低召回判定（避免无限套娃）；
+        如需测二次仍 0 召回的兜底，case 显式指定 mock_relaxed_search.result_count=0。
+        """
+        from types import SimpleNamespace
+        self.relaxed_search_calls.append({
+            "original_criteria": dict(original_criteria),
+            "step": step,
+            "direction": direction,
+            "raw_query": raw_query,
+            "user_msg_id": user_msg_id,
+        })
+        cfg = self.current_relaxed_search
+        result_count = cfg["result_count"]
+        # 放宽后 outcome.initial_count 默认设大于 threshold，保证二次 reducer 进
+        # _decide_zero_result 后命中"initial_count >= threshold"返回 None，
+        # 后续 reducer 默认输出 no_action，applier 直出放宽结果文案。
+        outcome_initial = max(result_count, 999) if result_count > 0 else 0
+        return (
+            SimpleNamespace(
+                reply_text=cfg["reply_text"],
+                has_more=False,
+                result_count=result_count,
+            ),
+            SimpleNamespace(
+                direction=direction,
+                criteria_used=dict(original_criteria),
+                initial_count=outcome_initial,
+                final_count=result_count,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=cfg["applied_step"],
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=False,
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
 
     def fake_show_more(self, session, user_ctx, db, **_kw):
         from types import SimpleNamespace
@@ -262,6 +337,9 @@ def run_dialogue_case(case: dict) -> dict:
                 mocks["set_mock_v2"](turn.get("mock_v2"))
                 mocks["set_mock_search"](turn.get("mock_search"))
                 mocks["set_mock_show_more"](turn.get("mock_show_more"))
+                # Phase 5 §5.2：注入 SearchOutcome 字段覆盖 + execute_relaxed_search mock
+                mocks["set_mock_search_outcome"](turn.get("mock_search_outcome"))
+                mocks["set_mock_relaxed_search"](turn.get("mock_relaxed_search"))
                 # turn 级别覆盖（不写则继承 case，case 不写则保持原 settings）
                 turn_mode = (turn.get("v2_mode") or case_mode or "off").strip()
                 _settings.dialogue_v2_mode = turn_mode
@@ -395,6 +473,12 @@ def _golden_mocks(
     def set_mock_show_more(payload):
         spy.set_show_more(payload)
 
+    def set_mock_search_outcome(payload):
+        spy.set_search_outcome(payload)
+
+    def set_mock_relaxed_search(payload):
+        spy.set_relaxed_search(payload)
+
     def _legacy_intent_result(text, role):
         # Phase 1 worker 搜索护栏要在这里也跑 sanitize（与生产路径对齐）
         from app.services.intent_service import _sanitize_intent_result
@@ -523,6 +607,9 @@ def _golden_mocks(
     _swap(message_router.search_service, "search_workers", spy.fake_search_workers)
     # Phase 5 §5.1：mock show_more 让 case 模拟翻完场景
     _swap(message_router.search_service, "show_more", spy.fake_show_more)
+    # Phase 5 §5.2：mock execute_relaxed_search 让 case 模拟用户接受放宽后的二次检索
+    _swap(message_router.search_service, "execute_relaxed_search",
+          spy.fake_execute_relaxed_search)
     _swap(message_router.search_service, "has_effective_search_criteria",
           lambda criteria: True)
     _swap(message_router, "_handle_follow_up",
@@ -539,6 +626,8 @@ def _golden_mocks(
             "set_mock_v2": set_mock_v2,
             "set_mock_search": set_mock_search,
             "set_mock_show_more": set_mock_show_more,
+            "set_mock_search_outcome": set_mock_search_outcome,
+            "set_mock_relaxed_search": set_mock_relaxed_search,
             "mark_handler": mark_handler,
         }
     finally:

@@ -388,3 +388,206 @@ class TestPaginateNoMoreDecision:
         d = self._reduce_with_session(s)
         assert d.action == "paginate_no_more"
         assert d.suggested_directions == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.2：低召回 / 0 结果决策表（_decide_zero_result）
+# ---------------------------------------------------------------------------
+
+
+def _make_decision_with_delta(slots_delta: dict | None = None) -> DialogueDecision:
+    return DialogueDecision(
+        dialogue_act="modify_search",
+        resolved_frame="job_search",
+        accepted_slots_delta=slots_delta or {},
+        route_intent="follow_up",
+    )
+
+
+def _make_low_recall_outcome(
+    *,
+    initial_count: int = 0,
+    available_steps: list[str] | None = None,
+    direction: str = "search_job",
+) -> SearchOutcome:
+    # 注意：available_steps=[] 时**保留空列表**（不走默认）；只有 None 才走默认值
+    if available_steps is None:
+        available_steps = ["relax_salary_10pct", "broaden_job_category"]
+    return SearchOutcome(
+        direction=direction,
+        criteria_used={"city": ["北京市"], "job_category": ["餐饮"]},
+        initial_count=initial_count,
+        final_count=initial_count,
+        desired_count=3,
+        low_recall_threshold=3,
+        available_relax_steps=available_steps,
+    )
+
+
+class TestDecideZeroResult:
+    """phased-plan §5.2.4 验收 #1：每条规则 ≥ 2 条单测；冲突优先级显式断言。"""
+
+    def test_default_auto_relax_when_low_recall(self):
+        """默认行为分支：低召回（initial_count<top_n）+ 高置信度 +
+        无 awaiting + 无 slots_delta 触碰 → auto_relax_and_retry 选第一个 step。"""
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="start_search", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(initial_count=1),
+            role="worker",
+        )
+        assert d.action == "auto_relax_and_retry"
+        assert d.relax_step == "relax_salary_10pct"
+
+    def test_default_auto_relax_zero_count(self):
+        """0 召回也走 auto_relax_and_retry（与低召回 1/2 等价处理）。"""
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="start_search", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(initial_count=0),
+            role="worker",
+        )
+        assert d.action == "auto_relax_and_retry"
+
+    def test_no_action_when_initial_count_meets_threshold(self):
+        """命中数 ≥ low_recall_threshold 不进决策表。"""
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="start_search", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(initial_count=5),
+            role="worker",
+        )
+        assert d.action == "no_action"
+
+    def test_awaiting_fields_blocks_auto_relax(self):
+        """规则 1：用户仍在补槽时不放宽。"""
+        s = _make_session()
+        s.awaiting_fields = ["job_category"]
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="answer_missing_slot", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=s,
+            search_outcome=_make_low_recall_outcome(initial_count=0),
+            role="worker",
+        )
+        assert d.action == "no_action"
+        assert "awaiting" in d.reasoning
+
+    def test_low_confidence_triggers_suggest_relaxation(self):
+        """规则 2：confidence < threshold → suggest_relaxation 不放宽。"""
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="start_search", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.3,  # 低置信度
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(initial_count=0),
+            role="worker",
+        )
+        assert d.action == "suggest_relaxation"
+        # directions 应来自 available_relax_steps
+        dims = [item["dimension"] for item in d.suggested_directions]
+        assert "relax_salary_10pct" in dims
+
+    def test_current_turn_slots_delta_touched_triggers_clarification(self):
+        """规则 3：当前 turn slots_delta 触碰 relax 目标字段 → ask_clarification。"""
+        # 用户当前 turn 刚断言了 salary_floor_monthly=5000
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="modify_search", frame_hint="job_search",
+                slots_delta={"salary_floor_monthly": 5000}, merge_hint={},
+                needs_clarification=False, confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({"salary_floor_monthly": 5000}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(
+                initial_count=0,
+                available_steps=["relax_salary_10pct"],
+            ),
+            role="worker",
+        )
+        assert d.action == "ask_clarification"
+        assert d.relax_step == "relax_salary_10pct"
+        assert d.clarification is not None
+        assert d.clarification["kind"] == "relaxation_offer"
+
+    def test_no_available_steps_returns_no_action(self):
+        """没有可用 relax step → no_action 让 search_service 默认 fallback 接管。"""
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="start_search", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(
+                initial_count=0,
+                available_steps=[],  # 没有可放宽方向
+            ),
+            role="worker",
+        )
+        assert d.action == "no_action"
+
+    def test_priority_awaiting_beats_low_confidence(self):
+        """冲突优先级：awaiting 优先于低置信度（先 return）"""
+        s = _make_session()
+        s.awaiting_fields = ["job_category"]
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="answer_missing_slot", frame_hint="job_search",
+                slots_delta={}, merge_hint={}, needs_clarification=False,
+                confidence=0.2,  # 也低置信度
+            ),
+            decision=_make_decision_with_delta({}),
+            session=s,
+            search_outcome=_make_low_recall_outcome(initial_count=0),
+            role="worker",
+        )
+        # awaiting 规则先命中
+        assert d.action == "no_action"
+        assert "awaiting" in d.reasoning
+
+    def test_no_history_dialogue_act_dependency(self):
+        """phased-plan §5.2.4 验收 #9 grep 守护：reducer 不读取历史 dialogue_act。
+
+        即使 parse_result.dialogue_act 与"放宽相关"无关（比如 chitchat），
+        decide_zero_result 也只看当前 turn 的 slots_delta + confidence + awaiting。
+        """
+        d = post_search_reduce(
+            parse_result=DialogueParseResult(
+                dialogue_act="chitchat",  # 与放宽无关
+                frame_hint="none",
+                slots_delta={},
+                merge_hint={},
+                needs_clarification=False,
+                confidence=0.9,
+            ),
+            decision=_make_decision_with_delta({}),
+            session=_make_session(),
+            search_outcome=_make_low_recall_outcome(initial_count=0),
+            role="worker",
+        )
+        # 仍然按现有信号决策（默认 auto_relax_and_retry）
+        assert d.action == "auto_relax_and_retry"

@@ -14,7 +14,11 @@ import pytest
 
 from tests.fixtures.dialogue_golden import (
     broker_show_more_exhausted_paginate,
+    worker_relaxation_offer_accept,
+    worker_relaxation_offer_reject,
     worker_show_more_exhausted_paginate,
+    worker_zero_result_auto_relax,
+    worker_zero_result_no_relax_steps,
 )
 from tests.fixtures.dialogue_golden.runner import (
     assert_turn,
@@ -25,8 +29,14 @@ from tests.fixtures.dialogue_golden.runner import (
 @pytest.mark.parametrize(
     "case",
     [
+        # 5.1 paginate_no_more
         worker_show_more_exhausted_paginate.CASE,
         broker_show_more_exhausted_paginate.CASE,
+        # 5.2 0/低召回策略
+        worker_zero_result_auto_relax.CASE,
+        worker_zero_result_no_relax_steps.CASE,
+        worker_relaxation_offer_accept.CASE,
+        worker_relaxation_offer_reject.CASE,
     ],
     ids=lambda c: c["id"],
 )

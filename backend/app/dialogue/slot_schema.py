@@ -893,6 +893,22 @@ def render_clarification(
 # ---------------------------------------------------------------------------
 
 
+_RELAX_STEP_HUMAN_LABEL = {
+    "relax_salary_10pct": "把薪资放宽 10%",
+    "broaden_job_category": "放宽工种范围",
+    "drop_optional_filters": "去掉部分次要条件",
+}
+
+
+def relax_step_human_label(step: str) -> str:
+    """Phase 5 §5.2.3 slot_schema 行：把内部 step 名映射为业务文案。
+
+    供 reducer 渲染 ask_clarification 反问时复用，避免向用户暴露
+    fallback 内部步骤名（phased-plan §5.2.2 边界）。
+    """
+    return _RELAX_STEP_HUMAN_LABEL.get(step, step)
+
+
 def relaxation_directions(
     criteria: dict | None,
     frame: str = "job_search",

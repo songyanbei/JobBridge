@@ -232,17 +232,21 @@ class TestSearchAwaitingFlow:
             lambda *a, **k: None,
         )
         # 阻断真正 SQL 检索
-        # Phase 5 §5.0：search_jobs / search_workers 现返回 tuple[SearchResult, SearchOutcome]
+        # Phase 5 §5.0/5.2：search_jobs / search_workers 现返回 tuple[SearchResult, SearchOutcome]；
+        # outcome 数值字段必须真实（_run_search 会比较 initial_count < low_recall_threshold）
+        from app.schemas.search import SearchOutcome as _SO
         sj = MagicMock(return_value=(
             SimpleNamespace(reply_text="[mock]", has_more=False, result_count=1),
-            SimpleNamespace(),
+            _SO(direction="search_job", criteria_used={}, initial_count=999,
+                final_count=1, desired_count=3, low_recall_threshold=3),
         ))
         monkeypatch.setattr(
             message_router.search_service, "search_jobs", sj,
         )
         sw = MagicMock(return_value=(
             SimpleNamespace(reply_text="[mock]", has_more=False, result_count=1),
-            SimpleNamespace(),
+            _SO(direction="search_worker", criteria_used={}, initial_count=999,
+                final_count=1, desired_count=3, low_recall_threshold=3),
         ))
         monkeypatch.setattr(
             message_router.search_service, "search_workers", sw,

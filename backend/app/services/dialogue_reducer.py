@@ -87,6 +87,14 @@ class DialogueDecision(BaseModel):
         "clear_pending_upload",
         "resume_upload_collecting",
         "apply_pending_interruption",
+        # Phase 5 §5.2：放宽确认状态机
+        # apply_relaxation / cancel_relaxation 不在 dialogue_applier 处理（拿不到 db），
+        # 由 message_router._route_v2_relaxation_response 接管；apply_decision 仅显式
+        # no-op 不告警，避免误调时干扰日志。
+        "apply_relaxation",
+        "cancel_relaxation",
+        # clear_pending_relaxation 在 dialogue_applier 处理（仅 session 写入）
+        "clear_pending_relaxation",
     ] = "none"
     pending_interruption: dict | None = None
     awaiting_ops: list[dict] = Field(default_factory=list)
@@ -346,6 +354,11 @@ def reduce(
     if act == "resolve_conflict":
         return _reduce_resolve_conflict(parse_result, session)
 
+    # 1.bis) Phase 5 §5.2：respond_relaxation_offer 路径（与 resolve_conflict 平行
+    # 但完全独立——upload_conflict 流程 vs 搜索放宽流程）
+    if act == "respond_relaxation_offer":
+        return _reduce_respond_relaxation_offer(parse_result, session)
+
     # 2) frame_hint vs active_flow 冲突：upload_collecting → search → enter_upload_conflict
     if _is_upload_to_search_conflict(session.active_flow, frame_hint):
         # 先把本轮 LLM 抽到的字段过一遍 schema/normalize，作为 pending_interruption 携带
@@ -379,6 +392,48 @@ def reduce(
 
     # 4) start_upload / answer_missing_slot / start_search / modify_search 主路径
     return _reduce_main(parse_result, session, role, raw_text=raw_text)
+
+
+def _reduce_respond_relaxation_offer(
+    parse_result: DialogueParseResult, session: SessionState,
+) -> DialogueDecision:
+    """phased-plan §5.2.3 dialogue_reducer 行：把 respond_relaxation_offer +
+    relaxation_response 翻译为 state_transition。
+
+    防御 LLM 误判（pending_relaxation 为 None 时输出 respond_relaxation_offer）：
+    降级为 chitchat（phased-plan §5.2.3 test_dialogue_reducer 防御单测）。
+    """
+    if not session.pending_relaxation:
+        # 误判：reducer 不应让该 act 通过；降级为 chitchat 走通用路径。
+        logger.info(
+            "dialogue_v2_relaxation_no_context: respond_relaxation_offer "
+            "without pending_relaxation; downgrading to chitchat"
+        )
+        return DialogueDecision(
+            dialogue_act="chitchat",
+            resolved_frame="none",
+            accepted_slots_delta={},
+            final_search_criteria=dict(session.search_criteria or {}),
+            route_intent="chitchat",
+        )
+
+    response = parse_result.relaxation_response
+    if response == "accept":
+        transition = "apply_relaxation"
+    elif response == "reject":
+        transition = "cancel_relaxation"
+    else:
+        # 缺失或非法 → 降级为 chitchat（防御）
+        transition = "none"
+
+    return DialogueDecision(
+        dialogue_act="respond_relaxation_offer",
+        resolved_frame="none",
+        accepted_slots_delta={},
+        final_search_criteria=dict(session.search_criteria or {}),
+        route_intent="follow_up",
+        state_transition=transition,  # type: ignore[arg-type]
+    )
 
 
 def _reduce_resolve_conflict(
