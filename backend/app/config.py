@@ -68,6 +68,14 @@ class DialoguePolicy(BaseModel):
     on=按 PostSearchDecision.action 改写 reply / 触发 applier。
     5.0 子阶段默认 off，message_router 暂不消费；5.1 起接通。"""
 
+    soft_preference_ranking_enabled: bool = False
+    """Phase 5 §5.3：是否启用 reranker 软偏好排序。
+    False（默认）→ search_service 调 reranker 时不传 soft_preferences/ranking_weights，
+    严格走 v2.0 等价路径；
+    True → 抽取 criteria 中软偏好字段 + 权重表（slot_schema.extract_soft_preferences）
+    传给 reranker，走 v2.1 prompt。**5.3 默认关闭**：业务直觉权重未经真实日志验证；
+    生产灰度由独立运营开关推全（phased-plan §5.4）。"""
+
     @field_validator("v2_mode", mode="before")
     @classmethod
     def _coerce_v2_mode(cls, v):
@@ -293,6 +301,17 @@ class Settings(BaseSettings):
             update={
                 "post_search_policy_mode": DialoguePolicy._coerce_psm(value),
             },
+        )
+
+    @property
+    def soft_preference_ranking_enabled(self) -> bool:
+        """Phase 5 §5.3：reranker 软偏好排序开关。"""
+        return self.dialogue_policy.soft_preference_ranking_enabled
+
+    @soft_preference_ranking_enabled.setter
+    def soft_preference_ranking_enabled(self, value: bool) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"soft_preference_ranking_enabled": bool(value)},
         )
 
     @property

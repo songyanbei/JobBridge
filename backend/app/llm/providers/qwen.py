@@ -197,16 +197,28 @@ class QwenReranker(Reranker):
         soft_preferences: dict | None = None,
         ranking_weights: dict[str, float] | None = None,
     ) -> RerankResult:
-        # Phase 5 §5.0：soft_preferences / ranking_weights 接收形参但忽略，5.3 才消费。
-        del soft_preferences, ranking_weights
         system_prompt = RERANK_SYSTEM_PROMPT.format(
             role=role,
             top_n=top_n,
         )
-        user_prompt = RERANK_USER_TEMPLATE.format(
-            query=query,
-            candidates=format_candidates(candidates),
-        )
+        # Phase 5 §5.3：soft_preferences 非空时走 v2.1 prompt
+        if soft_preferences:
+            from app.llm.prompts import (
+                RERANK_USER_TEMPLATE_WITH_SOFT_PREF,
+                format_soft_preferences_block,
+            )
+            user_prompt = RERANK_USER_TEMPLATE_WITH_SOFT_PREF.format(
+                query=query,
+                candidates=format_candidates(candidates),
+                soft_preferences_block=format_soft_preferences_block(
+                    soft_preferences, ranking_weights,
+                ),
+            )
+        else:
+            user_prompt = RERANK_USER_TEMPLATE.format(
+                query=query,
+                candidates=format_candidates(candidates),
+            )
 
         payload = {
             "model": settings.llm_reranker_model,

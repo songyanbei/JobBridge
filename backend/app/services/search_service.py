@@ -89,6 +89,19 @@ _SUGGESTION_LABEL_RESUME = {
 _MAX_SUGGESTIONS = 3
 
 
+def _extract_soft_prefs_for_rerank(
+    criteria: dict, frame: str,
+) -> tuple[dict, dict[str, float]]:
+    """Phase 5 §5.3：受 settings.soft_preference_ranking_enabled 控制。
+    关闭时返回空 dict，等价 5.0/5.1/5.2 路径（不传 soft_preferences 给 reranker）。
+    开启时调 slot_schema.extract_soft_preferences。
+    """
+    if not settings.soft_preference_ranking_enabled:
+        return {}, {}
+    from app.dialogue import slot_schema
+    return slot_schema.extract_soft_preferences(criteria, frame=frame)
+
+
 def _rerank_with_logging(
     query: str,
     candidates: list[dict],
@@ -96,6 +109,8 @@ def _rerank_with_logging(
     top_n: int,
     call_site: str,
     user_msg_id: str | None = None,
+    soft_preferences: dict | None = None,
+    ranking_weights: dict[str, float] | None = None,
 ) -> RerankResult:
     """统一封装 reranker.rerank，附带 loguru 结构化打点。
 
@@ -109,12 +124,18 @@ def _rerank_with_logging(
     result: RerankResult | None = None
     parse_failed = False
     try:
-        result = reranker.rerank(
-            query=query,
-            candidates=candidates,
-            role=role,
-            top_n=top_n,
-        )
+        # Phase 5 §5.3：soft_preferences 非空时透传给 reranker（v2.1 prompt）；
+        # 为空时严格走 v2.0 路径。两条路径都通过 keyword-only 参数。
+        rerank_kwargs = {
+            "query": query,
+            "candidates": candidates,
+            "role": role,
+            "top_n": top_n,
+        }
+        if soft_preferences:
+            rerank_kwargs["soft_preferences"] = soft_preferences
+            rerank_kwargs["ranking_weights"] = ranking_weights
+        result = reranker.rerank(**rerank_kwargs)
     except LLMTimeout:
         status = "timeout"
         raise
@@ -262,6 +283,9 @@ def search_jobs(
     candidate_dicts = _jobs_to_dicts(candidates, db)
 
     # Reranker（含结构化打点）
+    # Phase 5 §5.3：soft_preference_ranking_enabled=True 时把 criteria 中的
+    # 软偏好字段 + ranking_weight 透传给 reranker，让其优先排序匹配软偏好的候选。
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "job_search")
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -269,6 +293,8 @@ def search_jobs(
         top_n=top_n,
         call_site="search_jobs",
         user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
@@ -388,6 +414,7 @@ def search_workers(
 
     candidate_dicts = _resumes_to_dicts(candidates)
 
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "candidate_search")
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -395,6 +422,8 @@ def search_workers(
         top_n=top_n,
         call_site="search_workers",
         user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
     )
 
     ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
@@ -1003,6 +1032,8 @@ def execute_relaxed_search(
     else:
         candidate_dicts = _resumes_to_dicts(candidates)
 
+    frame = "candidate_search" if direction == "search_worker" else "job_search"
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame)
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -1010,6 +1041,8 @@ def execute_relaxed_search(
         top_n=top_n,
         call_site=f"execute_relaxed_search:{direction}",
         user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
     )
     ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
     ranked_id_set = set(ranked_ids)

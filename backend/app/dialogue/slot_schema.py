@@ -900,6 +900,54 @@ _RELAX_STEP_HUMAN_LABEL = {
 }
 
 
+# Phase 5 §5.3：软偏好字段排序权重表。
+#
+# **TODO（phased-plan §5.3.4 验收 #6 / 用户决策"拍直觉值"）**：
+# 当前权重为业务直觉初值（蓝领招聘场景，包吃住对工人价值高于班次 / 学历要求）；
+# 待生产 shadow 期采集真实用户接受率后按"用户主动提及偏好后接受第几位候选"
+# 反推调整。在此之前 soft_preference_ranking_enabled 默认 False（5.3 不真灰度）。
+_SOFT_PREF_RANKING_WEIGHTS: dict[str, float] = {
+    # 高价值（蓝领工人最关心）
+    "provide_meal": 0.3,
+    "provide_housing": 0.3,
+    # 中等价值（生活/工作模式相关）
+    "shift_pattern": 0.2,
+    "dorm_condition": 0.2,
+    "work_hours": 0.15,
+    # 低价值（少数特殊场景）
+    "accept_couple": 0.1,
+    "accept_student": 0.1,
+    "accept_minority": 0.1,
+    "pay_type": 0.1,
+}
+
+
+def extract_soft_preferences(
+    criteria: dict | None,
+    frame: str = "job_search",
+) -> tuple[dict, dict[str, float]]:
+    """Phase 5 §5.3：从 criteria 抽出软偏好字段 + 对应 ranking_weight。
+
+    返回 ``(soft_preferences, ranking_weights)``：
+    - soft_preferences: 仅含本次 criteria 实际写入的软偏好字段（None 不计）
+    - ranking_weights: 对应字段的权重（来自 _SOFT_PREF_RANKING_WEIGHTS）
+
+    candidate_search frame 与 job_search 共享同一权重表（软偏好语义跨 frame
+    一致：包吃住 / 班次对找工人和找岗位都有意义）。
+    """
+    if not criteria:
+        return {}, {}
+    soft_prefs: dict = {}
+    weights: dict[str, float] = {}
+    for key, weight in _SOFT_PREF_RANKING_WEIGHTS.items():
+        v = criteria.get(key)
+        if v is None:
+            continue
+        soft_prefs[key] = v
+        weights[key] = weight
+    return soft_prefs, weights
+
+
 def relax_step_human_label(step: str) -> str:
     """Phase 5 §5.2.3 slot_schema 行：把内部 step 名映射为业务文案。
 

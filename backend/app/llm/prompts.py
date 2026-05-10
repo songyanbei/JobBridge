@@ -422,6 +422,9 @@ DIALOGUE_USER_TEMPLATE = """\
 # ---------------------------------------------------------------------------
 
 # v2.0 2026-04-13
+# v2.1 2026-05-10 (Phase 5 §5.3)：新增软偏好排序参数 soft_preferences /
+#                  ranking_weights，让 reranker 对 filter_mode=soft 字段命中
+#                  候选优先排序；硬过滤已保证基础匹配，软偏好仅影响顺序。
 # Token 预算: input < 4000 tokens, output < 1000 tokens
 RERANK_SYSTEM_PROMPT = """\
 你是一个蓝领招聘撮合平台的排序推荐助手。
@@ -458,12 +461,47 @@ RERANK_SYSTEM_PROMPT = """\
 {{"ranked_items": [{{"id": 101, "score": 0.95}}, {{"id": 203, "score": 0.82}}, {{"id": 157, "score": 0.71}}], "reply_text": "为您找到几个高匹配岗位，薪资和福利都符合您的要求。"}}
 """
 
+# Phase 5 §5.3：当 soft_preferences 非空时附加到 user prompt 末尾，作为
+# 排序提示。candidates 已通过硬过滤，soft_preferences 仅影响顺序。
+RERANK_USER_TEMPLATE_WITH_SOFT_PREF = """\
+用户查询: {query}
+
+候选列表:
+{candidates}
+
+## 用户软偏好（影响排序，不影响是否入选）
+{soft_preferences_block}
+排序时**优先把命中软偏好的候选项排前面**；软偏好命中越多，排序越靠前。
+所有候选都已通过硬过滤，软偏好仅决定 ranked_items 顺序。
+"""
+
 RERANK_USER_TEMPLATE = """\
 用户查询: {query}
 
 候选列表:
 {candidates}
 """
+
+
+def format_soft_preferences_block(
+    soft_preferences: dict | None,
+    ranking_weights: dict[str, float] | None,
+) -> str:
+    """Phase 5 §5.3：把 soft_preferences + ranking_weights 渲染为 prompt 段落。
+
+    输出格式（每个偏好一行）：
+        - provide_meal: True (权重 0.3)
+        - shift_pattern: 日班 (权重 0.2)
+    """
+    if not soft_preferences:
+        return ""
+    weights = ranking_weights or {}
+    lines: list[str] = []
+    for k, v in soft_preferences.items():
+        w = weights.get(k)
+        weight_str = f" (权重 {w})" if w is not None else ""
+        lines.append(f"- {k}: {v}{weight_str}")
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # 常量汇总（便于测试和外部引用）
@@ -500,7 +538,7 @@ INTENT_PROMPT_VERSION = "v2.8"
 # 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
 PROMPT_VERSION = INTENT_PROMPT_VERSION
 PROMPT_DATE = "2026-05-02"
-RERANK_PROMPT_VERSION = "v2.0"
+RERANK_PROMPT_VERSION = "v2.1"
 
 # 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。
 # 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。
