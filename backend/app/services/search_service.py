@@ -218,11 +218,15 @@ def _build_search_outcome(
     has_more: bool = False,
     snapshot_exhausted: bool = False,
     soft_pref_hits: dict[str, int] | None = None,
+    available_relax_steps: list[str] | None = None,
+    relax_probe_results: list[dict] | None = None,
 ) -> SearchOutcome:
     """构造 SearchOutcome；low_recall_threshold 默认等于 desired_count（top_n）。
 
     5.0 子阶段产出该结构但 reducer 默认 no_action，本字段不会被实际消费；
     5.1 起 reducer 才开始读取（见 phased-plan §5.0.1 第 3 项 / §5.2.1）；
+    5.2 起 available_relax_steps / relax_probe_results 由 search_jobs/workers 在
+    post_search_policy_mode=on 时填充（让 reducer 决定走哪个 relax 步骤）；
     5.4 起 soft_pref_hits 由 search_jobs/workers/execute_relaxed_search 真填充。
     """
     return SearchOutcome(
@@ -237,8 +241,8 @@ def _build_search_outcome(
         soft_pref_hits=dict(soft_pref_hits or {}),
         has_more=has_more,
         snapshot_exhausted=snapshot_exhausted,
-        available_relax_steps=[],  # 5.2 才填充
-        relax_probe_results=[],    # 5.2 才填充
+        available_relax_steps=list(available_relax_steps or []),
+        relax_probe_results=list(relax_probe_results or []),
     )
 
 
@@ -266,9 +270,24 @@ def search_jobs(
     candidates = _query_jobs(criteria, max_candidates, db)
     initial_count = len(candidates)
 
-    # Stage B（§3.4）：0 命中或低召回时按显式 fallback 步骤逐步放宽
-    # Bug 3：fallback 返回 FallbackOutcome，记录采纳步骤 + 0 召回时的建议方向
-    if len(candidates) < top_n:
+    # Phase 5 §5.2.1 第 1 项："search_service 不再自己决定是否采纳放宽结果"
+    # post_search_policy_mode=on 时跳过 _run_job_fallback_steps，由 reducer +
+    # post_search_applier 接管（initial_count 透传给 reducer 判定低召回；
+    # available_relax_steps 由 _probe_relax_steps 填）。
+    # off / shadow 模式保持旧行为（向后兼容验收 §5.2.4 第 2 项）。
+    phase5_takeover = (
+        settings.post_search_policy_mode == "on"
+        and len(candidates) < top_n
+    )
+    available_steps: list[str] = []
+    probe_results: list[dict] = []
+    if phase5_takeover:
+        outcome = FallbackOutcome(candidates=candidates)
+        available_steps, probe_results = _probe_relax_steps(
+            criteria, "search_job", max_candidates, db,
+        )
+    elif len(candidates) < top_n:
+        # 旧 Stage B fallback：0 命中或低召回时按显式 fallback 步骤逐步放宽
         outcome = _run_job_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
@@ -297,6 +316,8 @@ def search_jobs(
             desired_count=top_n,
             applied_relax_step=outcome.applied_step,
             fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
         return sr, so
 
@@ -343,6 +364,8 @@ def search_jobs(
             desired_count=top_n,
             applied_relax_step=outcome.applied_step,
             fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
         return sr, so
 
@@ -378,6 +401,8 @@ def search_jobs(
         initial_count=initial_count,
         final_count=len(candidates),
         desired_count=top_n,
+        available_relax_steps=available_steps,
+        relax_probe_results=probe_results,
         applied_relax_step=outcome.applied_step,
         fallback_suggestions=outcome.suggestions,
         has_more=remaining > 0,
@@ -404,7 +429,20 @@ def search_workers(
     candidates = _query_resumes(criteria, max_candidates, db)
     initial_count = len(candidates)
 
-    if len(candidates) < top_n:
+    # Phase 5 §5.2.1 第 1 项：post_search_policy_mode=on 时跳过 _run_*_fallback_steps
+    # 由 reducer + applier 接管放宽决策。off / shadow 保持旧行为。
+    phase5_takeover = (
+        settings.post_search_policy_mode == "on"
+        and len(candidates) < top_n
+    )
+    available_steps: list[str] = []
+    probe_results: list[dict] = []
+    if phase5_takeover:
+        outcome = FallbackOutcome(candidates=candidates)
+        available_steps, probe_results = _probe_relax_steps(
+            criteria, "search_worker", max_candidates, db,
+        )
+    elif len(candidates) < top_n:
         outcome = _run_resume_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
@@ -433,6 +471,8 @@ def search_workers(
             desired_count=top_n,
             applied_relax_step=outcome.applied_step,
             fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
         return sr, so
 
@@ -471,6 +511,8 @@ def search_workers(
             desired_count=top_n,
             applied_relax_step=outcome.applied_step,
             fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
         return sr, so
 
@@ -509,6 +551,8 @@ def search_workers(
         fallback_suggestions=outcome.suggestions,
         has_more=remaining > 0,
         soft_pref_hits=soft_pref_hits,
+        available_relax_steps=available_steps,
+        relax_probe_results=probe_results,
     )
     return sr, so
 

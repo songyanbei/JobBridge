@@ -331,6 +331,9 @@ def run_dialogue_case(case: dict) -> dict:
         original_policy = getattr(_settings, "ambiguous_city_query_policy", "clarify")
         original_threshold = getattr(_settings, "low_confidence_threshold", 0.6)
         original_psm = getattr(_settings, "post_search_policy_mode", "off")
+        original_phase5_rollout = (
+            _settings.dialogue_policy.phase5_rollout_percentage
+        )
         try:
             for idx, turn in enumerate(case["turns"]):
                 mocks["set_mock_llm"](turn["mock_llm"])
@@ -351,6 +354,15 @@ def run_dialogue_case(case: dict) -> dict:
                 turn_psm = (turn.get("post_search_policy_mode")
                             or case.get("post_search_policy_mode") or "off").strip()
                 _settings.post_search_policy_mode = turn_psm
+                # Phase 5 §5.4：phase5_rollout_percentage hash 桶；case 顶层可覆盖。
+                # 默认在 on 模式自动设为 100（让 golden case 100% 命中桶），off 模式
+                # 不影响（dispatch 不查 hash）。需要测桶未命中行为的 case 显式设 0。
+                turn_phase5_pct = case.get("phase5_rollout_percentage")
+                if turn_phase5_pct is None:
+                    turn_phase5_pct = 100 if turn_psm == "on" else 0
+                _settings.dialogue_policy = _settings.dialogue_policy.model_copy(
+                    update={"phase5_rollout_percentage": int(turn_phase5_pct)},
+                )
 
                 handler_marker = {"name": ""}
                 mocks["mark_handler"](handler_marker)
@@ -416,6 +428,9 @@ def run_dialogue_case(case: dict) -> dict:
             _settings.ambiguous_city_query_policy = original_policy
             _settings.low_confidence_threshold = original_threshold
             _settings.post_search_policy_mode = original_psm
+            _settings.dialogue_policy = _settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": int(original_phase5_rollout)},
+            )
 
     return {"turns": trace_turns, "session": session, "spy": spy}
 

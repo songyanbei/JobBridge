@@ -969,6 +969,10 @@ class DialogueRouteResult:
     intent_result: IntentResult
     decision: object | None  # DialogueDecision 类型，避免循环 import
     source: str
+    # Phase 5 §5.2：透传 LLM parse_result.confidence 给 _post_search_dispatch，
+    # 让 reducer 的低置信度规则在真实链路上能用真实 confidence。仅 v2_dual_read /
+    # v2_primary 路径填值；legacy / fallback 路径为 None。
+    parse_result: object | None = None  # DialogueParseResult 类型
 
 
 def _hash_to_bucket(userid: str, total_buckets: int = 100) -> int:
@@ -1036,6 +1040,21 @@ def _is_primary_rollout_target(userid: str, percentage: int) -> bool:
     return _hash_to_bucket(userid) < percentage
 
 
+def is_phase5_rollout_target(userid: str, percentage: int) -> bool:
+    """Phase 5 §5.4：post_search_policy_mode + soft_preference_ranking_enabled
+    联合灰度的 hash 桶命中判定。
+
+    复用 _hash_to_bucket（与 dual_read / primary 同款 md5(userid)%100）；同一
+    userid 在三个灰度维度上的 bucket 号一致，便于分析师交叉对比。userid 为空 /
+    percentage<=0 → 不命中（等价 phase 5 关闭）；percentage>=100 → 全量命中。
+    """
+    if not userid or percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+    return _hash_to_bucket(userid) < percentage
+
+
 def _classify_dialogue_v2(
     *,
     text: str,
@@ -1076,7 +1095,9 @@ def _classify_dialogue_v2(
         needs_clarification=bool(decision.clarification),
         confidence=parse.confidence,
     )
-    return ir, decision
+    # Phase 5 §5.2：把 parse 也返回，让上游 DialogueRouteResult 透传给
+    # message_router._post_search_dispatch 使用真实 confidence。
+    return ir, decision, parse
 
 
 def classify_dialogue(
@@ -1201,7 +1222,7 @@ def classify_dialogue(
                 percentage=percentage,
             )
             try:
-                ir, decision = _classify_dialogue_v2(
+                ir, decision, parse = _classify_dialogue_v2(
                     text=stripped, role=role, history=history,
                     current_criteria=current_criteria,
                     session=session, session_hint=session_hint,
@@ -1209,6 +1230,7 @@ def classify_dialogue(
                 )
                 return DialogueRouteResult(
                     intent_result=ir, decision=decision, source="v2_primary",
+                    parse_result=parse,
                 )
             except Exception as exc:
                 log_event(
@@ -1232,7 +1254,7 @@ def classify_dialogue(
     # primary 模式未命中不再 fallthrough 到此处（codex review 修订）。
     if mode == "dual_read" and session is not None and _is_dual_read_target(userid or ""):
         try:
-            ir, decision = _classify_dialogue_v2(
+            ir, decision, parse = _classify_dialogue_v2(
                 text=stripped, role=role, history=history,
                 current_criteria=current_criteria,
                 session=session, session_hint=session_hint,
@@ -1240,6 +1262,7 @@ def classify_dialogue(
             )
             return DialogueRouteResult(
                 intent_result=ir, decision=decision, source="v2_dual_read",
+                parse_result=parse,
             )
         except Exception as exc:
             log_event(

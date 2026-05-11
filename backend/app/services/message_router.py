@@ -339,10 +339,12 @@ def _handle_text(
         if source in {"v2_dual_read", "v2_primary"} and decision is not None:
             # Phase 5 §5.2：把真实 parse_result + decision 暂存，让
             # _post_search_dispatch 在搜索后能读到。turn 结束（return 前后）需要清。
-            # 这里取不到 parse_result（route 只有 intent_result/decision/source），
-            # 暂存 decision 即可——_decide_zero_result 用 decision.accepted_slots_delta
-            # 判定字段触碰；confidence 用 stub 高值。
-            _set_v2_turn_context(parse_result=None, decision=decision)
+            # parse_result 由 intent_service.classify_dialogue 在 DialogueRouteResult
+            # 中透传，让 _decide_zero_result 的低置信度规则在真实链路也能命中。
+            _set_v2_turn_context(
+                parse_result=getattr(route, "parse_result", None),
+                decision=decision,
+            )
             from app.services.dialogue_applier import apply_awaiting_ops, apply_decision
             # awaiting_ops 必须在所有 v2 分支上执行（包括 clarification / 冲突短路），
             # 否则被消费的 awaiting 字段会僵尸保留（adversarial review C1/I15）。
@@ -1353,6 +1355,10 @@ def _post_search_dispatch(
 
     Phase 5 §5.2：从 _v2_turn_context 读取真实 parse_result / decision（如有），
     让 reducer 准确判断"用户刚断言的字段是否被 relax step 覆盖"。
+
+    Phase 5 §5.4：当 mode=on 时，进一步用 phase5_rollout_percentage hash 桶
+    判定灰度命中；未命中桶则等价 off 行为（保 reply 与 5.0 前一致），让
+    5%/25%/50%/100% 灰度阶梯真正生效。
     """
     mode = _settings_module.dialogue_policy.post_search_policy_mode
 
@@ -1363,6 +1369,21 @@ def _post_search_dispatch(
             intent=legacy_intent,
             criteria_snapshot=_snapshot_meta(session),
         )]
+
+    # Phase 5 §5.4：on 模式下进一步用 phase5_rollout_percentage hash 桶判定。
+    # percentage>=100 全量命中；<=0 一律不命中（等价 off）；中间值按 userid hash。
+    # shadow 不受 hash 桶约束（shadow 本来就只写日志不影响 reply，全量观测更有价值）。
+    if mode == "on":
+        from app.services.intent_service import is_phase5_rollout_target
+        percentage = _settings_module.dialogue_policy.phase5_rollout_percentage
+        if not is_phase5_rollout_target(msg.from_user or "", percentage):
+            # 未命中灰度桶 → 等价 off 行为
+            return [_reply(
+                msg.from_user,
+                search_result.reply_text,
+                intent=legacy_intent,
+                criteria_snapshot=_snapshot_meta(session),
+            )]
 
     # shadow / on 都需要构造 ctx + 调 reducer
     from app.services.dialogue_reducer import DialogueDecision
@@ -1919,21 +1940,10 @@ def _run_search(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
 
-    # Phase 5 §5.2：低召回时为 reducer 探查可用 relax 步骤（仅当 initial_count <
-    # low_recall_threshold 时跑；search_jobs/workers 已经走过 _run_*_fallback_steps，
-    # 所以这里再跑一次 _probe_relax_steps 是为给 reducer "选哪步" 用）。
-    # 性能考虑：仅在低召回触发，limit 与主搜索 max_candidates 一致，开销可控。
-    # 测试 spy 通过预填 available_relax_steps 跳过此 probe（避免 mock db 跑真实 SQL）。
-    if (
-        outcome.initial_count < outcome.low_recall_threshold
-        and not outcome.available_relax_steps
-    ):
-        max_candidates = search_service._get_config_int("match.max_candidates", db, 50)
-        available, probes = search_service._probe_relax_steps(
-            outcome.criteria_used, outcome.direction, max_candidates, db,
-        )
-        outcome.available_relax_steps = available
-        outcome.relax_probe_results = probes
+    # Phase 5 §5.2：available_relax_steps 现已由 search_jobs/search_workers 在
+    # post_search_policy_mode=on 时内部填好（跳过 _run_*_fallback_steps 由 reducer
+    # 接管）；off / shadow 模式下不需要 available_relax_steps（reducer 不接管）。
+    # 本处不再重复 probe（避免无意义的 SQL 调用）。
 
     # Stage C1（spec §2.8 / §9.2.1）：不论命中与否，只要 criteria 有效就写 last_criteria；
     # 并按是否生成 candidate_snapshot 推进 active_flow。
