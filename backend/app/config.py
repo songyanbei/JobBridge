@@ -76,13 +76,23 @@ class DialoguePolicy(BaseModel):
     传给 reranker，走 v2.1 prompt。**5.3 默认关闭**：业务直觉权重未经真实日志验证；
     生产灰度由独立运营开关推全（phased-plan §5.4）。"""
 
+    phase5_rollout_percentage: int = 0
+    """Phase 5 §5.4：post_search_policy_mode + soft_preference_ranking_enabled
+    联合灰度的 hash 桶比例，0..100。0=不启用 Phase 5 整体灰度。**5.4 默认 0**：
+    代码就位但不真灰度（用户决策"开发期只做代码不推灰度"）；上线时按 phased-plan
+    §5.4.1 第 4 项的阶梯（5%/25%/50%/100%）推全，任一阶段关键指标回退 ≥ 5%
+    立即回滚到上一比例。"""
+
     @field_validator("v2_mode", mode="before")
     @classmethod
     def _coerce_v2_mode(cls, v):
         v = (str(v) if v is not None else "").strip()
         return v if v in {"off", "shadow", "dual_read", "primary"} else "off"
 
-    @field_validator("hash_buckets", "primary_rollout_percentage", mode="before")
+    @field_validator(
+        "hash_buckets", "primary_rollout_percentage",
+        "phase5_rollout_percentage", mode="before",
+    )
     @classmethod
     def _clamp_pct(cls, v):
         try:

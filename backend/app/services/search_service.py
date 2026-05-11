@@ -102,6 +102,25 @@ def _extract_soft_prefs_for_rerank(
     return slot_schema.extract_soft_preferences(criteria, frame=frame)
 
 
+def _count_soft_pref_hits(
+    candidates: list[dict],
+    soft_preferences: dict | None,
+) -> dict[str, int]:
+    """Phase 5 §5.4：统计候选集中各软偏好字段的命中数。
+
+    candidate dict 中某字段值与 soft_preferences[key] 相等时算命中（bool 比较 + 字符串相等）。
+    仅 soft_preference_ranking_enabled=True 时由调用方使用；False 时返回空 dict。
+    """
+    if not soft_preferences or not candidates:
+        return {}
+    hits: dict[str, int] = {}
+    for key, expected in soft_preferences.items():
+        count = sum(1 for c in candidates if c.get(key) == expected)
+        if count > 0:
+            hits[key] = count
+    return hits
+
+
 def _rerank_with_logging(
     query: str,
     candidates: list[dict],
@@ -198,11 +217,13 @@ def _build_search_outcome(
     fallback_suggestions: list[FallbackSuggestion] | None = None,
     has_more: bool = False,
     snapshot_exhausted: bool = False,
+    soft_pref_hits: dict[str, int] | None = None,
 ) -> SearchOutcome:
     """构造 SearchOutcome；low_recall_threshold 默认等于 desired_count（top_n）。
 
     5.0 子阶段产出该结构但 reducer 默认 no_action，本字段不会被实际消费；
-    5.1 起 reducer 才开始读取（见 phased-plan §5.0.1 第 3 项 / §5.2.1）。
+    5.1 起 reducer 才开始读取（见 phased-plan §5.0.1 第 3 项 / §5.2.1）；
+    5.4 起 soft_pref_hits 由 search_jobs/workers/execute_relaxed_search 真填充。
     """
     return SearchOutcome(
         direction=direction,
@@ -213,7 +234,7 @@ def _build_search_outcome(
         low_recall_threshold=desired_count,
         applied_relax_step=applied_relax_step,
         fallback_suggestions=list(fallback_suggestions or []),
-        soft_pref_hits={},  # 5.4 才填充
+        soft_pref_hits=dict(soft_pref_hits or {}),
         has_more=has_more,
         snapshot_exhausted=snapshot_exhausted,
         available_relax_steps=[],  # 5.2 才填充
@@ -349,6 +370,8 @@ def search_jobs(
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    # Phase 5 §5.4：统计 ranked_items（即 batch）中各软偏好字段命中数。
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
     so = _build_search_outcome(
         direction="search_job",
         criteria_used=criteria,
@@ -358,6 +381,7 @@ def search_jobs(
         applied_relax_step=outcome.applied_step,
         fallback_suggestions=outcome.suggestions,
         has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
     )
     return sr, so
 
@@ -473,6 +497,8 @@ def search_workers(
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    # Phase 5 §5.4：统计 ranked_items 中各软偏好字段命中数。
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
     so = _build_search_outcome(
         direction="search_worker",
         criteria_used=criteria,
@@ -482,6 +508,7 @@ def search_workers(
         applied_relax_step=outcome.applied_step,
         fallback_suggestions=outcome.suggestions,
         has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
     )
     return sr, so
 
@@ -1095,6 +1122,8 @@ def execute_relaxed_search(
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
     so = _build_search_outcome(
         direction=direction,
         criteria_used=relaxed,
@@ -1103,6 +1132,7 @@ def execute_relaxed_search(
         desired_count=top_n,
         applied_relax_step=step,
         has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
     )
     return sr, so
 

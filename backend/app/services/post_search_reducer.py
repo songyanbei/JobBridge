@@ -141,8 +141,13 @@ def post_search_reduce(
     if decision_phase5_2 is not None:
         return decision_phase5_2
 
-    # 5.3/5.4 接通点位（本子阶段不输出对应 action）。
-    return PostSearchDecision(action="no_action", reasoning="phase 5.2 default")
+    # 5.4：软偏好可见性文案（仅当 settings.soft_preference_ranking_enabled 真开启 +
+    # ranked_items 中软偏好命中比例 ≥ 阈值时触发）。
+    decision_phase5_4 = _decide_show_results_with_soft_pref_notice(search_outcome)
+    if decision_phase5_4 is not None:
+        return decision_phase5_4
+
+    return PostSearchDecision(action="no_action", reasoning="phase 5.4 default")
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +288,50 @@ def _decide_zero_result(
         action="auto_relax_and_retry",
         relax_step=chosen_step,
         reasoning=f"default auto-relax; step={chosen_step}",
+    )
+
+
+_SOFT_PREF_VISIBILITY_THRESHOLD = 0.5
+"""phased-plan §5.4.1 第 3 项：命中比例 ≥ 0.5 才打可见性文案。"""
+
+
+def _decide_show_results_with_soft_pref_notice(
+    outcome: SearchOutcome,
+) -> PostSearchDecision | None:
+    """phased-plan §5.4.1 第 1 项：5.4 起首次接通 show_results_with_soft_pref_notice。
+
+    仅当：
+    1. ``settings.soft_preference_ranking_enabled=True``（reranker 真按软偏好排序，
+       不能在 5.3 排序未启用时向用户承诺"已优先展示"）；
+    2. ``outcome.soft_pref_hits`` 中某字段命中比例 ≥ 0.5（_SOFT_PREF_VISIBILITY_THRESHOLD）；
+    3. ``outcome.final_count > 0``（有结果可展示）。
+
+    满足时输出 PostSearchDecision(action="show_results_with_soft_pref_notice",
+    soft_pref_notice=<模板渲染>)。其它情况返回 None 让上层走 no_action。
+    """
+    if not settings.soft_preference_ranking_enabled:
+        return None
+    if outcome.final_count <= 0:
+        return None
+    hits = outcome.soft_pref_hits or {}
+    if not hits:
+        return None
+    fields_above_threshold = [
+        field for field, count in hits.items()
+        if outcome.final_count > 0
+        and (count / outcome.final_count) >= _SOFT_PREF_VISIBILITY_THRESHOLD
+    ]
+    if not fields_above_threshold:
+        return None
+
+    from app.dialogue import slot_schema
+    notice = slot_schema.soft_preference_visibility_template(fields_above_threshold)
+    if not notice:
+        return None
+    return PostSearchDecision(
+        action="show_results_with_soft_pref_notice",
+        soft_pref_notice=notice,
+        reasoning=f"soft_pref_hits above threshold: {fields_above_threshold}",
     )
 
 

@@ -100,7 +100,10 @@ def apply_post_search_decision(
     if action == "suggest_relaxation":
         return [_reply(msg_userid, _render_suggest_relaxation(ctx))]
 
-    # 5.4 接通后会处理 show_results / show_results_with_soft_pref_notice。
+    if action == "show_results_with_soft_pref_notice":
+        return [_reply(msg_userid, _render_soft_pref_notice(ctx))]
+
+    # 5.4 后续可能扩 show_results；当前仍走未实现 fallback。
     # 本子阶段未实现的 action：fallback no_action + 告警日志（phased-plan
     # §5.1.4 验收 #6）。
     logger.warning(
@@ -267,6 +270,15 @@ def _render_suggest_relaxation(ctx: PostSearchContext) -> str:
         return ctx.search_result.reply_text
     bullets = [f"- {d['hint_text']}" for d in directions]
     return _SUGGEST_RELAXATION_HEADER + "\n" + "\n".join(bullets)
+
+
+def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
+    """phased-plan §5.4.1：命中阈值满足时把可见性文案拼到 search_result.reply_text 前缀。"""
+    notice = ctx.decision.soft_pref_notice or ""
+    base = ctx.search_result.reply_text or ""
+    if not notice:
+        return base
+    return f"{notice}\n\n{base}" if base else notice
 
 
 # ---------------------------------------------------------------------------

@@ -1408,6 +1408,8 @@ def _post_search_dispatch(
 
     if mode == "shadow":
         # 5.1 验收 #2：shadow 只写日志，不影响 reply。
+        # Phase 5 §5.4：补 soft_pref_hits / applied_relax_step / final_count
+        # 监控面板字段。
         log_event(
             "post_search_decision",
             mode="shadow",
@@ -1415,6 +1417,10 @@ def _post_search_dispatch(
             reasoning=ps_decision.reasoning,
             direction=search_outcome.direction,
             snapshot_exhausted=search_outcome.snapshot_exhausted,
+            initial_count=search_outcome.initial_count,
+            final_count=search_outcome.final_count,
+            applied_relax_step=search_outcome.applied_relax_step,
+            soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
         )
         return [_reply(
             msg.from_user,
@@ -1424,6 +1430,7 @@ def _post_search_dispatch(
         )]
 
     # mode == "on"
+    # Phase 5 §5.4：on 模式监控字段同步扩展
     log_event(
         "post_search_decision",
         mode="on",
@@ -1431,6 +1438,10 @@ def _post_search_dispatch(
         reasoning=ps_decision.reasoning,
         direction=search_outcome.direction,
         snapshot_exhausted=search_outcome.snapshot_exhausted,
+        initial_count=search_outcome.initial_count,
+        final_count=search_outcome.final_count,
+        applied_relax_step=search_outcome.applied_relax_step,
+        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
     )
     ctx = PostSearchContext(
         decision=ps_decision,

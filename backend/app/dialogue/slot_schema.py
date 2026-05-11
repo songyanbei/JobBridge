@@ -922,6 +922,51 @@ _SOFT_PREF_RANKING_WEIGHTS: dict[str, float] = {
 }
 
 
+# Phase 5 §5.4：软偏好命中后的"已优先展示"文案
+_SOFT_PREF_DISPLAY_LABEL = {
+    "provide_meal": "包吃",
+    "provide_housing": "包住",
+    "shift_pattern": "班次",
+    "dorm_condition": "宿舍",
+    "work_hours": "工时",
+    "accept_couple": "可夫妻",
+    "accept_student": "可学生",
+    "accept_minority": "可少数民族",
+    "pay_type": "计薪方式",
+}
+
+
+def soft_preference_visibility_template(fields_hit: list[str]) -> str:
+    """Phase 5 §5.4.1：按命中字段集合产出可见性文案。
+
+    多偏好命中拼接为"已优先展示符合「包吃住、日班」偏好的岗位"格式。
+    阈值判定（命中比例 ≥ 0.5）由 applier 在调用本 helper 前做。
+
+    空列表返回空字符串（applier 不附加文案）。
+    """
+    if not fields_hit:
+        return ""
+    # 合并 provide_meal + provide_housing → "包吃住"
+    has_meal = "provide_meal" in fields_hit
+    has_housing = "provide_housing" in fields_hit
+    labels: list[str] = []
+    if has_meal and has_housing:
+        labels.append("包吃住")
+    elif has_meal:
+        labels.append("包吃")
+    elif has_housing:
+        labels.append("包住")
+    for f in fields_hit:
+        if f in ("provide_meal", "provide_housing"):
+            continue  # 已合并到包吃住
+        label = _SOFT_PREF_DISPLAY_LABEL.get(f)
+        if label:
+            labels.append(label)
+    if not labels:
+        return ""
+    return f"已优先展示符合「{'、'.join(labels)}」偏好的岗位。"
+
+
 def extract_soft_preferences(
     criteria: dict | None,
     frame: str = "job_search",

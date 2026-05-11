@@ -183,9 +183,9 @@ class TestUnsupportedActionFallback:
     等本子阶段未实现的 action 时 applier fallback 到 no_action + 日志告警。"""
 
     @pytest.mark.parametrize("unsupported", [
-        # Phase 5.2 起 auto_relax_and_retry / suggest_relaxation 已真接通；
-        # 仅剩 show_results_with_soft_pref_notice / show_results 留给 5.4。
-        "show_results_with_soft_pref_notice",
+        # Phase 5.2 接通 auto_relax_and_retry / suggest_relaxation / ask_clarification；
+        # Phase 5.4 接通 show_results_with_soft_pref_notice；
+        # 现仅 show_results 留给 5.4+ 后续（reducer 当前不输出）。
         "show_results",
     ])
     def test_unsupported_action_falls_back_to_no_action(self, unsupported, caplog):
