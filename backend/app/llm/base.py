@@ -6,7 +6,7 @@
 from abc import ABC, abstractmethod
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +106,27 @@ class DialogueParseResult(BaseModel):
     raw_response: str = Field(default="", description="LLM 原始输出（调试 & 日志用）")
     input_tokens: int | None = Field(default=None, description="prompt_tokens")
     output_tokens: int | None = Field(default=None, description="completion_tokens")
+
+    @model_validator(mode="after")
+    def _validate_action_fields_exclusive(self):
+        """Phase 5 §第 8 轮 review fix 4：跨字段守护，避免 LLM 把
+        conflict_action / relaxation_response 与错误的 dialogue_act 组合
+        （reducer 主路径不会进入错误分支，但 prompt drift 时早 fail 比静默通过好）。
+        """
+        if self.conflict_action is not None and self.dialogue_act != "resolve_conflict":
+            raise ValueError(
+                f"conflict_action={self.conflict_action!r} requires "
+                f"dialogue_act='resolve_conflict', got {self.dialogue_act!r}"
+            )
+        if (
+            self.relaxation_response is not None
+            and self.dialogue_act != "respond_relaxation_offer"
+        ):
+            raise ValueError(
+                f"relaxation_response={self.relaxation_response!r} requires "
+                f"dialogue_act='respond_relaxation_offer', got {self.dialogue_act!r}"
+            )
+        return self
 
 
 class RerankResult(BaseModel):

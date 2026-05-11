@@ -149,12 +149,14 @@ class TestParseResultConfidenceTranstmittedToReducer:
         )
         message_router._set_v2_turn_context(real_parse, real_decision)
         try:
-            assert message_router._v2_turn_context["parse_result"] is real_parse
-            assert message_router._v2_turn_context["decision"] is real_decision
+            # 第 8 轮 review fix 2：从 module-level dict 改为 ContextVar
+            assert message_router._v2_parse_result.get() is real_parse
+            assert message_router._v2_decision.get() is real_decision
         finally:
             message_router._clear_v2_turn_context()
-        # 清理后应该为空
-        assert "parse_result" not in message_router._v2_turn_context
+        # 清理后应该为 None
+        assert message_router._v2_parse_result.get() is None
+        assert message_router._v2_decision.get() is None
 
 
 # ---------------------------------------------------------------------------

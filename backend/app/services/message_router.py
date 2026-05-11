@@ -130,18 +130,44 @@ _V2_CLAR_DEFAULT = "请再说得具体一些，方便我帮您处理。"
 # Phase 5 §5.2：turn-scoped 上下文 holder。_handle_text 在 v2_dual_read / primary
 # 路径下把真实 parse_result / decision 存进来，_post_search_dispatch 读取后让
 # reducer 看到准确的 accepted_slots_delta / confidence；turn 结束清空。
-# 用 module-level dict 而非 thread-local：单测进程内串行执行；生产 fastapi 是 async
-# 但每个 webhook 请求是单线程处理 + 立即清空，不会跨请求泄漏。
-_v2_turn_context: dict = {}
+#
+# 第 8 轮 review fix 2：用 contextvars.ContextVar 替换 module-level dict。
+# 当前 worker 主循环是单线程串行（worker.py:_main_loop），但 contextvars 跨线程 /
+# 跨 asyncio task 默认隔离，对未来扩展（ThreadPoolExecutor 并行 / pytest-xdist
+# 并行测试）友好。注释里写"单线程处理"= 把并发约束埋在代码注释里，半年后没人会记得。
+from contextvars import ContextVar as _ContextVar
+
+_v2_parse_result: _ContextVar = _ContextVar("_v2_parse_result", default=None)
+_v2_decision: _ContextVar = _ContextVar("_v2_decision", default=None)
 
 
 def _set_v2_turn_context(parse_result, decision) -> None:
-    _v2_turn_context["parse_result"] = parse_result
-    _v2_turn_context["decision"] = decision
+    _v2_parse_result.set(parse_result)
+    _v2_decision.set(decision)
 
 
 def _clear_v2_turn_context() -> None:
-    _v2_turn_context.clear()
+    _v2_parse_result.set(None)
+    _v2_decision.set(None)
+
+
+def _is_relaxation_expired(iso_str: str) -> bool:
+    """Phase 5 §第 8 轮 review fix 1：判断 pending_relaxation.expires_at 是否过期。
+
+    与 upload_service.is_pending_upload_expired 同款防御：
+    1. 解析失败按已过期处理（脏数据不卡流程）。
+    2. naive datetime 补 UTC tzinfo 避免与 aware now 比较抛 TypeError。
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    if not iso_str:
+        return False
+    try:
+        expires = _dt.fromisoformat(iso_str)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=_tz.utc)
+        return _dt.now(_tz.utc) > expires
+    except (TypeError, ValueError):
+        return True
 
 
 def _render_v2_clarification(clarification: dict, session: SessionState) -> str:
@@ -864,6 +890,20 @@ def _route_v2_relaxation_response(
         )
         return [_reply(userid, "好的。")]
 
+    # 第 8 轮 review fix 1：检查 pending_relaxation.expires_at。
+    # TTL 在 applier 写入时由 search_awaiting_ttl_seconds 决定，过期后用户回话
+    # 不应再被识别为"接受放宽"——上下文已模糊。
+    expires_at = pending.get("expires_at")
+    if expires_at and _is_relaxation_expired(expires_at):
+        log_event(
+            "pending_relaxation_expired",
+            userid=userid,
+            step=pending.get("step"),
+            expires_at=expires_at,
+        )
+        session.pending_relaxation = None
+        return [_reply(userid, "刚才的搜索话题已过期，重新开始搜索吧。")]
+
     if transition == "cancel_relaxation":
         session.pending_relaxation = None
         return [_reply(userid, "好的，那我们换其他条件重新搜索。")]
@@ -919,10 +959,12 @@ def _route_v2_relaxation_response(
             role=user_ctx.role,
         )
         # 第二轮 reducer 必须不再输出 auto_relax_and_retry
-        assert new_ps_decision.action != "auto_relax_and_retry", (
-            "post_search_reduce produced auto_relax_and_retry on second pass "
-            "via _route_v2_relaxation_response"
-        )
+        # 第 8 轮 review fix 3：用 raise 而非 assert（-O 模式会剥）
+        if new_ps_decision.action == "auto_relax_and_retry":
+            raise RuntimeError(
+                "post_search_reduce produced auto_relax_and_retry on second pass "
+                "via _route_v2_relaxation_response"
+            )
 
         ctx = PostSearchContext(
             decision=new_ps_decision,
@@ -1397,8 +1439,9 @@ def _post_search_dispatch(
     # Phase 5 §5.2：优先从 turn-scoped holder 读 v2 真实 parse_result / decision
     # （由 _handle_text v2 路径在 dispatch 前暂存）；off / legacy 路径下没有，
     # 用高 confidence 的 stub 避免误触发 _decide_zero_result 的低置信度分支。
-    real_parse = _v2_turn_context.get("parse_result")
-    real_decision = _v2_turn_context.get("decision")
+    # 第 8 轮 review fix 2：改用 ContextVar 而非 module-level dict。
+    real_parse = _v2_parse_result.get()
+    real_decision = _v2_decision.get()
     if real_parse is not None:
         parse_stub = real_parse
     else:

@@ -80,10 +80,12 @@ def apply_post_search_decision(
     msg_userid = ctx.msg.from_user
 
     # 5.2 §跨阶段共同约束 #8：二阶段递归深度硬限制为 1
-    assert ctx.recursion_depth <= 1, (
-        f"post_search_applier recursion_depth={ctx.recursion_depth} > 1; "
-        f"reducer should never produce auto_relax_and_retry on second pass"
-    )
+    # 第 8 轮 review fix 3：用 raise 而非 assert（生产 -O 模式会剥掉 assert）
+    if ctx.recursion_depth > 1:
+        raise RuntimeError(
+            f"post_search_applier recursion_depth={ctx.recursion_depth} > 1; "
+            f"reducer should never produce auto_relax_and_retry on second pass"
+        )
 
     if action == "no_action":
         return [_reply(msg_userid, ctx.search_result.reply_text)]
@@ -240,10 +242,12 @@ def _handle_auto_relax_and_retry(
         role=ctx.role,
     )
     # 第二轮 reducer 必须不再输出 auto_relax_and_retry（避免无限套娃）
-    assert new_decision.action != "auto_relax_and_retry", (
-        "post_search_reduce produced auto_relax_and_retry on second pass; "
-        "this would cause infinite recursion"
-    )
+    # 第 8 轮 review fix 3：用 raise 而非 assert（生产 -O 模式会剥掉 assert）
+    if new_decision.action == "auto_relax_and_retry":
+        raise RuntimeError(
+            "post_search_reduce produced auto_relax_and_retry on second pass; "
+            "this would cause infinite recursion"
+        )
 
     new_ctx = PostSearchContext(
         decision=new_decision,
