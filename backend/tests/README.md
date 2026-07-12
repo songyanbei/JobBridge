@@ -22,13 +22,22 @@ mysql -u root -p jobbridge < sql/seed_cities_full.sql
 
 ## Test Commands
 
+The default local run skips tests marked `integration`. Set `RUN_INTEGRATION=1`
+only when the required external services are running.
+
 ### Linux / macOS / Git Bash
 
 ```bash
 cd backend
 
-# Unit tests
-pytest tests/unit/ -v
+# Unit tests (same command used by CI)
+pytest -p no:cacheprovider tests/unit -q
+
+# Search SQL integration gate (requires MySQL 8)
+RUN_INTEGRATION=1 \
+DB_HOST=127.0.0.1 DB_PORT=3306 DB_NAME=jobbridge_test \
+DB_USER=jobbridge_test DB_PASSWORD=jobbridge_test \
+pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
 
 # Integration tests
 RUN_INTEGRATION=1 pytest tests/integration/ -v
@@ -42,8 +51,17 @@ RUN_INTEGRATION=1 pytest tests/ -v
 ```powershell
 cd backend
 
-# Unit tests
-pytest tests/unit/ -v
+# Unit tests (same command used by CI)
+pytest -p no:cacheprovider tests/unit -q
+
+# Search SQL integration gate (requires MySQL 8)
+$env:RUN_INTEGRATION='1'
+$env:DB_HOST='127.0.0.1'
+$env:DB_PORT='3306'
+$env:DB_NAME='jobbridge_test'
+$env:DB_USER='jobbridge_test'
+$env:DB_PASSWORD='jobbridge_test'
+pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
 
 # Integration tests
 $env:RUN_INTEGRATION='1'; pytest tests/integration/ -v
@@ -57,8 +75,11 @@ $env:RUN_INTEGRATION='1'; pytest tests/ -v
 ```cmd
 cd backend
 
-:: Unit tests
-pytest tests/unit/ -v
+:: Unit tests (same command used by CI)
+pytest -p no:cacheprovider tests/unit -q
+
+:: Search SQL integration gate (requires MySQL 8)
+set RUN_INTEGRATION=1 && set DB_HOST=127.0.0.1 && set DB_PORT=3306 && set DB_NAME=jobbridge_test && set DB_USER=jobbridge_test && set DB_PASSWORD=jobbridge_test && pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
 
 :: Integration tests
 set RUN_INTEGRATION=1 && pytest tests/integration/ -v
