@@ -25,6 +25,16 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
     """search_jobs 在 post_search_policy_mode=on + 低召回时不再先跑
     _run_job_fallback_steps；available_relax_steps 由 _probe_relax_steps 填好。"""
 
+    @staticmethod
+    def _userid_for_rollout(*, percentage: int, target: bool) -> str:
+        from app.services.intent_service import is_phase5_rollout_target
+
+        return next(
+            f"phase5-{percentage}-{target}-{i}"
+            for i in range(1000)
+            if is_phase5_rollout_target(f"phase5-{percentage}-{target}-{i}", percentage) is target
+        )
+
     @patch("app.services.search_service._query_jobs")
     @patch("app.services.search_service._get_config_int")
     def test_on_mode_skips_run_job_fallback_steps(
@@ -137,6 +147,214 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
                 "北京找工人", session, user_ctx, MagicMock(),
             )
             mock_legacy_fb.assert_called_once()
+
+    @patch("app.services.search_service._probe_relax_steps")
+    @patch("app.services.search_service._query_jobs")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_mid_rollout_target_skips_legacy_job_fallback(
+        self, mock_config, mock_query, mock_probe, monkeypatch,
+    ):
+        from app.services.search_service import search_jobs
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        user_id = self._userid_for_rollout(percentage=50, target=True)
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+        mock_probe.return_value = ([], [])
+
+        with patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb:
+            session = SessionState(role="worker")
+            user_ctx = UserContext(
+                external_userid=user_id, role="worker", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=True, can_search_workers=False,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_jobs(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找餐饮", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_not_called()
+            mock_probe.assert_called_once()
+
+    @patch("app.services.search_service._query_jobs")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_mid_rollout_non_target_uses_legacy_job_fallback(
+        self, mock_config, mock_query, monkeypatch,
+    ):
+        from app.services.search_service import FallbackOutcome, search_jobs
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        user_id = self._userid_for_rollout(percentage=50, target=False)
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+
+        with patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb:
+            mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
+            session = SessionState(role="worker")
+            user_ctx = UserContext(
+                external_userid=user_id, role="worker", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=True, can_search_workers=False,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_jobs(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找餐饮", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_called_once()
+
+    @patch("app.services.search_service._probe_relax_steps")
+    @patch("app.services.search_service._query_resumes")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_mid_rollout_target_skips_legacy_worker_fallback(
+        self, mock_config, mock_query, mock_probe, monkeypatch,
+    ):
+        from app.services.search_service import search_workers
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        user_id = self._userid_for_rollout(percentage=50, target=True)
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+        mock_probe.return_value = ([], [])
+
+        with patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb:
+            session = SessionState(role="factory")
+            user_ctx = UserContext(
+                external_userid=user_id, role="factory", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=False, can_search_workers=True,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_workers(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找工人", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_not_called()
+            mock_probe.assert_called_once()
+
+    @patch("app.services.search_service._query_resumes")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_mid_rollout_non_target_uses_legacy_worker_fallback(
+        self, mock_config, mock_query, monkeypatch,
+    ):
+        from app.services.search_service import FallbackOutcome, search_workers
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        user_id = self._userid_for_rollout(percentage=50, target=False)
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+
+        with patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb:
+            mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
+            session = SessionState(role="factory")
+            user_ctx = UserContext(
+                external_userid=user_id, role="factory", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=False, can_search_workers=True,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_workers(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找工人", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_called_once()
+
+    @patch("app.services.search_service.permission_service")
+    @patch("app.services.search_service.conversation_service")
+    @patch("app.services.search_service._rerank_with_logging")
+    @patch("app.services.search_service._jobs_to_dicts")
+    @patch("app.services.search_service._query_jobs")
+    @patch("app.services.search_service._get_config_int")
+    def test_top_n_candidates_do_not_trigger_any_relaxation(
+        self, mock_config, mock_query, mock_to_dicts, mock_rerank,
+        mock_conv, mock_perm, monkeypatch,
+    ):
+        from app.services.search_service import search_jobs
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        user_id = self._userid_for_rollout(percentage=50, target=True)
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = [MagicMock(), MagicMock(), MagicMock()]
+        job_dicts = [
+            {"id": i, "city": "北京", "job_category": "餐饮",
+             "salary_floor_monthly": 5000, "pay_type": "月薪", "company": f"C{i}"}
+            for i in (1, 2, 3)
+        ]
+        mock_to_dicts.return_value = job_dicts
+        mock_rerank.return_value = MagicMock(
+            ranked_items=[{"id": 1}, {"id": 2}, {"id": 3}],
+        )
+        mock_conv.compute_query_digest.return_value = "digest"
+        mock_conv.get_next_candidate_ids.return_value = ["1", "2", "3"]
+        mock_conv.get_remaining_count.return_value = 0
+        mock_perm.filter_jobs_batch.return_value = job_dicts
+
+        with (
+            patch("app.services.search_service._probe_relax_steps") as mock_probe,
+            patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb,
+        ):
+            session = SessionState(role="worker")
+            user_ctx = UserContext(
+                external_userid=user_id, role="worker", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=True, can_search_workers=False,
+                is_first_touch=False, should_welcome=False,
+            )
+            result, outcome = search_jobs(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找餐饮", session, user_ctx, MagicMock(),
+            )
+
+            mock_probe.assert_not_called()
+            mock_legacy_fb.assert_not_called()
+            assert result.result_count == 3
+            assert outcome.initial_count == 3
 
     @patch("app.services.search_service._query_jobs")
     @patch("app.services.search_service._get_config_int")

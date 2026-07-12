@@ -93,15 +93,17 @@ SELECT id, salary_floor_monthly, salary_ceiling_monthly, headcount, audit_status
 FROM job WHERE city='苏州市' AND job_category='电子厂' AND deleted_at IS NULL
 ORDER BY salary_floor_monthly;
 
--- 第 5 步预期：salary_floor >= 5500 候选（应 ≥ 7 条）
-SELECT '第 5 步 5500+ 候选数' AS section, COUNT(*) AS cnt
+-- 第 5 步预期：岗位区间覆盖 5500 候选（应 ≥ 7 条）
+SELECT '第 5 步 5500+ 区间命中数' AS section, COUNT(*) AS cnt
 FROM job WHERE city='苏州市' AND job_category='电子厂'
-  AND salary_floor_monthly >= 5500 AND audit_status='passed' AND deleted_at IS NULL;
+  AND (salary_ceiling_monthly >= 5500 OR (salary_ceiling_monthly IS NULL AND salary_floor_monthly >= 5500))
+  AND audit_status='passed' AND deleted_at IS NULL;
 
--- 第 6 步预期：salary_floor >= 7000 候选（应 ≥ 4 条）
-SELECT '第 6 步 7000+ 候选数' AS section, COUNT(*) AS cnt
+-- 第 6 步预期：岗位区间覆盖 7000 候选（应 ≥ 7 条）
+SELECT '第 6 步 7000+ 区间命中数' AS section, COUNT(*) AS cnt
 FROM job WHERE city='苏州市' AND job_category='电子厂'
-  AND salary_floor_monthly >= 7000 AND audit_status='passed' AND deleted_at IS NULL;
+  AND (salary_ceiling_monthly >= 7000 OR (salary_ceiling_monthly IS NULL AND salary_floor_monthly >= 7000))
+  AND audit_status='passed' AND deleted_at IS NULL;
 
 -- 第 9 步预期：岗位区间覆盖 9500，应直接命中 ≥ 3 条
 SELECT '第 9 步 9500+ 区间命中数（应 ≥ 3）' AS section, COUNT(*) AS cnt

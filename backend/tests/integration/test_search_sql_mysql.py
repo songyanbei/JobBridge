@@ -248,6 +248,7 @@ def test_query_resumes_json_contains_city_category_and_lifecycle(db_session):
 
     by_city = _query_resumes({"city": "苏州市"}, 20, db)
     by_city_list = _query_resumes({"city": ["无锡市"]}, 20, db)
+    by_multi_city = _query_resumes({"city": ["北京市", "无锡市"]}, 20, db)
     by_category = _query_resumes({"job_category": ["电子厂"]}, 20, db)
     by_both = _query_resumes({"city": ["苏州市"], "job_category": ["电子厂"]}, 20, db)
     by_special = _query_resumes(
@@ -259,6 +260,7 @@ def test_query_resumes_json_contains_city_category_and_lifecycle(db_session):
 
     assert {row.id for row in by_city} == {wanted.id}
     assert {row.id for row in by_city_list} == {wanted.id}
+    assert {row.id for row in by_multi_city} == {wanted.id}
     assert {row.id for row in by_category} == {wanted.id}
     assert {row.id for row in by_both} == {wanted.id}
     assert {row.id for row in by_special} == {special.id}

@@ -149,7 +149,7 @@ class TestNormalizeStructuredData:
             {"expected_cities": ["无锡", "无锡"], "expected_job_categories": ["厨师", "保洁"]},
             role="worker", intent="upload_resume",
         )
-        assert out["expected_cities"] == ["无锡"]
+        assert out["expected_cities"] == ["无锡市"]
         assert out["expected_job_categories"] == ["餐饮", "保洁"]
 
     def test_unknown_keys_already_filtered_by_sanitize(self):
