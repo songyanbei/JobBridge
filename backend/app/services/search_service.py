@@ -293,11 +293,9 @@ def search_jobs(
     candidates = _query_jobs(criteria, max_candidates, db)
     initial_count = len(candidates)
 
-    # Phase 5 §5.2.1 第 1 项："search_service 不再自己决定是否采纳放宽结果"
-    # post_search_policy_mode=on 时跳过 _run_job_fallback_steps，由 reducer +
-    # post_search_applier 接管（initial_count 透传给 reducer 判定低召回；
-    # available_relax_steps 由 _probe_relax_steps 填）。
-    # off / shadow 模式保持旧行为（向后兼容验收 §5.2.4 第 2 项）。
+    # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
+    # 低召回才跳过 legacy fallback，由 reducer + post_search_applier 接管。
+    # off / shadow / 桶外用户保持旧行为（向后兼容验收 §5.2.4 第 2 项）。
     phase5_takeover = (
         _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
         and len(candidates) < top_n
@@ -452,8 +450,9 @@ def search_workers(
     candidates = _query_resumes(criteria, max_candidates, db)
     initial_count = len(candidates)
 
-    # Phase 5 §5.2.1 第 1 项：post_search_policy_mode=on 时跳过 _run_*_fallback_steps
-    # 由 reducer + applier 接管放宽决策。off / shadow 保持旧行为。
+    # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
+    # 低召回才跳过 legacy fallback，由 reducer + applier 接管放宽决策。
+    # off / shadow / 桶外用户保持旧行为。
     phase5_takeover = (
         _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
         and len(candidates) < top_n

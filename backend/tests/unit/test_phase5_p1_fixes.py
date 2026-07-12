@@ -1,8 +1,8 @@
 """Phase 5 P1 修复验证（评审第 7 轮）。
 
 三个 P1 阻塞项：
-1. search_service 在 post_search_policy_mode=on 时跳过 _run_*_fallback_steps
-   让 reducer 接管放宽决策（previously 旧 fallback 已采纳让 reducer 输出 no_action）。
+1. search_service 在 post_search_policy_mode=on 且用户命中 Phase5 rollout
+   时跳过 _run_*_fallback_steps，让 reducer 接管放宽决策。
 2. _v2_turn_context.parse_result 透传真实 confidence（previously 用 stub 1.0
    让低置信度规则不生效）。
 3. phase5_rollout_percentage hash 桶判定（previously on 模式对所有用户生效）。
@@ -17,12 +17,12 @@ from app.config import settings
 
 
 # ---------------------------------------------------------------------------
-# P1.1：search_service on 模式跳过旧 fallback，由 reducer 接管
+# P1.1：search_service on + rollout 命中时跳过旧 fallback，由 reducer 接管
 # ---------------------------------------------------------------------------
 
 
-class TestSearchServiceSkipsLegacyFallbackInOnMode:
-    """search_jobs 在 post_search_policy_mode=on + 低召回时不再先跑
+class TestSearchServicePhase5RolloutGate:
+    """search_jobs 在 post_search_policy_mode=on + rollout 命中 + 低召回时不再先跑
     _run_job_fallback_steps；available_relax_steps 由 _probe_relax_steps 填好。"""
 
     @staticmethod
@@ -148,11 +148,12 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             )
             mock_legacy_fb.assert_called_once()
 
+    @pytest.mark.parametrize("initial_count", [0, 1, 2])
     @patch("app.services.search_service._probe_relax_steps")
     @patch("app.services.search_service._query_jobs")
     @patch("app.services.search_service._get_config_int")
     def test_on_mode_mid_rollout_target_skips_legacy_job_fallback(
-        self, mock_config, mock_query, mock_probe, monkeypatch,
+        self, mock_config, mock_query, mock_probe, monkeypatch, initial_count,
     ):
         from app.services.search_service import search_jobs
         from app.schemas.conversation import SessionState
@@ -168,10 +169,31 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             ),
         )
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
-        mock_query.return_value = []
+        mock_query.return_value = [MagicMock()] * initial_count
         mock_probe.return_value = ([], [])
 
-        with patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb:
+        job_dicts = [
+            {"id": i, "city": "北京", "job_category": "餐饮",
+             "salary_floor_monthly": 5000, "pay_type": "月薪", "company": f"C{i}"}
+            for i in range(1, initial_count + 1)
+        ]
+        with (
+            patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb,
+            patch("app.services.search_service._jobs_to_dicts") as mock_to_dicts,
+            patch("app.services.search_service._rerank_with_logging") as mock_rerank,
+            patch("app.services.search_service.conversation_service") as mock_conv,
+            patch("app.services.search_service.permission_service") as mock_perm,
+        ):
+            mock_to_dicts.return_value = job_dicts
+            mock_rerank.return_value = MagicMock(
+                ranked_items=[{"id": row["id"]} for row in job_dicts],
+            )
+            mock_conv.compute_query_digest.return_value = "digest"
+            mock_conv.get_next_candidate_ids.return_value = [
+                str(row["id"]) for row in job_dicts
+            ]
+            mock_conv.get_remaining_count.return_value = 0
+            mock_perm.filter_jobs_batch.return_value = job_dicts
             session = SessionState(role="worker")
             user_ctx = UserContext(
                 external_userid=user_id, role="worker", status="active",
@@ -186,10 +208,11 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             mock_legacy_fb.assert_not_called()
             mock_probe.assert_called_once()
 
+    @pytest.mark.parametrize("initial_count", [0, 1, 2])
     @patch("app.services.search_service._query_jobs")
     @patch("app.services.search_service._get_config_int")
     def test_on_mode_mid_rollout_non_target_uses_legacy_job_fallback(
-        self, mock_config, mock_query, monkeypatch,
+        self, mock_config, mock_query, monkeypatch, initial_count,
     ):
         from app.services.search_service import FallbackOutcome, search_jobs
         from app.schemas.conversation import SessionState
@@ -205,7 +228,7 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             ),
         )
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
-        mock_query.return_value = []
+        mock_query.return_value = [MagicMock()] * initial_count
 
         with patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb:
             mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
@@ -222,11 +245,12 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             )
             mock_legacy_fb.assert_called_once()
 
+    @pytest.mark.parametrize("initial_count", [0, 1, 2])
     @patch("app.services.search_service._probe_relax_steps")
     @patch("app.services.search_service._query_resumes")
     @patch("app.services.search_service._get_config_int")
     def test_on_mode_mid_rollout_target_skips_legacy_worker_fallback(
-        self, mock_config, mock_query, mock_probe, monkeypatch,
+        self, mock_config, mock_query, mock_probe, monkeypatch, initial_count,
     ):
         from app.services.search_service import search_workers
         from app.schemas.conversation import SessionState
@@ -242,10 +266,35 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             ),
         )
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
-        mock_query.return_value = []
+        mock_query.return_value = [MagicMock()] * initial_count
         mock_probe.return_value = ([], [])
 
-        with patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb:
+        resume_dicts = [
+            {"id": i, "owner_userid": f"worker-{i}", "display_name": f"W{i}",
+             "gender": "男", "age": 30, "expected_job_categories": ["餐饮"],
+             "salary_expect_floor_monthly": 5000, "expected_cities": ["北京市"],
+             "phone": "13800000000"}
+            for i in range(1, initial_count + 1)
+        ]
+        with (
+            patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb,
+            patch("app.services.search_service._resumes_to_dicts") as mock_to_dicts,
+            patch("app.services.search_service._build_users_map") as mock_users,
+            patch("app.services.search_service._rerank_with_logging") as mock_rerank,
+            patch("app.services.search_service.conversation_service") as mock_conv,
+            patch("app.services.search_service.permission_service") as mock_perm,
+        ):
+            mock_to_dicts.return_value = resume_dicts
+            mock_users.return_value = {}
+            mock_rerank.return_value = MagicMock(
+                ranked_items=[{"id": row["id"]} for row in resume_dicts],
+            )
+            mock_conv.compute_query_digest.return_value = "digest"
+            mock_conv.get_next_candidate_ids.return_value = [
+                str(row["id"]) for row in resume_dicts
+            ]
+            mock_conv.get_remaining_count.return_value = 0
+            mock_perm.filter_resumes_batch.return_value = resume_dicts
             session = SessionState(role="factory")
             user_ctx = UserContext(
                 external_userid=user_id, role="factory", status="active",
@@ -260,10 +309,11 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             mock_legacy_fb.assert_not_called()
             mock_probe.assert_called_once()
 
+    @pytest.mark.parametrize("initial_count", [0, 1, 2])
     @patch("app.services.search_service._query_resumes")
     @patch("app.services.search_service._get_config_int")
     def test_on_mode_mid_rollout_non_target_uses_legacy_worker_fallback(
-        self, mock_config, mock_query, monkeypatch,
+        self, mock_config, mock_query, monkeypatch, initial_count,
     ):
         from app.services.search_service import FallbackOutcome, search_workers
         from app.schemas.conversation import SessionState
@@ -279,7 +329,7 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             ),
         )
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
-        mock_query.return_value = []
+        mock_query.return_value = [MagicMock()] * initial_count
 
         with patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb:
             mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
