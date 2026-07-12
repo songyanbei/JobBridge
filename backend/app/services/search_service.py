@@ -55,6 +55,16 @@ def _json_scalar(value: object) -> str:
     """Serialize a value as a JSON string scalar for MySQL JSON_CONTAINS."""
     return json.dumps(str(value), ensure_ascii=False)
 
+
+def _job_salary_covers_floor(salary_floor: int):
+    return sa.or_(
+        Job.salary_ceiling_monthly >= salary_floor,
+        sa.and_(
+            Job.salary_ceiling_monthly.is_(None),
+            Job.salary_floor_monthly >= salary_floor,
+        ),
+    )
+
 # Stage B：0 命中 fallback 文案（§3.5）。
 # 不能伪装成推荐结果；必须明确告知未找到并给出可操作建议。
 NO_JOB_MATCH_REPLY = (
@@ -719,7 +729,7 @@ def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
 
     salary_floor = criteria.get("salary_floor_monthly")
     if salary_floor is not None:
-        q = q.filter(Job.salary_floor_monthly >= salary_floor)
+        q = q.filter(_job_salary_covers_floor(salary_floor))
 
     is_long_term = criteria.get("is_long_term")
     if is_long_term is not None:

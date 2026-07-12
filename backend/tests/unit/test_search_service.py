@@ -19,6 +19,7 @@ from app.services.search_service import (
     _format_no_match_with_suggestions_resume,
     _format_resume_results,
     _is_job_search,
+    _job_salary_covers_floor,
     _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
@@ -69,6 +70,16 @@ class TestJsonScalar:
         assert json.loads(encoded) == str(value)
         assert encoded.startswith('"')
         assert encoded.endswith('"')
+
+
+class TestJobSalaryCoversFloor:
+    def test_uses_ceiling_when_present_and_floor_when_ceiling_unknown(self):
+        expr = _job_salary_covers_floor(9500)
+        compiled = str(expr.compile(compile_kwargs={"literal_binds": True}))
+
+        assert "job.salary_ceiling_monthly >= 9500" in compiled
+        assert "job.salary_ceiling_monthly IS NULL" in compiled
+        assert "job.salary_floor_monthly >= 9500" in compiled
 
 
 class TestIsJobSearch:

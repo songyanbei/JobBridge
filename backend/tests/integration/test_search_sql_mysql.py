@@ -143,6 +143,78 @@ def test_query_jobs_runs_against_mysql_and_filters_lifecycle(db_session):
     assert [row.id for row in rows] == [wanted.id]
 
 
+def test_query_jobs_salary_floor_uses_range_ceiling_semantics(db_session):
+    db, prefix = db_session
+    factory = _user(prefix, "salary-factory")
+    db.add(factory)
+    db.flush()
+
+    covers_by_ceiling = _job(
+        factory.external_userid,
+        salary_floor_monthly=8600,
+        salary_ceiling_monthly=11000,
+        raw_text="covers by ceiling",
+        description="covers by ceiling",
+    )
+    exact_range = _job(
+        factory.external_userid,
+        salary_floor_monthly=9500,
+        salary_ceiling_monthly=9500,
+        raw_text="exact range",
+        description="exact range",
+    )
+    open_high_floor = _job(
+        factory.external_userid,
+        salary_floor_monthly=10000,
+        salary_ceiling_monthly=None,
+        raw_text="open high floor",
+        description="open high floor",
+    )
+    below_open_floor = _job(
+        factory.external_userid,
+        salary_floor_monthly=8600,
+        salary_ceiling_monthly=None,
+        raw_text="below open floor",
+        description="below open floor",
+    )
+    below_ceiling = _job(
+        factory.external_userid,
+        salary_floor_monthly=8600,
+        salary_ceiling_monthly=9499,
+        raw_text="below ceiling",
+        description="below ceiling",
+    )
+    high_range = _job(
+        factory.external_userid,
+        salary_floor_monthly=10000,
+        salary_ceiling_monthly=12000,
+        raw_text="high range",
+        description="high range",
+    )
+    db.add_all([
+        covers_by_ceiling,
+        exact_range,
+        open_high_floor,
+        below_open_floor,
+        below_ceiling,
+        high_range,
+    ])
+    db.commit()
+
+    rows = _query_jobs(
+        {"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 9500},
+        20,
+        db,
+    )
+
+    assert {row.id for row in rows} == {
+        covers_by_ceiling.id,
+        exact_range.id,
+        open_high_floor.id,
+        high_range.id,
+    }
+
+
 def test_query_resumes_json_contains_city_category_and_lifecycle(db_session):
     db, prefix = db_session
     active_worker = _user(prefix, "active-worker", role="worker")
