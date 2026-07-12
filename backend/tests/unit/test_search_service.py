@@ -1,4 +1,5 @@
 """search_service 单元测试。"""
+import json
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +19,7 @@ from app.services.search_service import (
     _format_no_match_with_suggestions_resume,
     _format_resume_results,
     _is_job_search,
+    _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
     _summarize_search_criteria,
@@ -49,6 +51,24 @@ def _make_user_ctx(role="worker"):
 
 def _make_session(role="worker", **kwargs):
     return SessionState(role=role, **kwargs)
+
+
+class TestJsonScalar:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "苏州市",
+            '苏"州',
+            r"苏州\园区",
+            123,
+        ],
+    )
+    def test_serializes_json_string_scalar(self, value):
+        encoded = _json_scalar(value)
+
+        assert json.loads(encoded) == str(value)
+        assert encoded.startswith('"')
+        assert encoded.endswith('"')
 
 
 class TestIsJobSearch:

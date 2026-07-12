@@ -5,6 +5,7 @@ show_more 复用快照，不重新执行全量检索。
 
 Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 """
+import json
 import logging
 import math
 import time
@@ -48,6 +49,11 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 RERANK_PROMPT_VERSION = "v1"
+
+
+def _json_scalar(value: object) -> str:
+    """Serialize a value as a JSON string scalar for MySQL JSON_CONTAINS."""
+    return json.dumps(str(value), ensure_ascii=False)
 
 # Stage B：0 命中 fallback 文案（§3.5）。
 # 不能伪装成推荐结果；必须明确告知未找到并给出可操作建议。
@@ -757,7 +763,7 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         city_filters = [
             sa.func.json_contains(
                 Resume.expected_cities,
-                sa.func.cast(city, sa.JSON),
+                _json_scalar(city),
             )
             for city in cities
         ]
@@ -771,7 +777,7 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         cat_filters = [
             sa.func.json_contains(
                 Resume.expected_job_categories,
-                sa.func.cast(cat, sa.JSON),
+                _json_scalar(cat),
             )
             for cat in categories
         ]

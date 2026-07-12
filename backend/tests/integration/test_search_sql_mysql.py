@@ -10,7 +10,7 @@ import sqlalchemy as sa
 import app.models  # noqa: F401  - registers ORM metadata for create_all
 from app.db import Base, SessionLocal, engine
 from app.models import Job, Resume, User
-from app.services.search_service import _query_jobs
+from app.services.search_service import _query_jobs, _query_resumes
 
 pytestmark = pytest.mark.integration
 
@@ -141,3 +141,53 @@ def test_query_jobs_runs_against_mysql_and_filters_lifecycle(db_session):
     rows = _query_jobs({"city": ["苏州市"], "job_category": ["电子厂"]}, 20, db)
 
     assert [row.id for row in rows] == [wanted.id]
+
+
+def test_query_resumes_json_contains_city_category_and_lifecycle(db_session):
+    db, prefix = db_session
+    active_worker = _user(prefix, "active-worker", role="worker")
+    inactive_worker = _user(prefix, "inactive-worker", role="worker", status="blocked")
+    db.add_all([active_worker, inactive_worker])
+    db.flush()
+
+    wanted = _resume(
+        active_worker.external_userid,
+        expected_cities=["苏州市", "无锡市"],
+        expected_job_categories=["电子厂", "普工"],
+        raw_text="wanted",
+        description="wanted",
+    )
+    special = _resume(
+        active_worker.external_userid,
+        expected_cities=['苏"州\\园区'],
+        expected_job_categories=['电子"厂\\测试'],
+        raw_text="special",
+        description="special",
+    )
+    db.add_all([
+        wanted,
+        special,
+        _resume(active_worker.external_userid, audit_status="pending"),
+        _resume(active_worker.external_userid, expires_at=_past()),
+        _resume(active_worker.external_userid, deleted_at=datetime.now(timezone.utc)),
+        _resume(inactive_worker.external_userid),
+    ])
+    db.commit()
+
+    by_city = _query_resumes({"city": "苏州市"}, 20, db)
+    by_city_list = _query_resumes({"city": ["无锡市"]}, 20, db)
+    by_category = _query_resumes({"job_category": ["电子厂"]}, 20, db)
+    by_both = _query_resumes({"city": ["苏州市"], "job_category": ["电子厂"]}, 20, db)
+    by_special = _query_resumes(
+        {"city": ['苏"州\\园区'], "job_category": ['电子"厂\\测试']},
+        20,
+        db,
+    )
+    by_mismatch = _query_resumes({"city": ["北京市"], "job_category": ["餐饮"]}, 20, db)
+
+    assert {row.id for row in by_city} == {wanted.id}
+    assert {row.id for row in by_city_list} == {wanted.id}
+    assert {row.id for row in by_category} == {wanted.id}
+    assert {row.id for row in by_both} == {wanted.id}
+    assert {row.id for row in by_special} == {special.id}
+    assert by_mismatch == []
