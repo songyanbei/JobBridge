@@ -1055,6 +1055,15 @@ def is_phase5_rollout_target(userid: str, percentage: int) -> bool:
     return _hash_to_bucket(userid) < percentage
 
 
+def is_phase5_policy_enabled(userid: str) -> bool:
+    """Return whether Phase 5 post-search policy owns this user's request."""
+    policy = settings.dialogue_policy
+    return (
+        policy.post_search_policy_mode == "on"
+        and is_phase5_rollout_target(userid, policy.phase5_rollout_percentage)
+    )
+
+
 def _classify_dialogue_v2(
     *,
     text: str,

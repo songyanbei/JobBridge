@@ -1416,9 +1416,8 @@ def _post_search_dispatch(
     # percentage>=100 全量命中；<=0 一律不命中（等价 off）；中间值按 userid hash。
     # shadow 不受 hash 桶约束（shadow 本来就只写日志不影响 reply，全量观测更有价值）。
     if mode == "on":
-        from app.services.intent_service import is_phase5_rollout_target
-        percentage = _settings_module.dialogue_policy.phase5_rollout_percentage
-        if not is_phase5_rollout_target(msg.from_user or "", percentage):
+        from app.services.intent_service import is_phase5_policy_enabled
+        if not is_phase5_policy_enabled(user_ctx.external_userid or ""):
             # 未命中灰度桶 → 等价 off 行为
             return [_reply(
                 msg.from_user,

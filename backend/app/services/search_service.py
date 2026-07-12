@@ -65,6 +65,13 @@ def _job_salary_covers_floor(salary_floor: int):
         ),
     )
 
+
+def _is_phase5_policy_enabled_for_user(userid: str | None) -> bool:
+    from app.services.intent_service import is_phase5_policy_enabled
+
+    return is_phase5_policy_enabled(userid or "")
+
+
 # Stage B：0 命中 fallback 文案（§3.5）。
 # 不能伪装成推荐结果；必须明确告知未找到并给出可操作建议。
 NO_JOB_MATCH_REPLY = (
@@ -292,7 +299,7 @@ def search_jobs(
     # available_relax_steps 由 _probe_relax_steps 填）。
     # off / shadow 模式保持旧行为（向后兼容验收 §5.2.4 第 2 项）。
     phase5_takeover = (
-        settings.post_search_policy_mode == "on"
+        _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
         and len(candidates) < top_n
     )
     available_steps: list[str] = []
@@ -448,7 +455,7 @@ def search_workers(
     # Phase 5 §5.2.1 第 1 项：post_search_policy_mode=on 时跳过 _run_*_fallback_steps
     # 由 reducer + applier 接管放宽决策。off / shadow 保持旧行为。
     phase5_takeover = (
-        settings.post_search_policy_mode == "on"
+        _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
         and len(candidates) < top_n
     )
     available_steps: list[str] = []

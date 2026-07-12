@@ -35,6 +35,13 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
         from app.services.user_service import UserContext
 
         monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 100},
+            ),
+        )
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
 
         # 全部返回 0 候选：search_jobs 走 "if not candidates: return NO_MATCH" 早返回，
@@ -60,6 +67,76 @@ class TestSearchServiceSkipsLegacyFallbackInOnMode:
             assert outcome.initial_count == 0
             # outcome.available_relax_steps 应已被填充（探查 3 步）
             assert isinstance(outcome.available_relax_steps, list)
+
+    @patch("app.services.search_service._query_jobs")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_rollout_zero_keeps_legacy_job_fallback(
+        self, mock_config, mock_query, monkeypatch,
+    ):
+        from app.services.search_service import FallbackOutcome, search_jobs
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 0},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+
+        with patch("app.services.search_service._run_job_fallback_steps") as mock_legacy_fb:
+            mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
+            session = SessionState(role="worker")
+            user_ctx = UserContext(
+                external_userid="u1", role="worker", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=True, can_search_workers=False,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_jobs(
+                {"city": ["北京市"], "job_category": ["餐饮"], "salary_floor_monthly": 5000},
+                "北京找餐饮", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_called_once()
+
+    @patch("app.services.search_service._query_resumes")
+    @patch("app.services.search_service._get_config_int")
+    def test_on_mode_rollout_zero_keeps_legacy_worker_fallback(
+        self, mock_config, mock_query, monkeypatch,
+    ):
+        from app.services.search_service import FallbackOutcome, search_workers
+        from app.schemas.conversation import SessionState
+        from app.services.user_service import UserContext
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 0},
+            ),
+        )
+        mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
+        mock_query.return_value = []
+
+        with patch("app.services.search_service._run_resume_fallback_steps") as mock_legacy_fb:
+            mock_legacy_fb.return_value = FallbackOutcome(candidates=[], suggestions=[])
+            session = SessionState(role="factory")
+            user_ctx = UserContext(
+                external_userid="u-factory", role="factory", status="active",
+                display_name=None, company=None, contact_person=None, phone=None,
+                can_search_jobs=False, can_search_workers=True,
+                is_first_touch=False, should_welcome=False,
+            )
+            search_workers(
+                {"city": ["北京市"], "job_category": ["餐饮"]},
+                "北京找工人", session, user_ctx, MagicMock(),
+            )
+            mock_legacy_fb.assert_called_once()
 
     @patch("app.services.search_service._query_jobs")
     @patch("app.services.search_service._get_config_int")
@@ -198,15 +275,42 @@ class TestPhase5HashBucket:
         # 不要求严格 50%，但应在 30-70 范围内（md5 hash 分布合理）
         assert 30 <= hits <= 70, f"hits={hits} far from expected 50 ± 20"
 
+    def test_policy_enabled_combines_mode_and_rollout(self, monkeypatch):
+        from app.services.intent_service import is_phase5_policy_enabled
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "off")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 100},
+            ),
+        )
+        assert is_phase5_policy_enabled("u-any") is False
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 100},
+            ),
+        )
+        assert is_phase5_policy_enabled("u-any") is True
+        assert is_phase5_policy_enabled("") is False
+
     def test_post_search_dispatch_off_when_percentage_zero(self, monkeypatch):
         """post_search_policy_mode=on 但 phase5_rollout_percentage=0 → 等价 off。"""
-        from app.schemas.conversation import ReplyMessage
         from app.services import message_router
         from app.schemas.search import SearchOutcome, SearchResult
 
         monkeypatch.setattr(settings, "post_search_policy_mode", "on")
-        settings.dialogue_policy = settings.dialogue_policy.model_copy(
-            update={"phase5_rollout_percentage": 0},
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 0},
+            ),
         )
 
         msg = MagicMock()
@@ -215,6 +319,7 @@ class TestPhase5HashBucket:
         msg.msg_id = "m-1"
         user_ctx = MagicMock()
         user_ctx.role = "worker"
+        user_ctx.external_userid = "u-test"
         from app.schemas.conversation import SessionState
         session = SessionState(role="worker")
 
@@ -239,8 +344,12 @@ class TestPhase5HashBucket:
         from app.schemas.conversation import SessionState
 
         monkeypatch.setattr(settings, "post_search_policy_mode", "on")
-        settings.dialogue_policy = settings.dialogue_policy.model_copy(
-            update={"phase5_rollout_percentage": 100},
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 100},
+            ),
         )
 
         msg = MagicMock()
@@ -249,6 +358,7 @@ class TestPhase5HashBucket:
         msg.msg_id = "m-1"
         user_ctx = MagicMock()
         user_ctx.role = "worker"
+        user_ctx.external_userid = "u-test"
         session = SessionState(
             role="worker",
             search_criteria={"city": ["北京市"], "job_category": ["餐饮"]},
@@ -266,3 +376,51 @@ class TestPhase5HashBucket:
         )
         # 命中桶 → reducer 输出 paginate_no_more → applier 渲染降级建议
         assert "已经是所有匹配结果了。可以试试以下方向" in replies[0].content
+
+    def test_post_search_dispatch_uses_user_ctx_external_userid(self, monkeypatch):
+        """msg.from_user 与 user_ctx.external_userid 不一致时，只以后者判桶。"""
+        from app.services import message_router
+        from app.schemas.search import SearchOutcome, SearchResult
+        from app.schemas.conversation import SessionState
+        from app.services.intent_service import is_phase5_rollout_target
+
+        hit_user = next(
+            f"hit-{i}" for i in range(1000)
+            if is_phase5_rollout_target(f"hit-{i}", 50)
+        )
+        miss_user = next(
+            f"miss-{i}" for i in range(1000)
+            if not is_phase5_rollout_target(f"miss-{i}", 50)
+        )
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 50},
+            ),
+        )
+
+        msg = MagicMock()
+        msg.from_user = hit_user
+        msg.content = "test"
+        msg.msg_id = "m-1"
+        user_ctx = MagicMock()
+        user_ctx.role = "worker"
+        user_ctx.external_userid = miss_user
+        session = SessionState(role="worker")
+        outcome = SearchOutcome(
+            direction="search_job",
+            criteria_used={"city": ["北京市"]},
+            initial_count=0, final_count=0, desired_count=3,
+            low_recall_threshold=3, snapshot_exhausted=True,
+        )
+
+        replies = message_router._post_search_dispatch(
+            msg=msg, user_ctx=user_ctx, session=session, db=MagicMock(),
+            search_result=SearchResult(reply_text="原始回复", result_count=0),
+            search_outcome=outcome, legacy_intent="show_more",
+        )
+
+        assert replies[0].content == "原始回复"
