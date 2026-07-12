@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -254,9 +255,10 @@ class TestRecursionGuardRaisesRuntimeError:
             "backend/app/services/post_search_applier.py",
             "backend/app/services/message_router.py",
         ]
+        repo_root = Path(__file__).resolve().parents[3]
         # 只检查"assert"独立单词作为语句开头（不是 docstring / comment）
         for path in files:
-            with open(f"D:/work/JobBridge/{path}", "r", encoding="utf-8") as f:
+            with (repo_root / path).open("r", encoding="utf-8") as f:
                 content = f.read()
             # 排除注释和 docstring 内的 assert
             for i, line in enumerate(content.splitlines(), 1):

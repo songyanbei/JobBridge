@@ -16,7 +16,7 @@
 --
 -- 卡位策略（7 条苏州电子厂岗位）：
 --   薪资下限 5500 / 6500 / 7000 / 7500 → 第 5、6 步候选池
---   薪资区间 8600~11000 / 8800~11500 / 9000~12000 → 第 9 步 9500+ 直接命中
+--   薪资区间 8600~11000 / 8800~11500 / 9000~12000 → 第 8 步 9500+ 直接命中
 --
 -- 重复执行：所有 INSERT 用 demo_supp_* 标记到 extra.demo_tag，可通过下方 cleanup 段重置
 -- =============================================================================
@@ -64,7 +64,7 @@ INSERT INTO job (
  'passed', 'system', NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','6')),
 
--- 第 9 步候选（按薪资区间上限覆盖 9500 直接命中）
+-- 第 8 步候选（按薪资区间上限覆盖 9500 直接命中）
 ('seed_factory_014', '苏州市', '电子厂', 8600, 11000, '月薪', 8, '不限', 22, 45, 1,
  '工业园区', '工业园区现代大道 2008 号',1, 1, '白班',
  '苏州工业园电子厂招高级技工 8 人，8600-11000，包吃住，白班',
@@ -105,8 +105,8 @@ FROM job WHERE city='苏州市' AND job_category='电子厂'
   AND (salary_ceiling_monthly >= 7000 OR (salary_ceiling_monthly IS NULL AND salary_floor_monthly >= 7000))
   AND audit_status='passed' AND deleted_at IS NULL;
 
--- 第 9 步预期：岗位区间覆盖 9500，应直接命中 ≥ 3 条
-SELECT '第 9 步 9500+ 区间命中数（应 ≥ 3）' AS section, COUNT(*) AS cnt
+-- 第 8 步预期：岗位区间覆盖 9500，应直接命中 ≥ 3 条
+SELECT '第 8 步 9500+ 区间命中数（应 ≥ 3）' AS section, COUNT(*) AS cnt
 FROM job WHERE city='苏州市' AND job_category='电子厂'
   AND (salary_ceiling_monthly >= 9500 OR (salary_ceiling_monthly IS NULL AND salary_floor_monthly >= 9500))
   AND audit_status='passed' AND deleted_at IS NULL;
