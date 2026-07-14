@@ -127,6 +127,49 @@ _V2_CLAR_DROPPED_SLOTS_NO_VALID = (
 _V2_CLAR_DEFAULT = "请再说得具体一些，方便我帮您处理。"
 
 
+# Phase 5 §5.2：turn-scoped 上下文 holder。_handle_text 在 v2_dual_read / primary
+# 路径下把真实 parse_result / decision 存进来，_post_search_dispatch 读取后让
+# reducer 看到准确的 accepted_slots_delta / confidence；turn 结束清空。
+#
+# 第 8 轮 review fix 2：用 contextvars.ContextVar 替换 module-level dict。
+# 当前 worker 主循环是单线程串行（worker.py:_main_loop），但 contextvars 跨线程 /
+# 跨 asyncio task 默认隔离，对未来扩展（ThreadPoolExecutor 并行 / pytest-xdist
+# 并行测试）友好。注释里写"单线程处理"= 把并发约束埋在代码注释里，半年后没人会记得。
+from contextvars import ContextVar as _ContextVar
+
+_v2_parse_result: _ContextVar = _ContextVar("_v2_parse_result", default=None)
+_v2_decision: _ContextVar = _ContextVar("_v2_decision", default=None)
+
+
+def _set_v2_turn_context(parse_result, decision) -> None:
+    _v2_parse_result.set(parse_result)
+    _v2_decision.set(decision)
+
+
+def _clear_v2_turn_context() -> None:
+    _v2_parse_result.set(None)
+    _v2_decision.set(None)
+
+
+def _is_relaxation_expired(iso_str: str) -> bool:
+    """Phase 5 §第 8 轮 review fix 1：判断 pending_relaxation.expires_at 是否过期。
+
+    与 upload_service.is_pending_upload_expired 同款防御：
+    1. 解析失败按已过期处理（脏数据不卡流程）。
+    2. naive datetime 补 UTC tzinfo 避免与 aware now 比较抛 TypeError。
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    if not iso_str:
+        return False
+    try:
+        expires = _dt.fromisoformat(iso_str)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=_tz.utc)
+        return _dt.now(_tz.utc) > expires
+    except (TypeError, ValueError):
+        return True
+
+
 def _render_v2_clarification(clarification: dict, session: SessionState) -> str:
     """按 clarification.kind 渲染反问文案。"""
     clar = clarification or {}
@@ -218,22 +261,26 @@ def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
         logger.exception("message_router: update_last_active failed (non-fatal)")
 
     # 4. 按消息类型分流
-    mtype = msg.msg_type or ""
-    if mtype == "text":
-        return _handle_text(msg, user_ctx, db)
-    if mtype == "image":
-        return _handle_image(msg, user_ctx, db)
-    if mtype == "voice":
-        return [_reply(userid, VOICE_NOT_SUPPORTED)]
-    if mtype == "event":
-        logger.info("message_router: wecom event received userid=%s content=%s",
-                    userid, msg.content)
-        return []
-    if mtype in ("file", "video", "link", "location"):
-        return [_reply(userid, FILE_NOT_SUPPORTED)]
-    # 未知类型兜底
-    logger.warning("message_router: unknown msg_type=%s from userid=%s", mtype, userid)
-    return [_reply(userid, UNKNOWN_TYPE_REPLY)]
+    # Phase 5 §5.2：用 try/finally 清空 turn-scoped v2 context，避免跨 turn 泄漏。
+    try:
+        mtype = msg.msg_type or ""
+        if mtype == "text":
+            return _handle_text(msg, user_ctx, db)
+        if mtype == "image":
+            return _handle_image(msg, user_ctx, db)
+        if mtype == "voice":
+            return [_reply(userid, VOICE_NOT_SUPPORTED)]
+        if mtype == "event":
+            logger.info("message_router: wecom event received userid=%s content=%s",
+                        userid, msg.content)
+            return []
+        if mtype in ("file", "video", "link", "location"):
+            return [_reply(userid, FILE_NOT_SUPPORTED)]
+        # 未知类型兜底
+        logger.warning("message_router: unknown msg_type=%s from userid=%s", mtype, userid)
+        return [_reply(userid, UNKNOWN_TYPE_REPLY)]
+    finally:
+        _clear_v2_turn_context()
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +363,14 @@ def _handle_text(
         # 消费 + apply_decision。fallback 路径（v2_fallback_legacy / v2_primary_fallback_legacy）
         # 走下面的 legacy 路由，与 source=="legacy" 等价处理。
         if source in {"v2_dual_read", "v2_primary"} and decision is not None:
+            # Phase 5 §5.2：把真实 parse_result + decision 暂存，让
+            # _post_search_dispatch 在搜索后能读到。turn 结束（return 前后）需要清。
+            # parse_result 由 intent_service.classify_dialogue 在 DialogueRouteResult
+            # 中透传，让 _decide_zero_result 的低置信度规则在真实链路也能命中。
+            _set_v2_turn_context(
+                parse_result=getattr(route, "parse_result", None),
+                decision=decision,
+            )
             from app.services.dialogue_applier import apply_awaiting_ops, apply_decision
             # awaiting_ops 必须在所有 v2 分支上执行（包括 clarification / 冲突短路），
             # 否则被消费的 awaiting 字段会僵尸保留（adversarial review C1/I15）。
@@ -351,6 +406,24 @@ def _handle_text(
                 # （codex review 第二轮 P1）。
                 apply_decision(decision, session, msg=msg, intent_result=intent_result)
                 replies = _route_v2_resolve_conflict(
+                    decision, msg, user_ctx, session, db,
+                )
+                if replies:
+                    conversation_service.record_history(
+                        session, "assistant", replies[0].content,
+                    )
+                conversation_service.save_session(userid, session)
+                return replies
+            # Phase 5 §5.2.1.5 执行归属表 / §5.2.3 message_router 行：
+            # respond_relaxation_offer short-circuit（与 resolve_conflict 平行）。
+            # apply_decision 调用边界：仅当 state_transition=clear_pending_relaxation
+            # 时调（applier 处理 session-only 清状态）；apply_relaxation /
+            # cancel_relaxation **跳过** apply_decision，由 _route_v2_relaxation_response
+            # 接管二次检索 + 清状态。
+            if decision.dialogue_act == "respond_relaxation_offer":
+                if decision.state_transition == "clear_pending_relaxation":
+                    apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                replies = _route_v2_relaxation_response(
                     decision, msg, user_ctx, session, db,
                 )
                 if replies:
@@ -781,6 +854,151 @@ def _route_v2_resolve_conflict(
     return [_reply(userid, FALLBACK_REPLY)]
 
 
+def _route_v2_relaxation_response(
+    decision,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+) -> list[ReplyMessage]:
+    """Phase 5 §5.2.1.5 执行归属表 / §5.2.3 message_router 行：放宽确认派发。
+
+    与 ``_route_v2_resolve_conflict`` **平行**（不复用其函数体），处理用户对
+    "要把 X 放宽吗"反问的回应：
+    - ``apply_relaxation`` → 调 ``execute_relaxed_search(original, step, ...)``
+      拿放宽后 ``(SearchResult, SearchOutcome)``，构造 PostSearchContext
+      (recursion_depth=1) 走二阶段 reducer + applier；
+    - ``cancel_relaxation`` → 用模板渲染"好的，那我们换其他条件"。
+
+    无论哪条分支，**函数自身**在执行后清 ``session.pending_relaxation``。
+
+    P1 评审硬约束（详见 phased-plan §5.2.4 验收 #6 / #8）：
+    - **只读 ``original_criteria``**（不读 relaxed_criteria，避免二次放宽）；
+    - **raw_query 从 pending 读取**（不用 ``msg.content``——确认轮通常是
+      "好的/可以"，作为 reranker query 会让排序退化）。
+    """
+    userid = msg.from_user
+    transition = decision.state_transition
+    pending = dict(session.pending_relaxation or {})
+
+    # 兜底：pending_relaxation 缺失时不应走到这里（_handle_text 应该不会路由），
+    # 但防御一下。
+    if not pending:
+        logger.warning(
+            "_route_v2_relaxation_response: pending_relaxation is None; "
+            "falling back to chitchat reply",
+        )
+        return [_reply(userid, "好的。")]
+
+    # 第 8 轮 review fix 1：检查 pending_relaxation.expires_at。
+    # TTL 在 applier 写入时由 search_awaiting_ttl_seconds 决定，过期后用户回话
+    # 不应再被识别为"接受放宽"——上下文已模糊。
+    expires_at = pending.get("expires_at")
+    if expires_at and _is_relaxation_expired(expires_at):
+        log_event(
+            "pending_relaxation_expired",
+            userid=userid,
+            step=pending.get("step"),
+            expires_at=expires_at,
+        )
+        session.pending_relaxation = None
+        return [_reply(userid, "刚才的搜索话题已过期，重新开始搜索吧。")]
+
+    if transition == "cancel_relaxation":
+        session.pending_relaxation = None
+        return [_reply(userid, "好的，那我们换其他条件重新搜索。")]
+
+    if transition == "apply_relaxation":
+        from app.services.post_search_applier import apply_post_search_decision
+        from app.services.post_search_reducer import (
+            PostSearchContext,
+            post_search_reduce,
+        )
+        from app.services import search_service as _search_service
+        from app.llm.base import DialogueParseResult
+        from app.services.dialogue_reducer import DialogueDecision
+
+        # phased-plan §5.2.1.5 third row：只读 original_criteria + 持久化的
+        # raw_query / user_msg_id；**不**读 relaxed_criteria；**不**用 msg.content。
+        original_criteria = dict(pending.get("original_criteria") or {})
+        step = pending.get("step") or ""
+        direction = pending.get("direction") or "search_job"
+        persisted_raw_query = pending.get("raw_query") or ""
+        persisted_user_msg_id = pending.get("user_msg_id")
+
+        new_result, new_outcome = _search_service.execute_relaxed_search(
+            original_criteria,
+            step,
+            direction=direction,
+            raw_query=persisted_raw_query,
+            session=session,
+            user_ctx=user_ctx,
+            db=db,
+            user_msg_id=persisted_user_msg_id,
+        )
+
+        # 二阶段 reducer
+        parse_stub = DialogueParseResult(
+            dialogue_act="chitchat",
+            frame_hint="none",
+            slots_delta={},
+            merge_hint={},
+            needs_clarification=False,
+            confidence=1.0,
+        )
+        decision_stub = DialogueDecision(
+            dialogue_act="chitchat",
+            resolved_frame="none",
+            route_intent="follow_up",
+        )
+        new_ps_decision = post_search_reduce(
+            parse_result=parse_stub,
+            decision=decision_stub,
+            session=session,
+            search_outcome=new_outcome,
+            role=user_ctx.role,
+        )
+        # 第二轮 reducer 必须不再输出 auto_relax_and_retry
+        # 第 8 轮 review fix 3：用 raise 而非 assert（-O 模式会剥）
+        if new_ps_decision.action == "auto_relax_and_retry":
+            raise RuntimeError(
+                "post_search_reduce produced auto_relax_and_retry on second pass "
+                "via _route_v2_relaxation_response"
+            )
+
+        ctx = PostSearchContext(
+            decision=new_ps_decision,
+            search_result=new_result,
+            search_outcome=new_outcome,
+            parse_result=parse_stub,
+            dialogue_decision=decision_stub,
+            session=session,
+            msg=msg,
+            user_ctx=user_ctx,
+            db=db,
+            raw_query=persisted_raw_query,
+            role=user_ctx.role,
+            recursion_depth=1,
+        )
+        replies = apply_post_search_decision(ctx)
+
+        # 函数自身清 pending_relaxation（不依赖 apply_decision）
+        session.pending_relaxation = None
+
+        # 推进 active_flow（与 _handle_show_more 相同语义）
+        if session.candidate_snapshot is not None:
+            session.active_flow = "search_active"
+        return replies
+
+    # 兜底
+    logger.warning(
+        "_route_v2_relaxation_response: unexpected transition=%s",
+        transition,
+    )
+    session.pending_relaxation = None
+    return [_reply(userid, "好的。")]
+
+
 def _route_v2_cancel_reset(
     decision,
     pre_state: dict,
@@ -963,13 +1181,15 @@ def _handle_upload_and_search(
     if criteria:
         session.search_criteria = {**session.search_criteria, **criteria}
 
-    search_result = _run_search(
+    run_search_outcome = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
     )
-    if search_result is None:
+    if run_search_outcome is None:
         # 搜索 handler 抛错；保持入库成功语义，active_flow 已在 _run_search 回到 idle
         return replies
+    # Phase 5 §5.2：_run_search 现返回 (SearchResult, SearchOutcome)
+    search_result, _so = run_search_outcome
 
     # spec §9.2.1：0 命中也要追加“暂未找到”，并保持 active_flow=idle；
     # 有结果时 _run_search 已将 active_flow 推进到 search_active。
@@ -1040,18 +1260,24 @@ def _handle_search(
     # 否则 worker "看看新岗位" 这类空 structured_data 场景永远进不到
     # _apply_default_criteria，简历 expected_* 默认条件无机会兜底。
     criteria = dict(session.search_criteria)
-    search_result = _run_search(
+    run_search_outcome = _run_search(
         intent_result.intent, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
     )
-    if search_result is None:
+    if run_search_outcome is None:
         return [_reply(msg.from_user, SYSTEM_BUSY_REPLY)]
-    return [_reply(
-        msg.from_user,
-        search_result.reply_text,
-        intent=intent_result.intent,
-        criteria_snapshot=_snapshot_meta(session),
-    )]
+    # Phase 5 §5.2：_run_search 返回 (SearchResult, SearchOutcome)
+    search_result, outcome = run_search_outcome
+    # Phase 5 §5.2：_handle_search 也接 post_search_dispatch 三模式分流。
+    return _post_search_dispatch(
+        msg=msg,
+        user_ctx=user_ctx,
+        session=session,
+        db=db,
+        search_result=search_result,
+        search_outcome=outcome,
+        legacy_intent=intent_result.intent,
+    )
 
 
 def _handle_follow_up(
@@ -1102,18 +1328,24 @@ def _handle_follow_up(
     # - digest 未变：相当于"再搜一次"，快照会被同样 digest 重置，对用户无感
     # - follow_up 没有显式方向，沿用 session.broker_direction（首次 search 时已写）
     criteria = dict(session.search_criteria)
-    search_result = _run_search(
+    run_search_outcome = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
     )
-    if search_result is None:
+    if run_search_outcome is None:
         return [_reply(msg.from_user, SYSTEM_BUSY_REPLY)]
-    return [_reply(
-        msg.from_user,
-        search_result.reply_text,
-        intent=intent_result.intent,
-        criteria_snapshot=_snapshot_meta(session),
-    )]
+    # Phase 5 §5.2：_run_search 返回 (SearchResult, SearchOutcome)
+    search_result, outcome = run_search_outcome
+    # Phase 5 §5.2：_handle_follow_up 也接 post_search_dispatch 三模式分流。
+    return _post_search_dispatch(
+        msg=msg,
+        user_ctx=user_ctx,
+        session=session,
+        db=db,
+        search_result=search_result,
+        search_outcome=outcome,
+        legacy_intent="follow_up",
+    )
 
 
 def _handle_show_more(
@@ -1122,18 +1354,184 @@ def _handle_show_more(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
-    result = search_service.show_more(session, user_ctx, db)
+    # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
+    result, outcome = search_service.show_more(session, user_ctx, db)
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
     else:
         session.active_flow = "idle"
-    return [_reply(
-        msg.from_user,
-        result.reply_text,
-        intent="show_more",
-        criteria_snapshot=_snapshot_meta(session),
-    )]
+
+    # Phase 5 §5.1：post_search_policy_mode 三模式分流。
+    # - off：直接用 result.reply_text，逐字节等价 5.0；
+    # - shadow：调 reducer 但只写日志，不影响 reply；
+    # - on：构造 PostSearchContext 调 applier 拿最终 reply。
+    # _handle_search / _handle_follow_up 暂不接通（5.1 reducer 在主搜索路径
+    # 永远输出 no_action，行为等价 off；5.2 接通后会触发 auto_relax_and_retry
+    # 等 action，那时再扩）。
+    return _post_search_dispatch(
+        msg=msg,
+        user_ctx=user_ctx,
+        session=session,
+        db=db,
+        search_result=result,
+        search_outcome=outcome,
+        legacy_intent="show_more",
+    )
+
+
+def _post_search_dispatch(
+    *,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+    search_result,  # SearchResult
+    search_outcome,  # SearchOutcome
+    legacy_intent: str,
+) -> list[ReplyMessage]:
+    """Phase 5 §5.1：post_search_policy_mode 三模式分流入口。
+
+    legacy_intent 用于 off / shadow 模式构造与 5.0 之前完全等价的 ReplyMessage
+    （含 intent / criteria_snapshot 字段），on 模式由 applier 自行渲染。
+
+    Phase 5 §5.2：从 _v2_turn_context 读取真实 parse_result / decision（如有），
+    让 reducer 准确判断"用户刚断言的字段是否被 relax step 覆盖"。
+
+    Phase 5 §5.4：当 mode=on 时，进一步用 phase5_rollout_percentage hash 桶
+    判定灰度命中；未命中桶则等价 off 行为（保 reply 与 5.0 前一致），让
+    5%/25%/50%/100% 灰度阶梯真正生效。
+    """
+    mode = _settings_module.dialogue_policy.post_search_policy_mode
+
+    if mode == "off":
+        return [_reply(
+            msg.from_user,
+            search_result.reply_text,
+            intent=legacy_intent,
+            criteria_snapshot=_snapshot_meta(session),
+        )]
+
+    # Phase 5 §5.4：on 模式下进一步用 phase5_rollout_percentage hash 桶判定。
+    # percentage>=100 全量命中；<=0 一律不命中（等价 off）；中间值按 userid hash。
+    # shadow 不受 hash 桶约束（shadow 本来就只写日志不影响 reply，全量观测更有价值）。
+    if mode == "on":
+        from app.services.intent_service import is_phase5_policy_enabled
+        if not is_phase5_policy_enabled(user_ctx.external_userid or ""):
+            # 未命中灰度桶 → 等价 off 行为
+            return [_reply(
+                msg.from_user,
+                search_result.reply_text,
+                intent=legacy_intent,
+                criteria_snapshot=_snapshot_meta(session),
+            )]
+
+    # shadow / on 都需要构造 ctx + 调 reducer
+    from app.services.dialogue_reducer import DialogueDecision
+    from app.llm.base import DialogueParseResult
+    from app.services.post_search_applier import apply_post_search_decision
+    from app.services.post_search_reducer import (
+        PostSearchContext,
+        post_search_reduce,
+    )
+
+    # Phase 5 §5.2：优先从 turn-scoped holder 读 v2 真实 parse_result / decision
+    # （由 _handle_text v2 路径在 dispatch 前暂存）；off / legacy 路径下没有，
+    # 用高 confidence 的 stub 避免误触发 _decide_zero_result 的低置信度分支。
+    # 第 8 轮 review fix 2：改用 ContextVar 而非 module-level dict。
+    real_parse = _v2_parse_result.get()
+    real_decision = _v2_decision.get()
+    if real_parse is not None:
+        parse_stub = real_parse
+    else:
+        parse_stub = DialogueParseResult(
+            dialogue_act="chitchat",
+            frame_hint="none",
+            slots_delta={},
+            merge_hint={},
+            needs_clarification=False,
+            confidence=1.0,  # 高 confidence 跳过 _decide_zero_result 低置信度分支
+        )
+    if real_decision is not None:
+        decision_stub = real_decision
+    else:
+        decision_stub = DialogueDecision(
+            dialogue_act="chitchat",
+            resolved_frame="none",
+            route_intent=legacy_intent,
+        )
+
+    ps_decision = post_search_reduce(
+        parse_result=parse_stub,
+        decision=decision_stub,
+        session=session,
+        search_outcome=search_outcome,
+        role=user_ctx.role,
+    )
+
+    if mode == "shadow":
+        # 5.1 验收 #2：shadow 只写日志，不影响 reply。
+        # Phase 5 §5.4：补 soft_pref_hits / applied_relax_step / final_count
+        # 监控面板字段。
+        log_event(
+            "post_search_decision",
+            mode="shadow",
+            action=ps_decision.action,
+            reasoning=ps_decision.reasoning,
+            direction=search_outcome.direction,
+            snapshot_exhausted=search_outcome.snapshot_exhausted,
+            initial_count=search_outcome.initial_count,
+            final_count=search_outcome.final_count,
+            applied_relax_step=search_outcome.applied_relax_step,
+            soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+        )
+        return [_reply(
+            msg.from_user,
+            search_result.reply_text,
+            intent=legacy_intent,
+            criteria_snapshot=_snapshot_meta(session),
+        )]
+
+    # mode == "on"
+    # Phase 5 §5.4：on 模式监控字段同步扩展
+    log_event(
+        "post_search_decision",
+        mode="on",
+        action=ps_decision.action,
+        reasoning=ps_decision.reasoning,
+        direction=search_outcome.direction,
+        snapshot_exhausted=search_outcome.snapshot_exhausted,
+        initial_count=search_outcome.initial_count,
+        final_count=search_outcome.final_count,
+        applied_relax_step=search_outcome.applied_relax_step,
+        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+    )
+    ctx = PostSearchContext(
+        decision=ps_decision,
+        search_result=search_result,
+        search_outcome=search_outcome,
+        parse_result=parse_stub,
+        dialogue_decision=decision_stub,
+        session=session,
+        msg=msg,
+        user_ctx=user_ctx,
+        db=db,
+        raw_query=msg.content or "",
+        role=user_ctx.role,
+        recursion_depth=0,
+    )
+    replies = apply_post_search_decision(ctx)
+    # applier 返回的 ReplyMessage 没有 intent / criteria_snapshot，由本函数补齐
+    # 以保持与旧路径同构（便于 worker 落库 / 监控大盘）。
+    enriched: list[ReplyMessage] = []
+    for r in replies:
+        if r.intent is None:
+            r = r.model_copy(update={
+                "intent": legacy_intent,
+                "criteria_snapshot": _snapshot_meta(session),
+            })
+        enriched.append(r)
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -1574,14 +1972,20 @@ def _run_search(
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
+    # Phase 5 §5.0：search_jobs/search_workers 现返回 tuple[SearchResult, SearchOutcome]
     if direction == "search_job":
-        result = search_service.search_jobs(
+        result, outcome = search_service.search_jobs(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
     else:
-        result = search_service.search_workers(
+        result, outcome = search_service.search_workers(
             composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
         )
+
+    # Phase 5 §5.2：available_relax_steps 现已由 search_jobs/search_workers 在
+    # post_search_policy_mode=on 时内部填好（跳过 _run_*_fallback_steps 由 reducer
+    # 接管）；off / shadow 模式下不需要 available_relax_steps（reducer 不接管）。
+    # 本处不再重复 probe（避免无意义的 SQL 调用）。
 
     # Stage C1（spec §2.8 / §9.2.1）：不论命中与否，只要 criteria 有效就写 last_criteria；
     # 并按是否生成 candidate_snapshot 推进 active_flow。
@@ -1593,7 +1997,9 @@ def _run_search(
         session.active_flow = "idle"
     # Phase 1（§1.1.2）：搜索真正执行后清搜索 awaiting，避免下一轮裸值再被旧队列吃掉。
     conversation_service.clear_search_awaiting(session)
-    return result
+    # Phase 5 §5.2：返回 (result, outcome)，让上游 _handle_search /
+    # _handle_follow_up 接 post_search_reduce 三模式分流。
+    return result, outcome
 
 
 # ---------------------------------------------------------------------------

@@ -103,7 +103,7 @@ class TestUploadThenSearchSmoke:
             is_first_touch=False, should_welcome=False,
         )
         worker_session = SessionState(role="worker")
-        search_result = search_service.search_jobs(
+        search_result, _outcome = search_service.search_jobs(
             {"city": ["苏州市"], "job_category": ["电子厂"]},
             "苏州找电子厂",
             worker_session,

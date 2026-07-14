@@ -132,3 +132,61 @@ def test_pending_interruption_injected_on_enter_conflict():
     assert s.active_flow == "upload_conflict"
     assert s.pending_interruption is not None
     assert s.pending_interruption["intent"] == "search_worker"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5.2：放宽确认状态机
+# ---------------------------------------------------------------------------
+
+
+def test_clear_pending_relaxation_clears_session_field():
+    s = _session(pending_relaxation={
+        "frame": "job_search",
+        "step": "relax_salary_10pct",
+        "original_criteria": {"city": ["北京市"]},
+    })
+    result = apply_decision(_decision(state_transition="clear_pending_relaxation"), s)
+    assert s.pending_relaxation is None
+    assert result.transition_executed == "clear_pending_relaxation"
+
+
+def test_apply_relaxation_is_no_op_in_applier(caplog):
+    """phased-plan §5.2.4 验收 #5：apply_relaxation 不在 applier 物化（拿不到 db）；
+    显式 no-op + 打 dialogue_applier_relaxation_passthrough 日志，**不**走 unknown
+    兜底告警。"""
+    import logging
+    s = _session(pending_relaxation={
+        "frame": "job_search", "step": "relax_salary_10pct",
+        "original_criteria": {},
+    })
+    with caplog.at_level(logging.INFO):
+        result = apply_decision(_decision(state_transition="apply_relaxation"), s)
+    # session.pending_relaxation **未**被清（apply_relaxation 不归 applier 管）
+    assert s.pending_relaxation is not None
+    # 无 unknown_state_transition warning
+    assert not any(
+        "unknown state_transition" in r.message
+        for r in caplog.records
+    )
+    # 有 passthrough 日志
+    assert any(
+        "dialogue_applier_relaxation_passthrough" in r.message
+        for r in caplog.records
+    )
+    assert result.transition_executed == "apply_relaxation"
+
+
+def test_cancel_relaxation_is_no_op_in_applier(caplog):
+    import logging
+    s = _session(pending_relaxation={
+        "frame": "job_search", "step": "relax_salary_10pct",
+        "original_criteria": {},
+    })
+    with caplog.at_level(logging.INFO):
+        result = apply_decision(_decision(state_transition="cancel_relaxation"), s)
+    assert s.pending_relaxation is not None  # 不归 applier 管
+    assert result.transition_executed == "cancel_relaxation"
+    assert any(
+        "dialogue_applier_relaxation_passthrough" in r.message
+        for r in caplog.records
+    )

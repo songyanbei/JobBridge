@@ -82,6 +82,7 @@ class _SearchCallSpy:
         )
 
     def fake_search_jobs(self, criteria, raw_query, session, user_ctx, db, **_kw):
+        # Phase 5 §5.0：search_service.search_jobs 现返回 tuple[SearchResult, SearchOutcome]
         from types import SimpleNamespace
         self.jobs_calls.append(dict(criteria))
         reply_text = self.current_jobs_reply_text
@@ -89,9 +90,31 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
-        return SimpleNamespace(reply_text=reply_text)
+        ov = self.current_search_outcome_overrides or {}
+        return (
+            SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
+            SimpleNamespace(
+                direction="search_job",
+                criteria_used=dict(criteria),
+                # Phase 5 §5.2：默认 initial_count=999 跳过 _run_search 的低召回 probe
+                # （probe 会跑真实 SQL，spy 上下文不能跑）。需要测低召回的 case
+                # 由 turn 级 mock_search_outcome 入口注入。
+                initial_count=int(ov.get("initial_count", 999)),
+                final_count=int(ov.get("final_count", 1)),
+                desired_count=3,
+                low_recall_threshold=int(ov.get("low_recall_threshold", 3)),
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits=dict(ov.get("soft_pref_hits", {}) or {}),
+                has_more=False,
+                snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
+                available_relax_steps=list(ov.get("available_relax_steps", []) or []),
+                relax_probe_results=list(ov.get("relax_probe_results", []) or []),
+            ),
+        )
 
     def fake_search_workers(self, criteria, raw_query, session, user_ctx, db, **_kw):
+        # Phase 5 §5.0：search_workers 现返回 tuple[SearchResult, SearchOutcome]
         from types import SimpleNamespace
         self.workers_calls.append(dict(criteria))
         reply_text = self.current_workers_reply_text
@@ -99,7 +122,141 @@ class _SearchCallSpy:
             "criteria": dict(criteria),
             "reply_text": reply_text,
         })
-        return SimpleNamespace(reply_text=reply_text)
+        ov = self.current_search_outcome_overrides or {}
+        return (
+            SimpleNamespace(reply_text=reply_text, has_more=False, result_count=1),
+            SimpleNamespace(
+                direction="search_worker",
+                criteria_used=dict(criteria),
+                initial_count=int(ov.get("initial_count", 999)),
+                final_count=int(ov.get("final_count", 1)),
+                desired_count=3,
+                low_recall_threshold=int(ov.get("low_recall_threshold", 3)),
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits=dict(ov.get("soft_pref_hits", {}) or {}),
+                has_more=False,
+                snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
+                available_relax_steps=list(ov.get("available_relax_steps", []) or []),
+                relax_probe_results=list(ov.get("relax_probe_results", []) or []),
+            ),
+        )
+
+    # Phase 5 §5.1：mock show_more 让 case 模拟翻完场景。
+    # case 顶层可设 ``mock_show_more={"snapshot_exhausted": True, ...}``，
+    # 由 runner 透传到这里。默认 snapshot_exhausted=False，模拟"还有更多结果"。
+    show_more_calls: list[dict] = field(default_factory=list)
+    current_show_more_outcome: dict = field(default_factory=lambda: {
+        "direction": "search_job",
+        "snapshot_exhausted": False,
+        "reply_text": "[mock-show-more]",
+    })
+    # Phase 5 §5.2：search outcome 注入位（每 turn 可覆盖默认 initial_count=999）
+    current_search_outcome_overrides: dict = field(default_factory=dict)
+    # Phase 5 §5.2：mock execute_relaxed_search 返回值
+    current_relaxed_search: dict = field(default_factory=lambda: {
+        "reply_text": "[mock-relaxed-result]",
+        "result_count": 1,
+        "applied_step": "relax_salary_10pct",
+    })
+    relaxed_search_calls: list[dict] = field(default_factory=list)
+
+    def set_show_more(self, payload: dict | None) -> None:
+        if not payload:
+            return
+        self.current_show_more_outcome = {
+            "direction": payload.get("direction", "search_job"),
+            "snapshot_exhausted": bool(payload.get("snapshot_exhausted", False)),
+            "reply_text": payload.get("reply_text", "[mock-show-more]"),
+        }
+
+    def set_search_outcome(self, payload: dict | None) -> None:
+        """Phase 5 §5.2：覆盖 fake_search_jobs/fake_search_workers 返回的 SearchOutcome
+        字段，让 case 模拟低召回 / 0 结果 / 软偏好命中等场景。"""
+        self.current_search_outcome_overrides = dict(payload or {})
+
+    def set_relaxed_search(self, payload: dict | None) -> None:
+        """Phase 5 §5.2：覆盖 fake_execute_relaxed_search 返回值。"""
+        if not payload:
+            return
+        self.current_relaxed_search = {
+            "reply_text": payload.get("reply_text", "[mock-relaxed-result]"),
+            "result_count": int(payload.get("result_count", 1)),
+            "applied_step": payload.get("applied_step", "relax_salary_10pct"),
+        }
+
+    def fake_execute_relaxed_search(
+        self, original_criteria, step, *,
+        direction, raw_query, session, user_ctx, db, user_msg_id=None,
+    ):
+        """Mock execute_relaxed_search；记录调用细节供断言使用。
+
+        放宽后默认 initial_count=999 跳过二次 reducer 的低召回判定（避免无限套娃）；
+        如需测二次仍 0 召回的兜底，case 显式指定 mock_relaxed_search.result_count=0。
+        """
+        from types import SimpleNamespace
+        self.relaxed_search_calls.append({
+            "original_criteria": dict(original_criteria),
+            "step": step,
+            "direction": direction,
+            "raw_query": raw_query,
+            "user_msg_id": user_msg_id,
+        })
+        cfg = self.current_relaxed_search
+        result_count = cfg["result_count"]
+        # 放宽后 outcome.initial_count 默认设大于 threshold，保证二次 reducer 进
+        # _decide_zero_result 后命中"initial_count >= threshold"返回 None，
+        # 后续 reducer 默认输出 no_action，applier 直出放宽结果文案。
+        outcome_initial = max(result_count, 999) if result_count > 0 else 0
+        return (
+            SimpleNamespace(
+                reply_text=cfg["reply_text"],
+                has_more=False,
+                result_count=result_count,
+            ),
+            SimpleNamespace(
+                direction=direction,
+                criteria_used=dict(original_criteria),
+                initial_count=outcome_initial,
+                final_count=result_count,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=cfg["applied_step"],
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=False,
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
+
+    def fake_show_more(self, session, user_ctx, db, **_kw):
+        from types import SimpleNamespace
+        self.show_more_calls.append({
+            "search_criteria": dict(session.search_criteria or {}),
+        })
+        cfg = self.current_show_more_outcome
+        return (
+            SimpleNamespace(
+                reply_text=cfg["reply_text"], has_more=False, result_count=0,
+            ),
+            SimpleNamespace(
+                direction=cfg["direction"],
+                criteria_used=dict(session.search_criteria or {}),
+                initial_count=0,
+                final_count=0,
+                desired_count=3,
+                low_recall_threshold=3,
+                applied_relax_step=None,
+                fallback_suggestions=[],
+                soft_pref_hits={},
+                has_more=False,
+                snapshot_exhausted=cfg["snapshot_exhausted"],
+                available_relax_steps=[],
+                relax_probe_results=[],
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +330,19 @@ def run_dialogue_case(case: dict) -> dict:
         original_mode = getattr(_settings, "dialogue_v2_mode", "off")
         original_policy = getattr(_settings, "ambiguous_city_query_policy", "clarify")
         original_threshold = getattr(_settings, "low_confidence_threshold", 0.6)
+        original_psm = getattr(_settings, "post_search_policy_mode", "off")
+        original_phase5_rollout = (
+            _settings.dialogue_policy.phase5_rollout_percentage
+        )
         try:
             for idx, turn in enumerate(case["turns"]):
                 mocks["set_mock_llm"](turn["mock_llm"])
                 mocks["set_mock_v2"](turn.get("mock_v2"))
                 mocks["set_mock_search"](turn.get("mock_search"))
+                mocks["set_mock_show_more"](turn.get("mock_show_more"))
+                # Phase 5 §5.2：注入 SearchOutcome 字段覆盖 + execute_relaxed_search mock
+                mocks["set_mock_search_outcome"](turn.get("mock_search_outcome"))
+                mocks["set_mock_relaxed_search"](turn.get("mock_relaxed_search"))
                 # turn 级别覆盖（不写则继承 case，case 不写则保持原 settings）
                 turn_mode = (turn.get("v2_mode") or case_mode or "off").strip()
                 _settings.dialogue_v2_mode = turn_mode
@@ -185,6 +350,19 @@ def run_dialogue_case(case: dict) -> dict:
                     _settings.ambiguous_city_query_policy = case_policy
                 if case_low_conf_threshold is not None:
                     _settings.low_confidence_threshold = float(case_low_conf_threshold)
+                # Phase 5 §5.1：post_search_policy_mode 由 case 顶层 / turn 级别覆盖
+                turn_psm = (turn.get("post_search_policy_mode")
+                            or case.get("post_search_policy_mode") or "off").strip()
+                _settings.post_search_policy_mode = turn_psm
+                # Phase 5 §5.4：phase5_rollout_percentage hash 桶；case 顶层可覆盖。
+                # 默认在 on 模式自动设为 100（让 golden case 100% 命中桶），off 模式
+                # 不影响（dispatch 不查 hash）。需要测桶未命中行为的 case 显式设 0。
+                turn_phase5_pct = case.get("phase5_rollout_percentage")
+                if turn_phase5_pct is None:
+                    turn_phase5_pct = 100 if turn_psm == "on" else 0
+                _settings.dialogue_policy = _settings.dialogue_policy.model_copy(
+                    update={"phase5_rollout_percentage": int(turn_phase5_pct)},
+                )
 
                 handler_marker = {"name": ""}
                 mocks["mark_handler"](handler_marker)
@@ -235,12 +413,24 @@ def run_dialogue_case(case: dict) -> dict:
                     "session_pending_upload_keys": sorted((session.pending_upload or {}).keys()),
                     "session_pending_interruption_present": bool(session.pending_interruption),
                     "session_awaiting_field": session.awaiting_field,
+                    # Phase 5 §5.1：trace post_search_decision 的关键字段，
+                    # 让 fixture 能锁定 paginate_no_more 触发与 directions 内容。
+                    # 由 reply 文本反推：on 模式下 paginate_no_more 渲染的回复
+                    # 含特定 header；off / shadow 模式下 reply 仍是 search_result
+                    # 原文。
+                    "reply_includes_paginate_header": (
+                        "已经是所有匹配结果了。可以试试以下方向" in reply_text
+                    ),
                 })
                 prev_search_calls = cur_search_calls
         finally:
             _settings.dialogue_v2_mode = original_mode
             _settings.ambiguous_city_query_policy = original_policy
             _settings.low_confidence_threshold = original_threshold
+            _settings.post_search_policy_mode = original_psm
+            _settings.dialogue_policy = _settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": int(original_phase5_rollout)},
+            )
 
     return {"turns": trace_turns, "session": session, "spy": spy}
 
@@ -294,6 +484,15 @@ def _golden_mocks(
 
     def set_mock_search(payload):
         spy.set_responses(payload)
+
+    def set_mock_show_more(payload):
+        spy.set_show_more(payload)
+
+    def set_mock_search_outcome(payload):
+        spy.set_search_outcome(payload)
+
+    def set_mock_relaxed_search(payload):
+        spy.set_relaxed_search(payload)
 
     def _legacy_intent_result(text, role):
         # Phase 1 worker 搜索护栏要在这里也跑 sanitize（与生产路径对齐）
@@ -369,6 +568,20 @@ def _golden_mocks(
 
     def fake_classify(text, role, history=None, current_criteria=None,
                       user_msg_id=None, session_hint=None):
+        # Phase 5 §5.1：legacy 路径下 classify_intent 内部会先做斜杠命令 + show_more
+        # 同义语短路（intent_service.py 第 322-350 行），mock 也必须模拟，否则
+        # "更多 / 还有吗" 这类 fixture 会被吃成 chitchat。
+        from app.services.intent_service import _match_command, _match_show_more
+        stripped = (text or "").strip()
+        cmd_result = _match_command(stripped)
+        if cmd_result is not None:
+            cmd, args = cmd_result
+            data: dict = {"command": cmd}
+            if args:
+                data["args"] = args
+            return IntentResult(intent="command", structured_data=data, confidence=1.0)
+        if _match_show_more(stripped):
+            return IntentResult(intent="show_more", confidence=1.0)
         return _legacy_intent_result(text, role)
 
     handler_holder: dict[str, dict] = {}
@@ -407,6 +620,11 @@ def _golden_mocks(
     _swap(message_router, "classify_dialogue", fake_classify_dialogue)
     _swap(message_router.search_service, "search_jobs", spy.fake_search_jobs)
     _swap(message_router.search_service, "search_workers", spy.fake_search_workers)
+    # Phase 5 §5.1：mock show_more 让 case 模拟翻完场景
+    _swap(message_router.search_service, "show_more", spy.fake_show_more)
+    # Phase 5 §5.2：mock execute_relaxed_search 让 case 模拟用户接受放宽后的二次检索
+    _swap(message_router.search_service, "execute_relaxed_search",
+          spy.fake_execute_relaxed_search)
     _swap(message_router.search_service, "has_effective_search_criteria",
           lambda criteria: True)
     _swap(message_router, "_handle_follow_up",
@@ -422,6 +640,9 @@ def _golden_mocks(
             "set_mock_llm": set_mock_llm,
             "set_mock_v2": set_mock_v2,
             "set_mock_search": set_mock_search,
+            "set_mock_show_more": set_mock_show_more,
+            "set_mock_search_outcome": set_mock_search_outcome,
+            "set_mock_relaxed_search": set_mock_relaxed_search,
             "mark_handler": mark_handler,
         }
     finally:
@@ -467,6 +688,10 @@ _KNOWN_EXPECT_KEYS = frozenset({
     "session_pending_upload_keys",
     "session_pending_interruption_present",
     "session_awaiting_field",
+    # Phase 5 §5.1：post_search_decision 行为锁定
+    "reply_includes_paginate_header",
+    "reply_contains",
+    "reply_not_contains",
 })
 
 
@@ -609,6 +834,23 @@ def assert_turn(trace_turn: dict, expect: dict, label: str = "") -> None:
             f"{prefix}session_awaiting_field={trace_turn['session_awaiting_field']} "
             f"!= expect={expect['session_awaiting_field']}"
         )
+
+    # Phase 5 §5.1：reply 内容断言（精确匹配 paginate header 与子串）
+    if "reply_includes_paginate_header" in expect:
+        assert trace_turn["reply_includes_paginate_header"] == expect["reply_includes_paginate_header"], (
+            f"{prefix}reply_includes_paginate_header={trace_turn['reply_includes_paginate_header']} "
+            f"!= expect={expect['reply_includes_paginate_header']}; reply={trace_turn['reply']!r}"
+        )
+    if "reply_contains" in expect:
+        for needle in expect["reply_contains"]:
+            assert needle in trace_turn["reply"], (
+                f"{prefix}reply does not contain {needle!r}; reply={trace_turn['reply']!r}"
+            )
+    if "reply_not_contains" in expect:
+        for needle in expect["reply_not_contains"]:
+            assert needle not in trace_turn["reply"], (
+                f"{prefix}reply unexpectedly contains {needle!r}; reply={trace_turn['reply']!r}"
+            )
 
 
 def _normalize_criteria_for_compare(criteria: dict) -> dict:

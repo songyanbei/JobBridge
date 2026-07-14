@@ -1,4 +1,5 @@
 """search_service 单元测试。"""
+import json
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +19,8 @@ from app.services.search_service import (
     _format_no_match_with_suggestions_resume,
     _format_resume_results,
     _is_job_search,
+    _job_salary_covers_floor,
+    _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
     _summarize_search_criteria,
@@ -49,6 +52,34 @@ def _make_user_ctx(role="worker"):
 
 def _make_session(role="worker", **kwargs):
     return SessionState(role=role, **kwargs)
+
+
+class TestJsonScalar:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "苏州市",
+            '苏"州',
+            r"苏州\园区",
+            123,
+        ],
+    )
+    def test_serializes_json_string_scalar(self, value):
+        encoded = _json_scalar(value)
+
+        assert json.loads(encoded) == str(value)
+        assert encoded.startswith('"')
+        assert encoded.endswith('"')
+
+
+class TestJobSalaryCoversFloor:
+    def test_uses_ceiling_when_present_and_floor_when_ceiling_unknown(self):
+        expr = _job_salary_covers_floor(9500)
+        compiled = str(expr.compile(compile_kwargs={"literal_binds": True}))
+
+        assert "job.salary_ceiling_monthly >= 9500" in compiled
+        assert "job.salary_ceiling_monthly IS NULL" in compiled
+        assert "job.salary_floor_monthly >= 9500" in compiled
 
 
 class TestIsJobSearch:
@@ -142,7 +173,7 @@ class TestSearchJobs:
         session = _make_session()
         user_ctx = _make_user_ctx()
 
-        result = search_jobs({}, "苏州找工作", session, user_ctx, db)
+        result, _outcome = search_jobs({}, "苏州找工作", session, user_ctx, db)
         assert result.result_count == 0
         mock_reranker.assert_not_called()
 
@@ -153,7 +184,7 @@ class TestShowMore:
         mock_config.return_value = 3
         session = _make_session()
         db = MagicMock()
-        result = show_more(session, _make_user_ctx(), db)
+        result, _outcome = show_more(session, _make_user_ctx(), db)
         assert "没有" in result.reply_text or "先搜索" in result.reply_text
 
     @patch("app.services.search_service._validate_job_ids")
@@ -173,7 +204,7 @@ class TestShowMore:
         session.shown_items = ["1", "2", "3"]
 
         db = MagicMock()
-        result = show_more(session, _make_user_ctx(), db)
+        result, _outcome = show_more(session, _make_user_ctx(), db)
         assert result is not None
         assert result.result_count == 0
 
@@ -190,7 +221,7 @@ class TestShowMore:
         session.shown_items = ["1"]
 
         db = MagicMock()
-        result = show_more(session, _make_user_ctx(), db)
+        result, _outcome = show_more(session, _make_user_ctx(), db)
         assert "过期" in result.reply_text or "重新搜索" in result.reply_text
         # 快照应被清空
         assert session.candidate_snapshot is None
@@ -239,7 +270,7 @@ class TestShowMore:
         session.shown_items = ["1", "2"]
 
         db = MagicMock()
-        result = show_more(session, _make_user_ctx(), db)
+        result, _outcome = show_more(session, _make_user_ctx(), db)
         assert result.result_count == 2
         # 展示了 3,4 后，剩余应该是 5（1个）
         assert result.has_more is True
@@ -407,7 +438,7 @@ class TestSearchJobsFallbackPrefix:
         criteria = {
             "city": ["北京"], "job_category": ["餐饮"], "salary_floor_monthly": 2200,
         }
-        result = search_jobs(criteria, "北京餐饮", _make_session(), _make_user_ctx(), MagicMock())
+        result, _outcome = search_jobs(criteria, "北京餐饮", _make_session(), _make_user_ctx(), MagicMock())
 
         assert result.result_count == 3
         assert result.reply_text.startswith(_FALLBACK_NOTICE_JOB["relax_salary_10pct"])
@@ -447,7 +478,7 @@ class TestSearchJobsNoMatchSuggestion:
 
         mock_query.side_effect = fake_query
 
-        result = search_jobs(criteria, "原查询", _make_session(), _make_user_ctx(), MagicMock())
+        result, _outcome = search_jobs(criteria, "原查询", _make_session(), _make_user_ctx(), MagicMock())
 
         # 0 命中，reranker 不应被调用
         mock_rerank.assert_not_called()
@@ -467,7 +498,7 @@ class TestSearchJobsNoMatchSuggestion:
         criteria = {
             "city": ["北京"], "job_category": ["餐饮"], "salary_floor_monthly": 8000,
         }
-        result = search_jobs(criteria, "原查询", _make_session(), _make_user_ctx(), MagicMock())
+        result, _outcome = search_jobs(criteria, "原查询", _make_session(), _make_user_ctx(), MagicMock())
         assert result.reply_text == NO_JOB_MATCH_REPLY
 
 
@@ -496,7 +527,7 @@ class TestSearchWorkersFallback:
 
         mock_query.side_effect = fake_query
 
-        result = search_workers(
+        result, _outcome = search_workers(
             criteria, "原查询", _make_session(role="factory"),
             _make_user_ctx(role="factory"), MagicMock(),
         )
@@ -513,7 +544,7 @@ class TestSearchWorkersFallback:
         mock_config.side_effect = lambda key, *_: 3 if "top_n" in key else 50
         mock_query.return_value = []
         criteria = {"city": ["北京"], "job_category": ["餐饮"]}
-        result = search_workers(
+        result, _outcome = search_workers(
             criteria, "原查询", _make_session(role="factory"),
             _make_user_ctx(role="factory"), MagicMock(),
         )

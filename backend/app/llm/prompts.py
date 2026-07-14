@@ -11,6 +11,12 @@ Token 预算：每个 prompt 上方标注 input/output token 上限。
 # Intent Extraction Prompt
 # ---------------------------------------------------------------------------
 
+# v2.8 2026-05-02
+# 防幻觉收口：补"抽取忠实度"段（禁止参照 few-shot 中具体城市/薪资脑补）+
+# upload_resume 锚点示例（示例13：用户只说性别/年龄/工种时不输出
+# expected_cities / salary_expect_floor_monthly）。线上观察到的现象是：
+# 用户首条简历未提城市，LLM 受 prompt 中"苏州市"高频示例影响，输出
+# expected_cities=["苏州市"]，导致 upload_service 不再追问城市直接入库。
 # v2.3 2026-04-28
 # Bug 5：follow_up 改为"输出全量 criteria 快照"语义，消解 criteria_patch
 # 的 add/update 二元歧义（"换成 X" 误标 add 导致城市叠加而不是替换）。
@@ -90,6 +96,12 @@ INTENT_SYSTEM_PROMPT = """\
 - 上传简历（intent=upload_resume）：城市落到 expected_cities，工种落到 expected_job_categories，list[str]。
 - 上传岗位（intent ∈ {{upload_job, upload_and_search}}）：城市落到 city（标量 str），工种落到 job_category（标量 str）。
 - 城市值统一输出"规范名"（带"市"，如 苏州市 / 北京市 / 昆山市），不要输出短名"苏州"/"北京"。
+
+## 抽取忠实度（**强约束，防幻觉**）
+- structured_data 仅写入用户**本轮文本中明确出现**或**对话历史中已确认**的字段值。
+- **严禁参照下面 few-shot 示例中的城市 / 薪资 / 工种等具体值脑补**——示例只演示输出格式，不是给字段供值。例如：示例里大量出现"苏州市"，但当前用户没说城市时，**禁止**把 city / expected_cities 输出成 ["苏州市"]。
+- 用户没说的必填字段（如 city / expected_cities / salary_floor_monthly / salary_expect_floor_monthly 等）应当**整个不写入** structured_data，把字段名放到 missing_fields 里由后端追问；写入未经用户确认的值会导致岗位/简历字段错位入库，是严重事故。
+- 仅 job_category 闭集映射 / 城市规范名归一 是允许的"翻译"；除此之外不要做任何"补全"。
 
 ## follow_up 输出规则（**强约束**，避免 add/update 歧义）
 
@@ -201,6 +213,11 @@ structured_data**表达本轮抽取到的字段，**不要再用 op 语义**。
 当前累积检索条件: {{"city": ["西安市"], "job_category": ["餐饮"], "salary_floor_monthly": 2500}}
 用户消息: "北京有吗"
 {{"intent": "follow_up", "structured_data": {{"city": ["北京市"], "job_category": ["餐饮"], "salary_floor_monthly": 2500}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.85}}
+
+示例13 - 工人提交简历，**用户没说期望城市 / 期望月薪**（防幻觉锚点）:
+说明：用户原文没出现任何城市名 / 薪资数字。expected_cities / salary_expect_floor_monthly **绝对不允许出现在 structured_data 里**（不要因为前面示例都用"苏州市"就脑补一个），缺失字段名进 missing_fields 由后端追问。
+用户消息: "张三，男，28岁，初中，想做普工"
+{{"intent": "upload_resume", "structured_data": {{"gender": "男", "age": 28, "education": "初中", "expected_job_categories": ["普工"]}}, "criteria_patch": [], "missing_fields": ["expected_cities", "salary_expect_floor_monthly"], "confidence": 0.9}}
 """
 
 INTENT_USER_TEMPLATE = """\
@@ -230,7 +247,8 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 ## 输出字段（按此顺序输出）
 - dialogue_act：本轮对话行为，仅允许下列闭集：
   start_search / modify_search / answer_missing_slot / show_more /
-  start_upload / cancel / reset / resolve_conflict / chitchat
+  start_upload / cancel / reset / resolve_conflict /
+  respond_relaxation_offer / chitchat
 - frame_hint：本轮候选业务对象，仅允许：
   job_search / candidate_search / job_upload / resume_upload / none
 - slots_delta：本轮抽到的字段（dict）。字段名必须用 canonical key，按 frame 分组如下：
@@ -248,6 +266,8 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 - confidence：0.0-1.0 的整体置信度。
 - conflict_action：仅 dialogue_act=resolve_conflict 时输出，闭集：
   cancel_draft / resume_pending_upload / proceed_with_new；其它情况输出 null。
+- relaxation_response：仅 dialogue_act=respond_relaxation_offer 时输出，闭集：
+  accept / reject；其它情况输出 null。
 
 ## 当前用户角色
 {role}
@@ -272,7 +292,17 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
    如果本轮已经能独立 start_search / modify_search，应优先 start_search / modify_search。
 4. **resolve_conflict 仅在 active_flow=upload_conflict 上下文中有意义**；
    其它情况禁止输出 resolve_conflict。
+4.bis **respond_relaxation_offer 仅在系统上一轮反问"要把 X 放宽吗"
+   且 session_hint.pending_relaxation 非空时**有意义；其它情况禁止输出。
+   该 dialogue_act 与 resolve_conflict 完全独立，不属于上传冲突流程，
+   配套字段为 relaxation_response（accept / reject），与 conflict_action 互不复用。
 5. 所有不在闭集的字段 / 值都不要输出。
+6. **抽取忠实度（强约束，防幻觉）**：slots_delta 只能写入用户**本轮文本中明确出现**
+   或**对话历史中已确认**的字段值。**严禁参照下面输出示例中的具体值脑补**——
+   示例只演示输出结构，不是给字段供值。常见反例：示例多次出现"苏州市"，但当前
+   用户没提城市时，禁止把 city / expected_cities 输出成 ["苏州市"]；用户没说薪资
+   时禁止输出 salary_*。用户没说的字段直接**不要进 slots_delta**，由后端 reducer
+   / 追问处理。允许的"翻译"仅限 job_category 闭集映射与城市规范名归一。
 
 ## 输出示例
 
@@ -315,6 +345,21 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 示例 10（无法理解 / 闲聊）：
 用户消息：你好
 {{"dialogue_act": "chitchat", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.6, "conflict_action": null}}
+
+示例 11（worker 主动提交简历，**未提期望城市 / 期望月薪——禁止脑补 expected_cities**）：
+说明：用户原文没出现任何城市名 / 薪资数字。expected_cities 与 salary_expect_floor_monthly
+**绝对不允许出现在 slots_delta 里**（不要因为前面示例出现过"苏州市"就补一个），缺啥由
+后端 reducer 计算 missing 后追问。
+用户消息：李四，女，30岁，初中，想做物流仓储
+{{"dialogue_act": "start_upload", "frame_hint": "resume_upload", "slots_delta": {{"gender": "女", "age": 30, "education": "初中", "expected_job_categories": ["物流仓储"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.9, "conflict_action": null}}
+
+示例 12（系统上一轮反问"要把薪资放宽 10% 重新搜索吗"，session_hint.pending_relaxation 非空，用户接受）：
+用户消息：好的
+{{"dialogue_act": "respond_relaxation_offer", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null, "relaxation_response": "accept"}}
+
+示例 13（同上反问场景，用户拒绝）：
+用户消息：算了不要了
+{{"dialogue_act": "respond_relaxation_offer", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null, "relaxation_response": "reject"}}
 """
 
 
@@ -377,6 +422,9 @@ DIALOGUE_USER_TEMPLATE = """\
 # ---------------------------------------------------------------------------
 
 # v2.0 2026-04-13
+# v2.1 2026-05-10 (Phase 5 §5.3)：新增软偏好排序参数 soft_preferences /
+#                  ranking_weights，让 reranker 对 filter_mode=soft 字段命中
+#                  候选优先排序；硬过滤已保证基础匹配，软偏好仅影响顺序。
 # Token 预算: input < 4000 tokens, output < 1000 tokens
 RERANK_SYSTEM_PROMPT = """\
 你是一个蓝领招聘撮合平台的排序推荐助手。
@@ -413,12 +461,47 @@ RERANK_SYSTEM_PROMPT = """\
 {{"ranked_items": [{{"id": 101, "score": 0.95}}, {{"id": 203, "score": 0.82}}, {{"id": 157, "score": 0.71}}], "reply_text": "为您找到几个高匹配岗位，薪资和福利都符合您的要求。"}}
 """
 
+# Phase 5 §5.3：当 soft_preferences 非空时附加到 user prompt 末尾，作为
+# 排序提示。candidates 已通过硬过滤，soft_preferences 仅影响顺序。
+RERANK_USER_TEMPLATE_WITH_SOFT_PREF = """\
+用户查询: {query}
+
+候选列表:
+{candidates}
+
+## 用户软偏好（影响排序，不影响是否入选）
+{soft_preferences_block}
+排序时**优先把命中软偏好的候选项排前面**；软偏好命中越多，排序越靠前。
+所有候选都已通过硬过滤，软偏好仅决定 ranked_items 顺序。
+"""
+
 RERANK_USER_TEMPLATE = """\
 用户查询: {query}
 
 候选列表:
 {candidates}
 """
+
+
+def format_soft_preferences_block(
+    soft_preferences: dict | None,
+    ranking_weights: dict[str, float] | None,
+) -> str:
+    """Phase 5 §5.3：把 soft_preferences + ranking_weights 渲染为 prompt 段落。
+
+    输出格式（每个偏好一行）：
+        - provide_meal: True (权重 0.3)
+        - shift_pattern: 日班 (权重 0.2)
+    """
+    if not soft_preferences:
+        return ""
+    weights = ranking_weights or {}
+    lines: list[str] = []
+    for k, v in soft_preferences.items():
+        w = weights.get(k)
+        weight_str = f" (权重 {w})" if w is not None else ""
+        lines.append(f"- {k}: {v}{weight_str}")
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # 常量汇总（便于测试和外部引用）
@@ -428,6 +511,8 @@ RERANK_USER_TEMPLATE = """\
 # 否则 message_router 落 conversation_log.criteria_snapshot.prompt_version 会错记
 # 旧版本，回溯排查时被误导。intent_service.classify_intent 的 llm_call 日志也读这里。
 #
+# v2.8 (2026-05-02)：补"抽取忠实度"反幻觉条款 + upload_resume 锚点示例（示例13），
+#                   修复"用户没说城市但 LLM 输出 expected_cities=['苏州市']"漂移。
 # v2.7 (阶段四 PR3)：criteria_patch 收口 — prompt 明确该字段已废弃，
 #                  所有 intent 一律输出 `criteria_patch: []`；删示例 1/7/8 中残留的
 #                  op-style 输出。后端 v2 派生路径（dual_read / primary）由 reducer
@@ -447,19 +532,21 @@ RERANK_USER_TEMPLATE = """\
 # v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
 #               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
 # v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
-INTENT_PROMPT_VERSION = "v2.7"
+INTENT_PROMPT_VERSION = "v2.8"
 
 # PROMPT_VERSION 是给 conversation_log.criteria_snapshot 用的"对话快照版本"，
 # 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
 PROMPT_VERSION = INTENT_PROMPT_VERSION
 PROMPT_DATE = "2026-05-02"
-RERANK_PROMPT_VERSION = "v2.0"
+RERANK_PROMPT_VERSION = "v2.1"
 
 # 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。
 # 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。
+# v0.3 (2026-05-02)：在"重要约束"加防幻觉条款 + 加 resume_upload 锚点示例（示例 11），
+#                   与 INTENT v2.8 同步修复 expected_cities 脑补漂移。
 # v0.2 (Stage 3)：字段清单段落改为启动期由 slot_schema 渲染（一次性）；fallback 文案保留。
 # v0.1 2026-05-01：DialogueParseResult v2 首版（hard-coded 字段清单）。
-DIALOGUE_PROMPT_VERSION = "v0.2"
+DIALOGUE_PROMPT_VERSION = "v0.3"
 
 
 def build_criteria_snapshot_meta() -> dict:

@@ -893,6 +893,201 @@ def render_clarification(
 # ---------------------------------------------------------------------------
 
 
+_RELAX_STEP_HUMAN_LABEL = {
+    "relax_salary_10pct": "把薪资放宽 10%",
+    "broaden_job_category": "放宽工种范围",
+    "drop_optional_filters": "去掉部分次要条件",
+}
+
+
+# Phase 5 §5.3：软偏好字段排序权重表。
+#
+# **TODO（phased-plan §5.3.4 验收 #6 / 用户决策"拍直觉值"）**：
+# 当前权重为业务直觉初值（蓝领招聘场景，包吃住对工人价值高于班次 / 学历要求）；
+# 待生产 shadow 期采集真实用户接受率后按"用户主动提及偏好后接受第几位候选"
+# 反推调整。在此之前 soft_preference_ranking_enabled 默认 False（5.3 不真灰度）。
+_SOFT_PREF_RANKING_WEIGHTS: dict[str, float] = {
+    # 高价值（蓝领工人最关心）
+    "provide_meal": 0.3,
+    "provide_housing": 0.3,
+    # 中等价值（生活/工作模式相关）
+    "shift_pattern": 0.2,
+    "dorm_condition": 0.2,
+    "work_hours": 0.15,
+    # 低价值（少数特殊场景）
+    "accept_couple": 0.1,
+    "accept_student": 0.1,
+    "accept_minority": 0.1,
+    "pay_type": 0.1,
+}
+
+
+# Phase 5 §5.4：软偏好命中后的"已优先展示"文案
+_SOFT_PREF_DISPLAY_LABEL = {
+    "provide_meal": "包吃",
+    "provide_housing": "包住",
+    "shift_pattern": "班次",
+    "dorm_condition": "宿舍",
+    "work_hours": "工时",
+    "accept_couple": "可夫妻",
+    "accept_student": "可学生",
+    "accept_minority": "可少数民族",
+    "pay_type": "计薪方式",
+}
+
+
+def soft_preference_visibility_template(fields_hit: list[str]) -> str:
+    """Phase 5 §5.4.1：按命中字段集合产出可见性文案。
+
+    多偏好命中拼接为"已优先展示符合「包吃住、日班」偏好的岗位"格式。
+    阈值判定（命中比例 ≥ 0.5）由 applier 在调用本 helper 前做。
+
+    空列表返回空字符串（applier 不附加文案）。
+    """
+    if not fields_hit:
+        return ""
+    # 合并 provide_meal + provide_housing → "包吃住"
+    has_meal = "provide_meal" in fields_hit
+    has_housing = "provide_housing" in fields_hit
+    labels: list[str] = []
+    if has_meal and has_housing:
+        labels.append("包吃住")
+    elif has_meal:
+        labels.append("包吃")
+    elif has_housing:
+        labels.append("包住")
+    for f in fields_hit:
+        if f in ("provide_meal", "provide_housing"):
+            continue  # 已合并到包吃住
+        label = _SOFT_PREF_DISPLAY_LABEL.get(f)
+        if label:
+            labels.append(label)
+    if not labels:
+        return ""
+    return f"已优先展示符合「{'、'.join(labels)}」偏好的岗位。"
+
+
+def extract_soft_preferences(
+    criteria: dict | None,
+    frame: str = "job_search",
+) -> tuple[dict, dict[str, float]]:
+    """Phase 5 §5.3：从 criteria 抽出软偏好字段 + 对应 ranking_weight。
+
+    返回 ``(soft_preferences, ranking_weights)``：
+    - soft_preferences: 仅含本次 criteria 实际写入的软偏好字段（None 不计）
+    - ranking_weights: 对应字段的权重（来自 _SOFT_PREF_RANKING_WEIGHTS）
+
+    candidate_search frame 与 job_search 共享同一权重表（软偏好语义跨 frame
+    一致：包吃住 / 班次对找工人和找岗位都有意义）。
+    """
+    if not criteria:
+        return {}, {}
+    soft_prefs: dict = {}
+    weights: dict[str, float] = {}
+    for key, weight in _SOFT_PREF_RANKING_WEIGHTS.items():
+        v = criteria.get(key)
+        if v is None:
+            continue
+        soft_prefs[key] = v
+        weights[key] = weight
+    return soft_prefs, weights
+
+
+def relax_step_human_label(step: str) -> str:
+    """Phase 5 §5.2.3 slot_schema 行：把内部 step 名映射为业务文案。
+
+    供 reducer 渲染 ask_clarification 反问时复用，避免向用户暴露
+    fallback 内部步骤名（phased-plan §5.2.2 边界）。
+    """
+    return _RELAX_STEP_HUMAN_LABEL.get(step, step)
+
+
+def relaxation_directions(
+    criteria: dict | None,
+    frame: str = "job_search",
+) -> list[dict]:
+    """Phase 5 §5.1：根据 criteria 当前形态产出 show_more 翻完时的"建议放宽方向"。
+
+    返回列表，每项含 ``dimension / hint_text / target_field`` 三个键，供
+    post_search_applier 渲染 paginate_no_more 文案。
+
+    形态分支（phased-plan §5.1.1 第 2 项）：
+    - 仅有 city + job_category：建议放宽薪资 / 换附近城市 / 切换工种大类。
+    - 已有 salary_floor_monthly：建议下调薪资 10% / 换城市。
+    - 已有 salary_floor_monthly + 软偏好（provide_meal / provide_housing 等）：
+      建议先去掉软偏好。
+
+    candidate_search 走对称结构（salary_ceiling_monthly 替代 salary_floor_monthly）。
+
+    本函数不读 SQL、不调任何外部模块——5.1 验收 #5"降级文案不依赖 LLM"硬约束。
+    """
+    c = criteria or {}
+    has_city = bool(c.get("city"))
+    has_category = bool(c.get("job_category"))
+    has_salary_floor = c.get("salary_floor_monthly") is not None
+    has_salary_ceiling = c.get("salary_ceiling_monthly") is not None
+    soft_pref_keys = ("provide_meal", "provide_housing", "shift_pattern",
+                      "dorm_condition", "accept_couple", "accept_student",
+                      "accept_minority")
+    has_soft_pref = any(c.get(k) is not None for k in soft_pref_keys)
+
+    directions: list[dict] = []
+
+    if frame == "candidate_search":
+        if has_soft_pref:
+            directions.append({
+                "dimension": "soft_pref",
+                "hint_text": "去掉「包吃住 / 班次」等偏好",
+                "target_field": "soft_pref",
+            })
+        if has_salary_ceiling:
+            directions.append({
+                "dimension": "salary_ceiling",
+                "hint_text": "放宽期望薪资上限",
+                "target_field": "salary_ceiling_monthly",
+            })
+        if has_city:
+            directions.append({
+                "dimension": "city",
+                "hint_text": "换其他城市",
+                "target_field": "city",
+            })
+        if has_category:
+            directions.append({
+                "dimension": "job_category",
+                "hint_text": "切换工种大类",
+                "target_field": "job_category",
+            })
+        return directions
+
+    # frame == "job_search" 默认分支
+    if has_soft_pref:
+        directions.append({
+            "dimension": "soft_pref",
+            "hint_text": "去掉「包吃住 / 班次」等偏好",
+            "target_field": "soft_pref",
+        })
+    if has_salary_floor:
+        directions.append({
+            "dimension": "salary_floor",
+            "hint_text": "下调月薪下限 10%",
+            "target_field": "salary_floor_monthly",
+        })
+    if has_city:
+        directions.append({
+            "dimension": "city",
+            "hint_text": "换附近城市",
+            "target_field": "city",
+        })
+    if has_category:
+        directions.append({
+            "dimension": "job_category",
+            "hint_text": "切换工种大类",
+            "target_field": "job_category",
+        })
+    return directions
+
+
 def render_prompt_field_spec() -> str:
     """生成 prompt 中 frame → 字段清单段落。
 

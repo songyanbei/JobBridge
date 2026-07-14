@@ -5,11 +5,12 @@ show_more 复用快照，不重新执行全量检索。
 
 Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 """
+import json
 import logging
 import math
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Literal
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
@@ -20,13 +21,56 @@ from app.llm import get_reranker
 from app.llm.base import RerankResult
 from app.models import Job, Resume, SystemConfig, User
 from app.schemas.conversation import SessionState
+# Phase 5 §5.0：DTO 中立模块迁移。本模块仍可作为 search_service.SearchResult 等旧名
+# 的访问入口（re-export），避免破坏 backend/tests/unit/test_search_service.py 等
+# 直接 from app.services.search_service import SearchResult 的调用方。
+from app.schemas.search import (
+    FallbackOutcome,
+    FallbackSuggestion,
+    SearchOutcome,
+    SearchResult,
+)
 from app.services import conversation_service, permission_service
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 
+# 显式 re-export，让 mypy / IDE / runtime 都识别本模块仍提供这些名字。
+__all__ = [
+    "FallbackOutcome",
+    "FallbackSuggestion",
+    "SearchOutcome",
+    "SearchResult",
+    "search_jobs",
+    "search_workers",
+    "show_more",
+    "has_effective_search_criteria",
+]
+
 logger = logging.getLogger(__name__)
 
 RERANK_PROMPT_VERSION = "v1"
+
+
+def _json_scalar(value: object) -> str:
+    """Serialize a value as a JSON string scalar for MySQL JSON_CONTAINS."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _job_salary_covers_floor(salary_floor: int):
+    return sa.or_(
+        Job.salary_ceiling_monthly >= salary_floor,
+        sa.and_(
+            Job.salary_ceiling_monthly.is_(None),
+            Job.salary_floor_monthly >= salary_floor,
+        ),
+    )
+
+
+def _is_phase5_policy_enabled_for_user(userid: str | None) -> bool:
+    from app.services.intent_service import is_phase5_policy_enabled
+
+    return is_phase5_policy_enabled(userid or "")
+
 
 # Stage B：0 命中 fallback 文案（§3.5）。
 # 不能伪装成推荐结果；必须明确告知未找到并给出可操作建议。
@@ -68,6 +112,38 @@ _SUGGESTION_LABEL_RESUME = {
 _MAX_SUGGESTIONS = 3
 
 
+def _extract_soft_prefs_for_rerank(
+    criteria: dict, frame: str,
+) -> tuple[dict, dict[str, float]]:
+    """Phase 5 §5.3：受 settings.soft_preference_ranking_enabled 控制。
+    关闭时返回空 dict，等价 5.0/5.1/5.2 路径（不传 soft_preferences 给 reranker）。
+    开启时调 slot_schema.extract_soft_preferences。
+    """
+    if not settings.soft_preference_ranking_enabled:
+        return {}, {}
+    from app.dialogue import slot_schema
+    return slot_schema.extract_soft_preferences(criteria, frame=frame)
+
+
+def _count_soft_pref_hits(
+    candidates: list[dict],
+    soft_preferences: dict | None,
+) -> dict[str, int]:
+    """Phase 5 §5.4：统计候选集中各软偏好字段的命中数。
+
+    candidate dict 中某字段值与 soft_preferences[key] 相等时算命中（bool 比较 + 字符串相等）。
+    仅 soft_preference_ranking_enabled=True 时由调用方使用；False 时返回空 dict。
+    """
+    if not soft_preferences or not candidates:
+        return {}
+    hits: dict[str, int] = {}
+    for key, expected in soft_preferences.items():
+        count = sum(1 for c in candidates if c.get(key) == expected)
+        if count > 0:
+            hits[key] = count
+    return hits
+
+
 def _rerank_with_logging(
     query: str,
     candidates: list[dict],
@@ -75,6 +151,8 @@ def _rerank_with_logging(
     top_n: int,
     call_site: str,
     user_msg_id: str | None = None,
+    soft_preferences: dict | None = None,
+    ranking_weights: dict[str, float] | None = None,
 ) -> RerankResult:
     """统一封装 reranker.rerank，附带 loguru 结构化打点。
 
@@ -88,12 +166,18 @@ def _rerank_with_logging(
     result: RerankResult | None = None
     parse_failed = False
     try:
-        result = reranker.rerank(
-            query=query,
-            candidates=candidates,
-            role=role,
-            top_n=top_n,
-        )
+        # Phase 5 §5.3：soft_preferences 非空时透传给 reranker（v2.1 prompt）；
+        # 为空时严格走 v2.0 路径。两条路径都通过 keyword-only 参数。
+        rerank_kwargs = {
+            "query": query,
+            "candidates": candidates,
+            "role": role,
+            "top_n": top_n,
+        }
+        if soft_preferences:
+            rerank_kwargs["soft_preferences"] = soft_preferences
+            rerank_kwargs["ranking_weights"] = ranking_weights
+        result = reranker.rerank(**rerank_kwargs)
     except LLMTimeout:
         status = "timeout"
         raise
@@ -137,36 +221,52 @@ def _rerank_with_logging(
     return result
 
 
-@dataclass
-class SearchResult:
-    reply_text: str
-    has_more: bool = False
-    result_count: int = 0
+# Phase 5 §5.0：SearchResult / FallbackSuggestion / FallbackOutcome 已迁到
+# app/schemas/search.py，本模块仅 import + re-export，调用方不感知。
 
 
-@dataclass(frozen=True)
-class FallbackSuggestion:
-    """激进放宽探查命中的方向（Bug 3）。
+# ---------------------------------------------------------------------------
+# SearchOutcome 构造 helper（Phase 5 §5.0）
+# ---------------------------------------------------------------------------
 
-    仅用于文案提示，不会自动用这个 criteria 返回结果——避免把不符原意的
-    岗位/简历当作"找到的"展示给用户。
+def _build_search_outcome(
+    *,
+    direction: str,
+    criteria_used: dict,
+    initial_count: int,
+    final_count: int,
+    desired_count: int,
+    applied_relax_step: str | None = None,
+    fallback_suggestions: list[FallbackSuggestion] | None = None,
+    has_more: bool = False,
+    snapshot_exhausted: bool = False,
+    soft_pref_hits: dict[str, int] | None = None,
+    available_relax_steps: list[str] | None = None,
+    relax_probe_results: list[dict] | None = None,
+) -> SearchOutcome:
+    """构造 SearchOutcome；low_recall_threshold 默认等于 desired_count（top_n）。
+
+    5.0 子阶段产出该结构但 reducer 默认 no_action，本字段不会被实际消费；
+    5.1 起 reducer 才开始读取（见 phased-plan §5.0.1 第 3 项 / §5.2.1）；
+    5.2 起 available_relax_steps / relax_probe_results 由 search_jobs/workers 在
+    post_search_policy_mode=on 时填充（让 reducer 决定走哪个 relax 步骤）；
+    5.4 起 soft_pref_hits 由 search_jobs/workers/execute_relaxed_search 真填充。
     """
-    step: str           # _SUGGESTION_LABEL_* 中的 key
-    criteria: dict      # 探查时使用的 criteria（拷贝，外部不要 mutate）
-    count: int          # 该 criteria 下的候选数（≥1 才会进 suggestions）
-
-
-@dataclass
-class FallbackOutcome:
-    """fallback 步骤的结构化产物（Bug 3）。
-
-    - candidates：最终选用的候选列表（沿用既有"严格更优才采纳"语义）
-    - applied_step：哪一步被采纳；None 表示用原 criteria 命中或全部 0 召回
-    - suggestions：当 candidates 为空时探查到的激进放宽方向（已确认 ≥1）
-    """
-    candidates: list
-    applied_step: str | None = None
-    suggestions: list[FallbackSuggestion] = field(default_factory=list)
+    return SearchOutcome(
+        direction=direction,
+        criteria_used=dict(criteria_used or {}),
+        initial_count=initial_count,
+        final_count=final_count,
+        desired_count=desired_count,
+        low_recall_threshold=desired_count,
+        applied_relax_step=applied_relax_step,
+        fallback_suggestions=list(fallback_suggestions or []),
+        soft_pref_hits=dict(soft_pref_hits or {}),
+        has_more=has_more,
+        snapshot_exhausted=snapshot_exhausted,
+        available_relax_steps=list(available_relax_steps or []),
+        relax_probe_results=list(relax_probe_results or []),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -180,17 +280,35 @@ def search_jobs(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
-) -> SearchResult:
-    """工人/中介找岗位。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """工人/中介找岗位。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`，
+    本子阶段产出 SearchOutcome 但调用方解构后丢弃；5.1 起 message_router 才开始消费。
+    """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
 
     # 硬过滤
     candidates = _query_jobs(criteria, max_candidates, db)
+    initial_count = len(candidates)
 
-    # Stage B（§3.4）：0 命中或低召回时按显式 fallback 步骤逐步放宽
-    # Bug 3：fallback 返回 FallbackOutcome，记录采纳步骤 + 0 召回时的建议方向
-    if len(candidates) < top_n:
+    # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
+    # 低召回才跳过 legacy fallback，由 reducer + post_search_applier 接管。
+    # off / shadow / 桶外用户保持旧行为（向后兼容验收 §5.2.4 第 2 项）。
+    phase5_takeover = (
+        _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
+        and len(candidates) < top_n
+    )
+    available_steps: list[str] = []
+    probe_results: list[dict] = []
+    if phase5_takeover:
+        outcome = FallbackOutcome(candidates=candidates)
+        available_steps, probe_results = _probe_relax_steps(
+            criteria, "search_job", max_candidates, db,
+        )
+    elif len(candidates) < top_n:
+        # 旧 Stage B fallback：0 命中或低召回时按显式 fallback 步骤逐步放宽
         outcome = _run_job_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
@@ -200,21 +318,37 @@ def search_jobs(
 
     if not candidates:
         if outcome.suggestions:
-            return SearchResult(
+            sr = SearchResult(
                 reply_text=_format_no_match_with_suggestions_job(
                     criteria, outcome.suggestions,
                 ),
                 result_count=0,
             )
-        return SearchResult(
-            reply_text=NO_JOB_MATCH_REPLY,
-            result_count=0,
+        else:
+            sr = SearchResult(
+                reply_text=NO_JOB_MATCH_REPLY,
+                result_count=0,
+            )
+        so = _build_search_outcome(
+            direction="search_job",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
+        return sr, so
 
     # 转为 dict 列表用于 rerank
     candidate_dicts = _jobs_to_dicts(candidates, db)
 
     # Reranker（含结构化打点）
+    # Phase 5 §5.3：soft_preference_ranking_enabled=True 时把 criteria 中的
+    # 软偏好字段 + ranking_weight 透传给 reranker，让其优先排序匹配软偏好的候选。
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "job_search")
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -222,6 +356,8 @@ def search_jobs(
         top_n=top_n,
         call_site="search_jobs",
         user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
@@ -240,7 +376,19 @@ def search_jobs(
     # 取首批
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        return SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction="search_job",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
+        )
+        return sr, so
 
     # 从候选中找到对应记录
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
@@ -261,11 +409,27 @@ def search_jobs(
         if notice:
             reply = f"{notice}\n\n{reply}"
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    # Phase 5 §5.4：统计 ranked_items（即 batch）中各软偏好字段命中数。
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
+    so = _build_search_outcome(
+        direction="search_job",
+        criteria_used=criteria,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        available_relax_steps=available_steps,
+        relax_probe_results=probe_results,
+        applied_relax_step=outcome.applied_step,
+        fallback_suggestions=outcome.suggestions,
+        has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
+    )
+    return sr, so
 
 
 def search_workers(
@@ -275,14 +439,32 @@ def search_workers(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
-) -> SearchResult:
-    """厂家/中介找工人。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """厂家/中介找工人。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
+    """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
 
     candidates = _query_resumes(criteria, max_candidates, db)
+    initial_count = len(candidates)
 
-    if len(candidates) < top_n:
+    # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
+    # 低召回才跳过 legacy fallback，由 reducer + applier 接管放宽决策。
+    # off / shadow / 桶外用户保持旧行为。
+    phase5_takeover = (
+        _is_phase5_policy_enabled_for_user(user_ctx.external_userid)
+        and len(candidates) < top_n
+    )
+    available_steps: list[str] = []
+    probe_results: list[dict] = []
+    if phase5_takeover:
+        outcome = FallbackOutcome(candidates=candidates)
+        available_steps, probe_results = _probe_relax_steps(
+            criteria, "search_worker", max_candidates, db,
+        )
+    elif len(candidates) < top_n:
         outcome = _run_resume_fallback_steps(
             criteria, candidates, top_n, max_candidates, db,
         )
@@ -292,19 +474,33 @@ def search_workers(
 
     if not candidates:
         if outcome.suggestions:
-            return SearchResult(
+            sr = SearchResult(
                 reply_text=_format_no_match_with_suggestions_resume(
                     criteria, outcome.suggestions,
                 ),
                 result_count=0,
             )
-        return SearchResult(
-            reply_text=NO_WORKER_MATCH_REPLY,
-            result_count=0,
+        else:
+            sr = SearchResult(
+                reply_text=NO_WORKER_MATCH_REPLY,
+                result_count=0,
+            )
+        so = _build_search_outcome(
+            direction="search_worker",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
         )
+        return sr, so
 
     candidate_dicts = _resumes_to_dicts(candidates)
 
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "candidate_search")
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -312,6 +508,8 @@ def search_workers(
         top_n=top_n,
         call_site="search_workers",
         user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
     )
 
     ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
@@ -326,7 +524,19 @@ def search_workers(
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        return SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction="search_worker",
+            criteria_used=criteria,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=outcome.applied_step,
+            fallback_suggestions=outcome.suggestions,
+            available_relax_steps=available_steps,
+            relax_probe_results=probe_results,
+        )
+        return sr, so
 
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
@@ -346,29 +556,67 @@ def search_workers(
         if notice:
             reply = f"{notice}\n\n{reply}"
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
     )
+    # Phase 5 §5.4：统计 ranked_items 中各软偏好字段命中数。
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
+    so = _build_search_outcome(
+        direction="search_worker",
+        criteria_used=criteria,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        applied_relax_step=outcome.applied_step,
+        fallback_suggestions=outcome.suggestions,
+        has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
+        available_relax_steps=available_steps,
+        relax_probe_results=probe_results,
+    )
+    return sr, so
 
 
 def show_more(
     session: SessionState,
     user_ctx: UserContext,
     db: Session,
-) -> SearchResult:
-    """show_more：从快照取下一批，跳过失效条目。"""
+) -> tuple[SearchResult, SearchOutcome]:
+    """show_more：从快照取下一批，跳过失效条目。
+
+    Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
+    `SearchResult.reply_text` 完全保留旧文案（含"已经是所有匹配结果了..."兜底），
+    off / shadow 模式下逐字节等价 5.0 前的输出；on 模式下由 5.1 reducer + applier
+    根据 `SearchOutcome.snapshot_exhausted` 决定是否覆盖 reply。
+    """
+    is_job_search = _is_job_search(session, user_ctx)
+    direction = "search_job" if is_job_search else "search_worker"
+    top_n = _get_config_int("match.top_n", db, 3)
+
     if session.candidate_snapshot is None:
-        return SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
+        sr = SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used={},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+        )
+        return sr, so
 
     # 快照过期检查
     if conversation_service.invalidate_snapshot_if_expired(session):
-        return SearchResult(reply_text="搜索结果已过期，请重新搜索。")
-
-    top_n = _get_config_int("match.top_n", db, 3)
-    # 确定搜索方向
-    is_job_search = _is_job_search(session, user_ctx)
+        sr = SearchResult(reply_text="搜索结果已过期，请重新搜索。")
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used={},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+        )
+        return sr, so
 
     collected = []
     attempts = 0
@@ -402,10 +650,19 @@ def show_more(
         collected.extend(filtered)
 
     if not collected:
-        return SearchResult(
+        sr = SearchResult(
             reply_text="已经是所有匹配结果了。要不要调整条件重新搜索？",
             result_count=0,
         )
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=session.search_criteria or {},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+            snapshot_exhausted=True,  # 5.1 reducer 据此决定 paginate_no_more
+        )
+        return sr, so
 
     # 截断到 top_n
     collected = collected[:top_n]
@@ -417,11 +674,20 @@ def show_more(
     else:
         reply = _format_resume_results(collected, remaining)
 
-    return SearchResult(
+    sr = SearchResult(
         reply_text=reply,
         has_more=has_more,
         result_count=len(collected),
     )
+    so = _build_search_outcome(
+        direction=direction,
+        criteria_used=session.search_criteria or {},
+        initial_count=len(collected),
+        final_count=len(collected),
+        desired_count=top_n,
+        has_more=has_more,
+    )
+    return sr, so
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +735,7 @@ def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
 
     salary_floor = criteria.get("salary_floor_monthly")
     if salary_floor is not None:
-        q = q.filter(Job.salary_floor_monthly >= salary_floor)
+        q = q.filter(_job_salary_covers_floor(salary_floor))
 
     is_long_term = criteria.get("is_long_term")
     if is_long_term is not None:
@@ -513,7 +779,7 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         city_filters = [
             sa.func.json_contains(
                 Resume.expected_cities,
-                sa.func.cast(city, sa.JSON),
+                _json_scalar(city),
             )
             for city in cities
         ]
@@ -527,7 +793,7 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         cat_filters = [
             sa.func.json_contains(
                 Resume.expected_job_categories,
-                sa.func.cast(cat, sa.JSON),
+                _json_scalar(cat),
             )
             for cat in categories
         ]
@@ -695,6 +961,246 @@ def _run_resume_fallback_steps(
         applied_step=applied_step,
         suggestions=suggestions,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 §5.2：放宽步骤探查 + 显式 step 二次检索
+# ---------------------------------------------------------------------------
+
+# 5.2 reducer 据此知道"哪些 step 还能放宽"；step 名与 _FALLBACK_NOTICE_* 对齐，
+# 避免再写一份内部常量。
+_RELAX_STEP_NAMES_JOB = ("relax_salary_10pct", "broaden_job_category", "drop_optional_filters")
+_RELAX_STEP_NAMES_RESUME = ("relax_salary_10pct", "broaden_job_category", "drop_optional_filters")
+
+
+def _compute_relaxed_criteria_job(original: dict, step: str) -> dict:
+    """phased-plan §5.2.1 第 4 项：按 step 名一次性算放宽后的 criteria。
+
+    与 _run_job_fallback_steps 内部分支语义一致；execute_relaxed_search 调本
+    helper 算一次，**不**让外部传入 relaxed_criteria（避免二次放宽风险）。
+    """
+    if step == "relax_salary_10pct":
+        salary = original.get("salary_floor_monthly")
+        if salary is None:
+            return dict(original)
+        out = dict(original)
+        out["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        return out
+    if step == "broaden_job_category":
+        broadened = _broaden_job_categories(original)
+        return broadened if broadened is not None else dict(original)
+    if step == "drop_optional_filters":
+        out = _strip_optional_filters(original, _OPTIONAL_HARD_FILTERS_JOB)
+        salary = original.get("salary_floor_monthly")
+        if salary is not None:
+            out["salary_floor_monthly"] = math.floor(int(salary) * 0.9)
+        broadened = _broaden_job_categories(out)
+        if broadened is not None:
+            out = broadened
+        return out
+    return dict(original)
+
+
+def _compute_relaxed_criteria_resume(original: dict, step: str) -> dict:
+    """phased-plan §5.2.1 第 4 项：candidate_search 视角按 step 算放宽。"""
+    if step == "relax_salary_10pct":
+        salary = original.get("salary_ceiling_monthly")
+        if salary is None:
+            return dict(original)
+        out = dict(original)
+        out["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        return out
+    if step == "broaden_job_category":
+        broadened = _broaden_job_categories(original)
+        return broadened if broadened is not None else dict(original)
+    if step == "drop_optional_filters":
+        out = _strip_optional_filters(original, _OPTIONAL_HARD_FILTERS_RESUME)
+        salary = original.get("salary_ceiling_monthly")
+        if salary is not None:
+            out["salary_ceiling_monthly"] = math.ceil(int(salary) * 1.1)
+        broadened = _broaden_job_categories(out)
+        if broadened is not None:
+            out = broadened
+        return out
+    return dict(original)
+
+
+def _probe_relax_steps(
+    criteria: dict,
+    direction: str,
+    limit: int,
+    db: Session,
+) -> tuple[list[str], list[dict]]:
+    """phased-plan §5.2.3 search_service 行：探查每步放宽下的候选数。
+
+    返回 ``(available_step_names, probe_results)``：
+    - available_step_names：仍然适用的 step 名（如 salary 字段为 None 时
+      ``relax_salary_10pct`` 不进入）；
+    - probe_results：``[{"step": ..., "count": ...}, ...]`` 给 reducer 决策参考。
+
+    注意：本函数会跑 SQL，但只在低召回 / 0 召回时才被调用，且 limit 小（max_candidates）。
+    """
+    if direction == "search_job":
+        all_steps = _RELAX_STEP_NAMES_JOB
+        compute = _compute_relaxed_criteria_job
+        query_fn = _query_jobs
+    else:
+        all_steps = _RELAX_STEP_NAMES_RESUME
+        compute = _compute_relaxed_criteria_resume
+        query_fn = _query_resumes
+
+    available: list[str] = []
+    probes: list[dict] = []
+    for step in all_steps:
+        relaxed = compute(criteria, step)
+        if relaxed == criteria:
+            # 该 step 不会改变 criteria（如薪资字段缺失 → relax_salary_10pct 无效）
+            continue
+        candidates = query_fn(relaxed, limit, db)
+        available.append(step)
+        probes.append({"step": step, "count": len(candidates)})
+    return available, probes
+
+
+def execute_relaxed_search(
+    original_criteria: dict,
+    step: str,
+    *,
+    direction: Literal["search_job", "search_worker"],
+    raw_query: str,
+    session: SessionState,
+    user_ctx: UserContext,
+    db: Session,
+    user_msg_id: str | None = None,
+) -> tuple[SearchResult, SearchOutcome]:
+    """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
+
+    第一参数 **必须** 是 original_criteria（未放宽），由本函数内部按 step
+    **一次性** 计算放宽 criteria。**不允许** 调用方传 relaxed_criteria（会
+    导致二次放宽，详见 phased-plan §5.2.4 验收 #6 grep 守护）。
+
+    内部链路与 search_jobs/search_workers 一致：硬过滤 → reranker → 快照 →
+    权限过滤 → 文案渲染。**不再走** ``_run_*_fallback_steps`` 级联（reducer
+    第二轮已由 recursion_depth=1 守护，不允许再次输出 auto_relax_and_retry）。
+    """
+    if direction == "search_job":
+        relaxed = _compute_relaxed_criteria_job(original_criteria, step)
+    else:
+        relaxed = _compute_relaxed_criteria_resume(original_criteria, step)
+
+    top_n = _get_config_int("match.top_n", db, 3)
+    max_candidates = _get_config_int("match.max_candidates", db, 50)
+
+    if direction == "search_job":
+        candidates = _query_jobs(relaxed, max_candidates, db)
+    else:
+        candidates = _query_resumes(relaxed, max_candidates, db)
+    initial_count = len(candidates)
+
+    if not candidates:
+        # 二次检索仍然 0 命中（极少；用户已经接受放宽了，不再继续放宽）
+        notice_table = (
+            _FALLBACK_NOTICE_JOB if direction == "search_job"
+            else _FALLBACK_NOTICE_RESUME
+        )
+        notice = notice_table.get(step, "")
+        no_match_reply = (
+            NO_JOB_MATCH_REPLY if direction == "search_job"
+            else NO_WORKER_MATCH_REPLY
+        )
+        reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
+        sr = SearchResult(reply_text=reply, result_count=0)
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=relaxed,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=step,
+        )
+        return sr, so
+
+    if direction == "search_job":
+        candidate_dicts = _jobs_to_dicts(candidates, db)
+    else:
+        candidate_dicts = _resumes_to_dicts(candidates)
+
+    frame = "candidate_search" if direction == "search_worker" else "job_search"
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame)
+    rerank_result = _rerank_with_logging(
+        query=raw_query,
+        candidates=candidate_dicts,
+        role=user_ctx.role,
+        top_n=top_n,
+        call_site=f"execute_relaxed_search:{direction}",
+        user_msg_id=user_msg_id,
+        soft_preferences=soft_prefs,
+        ranking_weights=ranking_weights,
+    )
+    ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    ranked_id_set = set(ranked_ids)
+    for c in candidate_dicts:
+        cid = str(c["id"])
+        if cid not in ranked_id_set:
+            ranked_ids.append(cid)
+
+    digest = conversation_service.compute_query_digest(relaxed)
+    conversation_service.save_snapshot(session, ranked_ids, digest)
+
+    first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
+    if not first_batch_ids:
+        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used=relaxed,
+            initial_count=initial_count,
+            final_count=0,
+            desired_count=top_n,
+            applied_relax_step=step,
+        )
+        return sr, so
+
+    id_to_dict = {str(c["id"]): c for c in candidate_dicts}
+    batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
+
+    if direction == "search_job":
+        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+    else:
+        owner_ids = list({r.get("owner_userid", "") for r in batch})
+        users_map = _build_users_map(owner_ids, db)
+        filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+
+    shown_ids = [str(r["id"]) for r in batch]
+    conversation_service.record_shown(session, shown_ids)
+
+    remaining = conversation_service.get_remaining_count(session)
+    if direction == "search_job":
+        reply = _format_job_results(filtered, remaining)
+        notice = _FALLBACK_NOTICE_JOB.get(step)
+    else:
+        reply = _format_resume_results(filtered, remaining)
+        notice = _FALLBACK_NOTICE_RESUME.get(step)
+    if notice:
+        reply = f"{notice}\n\n{reply}"
+
+    sr = SearchResult(
+        reply_text=reply,
+        has_more=remaining > 0,
+        result_count=len(filtered),
+    )
+    # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
+    soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
+    so = _build_search_outcome(
+        direction=direction,
+        criteria_used=relaxed,
+        initial_count=initial_count,
+        final_count=len(candidates),
+        desired_count=top_n,
+        applied_relax_step=step,
+        has_more=remaining > 0,
+        soft_pref_hits=soft_pref_hits,
+    )
+    return sr, so
 
 
 def _probe_job_suggestions(

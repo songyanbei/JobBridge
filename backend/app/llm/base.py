@@ -6,7 +6,7 @@
 from abc import ABC, abstractmethod
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,10 @@ class DialogueParseResult(BaseModel):
         "cancel",
         "reset",
         "resolve_conflict",
+        # Phase 5 §5.2：放宽确认（独立于 resolve_conflict，后者仅用于
+        # upload_conflict 上下文）。系统上一轮反问"要把 X 放宽吗"且
+        # session.pending_relaxation 非空时，本轮用户回应解析为该 act。
+        "respond_relaxation_offer",
         "chitchat",
     ] = Field(..., description="本轮对话行为")
     frame_hint: Literal[
@@ -93,9 +97,36 @@ class DialogueParseResult(BaseModel):
         default=None,
         description="仅 dialogue_act=resolve_conflict 时出现",
     )
+    # Phase 5 §5.2：放宽确认场景的用户响应（accept/reject）。与 conflict_action
+    # **独立**——前者属于 upload_conflict 流程，后者属于搜索放宽流程。
+    relaxation_response: Literal["accept", "reject"] | None = Field(
+        default=None,
+        description="仅 dialogue_act=respond_relaxation_offer 时出现",
+    )
     raw_response: str = Field(default="", description="LLM 原始输出（调试 & 日志用）")
     input_tokens: int | None = Field(default=None, description="prompt_tokens")
     output_tokens: int | None = Field(default=None, description="completion_tokens")
+
+    @model_validator(mode="after")
+    def _validate_action_fields_exclusive(self):
+        """Phase 5 §第 8 轮 review fix 4：跨字段守护，避免 LLM 把
+        conflict_action / relaxation_response 与错误的 dialogue_act 组合
+        （reducer 主路径不会进入错误分支，但 prompt drift 时早 fail 比静默通过好）。
+        """
+        if self.conflict_action is not None and self.dialogue_act != "resolve_conflict":
+            raise ValueError(
+                f"conflict_action={self.conflict_action!r} requires "
+                f"dialogue_act='resolve_conflict', got {self.dialogue_act!r}"
+            )
+        if (
+            self.relaxation_response is not None
+            and self.dialogue_act != "respond_relaxation_offer"
+        ):
+            raise ValueError(
+                f"relaxation_response={self.relaxation_response!r} requires "
+                f"dialogue_act='respond_relaxation_offer', got {self.dialogue_act!r}"
+            )
+        return self
 
 
 class RerankResult(BaseModel):
@@ -187,6 +218,9 @@ class Reranker(ABC):
         candidates: list[dict],
         role: str,
         top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
     ) -> RerankResult:
         """对候选集重排并生成回复。
 
@@ -195,6 +229,11 @@ class Reranker(ABC):
             candidates: SQL 硬过滤后的候选集（字典列表，含全部字段）
             role: 用户角色（决定回复视角和可见字段）
             top_n: 返回的 Top N 条数
+            soft_preferences: Phase 5 §5.0 预声明位（5.3 才会消费）。例如
+                ``{"provide_meal": True, "shift_pattern": "日班"}``。5.0/5.1/5.2
+                所有 provider 实现接收形参但忽略，确保后续接通时不破坏现有调用。
+            ranking_weights: Phase 5 §5.0 预声明位（5.3 才会消费）。例如
+                ``{"provide_meal": 0.3, "shift_pattern": 0.2}``。
 
         Returns:
             RerankResult

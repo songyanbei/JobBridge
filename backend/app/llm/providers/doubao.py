@@ -190,15 +190,33 @@ class DoubaoReranker(Reranker):
         candidates: list[dict],
         role: str,
         top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
     ) -> RerankResult:
         system_prompt = RERANK_SYSTEM_PROMPT.format(
             role=role,
             top_n=top_n,
         )
-        user_prompt = RERANK_USER_TEMPLATE.format(
-            query=query,
-            candidates=format_candidates(candidates),
-        )
+        # Phase 5 §5.3：soft_preferences 非空时走 v2.1 prompt（带软偏好块）；
+        # 为空时严格走 v2.0 等价路径（向后兼容验收）。
+        if soft_preferences:
+            from app.llm.prompts import (
+                RERANK_USER_TEMPLATE_WITH_SOFT_PREF,
+                format_soft_preferences_block,
+            )
+            user_prompt = RERANK_USER_TEMPLATE_WITH_SOFT_PREF.format(
+                query=query,
+                candidates=format_candidates(candidates),
+                soft_preferences_block=format_soft_preferences_block(
+                    soft_preferences, ranking_weights,
+                ),
+            )
+        else:
+            user_prompt = RERANK_USER_TEMPLATE.format(
+                query=query,
+                candidates=format_candidates(candidates),
+            )
 
         payload = {
             "model": settings.llm_reranker_model,

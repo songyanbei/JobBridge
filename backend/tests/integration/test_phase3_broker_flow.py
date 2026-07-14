@@ -137,7 +137,7 @@ class TestBrokerDualSearch:
         )
         session = SessionState(role="broker", broker_direction="search_job")
 
-        result = search_service.search_jobs(
+        result, _outcome = search_service.search_jobs(
             {"city": ["苏州市"]}, "苏州找岗位", session, user_ctx, db,
         )
         assert result.result_count > 0
@@ -162,7 +162,7 @@ class TestBrokerDualSearch:
         )
         session = SessionState(role="broker", broker_direction="search_worker")
 
-        result = search_service.search_workers(
+        result, _outcome = search_service.search_workers(
             {"city": ["苏州市"]}, "苏州找工人", session, user_ctx, db,
         )
         assert result.result_count > 0

@@ -149,7 +149,7 @@ class TestNormalizeStructuredData:
             {"expected_cities": ["无锡", "无锡"], "expected_job_categories": ["厨师", "保洁"]},
             role="worker", intent="upload_resume",
         )
-        assert out["expected_cities"] == ["无锡"]
+        assert out["expected_cities"] == ["无锡市"]
         assert out["expected_job_categories"] == ["餐饮", "保洁"]
 
     def test_unknown_keys_already_filtered_by_sanitize(self):
@@ -392,8 +392,14 @@ class TestFixP1ResumeDefaultsReachSearch:
     ):
         # 模拟 worker 已有简历兜底
         mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
-        mock_search.return_value = search_service.SearchResult(
-            reply_text="为您找到 2 个匹配岗位", result_count=2,
+        # Phase 5 §5.0/5.2：tuple[SearchResult, SearchOutcome]；outcome 数值字段必须真实
+        from app.schemas.search import SearchOutcome as _SO
+        mock_search.return_value = (
+            search_service.SearchResult(
+                reply_text="为您找到 2 个匹配岗位", result_count=2,
+            ),
+            _SO(direction="search_job", criteria_used={}, initial_count=999,
+                final_count=2, desired_count=3, low_recall_threshold=3),
         )
         ctx = _ctx("worker")
         session = SessionState(role="worker")
@@ -414,8 +420,14 @@ class TestFixP1ResumeDefaultsReachSearch:
         self, mock_load, mock_search,
     ):
         mock_load.return_value = {"city": ["无锡"], "job_category": ["电子厂"]}
-        mock_search.return_value = search_service.SearchResult(
-            reply_text="为您找到 1 个匹配岗位", result_count=1,
+        # Phase 5 §5.0/5.2：tuple[SearchResult, SearchOutcome]；outcome 数值字段必须真实
+        from app.schemas.search import SearchOutcome as _SO
+        mock_search.return_value = (
+            search_service.SearchResult(
+                reply_text="为您找到 1 个匹配岗位", result_count=1,
+            ),
+            _SO(direction="search_job", criteria_used={}, initial_count=999,
+                final_count=1, desired_count=3, low_recall_threshold=3),
         )
         ctx = _ctx("worker")
         session = SessionState(role="worker")

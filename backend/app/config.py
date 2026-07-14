@@ -61,13 +61,38 @@ class DialoguePolicy(BaseModel):
     search_awaiting_ttl_seconds: int = 600
     """搜索追问字段 FIFO 队列过期时间；与上传草稿 TTL 独立可调。"""
 
+    post_search_policy_mode: Literal["off", "shadow", "on"] = "off"
+    """Phase 5 §5.0：结果感知二阶段裁决（post_search_reduce）的灰度模式。
+    off=不调 reducer，行为完全等价 5.0 前；
+    shadow=旁路调 reducer 写日志，不影响 reply；
+    on=按 PostSearchDecision.action 改写 reply / 触发 applier。
+    5.0 子阶段默认 off，message_router 暂不消费；5.1 起接通。"""
+
+    soft_preference_ranking_enabled: bool = False
+    """Phase 5 §5.3：是否启用 reranker 软偏好排序。
+    False（默认）→ search_service 调 reranker 时不传 soft_preferences/ranking_weights，
+    严格走 v2.0 等价路径；
+    True → 抽取 criteria 中软偏好字段 + 权重表（slot_schema.extract_soft_preferences）
+    传给 reranker，走 v2.1 prompt。**5.3 默认关闭**：业务直觉权重未经真实日志验证；
+    生产灰度由独立运营开关推全（phased-plan §5.4）。"""
+
+    phase5_rollout_percentage: int = 0
+    """Phase 5 §5.4：post_search_policy_mode + soft_preference_ranking_enabled
+    联合灰度的 hash 桶比例，0..100。0=不启用 Phase 5 整体灰度。**5.4 默认 0**：
+    代码就位但不真灰度（用户决策"开发期只做代码不推灰度"）；上线时按 phased-plan
+    §5.4.1 第 4 项的阶梯（5%/25%/50%/100%）推全，任一阶段关键指标回退 ≥ 5%
+    立即回滚到上一比例。"""
+
     @field_validator("v2_mode", mode="before")
     @classmethod
     def _coerce_v2_mode(cls, v):
         v = (str(v) if v is not None else "").strip()
         return v if v in {"off", "shadow", "dual_read", "primary"} else "off"
 
-    @field_validator("hash_buckets", "primary_rollout_percentage", mode="before")
+    @field_validator(
+        "hash_buckets", "primary_rollout_percentage",
+        "phase5_rollout_percentage", mode="before",
+    )
     @classmethod
     def _clamp_pct(cls, v):
         try:
@@ -81,6 +106,12 @@ class DialoguePolicy(BaseModel):
     def _coerce_acqp(cls, v):
         v = (str(v) if v is not None else "").strip()
         return v if v in {"clarify", "replace"} else "clarify"
+
+    @field_validator("post_search_policy_mode", mode="before")
+    @classmethod
+    def _coerce_psm(cls, v):
+        v = (str(v) if v is not None else "").strip()
+        return v if v in {"off", "shadow", "on"} else "off"
 
 
 # 旧顶层 env 名 → DialoguePolicy 字段名
@@ -267,6 +298,30 @@ class Settings(BaseSettings):
     def search_awaiting_ttl_seconds(self, value: int) -> None:
         self.dialogue_policy = self.dialogue_policy.model_copy(
             update={"search_awaiting_ttl_seconds": int(value)},
+        )
+
+    @property
+    def post_search_policy_mode(self) -> str:
+        """Phase 5 §5.0：post_search_reduce 灰度模式（off/shadow/on）。"""
+        return self.dialogue_policy.post_search_policy_mode
+
+    @post_search_policy_mode.setter
+    def post_search_policy_mode(self, value: str) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "post_search_policy_mode": DialoguePolicy._coerce_psm(value),
+            },
+        )
+
+    @property
+    def soft_preference_ranking_enabled(self) -> bool:
+        """Phase 5 §5.3：reranker 软偏好排序开关。"""
+        return self.dialogue_policy.soft_preference_ranking_enabled
+
+    @soft_preference_ranking_enabled.setter
+    def soft_preference_ranking_enabled(self, value: bool) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"soft_preference_ranking_enabled": bool(value)},
         )
 
     @property

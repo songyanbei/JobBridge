@@ -136,5 +136,27 @@ def apply_decision(
             session.active_flow = "search_active"
         return ApplyResult(transition_executed="enter_search_active")
 
+    # Phase 5 §5.2：放宽确认状态机
+    if transition == "clear_pending_relaxation":
+        # session-only：清待确认上下文（用户接受/拒绝放宽后由
+        # _route_v2_relaxation_response 也会兜底清；这里给 reducer 提供
+        # 显式语义入口）。
+        session.pending_relaxation = None
+        return ApplyResult(transition_executed="clear_pending_relaxation")
+
+    if transition in ("apply_relaxation", "cancel_relaxation"):
+        # phased-plan §5.2.1.5 执行归属表 + §5.2.3 dialogue_applier 行：
+        # 这两个 transition 需要 db / user_ctx 才能跑二次检索 / 渲染回复，
+        # 由 message_router._route_v2_relaxation_response 接管，applier 仅
+        # 显式 no-op + 打 passthrough 日志（**不**走 unknown 兜底告警）。
+        # 正确的调用方应按 §5.2.1 第 5 项规则跳过 apply_decision；no-op 仅
+        # 作为防御层避免误调时干扰日志。
+        logger.info(
+            "dialogue_applier_relaxation_passthrough: transition=%s "
+            "(handled by _route_v2_relaxation_response)",
+            transition,
+        )
+        return ApplyResult(transition_executed=transition)
+
     logger.warning("apply_decision: unknown state_transition=%s", transition)
     return ApplyResult(transition_executed="unknown")
