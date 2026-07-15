@@ -128,6 +128,18 @@ class TestFormatJobResults:
         text = _format_job_results([], 0)
         assert "暂无" in text
 
+    def test_match_reasons_are_optional(self):
+        jobs = [{"id": 1, "company": "XX", "job_category": "普工",
+                 "salary_floor_monthly": 5000, "pay_type": "月薪",
+                 "city": "苏州市"}]
+        text = _format_job_results(jobs, 0)
+        assert "匹配依据" not in text
+
+        text_with_reason = _format_job_results(
+            jobs, 0, {"1": ["   匹配依据：地点符合 苏州市"]},
+        )
+        assert "匹配依据：地点符合 苏州市" in text_with_reason
+
 
 class TestFormatResumeResults:
     def test_basic_format(self):

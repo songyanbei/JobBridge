@@ -33,6 +33,12 @@ from app.schemas.search import (
 )
 from app.services import conversation_service, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
+from app.services.recommendation_reason_service import (
+    build_match_reasons,
+    project_job_for_explanation,
+    project_resume_for_explanation,
+    render_match_reasons,
+)
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 
@@ -124,6 +130,72 @@ def _relax_step_label(direction: str, step: str) -> str:
     if direction == "search_job":
         return _FALLBACK_NOTICE_JOB.get(step, step).replace("已为您", "").strip("。")
     return _FALLBACK_NOTICE_RESUME.get(step, step).replace("已为您", "").strip("。")
+
+
+def _build_job_reason_lines_by_id(
+    jobs: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+) -> dict[str, list[str]]:
+    return _build_reason_lines_by_id(
+        jobs,
+        criteria,
+        flags,
+        item_type="job",
+    )
+
+
+def _build_resume_reason_lines_by_id(
+    resumes: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+) -> dict[str, list[str]]:
+    return _build_reason_lines_by_id(
+        resumes,
+        criteria,
+        flags,
+        item_type="resume",
+    )
+
+
+def _build_reason_lines_by_id(
+    items: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+    *,
+    item_type: Literal["job", "resume"],
+) -> dict[str, list[str]]:
+    if not (flags.show_match_reasons or flags.build_shadow_reasons):
+        return {}
+
+    reason_lines: dict[str, list[str]] = {}
+    reason_kinds: set[str] = set()
+    for item in items:
+        projected = (
+            project_job_for_explanation(item)
+            if item_type == "job"
+            else project_resume_for_explanation(item)
+        )
+        reasons = build_match_reasons(
+            item=projected,
+            criteria=criteria,
+            item_type=item_type,
+            include_soft_preferences=False,
+        )
+        if reasons:
+            reason_lines[str(item.get("id", ""))] = render_match_reasons(reasons)
+            reason_kinds.update(r.kind for r in reasons)
+
+    if reason_lines:
+        log_event(
+            "match_explanation_built",
+            direction="search_job" if item_type == "job" else "search_worker",
+            item_type=item_type,
+            explanation_count=sum(len(v) for v in reason_lines.values()),
+            reason_kinds=sorted(reason_kinds),
+            shadow_only=not flags.show_match_reasons,
+        )
+    return reason_lines if flags.show_match_reasons else {}
 
 
 def _extract_soft_prefs_for_rerank(
@@ -436,7 +508,8 @@ def search_jobs(
 
     # 格式化
     remaining = conversation_service.get_remaining_count(session)
-    reply = _format_job_results(filtered, remaining)
+    reason_lines = _build_job_reason_lines_by_id(filtered, criteria, flags)
+    reply = _format_job_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_JOB.get(outcome.applied_step)
         if notice:
@@ -591,7 +664,8 @@ def search_workers(
     conversation_service.record_shown(session, shown_ids)
 
     remaining = conversation_service.get_remaining_count(session)
-    reply = _format_resume_results(filtered, remaining)
+    reason_lines = _build_resume_reason_lines_by_id(filtered, criteria, flags)
+    reply = _format_resume_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_RESUME.get(outcome.applied_step)
         if notice:
@@ -640,7 +714,7 @@ def show_more(
     is_job_search = _is_job_search(session, user_ctx)
     direction = "search_job" if is_job_search else "search_worker"
     top_n = _get_config_int("match.top_n", db, 3)
-    _normalize_experience_flags(experience_flags)
+    flags = _normalize_experience_flags(experience_flags)
 
     if session.candidate_snapshot is None:
         sr = SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
@@ -726,9 +800,15 @@ def show_more(
     has_more = remaining > 0
 
     if is_job_search:
-        reply = _format_job_results(collected, remaining)
+        reason_lines = _build_job_reason_lines_by_id(
+            collected, effective_criteria, flags,
+        )
+        reply = _format_job_results(collected, remaining, reason_lines)
     else:
-        reply = _format_resume_results(collected, remaining)
+        reason_lines = _build_resume_reason_lines_by_id(
+            collected, effective_criteria, flags,
+        )
+        reply = _format_resume_results(collected, remaining, reason_lines)
 
     sr = SearchResult(
         reply_text=reply,
@@ -1236,10 +1316,12 @@ def execute_relaxed_search(
 
     remaining = conversation_service.get_remaining_count(session)
     if direction == "search_job":
-        reply = _format_job_results(filtered, remaining)
+        reason_lines = _build_job_reason_lines_by_id(filtered, relaxed, flags)
+        reply = _format_job_results(filtered, remaining, reason_lines)
         notice = _FALLBACK_NOTICE_JOB.get(step)
     else:
-        reply = _format_resume_results(filtered, remaining)
+        reason_lines = _build_resume_reason_lines_by_id(filtered, relaxed, flags)
+        reply = _format_resume_results(filtered, remaining, reason_lines)
         notice = _FALLBACK_NOTICE_RESUME.get(step)
     if notice:
         reply = f"{notice}\n\n{reply}"
@@ -1528,7 +1610,11 @@ def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
 # 格式化
 # ---------------------------------------------------------------------------
 
-def _format_job_results(jobs: list[dict], remaining: int) -> str:
+def _format_job_results(
+    jobs: list[dict],
+    remaining: int,
+    reason_lines_by_id: dict[str, list[str]] | None = None,
+) -> str:
     """按 §10.5 格式化岗位结果（工人视角）。"""
     if not jobs:
         return "暂无匹配结果。"
@@ -1564,6 +1650,8 @@ def _format_job_results(jobs: list[dict], remaining: int) -> str:
         lines.append(f"{marker} {title}")
         lines.append(f"   💰 {salary_str}{benefit_str}")
         lines.append(f"   📍 {location}")
+        for reason_line in (reason_lines_by_id or {}).get(str(j.get("id", "")), []):
+            lines.append(reason_line)
 
         shift = j.get("shift_pattern", "")
         hours = j.get("work_hours", "")
@@ -1578,7 +1666,11 @@ def _format_job_results(jobs: list[dict], remaining: int) -> str:
     return "\n".join(lines)
 
 
-def _format_resume_results(resumes: list[dict], remaining: int) -> str:
+def _format_resume_results(
+    resumes: list[dict],
+    remaining: int,
+    reason_lines_by_id: dict[str, list[str]] | None = None,
+) -> str:
     """按 §10.5 格式化简历结果（厂家/中介视角）。"""
     if not resumes:
         return "暂无匹配结果。"
@@ -1605,6 +1697,8 @@ def _format_resume_results(resumes: list[dict], remaining: int) -> str:
             lines.append(f"   🔧 期望：{cat_str}，{salary}+/月")
         if city_str:
             lines.append(f"   📍 期望城市：{city_str}")
+        for reason_line in (reason_lines_by_id or {}).get(str(r.get("id", "")), []):
+            lines.append(reason_line)
 
         phone = r.get("phone")
         placeholder = r.get("phone_placeholder")
