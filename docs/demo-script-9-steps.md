@@ -6,6 +6,7 @@
 
 - [ ] 后端 `uvicorn` 已起，`/health` 返回 ok
 - [ ] Worker 进程已起（消费 Redis 队列）
+- [ ] 如演示 Phase5 推荐体验：确认 app 与 worker 使用同一套推荐体验环境变量，并已在调整后重启
 - [ ] 前端运营后台 admin 已登录（admin/admin123）
 - [ ] 企微 webhook（或 mock 工具）能发消息到后端
 - [ ] 演示用账号确认：
@@ -13,6 +14,7 @@
   - 中介：`seed_broker_002`（云国华）
   - 工人：用一个**新的** external_userid（如 `demo_worker_show_001`）触发自动注册
 - [ ] 苏州电子厂岗位密度：10 条（演示前 SQL 复核：`SELECT COUNT(*) FROM job WHERE city='苏州市' AND job_category='电子厂'`）
+- [ ] 命中匹配依据 gate 时，回复里会出现"匹配依据"；未命中时不出现该文案
 
 ---
 
@@ -118,6 +120,8 @@
 >    两班倒
 > ② ……
 > ③ ……
+
+若 `RECOMMENDATION_EXPERIENCE_ENABLED=true` 且匹配依据 rollout 命中，每条结果最多额外出现 2 条"匹配依据"，只说明地点、工种、薪资、包吃住等可验证命中，不解释最终排序。
 
 **口播**：
 - "中介这个角色比较特殊：双向权限——既能发岗位又能查岗位查工人。这条消息触发了 `search_job` 意图"

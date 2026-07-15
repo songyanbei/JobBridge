@@ -33,6 +33,7 @@ from app.schemas.search import (
 )
 from app.services import conversation_service, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
+from app.services.recommendation_experience_gate import userid_hash
 from app.services.recommendation_reason_service import (
     build_match_reasons,
     project_job_for_explanation,
@@ -814,6 +815,14 @@ def show_more(
         collected.extend(filtered)
 
     if not collected:
+        log_event(
+            "show_more_exhausted",
+            external_userid_hash=userid_hash(user_ctx.external_userid),
+            direction=direction,
+            remaining_count_capped=0,
+            snapshot_has_effective_criteria=bool(effective_criteria),
+            active_flow=session.active_flow or "",
+        )
         sr = SearchResult(
             reply_text="已经是所有匹配结果了。要不要调整条件重新搜索？",
             result_count=0,
@@ -1303,6 +1312,16 @@ def execute_relaxed_search(
         )
         reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
         reply = f"{_render_relaxation_summary_notice(summary)}\n\n{reply}"
+        log_event(
+            "auto_relax_applied",
+            external_userid_hash=userid_hash(user_ctx.external_userid),
+            direction=direction,
+            field=step,
+            original_visible_count=original_visible_count,
+            relaxed_visible_count=0,
+            relaxed_shown_count=0,
+            applied=True,
+        )
         sr = SearchResult(reply_text=reply, result_count=0)
         so = _build_search_outcome(
             direction=direction,
@@ -1387,6 +1406,16 @@ def execute_relaxed_search(
         relaxed_shown_count=len(filtered),
     )
     reply = f"{_render_relaxation_summary_notice(relaxation_summary)}\n\n{reply}"
+    log_event(
+        "auto_relax_applied",
+        external_userid_hash=userid_hash(user_ctx.external_userid),
+        direction=direction,
+        field=step,
+        original_visible_count=original_visible_count,
+        relaxed_visible_count=len(filtered),
+        relaxed_shown_count=len(filtered),
+        applied=True,
+    )
 
     sr = SearchResult(
         reply_text=reply,

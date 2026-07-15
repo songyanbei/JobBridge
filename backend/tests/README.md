@@ -164,3 +164,31 @@ python -c "from app.wecom.client import WeComClient; print('wecom OK')"
 python -c "from app.wecom.crypto import verify_signature, decrypt_message; print('crypto OK')"
 python -c "from app.wecom.callback import parse_message, WeComMessage; print('callback OK')"
 ```
+
+## Phase 5 Full-Service Async Message Smoke
+
+This smoke test injects a mock WeCom text message into `queue:incoming`, lets the
+real worker consume it, and reads the business reply from Redis Pub/Sub channel
+`mock:outbound:<userid>`. It is intentionally not called an HTTP E2E test
+because the real webhook returns an enqueue ACK rather than the business reply.
+
+Prerequisites:
+
+- Backend app is running and `/health` is reachable.
+- Worker is running against the same Redis/MySQL.
+- `MOCK_WEWORK_OUTBOUND=true`
+- `MOCK_WEWORK_REDIS_URL=<redis-url>`
+- `APP_ENV` is not `production`.
+- Base seed and `scripts/demo_seed_supplement.sql` have been applied.
+
+```bash
+python ../scripts/demo_acceptance_smoke.py \
+  --base-url http://127.0.0.1:8000 \
+  --redis-url redis://127.0.0.1:6379/0 \
+  --mysql-dsn mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge \
+  --expect "为您找到"
+```
+
+For gate hit/miss acceptance, run once with recommendation rollout values set to
+`100`, restart app and worker, then run again with the same rollout values set
+to `0` and restart both processes.

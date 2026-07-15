@@ -26,10 +26,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from app.schemas.conversation import ReplyMessage
+from app.services.recommendation_experience_gate import userid_hash
 from app.services.post_search_reducer import (
     PostSearchContext,
     post_search_reduce,
 )
+from app.tasks.common import log_event
 
 if TYPE_CHECKING:
     pass
@@ -295,6 +297,16 @@ def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
     base = ctx.search_result.reply_text or ""
     if not notice:
         return base
+    log_event(
+        "soft_preference_notice_shown",
+        external_userid_hash=userid_hash(ctx.user_ctx.external_userid),
+        direction=ctx.search_outcome.direction,
+        soft_pref_hits=sum((ctx.search_outcome.soft_pref_hits or {}).values()),
+        visible_count=ctx.search_outcome.visible_count
+        if ctx.search_outcome.visible_count is not None
+        else ctx.search_outcome.final_count,
+        notice_gate=ctx.experience_flags.soft_preference_notice,
+    )
     return f"{notice}\n\n{base}" if base else notice
 
 

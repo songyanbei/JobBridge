@@ -51,7 +51,7 @@ def rollout_hit(external_userid: str | None, percentage: int) -> bool:
 def userid_hash(external_userid: str | None) -> str:
     if not external_userid:
         return ""
-    return hashlib.sha256(external_userid.encode("utf-8")).hexdigest()[:12]
+    return hashlib.sha256(str(external_userid).encode("utf-8")).hexdigest()[:12]
 
 
 def compute_recommendation_experience_flags(
