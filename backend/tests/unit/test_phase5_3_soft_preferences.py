@@ -137,9 +137,14 @@ class TestExtractSoftPrefsForRerank:
 
     def test_enabled_extracts(self, monkeypatch):
         from app.services.search_service import _extract_soft_prefs_for_rerank
+        from app.services.recommendation_experience_gate import (
+            RecommendationExperienceFlags,
+        )
         monkeypatch.setattr(settings, "soft_preference_ranking_enabled", True)
         prefs, weights = _extract_soft_prefs_for_rerank(
-            {"city": ["北京市"], "provide_meal": True}, "job_search",
+            {"city": ["北京市"], "provide_meal": True},
+            "job_search",
+            RecommendationExperienceFlags(soft_preference_ranking=True),
         )
         assert prefs == {"provide_meal": True}
         assert weights == {"provide_meal": 0.3}

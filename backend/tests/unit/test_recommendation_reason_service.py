@@ -55,3 +55,25 @@ def test_resume_projection_drops_phone_field():
 
     assert projected.name == "张三"
     assert not hasattr(projected, "phone")
+
+
+def test_soft_preference_reason_only_for_hits():
+    item = project_job_for_explanation({
+        "id": 1,
+        "job_category": "电子厂",
+        "city": "苏州市",
+        "provide_meal": True,
+    })
+
+    reasons = build_match_reasons(
+        item=item,
+        criteria={"city": ["苏州市"]},
+        item_type="job",
+        soft_pref_hits={"provide_meal": True, "provide_housing": False},
+        include_soft_preferences=True,
+        limit=3,
+    )
+
+    texts = [r.text for r in reasons]
+    assert any("包吃" in text for text in texts)
+    assert all("包住" not in text for text in texts)

@@ -150,12 +150,14 @@ def _build_job_reason_lines_by_id(
     jobs: list[dict],
     criteria: dict,
     flags: RecommendationExperienceFlags,
+    soft_preferences: dict | None = None,
 ) -> dict[str, list[str]]:
     return _build_reason_lines_by_id(
         jobs,
         criteria,
         flags,
         item_type="job",
+        soft_preferences=soft_preferences,
     )
 
 
@@ -163,12 +165,14 @@ def _build_resume_reason_lines_by_id(
     resumes: list[dict],
     criteria: dict,
     flags: RecommendationExperienceFlags,
+    soft_preferences: dict | None = None,
 ) -> dict[str, list[str]]:
     return _build_reason_lines_by_id(
         resumes,
         criteria,
         flags,
         item_type="resume",
+        soft_preferences=soft_preferences,
     )
 
 
@@ -178,8 +182,10 @@ def _build_reason_lines_by_id(
     flags: RecommendationExperienceFlags,
     *,
     item_type: Literal["job", "resume"],
+    soft_preferences: dict | None = None,
 ) -> dict[str, list[str]]:
-    if not (flags.show_match_reasons or flags.build_shadow_reasons):
+    can_show_reasons = flags.show_match_reasons or flags.soft_preference_reasons
+    if not (can_show_reasons or flags.build_shadow_reasons):
         return {}
 
     reason_lines: dict[str, list[str]] = {}
@@ -194,7 +200,8 @@ def _build_reason_lines_by_id(
             item=projected,
             criteria=criteria,
             item_type=item_type,
-            include_soft_preferences=False,
+            soft_pref_hits=_item_soft_preference_hits(item, soft_preferences),
+            include_soft_preferences=flags.soft_preference_reasons,
         )
         if reasons:
             reason_lines[str(item.get("id", ""))] = render_match_reasons(reasons)
@@ -207,9 +214,22 @@ def _build_reason_lines_by_id(
             item_type=item_type,
             explanation_count=sum(len(v) for v in reason_lines.values()),
             reason_kinds=sorted(reason_kinds),
-            shadow_only=not flags.show_match_reasons,
+            shadow_only=not can_show_reasons,
         )
-    return reason_lines if flags.show_match_reasons else {}
+    return reason_lines if can_show_reasons else {}
+
+
+def _item_soft_preference_hits(
+    item: dict,
+    soft_preferences: dict | None,
+) -> dict[str, bool]:
+    if not soft_preferences:
+        return {}
+    hits: dict[str, bool] = {}
+    for key, expected in soft_preferences.items():
+        if item.get(key) == expected:
+            hits[key] = True
+    return hits
 
 
 def _extract_soft_prefs_for_rerank(
@@ -522,7 +542,7 @@ def search_jobs(
 
     # 格式化
     remaining = conversation_service.get_remaining_count(session)
-    reason_lines = _build_job_reason_lines_by_id(filtered, criteria, flags)
+    reason_lines = _build_job_reason_lines_by_id(filtered, criteria, flags, soft_prefs)
     reply = _format_job_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_JOB.get(outcome.applied_step)
@@ -679,7 +699,9 @@ def search_workers(
     conversation_service.record_shown(session, shown_ids)
 
     remaining = conversation_service.get_remaining_count(session)
-    reason_lines = _build_resume_reason_lines_by_id(filtered, criteria, flags)
+    reason_lines = _build_resume_reason_lines_by_id(
+        filtered, criteria, flags, soft_prefs,
+    )
     reply = _format_resume_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_RESUME.get(outcome.applied_step)
@@ -815,13 +837,19 @@ def show_more(
     has_more = remaining > 0
 
     if is_job_search:
+        soft_prefs, _ = _extract_soft_prefs_for_rerank(
+            effective_criteria, "job_search", flags,
+        )
         reason_lines = _build_job_reason_lines_by_id(
-            collected, effective_criteria, flags,
+            collected, effective_criteria, flags, soft_prefs,
         )
         reply = _format_job_results(collected, remaining, reason_lines)
     else:
+        soft_prefs, _ = _extract_soft_prefs_for_rerank(
+            effective_criteria, "candidate_search", flags,
+        )
         reason_lines = _build_resume_reason_lines_by_id(
-            collected, effective_criteria, flags,
+            collected, effective_criteria, flags, soft_prefs,
         )
         reply = _format_resume_results(collected, remaining, reason_lines)
 
@@ -1342,10 +1370,12 @@ def execute_relaxed_search(
 
     remaining = conversation_service.get_remaining_count(session)
     if direction == "search_job":
-        reason_lines = _build_job_reason_lines_by_id(filtered, relaxed, flags)
+        reason_lines = _build_job_reason_lines_by_id(filtered, relaxed, flags, soft_prefs)
         reply = _format_job_results(filtered, remaining, reason_lines)
     else:
-        reason_lines = _build_resume_reason_lines_by_id(filtered, relaxed, flags)
+        reason_lines = _build_resume_reason_lines_by_id(
+            filtered, relaxed, flags, soft_prefs,
+        )
         reply = _format_resume_results(filtered, remaining, reason_lines)
     relaxation_summary = RelaxationSummary(
         field=step,

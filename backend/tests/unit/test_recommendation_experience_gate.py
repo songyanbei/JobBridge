@@ -64,3 +64,20 @@ def test_soft_preference_reasons_and_notice_depend_on_ranking(monkeypatch):
     assert flags.soft_preference_ranking is False
     assert flags.soft_preference_reasons is False
     assert flags.soft_preference_notice is False
+
+
+def test_soft_preference_global_switch_disables_soft_flags(monkeypatch):
+    _set_policy(
+        monkeypatch,
+        recommendation_experience_enabled=True,
+        soft_preference_ranking_enabled=False,
+        soft_preference_ranking_rollout_percentage=100,
+        soft_preference_reason_rollout_percentage=100,
+        soft_preference_notice_rollout_percentage=100,
+    )
+
+    flags = compute_recommendation_experience_flags("u1")
+
+    assert flags.soft_preference_ranking is False
+    assert flags.soft_preference_reasons is False
+    assert flags.soft_preference_notice is False

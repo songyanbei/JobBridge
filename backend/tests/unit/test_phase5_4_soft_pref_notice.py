@@ -27,6 +27,7 @@ from app.services.post_search_reducer import (
     PostSearchDecision,
     post_search_reduce,
 )
+from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 from app.services.search_service import _count_soft_pref_hits
 
 
@@ -91,7 +92,10 @@ def _make_outcome(
     )
 
 
-def _reduce(outcome: SearchOutcome) -> PostSearchDecision:
+def _reduce(
+    outcome: SearchOutcome,
+    experience_flags: RecommendationExperienceFlags | None = None,
+) -> PostSearchDecision:
     parse = DialogueParseResult(
         dialogue_act="start_search", frame_hint="job_search",
         slots_delta={}, merge_hint={}, needs_clarification=False,
@@ -108,6 +112,7 @@ def _reduce(outcome: SearchOutcome) -> PostSearchDecision:
         session=session,
         search_outcome=outcome,
         role="worker",
+        experience_flags=experience_flags,
     )
 
 
@@ -126,7 +131,10 @@ class TestSoftPrefNoticeReducerDecision:
         outcome = _make_outcome(
             final_count=3, soft_pref_hits={"provide_meal": 3},
         )
-        d = _reduce(outcome)
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
         assert d.action == "show_results_with_soft_pref_notice"
         assert d.soft_pref_notice is not None
         assert "包吃" in d.soft_pref_notice
@@ -138,7 +146,10 @@ class TestSoftPrefNoticeReducerDecision:
         outcome = _make_outcome(
             final_count=100, soft_pref_hits={"provide_meal": 49},
         )
-        d = _reduce(outcome)
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
         assert d.action == "no_action"
 
     def test_threshold_boundary_exactly_50(self, monkeypatch):
@@ -147,7 +158,10 @@ class TestSoftPrefNoticeReducerDecision:
         outcome = _make_outcome(
             final_count=100, soft_pref_hits={"provide_meal": 50},
         )
-        d = _reduce(outcome)
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
         assert d.action == "show_results_with_soft_pref_notice"
 
     def test_zero_results_does_not_trigger(self, monkeypatch):
@@ -157,14 +171,20 @@ class TestSoftPrefNoticeReducerDecision:
             final_count=0, soft_pref_hits={},
         )
         # 0 结果会先走 _decide_zero_result（initial_count<threshold）→ no_action 或其他
-        d = _reduce(outcome)
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
         # 不应是 show_results_with_soft_pref_notice
         assert d.action != "show_results_with_soft_pref_notice"
 
     def test_empty_hits_does_not_trigger(self, monkeypatch):
         monkeypatch.setattr(settings, "soft_preference_ranking_enabled", True)
         outcome = _make_outcome(final_count=3, soft_pref_hits={})
-        d = _reduce(outcome)
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
         assert d.action == "no_action"
 
 
