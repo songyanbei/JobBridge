@@ -41,11 +41,11 @@ logger = logging.getLogger(__name__)
 # 文案模板（phased-plan §跨阶段共同约束 #3：clarification / 降级文案不依赖 LLM）
 # ---------------------------------------------------------------------------
 
-_PAGINATE_FALLBACK_TEMPLATE = "已经是所有匹配结果了。要不要换城市或工种重新搜索？"
+_PAGINATE_FALLBACK_TEMPLATE = "本轮结果已经看完了。可以换城市或工种重新搜索。"
 """criteria 已极简（relaxation_directions 为空）时的兜底文案
 （phased-plan 失败模式表）。"""
 
-_PAGINATE_HEADER = "已经是所有匹配结果了。可以试试以下方向重新搜索："
+_PAGINATE_HEADER = "本轮结果已经看完了。可以试试这些方向重新搜索："
 
 # Phase 5.2：ask_clarification 反问文案（reducer 已通过 clarification.question
 # 给出业务文案；这里的模板仅用于桩输入或 question 缺失时的兜底）。
@@ -129,7 +129,7 @@ def _render_paginate_no_more(ctx: PostSearchContext) -> str:
     directions = ctx.decision.suggested_directions or []
     if not directions:
         return _PAGINATE_FALLBACK_TEMPLATE
-    bullets = [f"- {d['hint_text']}" for d in directions]
+    bullets = [f"- {d['hint_text']}" for d in directions[:3]]
     return _PAGINATE_HEADER + "\n" + "\n".join(bullets)
 
 

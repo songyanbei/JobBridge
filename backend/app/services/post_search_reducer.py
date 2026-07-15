@@ -182,8 +182,10 @@ def _decide_paginate_no_more(
     frame = (
         "candidate_search" if outcome.direction == "search_worker" else "job_search"
     )
-    directions = slot_schema.relaxation_directions(
-        session.search_criteria, frame=frame,
+    directions = _dedupe_suggested_directions(
+        slot_schema.relaxation_directions(
+            outcome.criteria_used or session.search_criteria, frame=frame,
+        ),
     )
     return PostSearchDecision(
         action="paginate_no_more",
@@ -354,3 +356,20 @@ def _relax_steps_to_directions(outcome: SearchOutcome) -> list[dict]:
         }
         for step in (outcome.available_relax_steps or [])
     ]
+
+
+def _dedupe_suggested_directions(directions: list[dict], limit: int = 3) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    result: list[dict] = []
+    for direction in directions:
+        key = (
+            str(direction.get("target_field") or ""),
+            str(direction.get("hint_text") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(direction)
+        if len(result) >= limit:
+            break
+    return result

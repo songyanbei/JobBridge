@@ -129,7 +129,7 @@ class TestPaginateNoMore:
         replies = apply_post_search_decision(ctx)
         assert len(replies) == 1
         text = replies[0].content
-        assert "已经是所有匹配结果了" in text
+        assert "本轮结果已经看完了" in text
         assert "换附近城市" in text
         assert "切换工种大类" in text
         # 应该是项目符号格式
@@ -144,6 +144,20 @@ class TestPaginateNoMore:
         replies = apply_post_search_decision(ctx)
         # criteria 极简 fallback 文案
         assert "换城市或工种重新搜索" in replies[0].content
+
+    def test_limits_directions_to_three(self):
+        decision = PostSearchDecision(
+            action="paginate_no_more",
+            suggested_directions=[
+                {"dimension": "city", "hint_text": "换附近城市", "target_field": "city"},
+                {"dimension": "job_category", "hint_text": "切换工种大类", "target_field": "job_category"},
+                {"dimension": "salary", "hint_text": "放宽薪资", "target_field": "salary"},
+                {"dimension": "shift", "hint_text": "放宽班次", "target_field": "shift"},
+            ],
+        )
+        ctx = _make_ctx(decision=decision)
+        text = apply_post_search_decision(ctx)[0].content
+        assert "放宽班次" not in text
 
 
 # ---------------------------------------------------------------------------
