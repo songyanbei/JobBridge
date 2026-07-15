@@ -83,6 +83,29 @@ class DialoguePolicy(BaseModel):
     §5.4.1 第 4 项的阶梯（5%/25%/50%/100%）推全，任一阶段关键指标回退 ≥ 5%
     立即回滚到上一比例。"""
 
+    recommendation_experience_enabled: bool = False
+    """Phase 5 recommendation experience master switch.
+
+    False is the highest-priority kill switch: recommendation reasons, shadow
+    reason building, soft-preference ranking, soft-preference reasons, and the
+    soft-preference notice must all resolve to disabled.
+    """
+
+    recommendation_reason_rollout_percentage: int = 0
+    """User rollout percentage for writing match reasons into replies."""
+
+    recommendation_reason_shadow_enabled: bool = False
+    """Build recommendation reasons for structured logs only; never changes reply text."""
+
+    soft_preference_ranking_rollout_percentage: int = 0
+    """User rollout percentage for soft-preference ranking; the global bool remains the kill switch."""
+
+    soft_preference_reason_rollout_percentage: int = 0
+    """User rollout percentage for per-result soft-preference match reasons."""
+
+    soft_preference_notice_rollout_percentage: int = 0
+    """User rollout percentage for the overall soft-preference visibility notice."""
+
     @field_validator("v2_mode", mode="before")
     @classmethod
     def _coerce_v2_mode(cls, v):
@@ -91,7 +114,11 @@ class DialoguePolicy(BaseModel):
 
     @field_validator(
         "hash_buckets", "primary_rollout_percentage",
-        "phase5_rollout_percentage", mode="before",
+        "phase5_rollout_percentage",
+        "recommendation_reason_rollout_percentage",
+        "soft_preference_ranking_rollout_percentage",
+        "soft_preference_reason_rollout_percentage",
+        "soft_preference_notice_rollout_percentage", mode="before",
     )
     @classmethod
     def _clamp_pct(cls, v):
@@ -123,6 +150,15 @@ _LEGACY_DIALOGUE_FIELD_MAP = {
     "ambiguous_city_query_policy": "ambiguous_city_query_policy",
     "low_confidence_threshold": "low_confidence_threshold",
     "search_awaiting_ttl_seconds": "search_awaiting_ttl_seconds",
+    "post_search_policy_mode": "post_search_policy_mode",
+    "soft_preference_ranking_enabled": "soft_preference_ranking_enabled",
+    "phase5_rollout_percentage": "phase5_rollout_percentage",
+    "recommendation_experience_enabled": "recommendation_experience_enabled",
+    "recommendation_reason_rollout_percentage": "recommendation_reason_rollout_percentage",
+    "recommendation_reason_shadow_enabled": "recommendation_reason_shadow_enabled",
+    "soft_preference_ranking_rollout_percentage": "soft_preference_ranking_rollout_percentage",
+    "soft_preference_reason_rollout_percentage": "soft_preference_reason_rollout_percentage",
+    "soft_preference_notice_rollout_percentage": "soft_preference_notice_rollout_percentage",
 }
 
 
@@ -322,6 +358,84 @@ class Settings(BaseSettings):
     def soft_preference_ranking_enabled(self, value: bool) -> None:
         self.dialogue_policy = self.dialogue_policy.model_copy(
             update={"soft_preference_ranking_enabled": bool(value)},
+        )
+
+    @property
+    def phase5_rollout_percentage(self) -> int:
+        return self.dialogue_policy.phase5_rollout_percentage
+
+    @phase5_rollout_percentage.setter
+    def phase5_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"phase5_rollout_percentage": DialoguePolicy._clamp_pct(value)},
+        )
+
+    @property
+    def recommendation_experience_enabled(self) -> bool:
+        return self.dialogue_policy.recommendation_experience_enabled
+
+    @recommendation_experience_enabled.setter
+    def recommendation_experience_enabled(self, value: bool) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"recommendation_experience_enabled": bool(value)},
+        )
+
+    @property
+    def recommendation_reason_rollout_percentage(self) -> int:
+        return self.dialogue_policy.recommendation_reason_rollout_percentage
+
+    @recommendation_reason_rollout_percentage.setter
+    def recommendation_reason_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "recommendation_reason_rollout_percentage": DialoguePolicy._clamp_pct(value),
+            },
+        )
+
+    @property
+    def recommendation_reason_shadow_enabled(self) -> bool:
+        return self.dialogue_policy.recommendation_reason_shadow_enabled
+
+    @recommendation_reason_shadow_enabled.setter
+    def recommendation_reason_shadow_enabled(self, value: bool) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"recommendation_reason_shadow_enabled": bool(value)},
+        )
+
+    @property
+    def soft_preference_ranking_rollout_percentage(self) -> int:
+        return self.dialogue_policy.soft_preference_ranking_rollout_percentage
+
+    @soft_preference_ranking_rollout_percentage.setter
+    def soft_preference_ranking_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "soft_preference_ranking_rollout_percentage": DialoguePolicy._clamp_pct(value),
+            },
+        )
+
+    @property
+    def soft_preference_reason_rollout_percentage(self) -> int:
+        return self.dialogue_policy.soft_preference_reason_rollout_percentage
+
+    @soft_preference_reason_rollout_percentage.setter
+    def soft_preference_reason_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "soft_preference_reason_rollout_percentage": DialoguePolicy._clamp_pct(value),
+            },
+        )
+
+    @property
+    def soft_preference_notice_rollout_percentage(self) -> int:
+        return self.dialogue_policy.soft_preference_notice_rollout_percentage
+
+    @soft_preference_notice_rollout_percentage.setter
+    def soft_preference_notice_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={
+                "soft_preference_notice_rollout_percentage": DialoguePolicy._clamp_pct(value),
+            },
         )
 
     @property

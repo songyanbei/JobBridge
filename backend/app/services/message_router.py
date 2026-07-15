@@ -54,6 +54,24 @@ from app.wecom.callback import WeComMessage
 logger = logging.getLogger(__name__)
 
 
+def _experience_flags_for(
+    user_ctx: UserContext,
+    *,
+    direction: str | None = None,
+    emit_log: bool = False,
+):
+    from app.services.recommendation_experience_gate import (
+        compute_recommendation_experience_flags,
+    )
+
+    return compute_recommendation_experience_flags(
+        user_ctx.external_userid,
+        direction=direction,
+        mode=_settings_module.dialogue_policy.post_search_policy_mode,
+        emit_log=emit_log,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 固定回复文案
 # ---------------------------------------------------------------------------
@@ -925,6 +943,9 @@ def _route_v2_relaxation_response(
         direction = pending.get("direction") or "search_job"
         persisted_raw_query = pending.get("raw_query") or ""
         persisted_user_msg_id = pending.get("user_msg_id")
+        experience_flags = _experience_flags_for(
+            user_ctx, direction=direction, emit_log=True,
+        )
 
         new_result, new_outcome = _search_service.execute_relaxed_search(
             original_criteria,
@@ -935,6 +956,7 @@ def _route_v2_relaxation_response(
             user_ctx=user_ctx,
             db=db,
             user_msg_id=persisted_user_msg_id,
+            experience_flags=experience_flags,
         )
 
         # 二阶段 reducer
@@ -957,6 +979,7 @@ def _route_v2_relaxation_response(
             session=session,
             search_outcome=new_outcome,
             role=user_ctx.role,
+            experience_flags=experience_flags,
         )
         # 第二轮 reducer 必须不再输出 auto_relax_and_retry
         # 第 8 轮 review fix 3：用 raise 而非 assert（-O 模式会剥）
@@ -978,6 +1001,7 @@ def _route_v2_relaxation_response(
             db=db,
             raw_query=persisted_raw_query,
             role=user_ctx.role,
+            experience_flags=experience_flags,
             recursion_depth=1,
         )
         replies = apply_post_search_decision(ctx)
@@ -1355,7 +1379,17 @@ def _handle_show_more(
     db: Session,
 ) -> list[ReplyMessage]:
     # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
-    result, outcome = search_service.show_more(session, user_ctx, db)
+    direction = (
+        "search_job"
+        if (user_ctx.role == "worker" or session.broker_direction == "search_job")
+        else "search_worker"
+    )
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=direction, emit_log=True,
+    )
+    result, outcome = search_service.show_more(
+        session, user_ctx, db, experience_flags=experience_flags,
+    )
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
@@ -1461,12 +1495,16 @@ def _post_search_dispatch(
             route_intent=legacy_intent,
         )
 
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=search_outcome.direction, emit_log=False,
+    )
     ps_decision = post_search_reduce(
         parse_result=parse_stub,
         decision=decision_stub,
         session=session,
         search_outcome=search_outcome,
         role=user_ctx.role,
+        experience_flags=experience_flags,
     )
 
     if mode == "shadow":
@@ -1518,6 +1556,7 @@ def _post_search_dispatch(
         db=db,
         raw_query=msg.content or "",
         role=user_ctx.role,
+        experience_flags=experience_flags,
         recursion_depth=0,
     )
     replies = apply_post_search_decision(ctx)
@@ -1971,15 +2010,22 @@ def _run_search(
     Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=direction, emit_log=True,
+    )
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
     # Phase 5 §5.0：search_jobs/search_workers 现返回 tuple[SearchResult, SearchOutcome]
     if direction == "search_job":
         result, outcome = search_service.search_jobs(
-            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+            composed, raw_query, session, user_ctx, db,
+            user_msg_id=user_msg_id,
+            experience_flags=experience_flags,
         )
     else:
         result, outcome = search_service.search_workers(
-            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+            composed, raw_query, session, user_ctx, db,
+            user_msg_id=user_msg_id,
+            experience_flags=experience_flags,
         )
 
     # Phase 5 §5.2：available_relax_steps 现已由 search_jobs/search_workers 在

@@ -232,6 +232,7 @@ def _handle_auto_relax_and_retry(
         user_ctx=ctx.user_ctx,
         db=ctx.db,
         user_msg_id=ctx.msg.msg_id,
+        experience_flags=ctx.experience_flags,
     )
 
     new_decision = post_search_reduce(
@@ -240,6 +241,7 @@ def _handle_auto_relax_and_retry(
         session=ctx.session,
         search_outcome=new_outcome,
         role=ctx.role,
+        experience_flags=ctx.experience_flags,
     )
     # 第二轮 reducer 必须不再输出 auto_relax_and_retry（避免无限套娃）
     # 第 8 轮 review fix 3：用 raise 而非 assert（生产 -O 模式会剥掉 assert）
@@ -261,6 +263,7 @@ def _handle_auto_relax_and_retry(
         db=ctx.db,
         raw_query=ctx.raw_query,
         role=ctx.role,
+        experience_flags=ctx.experience_flags,
         recursion_depth=ctx.recursion_depth + 1,  # 0 → 1
     )
     return apply_post_search_decision(new_ctx)

@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.schemas.conversation import SessionState
 from app.schemas.search import SearchOutcome, SearchResult
+from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 
 if TYPE_CHECKING:
     # 仅类型提示用，避免运行时循环 import。
@@ -104,6 +105,9 @@ class PostSearchContext:
     db: Any  # sqlalchemy.orm.Session，同上
     raw_query: str
     role: str
+    experience_flags: RecommendationExperienceFlags = field(
+        default_factory=RecommendationExperienceFlags.disabled,
+    )
     recursion_depth: int = 0
     """0 = 主搜索路径；1 = 二阶段（auto_relax_and_retry 之后）；
     >=2 不允许（applier 端 assert 守护）。"""
@@ -120,6 +124,7 @@ def post_search_reduce(
     session: SessionState,
     search_outcome: SearchOutcome,
     role: str,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> PostSearchDecision:
     """纯函数：基于搜索结果 + 阶段二裁决产出二阶段动作。
 
@@ -143,7 +148,8 @@ def post_search_reduce(
 
     # 5.4：软偏好可见性文案（仅当 settings.soft_preference_ranking_enabled 真开启 +
     # ranked_items 中软偏好命中比例 ≥ 阈值时触发）。
-    decision_phase5_4 = _decide_show_results_with_soft_pref_notice(search_outcome)
+    flags = experience_flags or RecommendationExperienceFlags.disabled()
+    decision_phase5_4 = _decide_show_results_with_soft_pref_notice(search_outcome, flags)
     if decision_phase5_4 is not None:
         return decision_phase5_4
 
@@ -297,6 +303,7 @@ _SOFT_PREF_VISIBILITY_THRESHOLD = 0.5
 
 def _decide_show_results_with_soft_pref_notice(
     outcome: SearchOutcome,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> PostSearchDecision | None:
     """phased-plan §5.4.1 第 1 项：5.4 起首次接通 show_results_with_soft_pref_notice。
 
@@ -309,7 +316,8 @@ def _decide_show_results_with_soft_pref_notice(
     满足时输出 PostSearchDecision(action="show_results_with_soft_pref_notice",
     soft_pref_notice=<模板渲染>)。其它情况返回 None 让上层走 no_action。
     """
-    if not settings.soft_preference_ranking_enabled:
+    flags = experience_flags or RecommendationExperienceFlags.disabled()
+    if not flags.soft_preference_notice:
         return None
     if outcome.final_count <= 0:
         return None

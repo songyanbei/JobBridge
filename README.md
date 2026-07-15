@@ -107,6 +107,20 @@ JobBridge/
 - [Phase 0 验收](docs/phase0-kickoff.md) — Kickoff 基线确认、环境验证、外部依赖清单
 - [前后端协作](collaboration/使用说明.md) — 前后端协作工作区使用说明
 
+## Phase5 推荐体验灰度
+
+推荐体验默认关闭，所有匹配依据、软偏好排序和软偏好 notice 都必须通过用户级灰度命中后才会生效。`RECOMMENDATION_EXPERIENCE_ENABLED=false` 是最高优先级 kill switch。
+
+| 场景 | 后置策略变化 | 匹配依据写入回复 | 软偏好排序 | 总体软偏好 notice | 回复是否严格等价当前版本 |
+| --- | --- | --- | --- | --- | --- |
+| `POST_SEARCH_POLICY_MODE=off` 且所有 recommendation/soft rollout 为 0 | 否 | 否 | 否 | 否 | 是 |
+| `POST_SEARCH_POLICY_MODE=shadow` 且所有 recommendation/soft rollout 为 0 | 否，仅记录 shadow decision | 否 | 否 | 否 | 是 |
+| `POST_SEARCH_POLICY_MODE=off/shadow` 但软偏好排序 rollout 命中 | 否 | 否 | 是 | 否 | 否，排序可能改变 |
+| `POST_SEARCH_POLICY_MODE=on` 且 recommendation reason rollout 命中 | 是 | 是 | 取决于软偏好排序 rollout | 取决于 notice rollout | 否 |
+| 严格 legacy 等价 | 否 | 否 | 否 | 否 | 是 |
+
+关闭 `POST_SEARCH_POLICY_MODE` 只能回滚后置文案/策略；关闭软偏好排序需关闭 `SOFT_PREFERENCE_RANKING_ENABLED` 或将 `SOFT_PREFERENCE_RANKING_ROLLOUT_PERCENTAGE=0`。配置调整后需要同时重启 app 和 worker。
+
 ## 当前状态
 
 **阶段**：Phase 0（Kickoff）验收通过，准备进入 Phase 1（数据与后端骨架）

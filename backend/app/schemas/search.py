@@ -35,6 +35,28 @@ class SearchResult:
 
 
 @dataclass(frozen=True)
+class MatchReason:
+    """A deterministic, safe match explanation rendered only when gated on."""
+
+    kind: Literal["hard_match", "soft_preference"]
+    text: str
+    field: str = ""
+
+
+@dataclass(frozen=True)
+class RelaxationSummary:
+    """Visible-count summary for auto/confirmed relaxation copy."""
+
+    field: str
+    label: str
+    original_criteria: dict
+    relaxed_criteria: dict
+    original_visible_count: int = 0
+    relaxed_visible_count: int = 0
+    relaxed_shown_count: int = 0
+
+
+@dataclass(frozen=True)
 class FallbackSuggestion:
     """激进放宽探查命中的方向（Bug 3，迁移自 search_service.py）。
 
@@ -100,6 +122,21 @@ class SearchOutcome:
     （即 initial_count < top_n 即视为低召回）。
     5.2 reducer 复用此阈值保持等价。"""
 
+    candidate_count_capped: int | None = None
+    """SQL/内存候选数，可能受 max_candidates 截断，不直接宣称为全库总数。"""
+
+    visible_count: int | None = None
+    """权限过滤后可展示数量，用户可见文案优先使用该字段。"""
+
+    shown_count: int | None = None
+    """本次实际进入 reply 的数量。"""
+
+    probe_count: int | None = None
+    """放宽探测数量，只能作为约数或方向可用信号。"""
+
+    remaining_count_capped: int | None = None
+    """基于当前 snapshot 与已展示 ID 计算的剩余可展示数量。"""
+
     applied_relax_step: str | None = None
     """已采纳的放宽步（None=未放宽）。"""
 
@@ -121,3 +158,6 @@ class SearchOutcome:
 
     relax_probe_results: list[dict] = field(default_factory=list)
     """探查每步的候选数（5.2 使用，含 step / count）。"""
+
+    relaxation_summary: RelaxationSummary | None = None
+    """自动/确认放宽后的用户可见摘要，保留原条件与放宽后数量。"""
