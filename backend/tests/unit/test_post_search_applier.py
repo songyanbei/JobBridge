@@ -172,6 +172,22 @@ class TestAskClarificationStub:
         replies = apply_post_search_decision(ctx)
         assert replies[0].content == "兜底文案"
 
+    def test_pending_relaxation_records_original_visible_count(self):
+        decision = PostSearchDecision(
+            action="ask_clarification",
+            relax_step="relax_salary_10pct",
+            clarification={
+                "question": "要把薪资放宽 10% 重新搜索吗？",
+                "step": "relax_salary_10pct",
+            },
+        )
+        ctx = _make_ctx(decision=decision)
+        ctx.search_outcome.visible_count = 1
+
+        apply_post_search_decision(ctx)
+
+        assert ctx.session.pending_relaxation["original_visible_count"] == 1
+
 
 # ---------------------------------------------------------------------------
 # 防御：未实现的 action（5.1 不输出，但 reducer 误输出时必须 fallback）

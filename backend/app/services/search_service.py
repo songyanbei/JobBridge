@@ -132,6 +132,20 @@ def _relax_step_label(direction: str, step: str) -> str:
     return _FALLBACK_NOTICE_RESUME.get(step, step).replace("已为您", "").strip("。")
 
 
+def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
+    original = summary.original_visible_count
+    relaxed = summary.relaxed_visible_count
+    shown = summary.relaxed_shown_count
+    parts = [
+        f"原条件下可展示 {original} 条结果，已为你{summary.label}。",
+        f"放宽后本次展示 {shown} 条",
+    ]
+    if relaxed != shown:
+        parts[-1] += f"，当前可见 {relaxed} 条"
+    parts[-1] += "。"
+    return "\n".join(parts)
+
+
 def _build_job_reason_lines_by_id(
     jobs: list[dict],
     criteria: dict,
@@ -550,6 +564,7 @@ def search_workers(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    original_visible_count: int = 0,
 ) -> tuple[SearchResult, SearchOutcome]:
     """厂家/中介找工人。
 
@@ -1249,7 +1264,17 @@ def execute_relaxed_search(
             NO_JOB_MATCH_REPLY if direction == "search_job"
             else NO_WORKER_MATCH_REPLY
         )
+        summary = RelaxationSummary(
+            field=step,
+            label=_relax_step_label(direction, step),
+            original_criteria=dict(original_criteria or {}),
+            relaxed_criteria=dict(relaxed or {}),
+            original_visible_count=original_visible_count,
+            relaxed_visible_count=0,
+            relaxed_shown_count=0,
+        )
         reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
+        reply = f"{_render_relaxation_summary_notice(summary)}\n\n{reply}"
         sr = SearchResult(reply_text=reply, result_count=0)
         so = _build_search_outcome(
             direction=direction,
@@ -1258,6 +1283,7 @@ def execute_relaxed_search(
             final_count=0,
             desired_count=top_n,
             applied_relax_step=step,
+            relaxation_summary=summary,
         )
         return sr, so
 
@@ -1318,13 +1344,19 @@ def execute_relaxed_search(
     if direction == "search_job":
         reason_lines = _build_job_reason_lines_by_id(filtered, relaxed, flags)
         reply = _format_job_results(filtered, remaining, reason_lines)
-        notice = _FALLBACK_NOTICE_JOB.get(step)
     else:
         reason_lines = _build_resume_reason_lines_by_id(filtered, relaxed, flags)
         reply = _format_resume_results(filtered, remaining, reason_lines)
-        notice = _FALLBACK_NOTICE_RESUME.get(step)
-    if notice:
-        reply = f"{notice}\n\n{reply}"
+    relaxation_summary = RelaxationSummary(
+        field=step,
+        label=_relax_step_label(direction, step),
+        original_criteria=dict(original_criteria or {}),
+        relaxed_criteria=dict(relaxed or {}),
+        original_visible_count=original_visible_count,
+        relaxed_visible_count=len(filtered),
+        relaxed_shown_count=len(filtered),
+    )
+    reply = f"{_render_relaxation_summary_notice(relaxation_summary)}\n\n{reply}"
 
     sr = SearchResult(
         reply_text=reply,
@@ -1333,15 +1365,6 @@ def execute_relaxed_search(
     )
     # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
-    relaxation_summary = RelaxationSummary(
-        field=step,
-        label=_relax_step_label(direction, step),
-        original_criteria=dict(original_criteria or {}),
-        relaxed_criteria=dict(relaxed or {}),
-        original_visible_count=0,
-        relaxed_visible_count=len(filtered),
-        relaxed_shown_count=len(filtered),
-    )
     so = _build_search_outcome(
         direction=direction,
         criteria_used=relaxed,

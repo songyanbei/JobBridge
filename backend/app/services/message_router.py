@@ -943,6 +943,7 @@ def _route_v2_relaxation_response(
         direction = pending.get("direction") or "search_job"
         persisted_raw_query = pending.get("raw_query") or ""
         persisted_user_msg_id = pending.get("user_msg_id")
+        original_visible_count = int(pending.get("original_visible_count") or 0)
         experience_flags = _experience_flags_for(
             user_ctx, direction=direction, emit_log=True,
         )
@@ -957,6 +958,7 @@ def _route_v2_relaxation_response(
             db=db,
             user_msg_id=persisted_user_msg_id,
             experience_flags=experience_flags,
+            original_visible_count=original_visible_count,
         )
 
         # 二阶段 reducer

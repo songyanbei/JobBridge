@@ -185,6 +185,11 @@ def _handle_ask_clarification(ctx: PostSearchContext) -> list[ReplyMessage]:
         "step": step,
         "original_criteria": dict(ctx.search_outcome.criteria_used),
         "relaxed_criteria": dict(relaxed),
+        "original_visible_count": (
+            ctx.search_outcome.visible_count
+            if ctx.search_outcome.visible_count is not None
+            else ctx.search_outcome.final_count
+        ),
         # P1 评审 #2：必须持久化主搜索 raw_query + msg_id。确认轮 msg.content
         # 通常是"好的/可以"，不能用作 reranker query；user_msg_id 透传给
         # 二次 _rerank_with_logging 做归因（与主搜索一致）。
@@ -233,6 +238,11 @@ def _handle_auto_relax_and_retry(
         db=ctx.db,
         user_msg_id=ctx.msg.msg_id,
         experience_flags=ctx.experience_flags,
+        original_visible_count=(
+            ctx.search_outcome.visible_count
+            if ctx.search_outcome.visible_count is not None
+            else ctx.search_outcome.final_count
+        ),
     )
 
     new_decision = post_search_reduce(
