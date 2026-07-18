@@ -643,7 +643,7 @@ class TestPhase5HashBucket:
             search_outcome=outcome, legacy_intent="show_more",
         )
         # 命中桶 → reducer 输出 paginate_no_more → applier 渲染降级建议
-        assert "已经是所有匹配结果了。可以试试以下方向" in replies[0].content
+        assert "本轮结果已经看完了。可以试试这些方向" in replies[0].content
 
     def test_post_search_dispatch_uses_user_ctx_external_userid(self, monkeypatch):
         """msg.from_user 与 user_ctx.external_userid 不一致时，只以后者判桶。"""

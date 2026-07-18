@@ -35,6 +35,11 @@ CASE = {
             "query_digest": "x" * 12,
             "created_at": "2026-05-10T12:00:00+00:00",
             "expires_at": "2050-01-01T00:00:00+00:00",
+            "effective_criteria": {
+                "city": ["北京市"],
+                "job_category": ["餐饮"],
+                "salary_floor_monthly": 5000,
+            },
         },
         "shown_items": ["1"],
     },

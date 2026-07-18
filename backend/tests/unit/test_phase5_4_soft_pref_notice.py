@@ -80,6 +80,8 @@ def _make_outcome(
     *,
     final_count: int = 3,
     soft_pref_hits: dict | None = None,
+    visible_count: int | None = None,
+    shown_count: int | None = None,
 ) -> SearchOutcome:
     return SearchOutcome(
         direction="search_job",
@@ -89,6 +91,8 @@ def _make_outcome(
         desired_count=3,
         low_recall_threshold=3,
         soft_pref_hits=dict(soft_pref_hits or {}),
+        visible_count=visible_count,
+        shown_count=shown_count,
     )
 
 
@@ -157,6 +161,20 @@ class TestSoftPrefNoticeReducerDecision:
         monkeypatch.setattr(settings, "soft_preference_ranking_enabled", True)
         outcome = _make_outcome(
             final_count=100, soft_pref_hits={"provide_meal": 50},
+        )
+        d = _reduce(
+            outcome,
+            RecommendationExperienceFlags(soft_preference_notice=True),
+        )
+        assert d.action == "show_results_with_soft_pref_notice"
+
+    def test_threshold_uses_shown_count_when_present(self, monkeypatch):
+        monkeypatch.setattr(settings, "soft_preference_ranking_enabled", True)
+        outcome = _make_outcome(
+            final_count=100,
+            visible_count=3,
+            shown_count=3,
+            soft_pref_hits={"provide_meal": 2},
         )
         d = _reduce(
             outcome,

@@ -63,6 +63,7 @@ def compute_recommendation_experience_flags(
 ) -> RecommendationExperienceFlags:
     policy = settings.dialogue_policy
     bucket = rollout_bucket(external_userid)
+    is_shadow = mode == "shadow"
 
     if not policy.recommendation_experience_enabled:
         flags = RecommendationExperienceFlags.disabled()
@@ -70,13 +71,14 @@ def compute_recommendation_experience_flags(
         show_match_reasons = rollout_hit(
             external_userid,
             policy.recommendation_reason_rollout_percentage,
-        )
+        ) and not is_shadow
         build_shadow_reasons = (
             policy.recommendation_reason_shadow_enabled
             and (mode == "shadow" or not show_match_reasons)
         )
         soft_preference_ranking = (
             policy.soft_preference_ranking_enabled
+            and not is_shadow
             and rollout_hit(
                 external_userid,
                 policy.soft_preference_ranking_rollout_percentage,
@@ -84,6 +86,7 @@ def compute_recommendation_experience_flags(
         )
         soft_preference_reasons = (
             soft_preference_ranking
+            and not is_shadow
             and rollout_hit(
                 external_userid,
                 policy.soft_preference_reason_rollout_percentage,
@@ -91,6 +94,7 @@ def compute_recommendation_experience_flags(
         )
         soft_preference_notice = (
             soft_preference_ranking
+            and not is_shadow
             and rollout_hit(
                 external_userid,
                 policy.soft_preference_notice_rollout_percentage,

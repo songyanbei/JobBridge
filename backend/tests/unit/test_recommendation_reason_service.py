@@ -77,3 +77,48 @@ def test_soft_preference_reason_only_for_hits():
     texts = [r.text for r in reasons]
     assert any("包吃" in text for text in texts)
     assert all("包住" not in text for text in texts)
+
+
+def test_hard_reasons_only_use_present_filter_criteria():
+    item = project_job_for_explanation({
+        "id": 1,
+        "job_category": "电子厂",
+        "city": "苏州市",
+        "salary_floor_monthly": 6000,
+        "salary_ceiling_monthly": 7000,
+    })
+
+    reasons = build_match_reasons(
+        item=item,
+        criteria={},
+        item_type="job",
+    )
+
+    assert reasons == []
+
+
+def test_soft_preference_reason_is_not_squeezed_out_by_hard_reasons():
+    item = project_job_for_explanation({
+        "id": 1,
+        "job_category": "电子厂",
+        "city": "苏州市",
+        "salary_floor_monthly": 6000,
+        "salary_ceiling_monthly": 7000,
+        "provide_meal": True,
+    })
+
+    reasons = build_match_reasons(
+        item=item,
+        criteria={
+            "city": ["苏州市"],
+            "job_category": ["电子厂"],
+            "salary_floor_monthly": 6500,
+        },
+        item_type="job",
+        soft_pref_hits={"provide_meal": True},
+        include_soft_preferences=True,
+        limit=2,
+    )
+
+    assert [r.kind for r in reasons] == ["soft_preference", "hard_match"]
+    assert reasons[0].field == "provide_meal"

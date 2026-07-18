@@ -47,6 +47,7 @@ from app.services.intent_service import (
     classify_dialogue,
     classify_intent,
 )
+from app.services.recommendation_experience_gate import userid_hash
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -75,6 +76,13 @@ def _experience_flags_for(
 # ---------------------------------------------------------------------------
 # 固定回复文案
 # ---------------------------------------------------------------------------
+
+def _outcome_count(search_outcome, field: str, default: int | None = 0) -> int | None:
+    value = getattr(search_outcome, field, default)
+    if value is None:
+        return default
+    return int(value)
+
 
 BLOCKED_REPLY = "您的账号已被限制使用，如有疑问请联系客服。"
 DELETED_REPLY = "账号已进入删除状态，请联系客服处理。"
@@ -1515,13 +1523,26 @@ def _post_search_dispatch(
         # 监控面板字段。
         log_event(
             "post_search_decision",
+            external_userid_hash=userid_hash(user_ctx.external_userid),
             mode="shadow",
             action=ps_decision.action,
+            decision=ps_decision.action,
             reasoning=ps_decision.reasoning,
             direction=search_outcome.direction,
             snapshot_exhausted=search_outcome.snapshot_exhausted,
             initial_count=search_outcome.initial_count,
+            initial_visible_count=_outcome_count(
+                search_outcome, "visible_count", search_outcome.initial_count,
+            ),
             final_count=search_outcome.final_count,
+            final_visible_count=_outcome_count(
+                search_outcome, "visible_count", search_outcome.final_count,
+            ),
+            shown_count=_outcome_count(search_outcome, "shown_count", None),
+            remaining_count_capped=_outcome_count(
+                search_outcome, "remaining_count_capped", None,
+            ),
+            desired_count=search_outcome.desired_count,
             applied_relax_step=search_outcome.applied_relax_step,
             soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
         )
@@ -1536,13 +1557,26 @@ def _post_search_dispatch(
     # Phase 5 §5.4：on 模式监控字段同步扩展
     log_event(
         "post_search_decision",
+        external_userid_hash=userid_hash(user_ctx.external_userid),
         mode="on",
         action=ps_decision.action,
+        decision=ps_decision.action,
         reasoning=ps_decision.reasoning,
         direction=search_outcome.direction,
         snapshot_exhausted=search_outcome.snapshot_exhausted,
         initial_count=search_outcome.initial_count,
+        initial_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.initial_count,
+        ),
         final_count=search_outcome.final_count,
+        final_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.final_count,
+        ),
+        shown_count=_outcome_count(search_outcome, "shown_count", None),
+        remaining_count_capped=_outcome_count(
+            search_outcome, "remaining_count_capped", None,
+        ),
+        desired_count=search_outcome.desired_count,
         applied_relax_step=search_outcome.applied_relax_step,
         soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
     )

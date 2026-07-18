@@ -81,14 +81,17 @@ def build_match_reasons(
     limit: int = 2,
 ) -> list[MatchReason]:
     """Build at most ``limit`` safe, deterministic match reasons."""
-    reasons: list[MatchReason] = []
+    criteria = criteria or {}
+    hard_reasons: list[MatchReason] = []
     if item_type == "job":
-        reasons.extend(_job_hard_reasons(item, criteria))  # type: ignore[arg-type]
+        hard_reasons.extend(_job_hard_reasons(item, criteria))  # type: ignore[arg-type]
     else:
-        reasons.extend(_resume_hard_reasons(item, criteria))  # type: ignore[arg-type]
+        hard_reasons.extend(_resume_hard_reasons(item, criteria))  # type: ignore[arg-type]
 
+    reasons: list[MatchReason] = []
     if include_soft_preferences and soft_pref_hits:
         reasons.extend(_soft_preference_reasons(soft_pref_hits))
+    reasons.extend(hard_reasons)
     return reasons[:limit]
 
 
@@ -101,10 +104,10 @@ def _job_hard_reasons(item: JobExplanationInput, criteria: dict[str, Any]) -> li
     cities = set(_as_tuple(criteria.get("city")))
     cats = set(_as_tuple(criteria.get("job_category")))
     salary_floor = _maybe_int(criteria.get("salary_floor_monthly"))
-    if item.city and (not cities or item.city in cities):
+    if cities and item.city and item.city in cities:
         location = f"{item.city}{item.district}" if item.district else item.city
         reasons.append(MatchReason("hard_match", f"地点符合 {location}", "city"))
-    if item.category and (not cats or item.category in cats):
+    if cats and item.category and item.category in cats:
         reasons.append(MatchReason("hard_match", f"工种匹配 {item.category}", "job_category"))
     if salary_floor is not None and item.salary_min is not None:
         salary_max = item.salary_max if item.salary_max is not None else item.salary_min
@@ -118,9 +121,9 @@ def _resume_hard_reasons(item: ResumeExplanationInput, criteria: dict[str, Any])
     cities = set(_as_tuple(criteria.get("city")))
     cats = set(_as_tuple(criteria.get("job_category")))
     salary_ceiling = _maybe_int(criteria.get("salary_ceiling_monthly"))
-    if item.expected_city and (not cities or cities.intersection(item.expected_city)):
+    if cities and item.expected_city and cities.intersection(item.expected_city):
         reasons.append(MatchReason("hard_match", f"期望城市包含 {'、'.join(item.expected_city[:2])}", "city"))
-    if item.expected_category and (not cats or cats.intersection(item.expected_category)):
+    if cats and item.expected_category and cats.intersection(item.expected_category):
         reasons.append(MatchReason("hard_match", f"期望工种匹配 {'/'.join(item.expected_category[:2])}", "job_category"))
     if salary_ceiling is not None and item.expected_salary_min is not None:
         if item.expected_salary_min <= salary_ceiling:

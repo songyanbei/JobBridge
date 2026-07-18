@@ -34,6 +34,11 @@ CASE = {
             "query_digest": "y" * 12,
             "created_at": "2026-05-10T12:00:00+00:00",
             "expires_at": "2050-01-01T00:00:00+00:00",
+            "effective_criteria": {
+                "city": ["苏州市"],
+                "job_category": ["机械"],
+                "salary_ceiling_monthly": 6000,
+            },
         },
         "shown_items": ["1"],
     },

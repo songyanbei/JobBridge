@@ -187,11 +187,7 @@ def _handle_ask_clarification(ctx: PostSearchContext) -> list[ReplyMessage]:
         "step": step,
         "original_criteria": dict(ctx.search_outcome.criteria_used),
         "relaxed_criteria": dict(relaxed),
-        "original_visible_count": (
-            ctx.search_outcome.visible_count
-            if ctx.search_outcome.visible_count is not None
-            else ctx.search_outcome.final_count
-        ),
+        "original_visible_count": _visible_or_final_count(ctx.search_outcome),
         # P1 评审 #2：必须持久化主搜索 raw_query + msg_id。确认轮 msg.content
         # 通常是"好的/可以"，不能用作 reranker query；user_msg_id 透传给
         # 二次 _rerank_with_logging 做归因（与主搜索一致）。
@@ -240,11 +236,7 @@ def _handle_auto_relax_and_retry(
         db=ctx.db,
         user_msg_id=ctx.msg.msg_id,
         experience_flags=ctx.experience_flags,
-        original_visible_count=(
-            ctx.search_outcome.visible_count
-            if ctx.search_outcome.visible_count is not None
-            else ctx.search_outcome.final_count
-        ),
+        original_visible_count=_visible_or_final_count(ctx.search_outcome),
     )
 
     new_decision = post_search_reduce(
@@ -302,9 +294,7 @@ def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
         external_userid_hash=userid_hash(ctx.user_ctx.external_userid),
         direction=ctx.search_outcome.direction,
         soft_pref_hits=sum((ctx.search_outcome.soft_pref_hits or {}).values()),
-        visible_count=ctx.search_outcome.visible_count
-        if ctx.search_outcome.visible_count is not None
-        else ctx.search_outcome.final_count,
+        visible_count=_visible_or_final_count(ctx.search_outcome),
         notice_gate=ctx.experience_flags.soft_preference_notice,
     )
     return f"{notice}\n\n{base}" if base else notice
@@ -313,6 +303,13 @@ def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
 # ---------------------------------------------------------------------------
 # helper
 # ---------------------------------------------------------------------------
+
+def _visible_or_final_count(search_outcome) -> int:
+    visible_count = getattr(search_outcome, "visible_count", None)
+    if visible_count is not None:
+        return int(visible_count)
+    return int(getattr(search_outcome, "final_count", 0) or 0)
+
 
 def _reply(userid: str, content: str) -> ReplyMessage:
     """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。"""

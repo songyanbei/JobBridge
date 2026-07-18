@@ -321,15 +321,19 @@ def _decide_show_results_with_soft_pref_notice(
     flags = experience_flags or RecommendationExperienceFlags.disabled()
     if not flags.soft_preference_notice:
         return None
-    if outcome.final_count <= 0:
+    denominator = getattr(outcome, "shown_count", None)
+    if denominator is None:
+        denominator = getattr(outcome, "visible_count", None)
+    if denominator is None:
+        denominator = getattr(outcome, "final_count", 0)
+    if denominator <= 0:
         return None
     hits = outcome.soft_pref_hits or {}
     if not hits:
         return None
     fields_above_threshold = [
         field for field, count in hits.items()
-        if outcome.final_count > 0
-        and (count / outcome.final_count) >= _SOFT_PREF_VISIBILITY_THRESHOLD
+        if (count / denominator) >= _SOFT_PREF_VISIBILITY_THRESHOLD
     ]
     if not fields_above_threshold:
         return None

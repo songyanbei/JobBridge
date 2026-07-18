@@ -128,9 +128,14 @@ _MAX_SUGGESTIONS = 3
 
 
 def _relax_step_label(direction: str, step: str) -> str:
-    if direction == "search_job":
-        return _FALLBACK_NOTICE_JOB.get(step, step).replace("已为您", "").strip("。")
-    return _FALLBACK_NOTICE_RESUME.get(step, step).replace("已为您", "").strip("。")
+    labels = {
+        "relax_salary_10pct": "放宽薪资条件",
+        "drop_salary_floor": "不限薪资下限",
+        "drop_salary_ceiling": "不限期望薪资",
+        "drop_job_category": "不限工种",
+        "keep_city_only": "只保留城市条件",
+    }
+    return labels.get(step, step)
 
 
 def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
@@ -138,7 +143,7 @@ def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
     relaxed = summary.relaxed_visible_count
     shown = summary.relaxed_shown_count
     parts = [
-        f"原条件下可展示 {original} 条结果，已为你{summary.label}。",
+        f"原条件下可展示 {original} 条结果，我已为你{summary.label}后重新搜索。",
         f"放宽后本次展示 {shown} 条",
     ]
     if relaxed != shown:
@@ -152,6 +157,7 @@ def _build_job_reason_lines_by_id(
     criteria: dict,
     flags: RecommendationExperienceFlags,
     soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
 ) -> dict[str, list[str]]:
     return _build_reason_lines_by_id(
         jobs,
@@ -159,6 +165,7 @@ def _build_job_reason_lines_by_id(
         flags,
         item_type="job",
         soft_preferences=soft_preferences,
+        external_userid_hash=external_userid_hash,
     )
 
 
@@ -167,6 +174,7 @@ def _build_resume_reason_lines_by_id(
     criteria: dict,
     flags: RecommendationExperienceFlags,
     soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
 ) -> dict[str, list[str]]:
     return _build_reason_lines_by_id(
         resumes,
@@ -174,6 +182,7 @@ def _build_resume_reason_lines_by_id(
         flags,
         item_type="resume",
         soft_preferences=soft_preferences,
+        external_userid_hash=external_userid_hash,
     )
 
 
@@ -184,6 +193,7 @@ def _build_reason_lines_by_id(
     *,
     item_type: Literal["job", "resume"],
     soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
 ) -> dict[str, list[str]]:
     can_show_reasons = flags.show_match_reasons or flags.soft_preference_reasons
     if not (can_show_reasons or flags.build_shadow_reasons):
@@ -211,6 +221,7 @@ def _build_reason_lines_by_id(
     if reason_lines:
         log_event(
             "match_explanation_built",
+            external_userid_hash=external_userid_hash,
             direction="search_job" if item_type == "job" else "search_worker",
             item_type=item_type,
             explanation_count=sum(len(v) for v in reason_lines.values()),
@@ -543,7 +554,9 @@ def search_jobs(
 
     # 格式化
     remaining = conversation_service.get_remaining_count(session)
-    reason_lines = _build_job_reason_lines_by_id(filtered, criteria, flags, soft_prefs)
+    reason_lines = _build_job_reason_lines_by_id(
+        filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+    )
     reply = _format_job_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_JOB.get(outcome.applied_step)
@@ -585,7 +598,6 @@ def search_workers(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
-    original_visible_count: int = 0,
 ) -> tuple[SearchResult, SearchOutcome]:
     """厂家/中介找工人。
 
@@ -701,7 +713,7 @@ def search_workers(
 
     remaining = conversation_service.get_remaining_count(session)
     reason_lines = _build_resume_reason_lines_by_id(
-        filtered, criteria, flags, soft_prefs,
+        filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
     )
     reply = _format_resume_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
@@ -777,11 +789,10 @@ def show_more(
         )
         return sr, so
 
-    effective_criteria = dict(
-        getattr(session.candidate_snapshot, "effective_criteria", None)
-        or session.search_criteria
-        or {}
+    snapshot_effective_criteria = getattr(
+        session.candidate_snapshot, "effective_criteria", None,
     )
+    effective_criteria = dict(snapshot_effective_criteria or {})
 
     collected = []
     attempts = 0
@@ -820,7 +831,7 @@ def show_more(
             external_userid_hash=userid_hash(user_ctx.external_userid),
             direction=direction,
             remaining_count_capped=0,
-            snapshot_has_effective_criteria=bool(effective_criteria),
+            snapshot_has_effective_criteria=bool(snapshot_effective_criteria),
             active_flow=session.active_flow or "",
         )
         sr = SearchResult(
@@ -850,7 +861,11 @@ def show_more(
             effective_criteria, "job_search", flags,
         )
         reason_lines = _build_job_reason_lines_by_id(
-            collected, effective_criteria, flags, soft_prefs,
+            collected,
+            effective_criteria,
+            flags,
+            soft_prefs,
+            userid_hash(user_ctx.external_userid),
         )
         reply = _format_job_results(collected, remaining, reason_lines)
     else:
@@ -858,7 +873,11 @@ def show_more(
             effective_criteria, "candidate_search", flags,
         )
         reason_lines = _build_resume_reason_lines_by_id(
-            collected, effective_criteria, flags, soft_prefs,
+            collected,
+            effective_criteria,
+            flags,
+            soft_prefs,
+            userid_hash(user_ctx.external_userid),
         )
         reply = _format_resume_results(collected, remaining, reason_lines)
 
@@ -1264,6 +1283,7 @@ def execute_relaxed_search(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    original_visible_count: int = 0,
 ) -> tuple[SearchResult, SearchOutcome]:
     """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
 
@@ -1292,11 +1312,6 @@ def execute_relaxed_search(
 
     if not candidates:
         # 二次检索仍然 0 命中（极少；用户已经接受放宽了，不再继续放宽）
-        notice_table = (
-            _FALLBACK_NOTICE_JOB if direction == "search_job"
-            else _FALLBACK_NOTICE_RESUME
-        )
-        notice = notice_table.get(step, "")
         no_match_reply = (
             NO_JOB_MATCH_REPLY if direction == "search_job"
             else NO_WORKER_MATCH_REPLY
@@ -1310,8 +1325,7 @@ def execute_relaxed_search(
             relaxed_visible_count=0,
             relaxed_shown_count=0,
         )
-        reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
-        reply = f"{_render_relaxation_summary_notice(summary)}\n\n{reply}"
+        reply = f"{_render_relaxation_summary_notice(summary)}\n\n{no_match_reply}"
         log_event(
             "auto_relax_applied",
             external_userid_hash=userid_hash(user_ctx.external_userid),
@@ -1389,11 +1403,13 @@ def execute_relaxed_search(
 
     remaining = conversation_service.get_remaining_count(session)
     if direction == "search_job":
-        reason_lines = _build_job_reason_lines_by_id(filtered, relaxed, flags, soft_prefs)
+        reason_lines = _build_job_reason_lines_by_id(
+            filtered, relaxed, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+        )
         reply = _format_job_results(filtered, remaining, reason_lines)
     else:
         reason_lines = _build_resume_reason_lines_by_id(
-            filtered, relaxed, flags, soft_prefs,
+            filtered, relaxed, flags, soft_prefs, userid_hash(user_ctx.external_userid),
         )
         reply = _format_resume_results(filtered, remaining, reason_lines)
     relaxation_summary = RelaxationSummary(

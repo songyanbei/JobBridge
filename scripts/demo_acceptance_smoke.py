@@ -12,10 +12,12 @@ import json
 import sys
 import time
 import uuid
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 
 
 QUEUE_INCOMING = "queue:incoming"
+DEFAULT_SEARCH_MESSAGE = "帮我找苏州电子厂岗位，5500以上，最好包吃住"
 
 
 def build_inbound_payload(userid: str, content: str) -> dict:
@@ -61,6 +63,45 @@ def wait_for_outbound(pubsub, timeout_seconds: int) -> list[dict]:
     raise TimeoutError("No outbound mock WeCom message received before timeout")
 
 
+def check_mysql_seed(mysql_dsn: str, min_passed_jobs: int) -> dict:
+    if not mysql_dsn:
+        return {"checked": False, "reason": "mysql_dsn_not_set"}
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("--mysql-dsn requires pymysql in the smoke runtime") from exc
+
+    parsed = urlparse(mysql_dsn)
+    query = parse_qs(parsed.query)
+    database = unquote(parsed.path.lstrip("/"))
+    conn = pymysql.connect(
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        database=database,
+        charset=query.get("charset", ["utf8mb4"])[0],
+        connect_timeout=5,
+        read_timeout=5,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE audit_status = 'passed'"
+            )
+            row = cursor.fetchone() or {}
+            passed_jobs = int(row.get("count") or 0)
+    finally:
+        conn.close()
+    if passed_jobs < min_passed_jobs:
+        raise RuntimeError(
+            f"seed check failed: passed_jobs={passed_jobs}, "
+            f"min_passed_jobs={min_passed_jobs}"
+        )
+    return {"checked": True, "passed_jobs": passed_jobs}
+
+
 def assert_text(payloads: list[dict], expects: list[str], rejects: list[str]) -> None:
     text = "\n".join(
         str(payload.get("text", {}).get("content", ""))
@@ -85,21 +126,33 @@ def run(args: argparse.Namespace) -> int:
     r.delete(f"session:{userid}")
 
     health_check(args.base_url, args.timeout_seconds)
+    seed_status = (
+        {"checked": False, "reason": "skipped"}
+        if args.skip_seed_check
+        else check_mysql_seed(args.mysql_dsn, args.min_passed_jobs)
+    )
 
     channel = f"mock:outbound:{userid}"
     pubsub = r.pubsub()
     try:
         pubsub.subscribe(channel)
         wait_for_subscribe(pubsub, args.timeout_seconds)
-        payload = build_inbound_payload(userid, args.message)
-        r.rpush(QUEUE_INCOMING, json.dumps(payload, ensure_ascii=False))
-        outbound = wait_for_outbound(pubsub, args.timeout_seconds)
+        messages = list(args.message or [DEFAULT_SEARCH_MESSAGE])
+        if not args.no_warmup:
+            messages.insert(0, args.warmup_message)
+        outbound: list[dict] = []
+        for content in messages:
+            payload = build_inbound_payload(userid, content)
+            r.rpush(QUEUE_INCOMING, json.dumps(payload, ensure_ascii=False))
+            outbound.extend(wait_for_outbound(pubsub, args.timeout_seconds))
         assert_text(outbound, args.expect, args.reject)
         print(json.dumps({
             "ok": True,
             "userid": userid,
             "channel": channel,
             "reply_count": len(outbound),
+            "message_count": len(messages),
+            "seed": seed_status,
         }, ensure_ascii=False))
         return 0
     except Exception as exc:  # noqa: BLE001 - CLI should print diagnostics
@@ -125,10 +178,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--redis-url", required=True)
-    parser.add_argument("--mysql-dsn", default="", help="Accepted for runbook parity; app/worker own DB access")
+    parser.add_argument(
+        "--mysql-dsn",
+        default="",
+        help="Optional MySQL DSN used to verify demo seed data",
+    )
     parser.add_argument("--user-prefix", default="phase5_smoke")
     parser.add_argument("--timeout-seconds", type=int, default=30)
-    parser.add_argument("--message", default="帮我找苏州电子厂岗位，5500以上，最好包吃住")
+    parser.add_argument("--message", action="append", default=None)
+    parser.add_argument("--warmup-message", default="你好")
+    parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--min-passed-jobs", type=int, default=1)
+    parser.add_argument("--skip-seed-check", action="store_true")
     parser.add_argument("--expect", action="append", default=[])
     parser.add_argument("--reject", action="append", default=[])
     return parser.parse_args(argv)

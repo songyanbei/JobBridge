@@ -81,3 +81,24 @@ def test_soft_preference_global_switch_disables_soft_flags(monkeypatch):
     assert flags.soft_preference_ranking is False
     assert flags.soft_preference_reasons is False
     assert flags.soft_preference_notice is False
+
+
+def test_shadow_mode_only_builds_shadow_reasons(monkeypatch):
+    _set_policy(
+        monkeypatch,
+        recommendation_experience_enabled=True,
+        recommendation_reason_shadow_enabled=True,
+        recommendation_reason_rollout_percentage=100,
+        soft_preference_ranking_enabled=True,
+        soft_preference_ranking_rollout_percentage=100,
+        soft_preference_reason_rollout_percentage=100,
+        soft_preference_notice_rollout_percentage=100,
+    )
+
+    flags = compute_recommendation_experience_flags("u1", mode="shadow")
+
+    assert flags.show_match_reasons is False
+    assert flags.build_shadow_reasons is True
+    assert flags.soft_preference_ranking is False
+    assert flags.soft_preference_reasons is False
+    assert flags.soft_preference_notice is False
