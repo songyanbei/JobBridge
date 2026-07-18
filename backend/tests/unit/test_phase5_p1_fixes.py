@@ -21,6 +21,21 @@ from app.config import settings
 # ---------------------------------------------------------------------------
 
 
+def test_relaxation_summary_labels_do_not_leak_step_ids():
+    from app.services.search_service import _relax_step_label
+
+    for direction in ("search_job", "search_worker"):
+        for step in (
+            "relax_salary_10pct",
+            "broaden_job_category",
+            "drop_optional_filters",
+            "unknown_future_step",
+        ):
+            label = _relax_step_label(direction, step)
+            assert label != step
+            assert "_" not in label
+
+
 class TestSearchServicePhase5RolloutGate:
     """search_jobs 在 post_search_policy_mode=on + rollout 命中 + 低召回时不再先跑
     _run_job_fallback_steps；available_relax_steps 由 _probe_relax_steps 填好。"""

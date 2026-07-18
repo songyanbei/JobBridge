@@ -1,12 +1,18 @@
 """Unit tests for demo_acceptance_smoke helper functions."""
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from scripts.demo_acceptance_smoke import assert_text, build_inbound_payload, parse_args
+from scripts.demo_acceptance_smoke import (
+    assert_text,
+    build_inbound_payload,
+    check_mysql_seed,
+    parse_args,
+)
 
 
 def test_build_inbound_payload_shape():
@@ -42,4 +48,50 @@ def test_parse_args_supports_warmup_and_multiple_messages():
 
     assert args.no_warmup is False
     assert args.warmup_message == "你好"
+    assert args.seed_city_like == "苏州"
+    assert args.seed_job_category_like == "电子"
+    assert args.keep_session is False
     assert args.message == ["找岗位", "更多"]
+
+
+def test_check_mysql_seed_uses_job_table_and_seed_filters(monkeypatch):
+    calls = {}
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, query, params):
+            calls["query"] = query
+            calls["params"] = params
+
+        def fetchone(self):
+            return {"count": 2}
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            calls["closed"] = True
+
+    fake_pymysql = SimpleNamespace(
+        connect=lambda **kwargs: calls.setdefault("connect", kwargs) and FakeConnection(),
+        cursors=SimpleNamespace(DictCursor=object),
+    )
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
+
+    result = check_mysql_seed(
+        "mysql+pymysql://user:pass@127.0.0.1:3306/jobbridge?charset=utf8mb4",
+        1,
+        city_like="苏州",
+        job_category_like="电子",
+    )
+
+    assert result["checked"] is True
+    assert "FROM job" in calls["query"]
+    assert calls["params"] == ("%苏州%", "%电子%")
+    assert calls["closed"] is True

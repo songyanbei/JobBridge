@@ -128,14 +128,18 @@ _MAX_SUGGESTIONS = 3
 
 
 def _relax_step_label(direction: str, step: str) -> str:
-    labels = {
-        "relax_salary_10pct": "放宽薪资条件",
-        "drop_salary_floor": "不限薪资下限",
-        "drop_salary_ceiling": "不限期望薪资",
-        "drop_job_category": "不限工种",
-        "keep_city_only": "只保留城市条件",
+    job_labels = {
+        "relax_salary_10pct": "放宽薪资下限",
+        "broaden_job_category": "放宽工种到大类",
+        "drop_optional_filters": "去掉部分次要条件",
     }
-    return labels.get(step, step)
+    resume_labels = {
+        "relax_salary_10pct": "放宽期望薪资上限",
+        "broaden_job_category": "放宽工种到大类",
+        "drop_optional_filters": "去掉部分次要条件",
+    }
+    labels = job_labels if direction == "search_job" else resume_labels
+    return labels.get(step, "放宽部分条件")
 
 
 def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:

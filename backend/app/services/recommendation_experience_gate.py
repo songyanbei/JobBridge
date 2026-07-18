@@ -78,7 +78,6 @@ def compute_recommendation_experience_flags(
         )
         soft_preference_ranking = (
             policy.soft_preference_ranking_enabled
-            and not is_shadow
             and rollout_hit(
                 external_userid,
                 policy.soft_preference_ranking_rollout_percentage,

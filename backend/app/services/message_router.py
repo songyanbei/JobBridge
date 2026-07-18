@@ -84,6 +84,40 @@ def _outcome_count(search_outcome, field: str, default: int | None = 0) -> int |
     return int(value)
 
 
+def _log_post_search_decision(
+    *,
+    mode: str,
+    user_ctx: UserContext,
+    ps_decision,
+    search_outcome,
+) -> None:
+    log_event(
+        "post_search_decision",
+        external_userid_hash=userid_hash(user_ctx.external_userid),
+        mode=mode,
+        action=ps_decision.action,
+        decision=ps_decision.action,
+        reasoning=ps_decision.reasoning,
+        direction=search_outcome.direction,
+        snapshot_exhausted=search_outcome.snapshot_exhausted,
+        initial_count=search_outcome.initial_count,
+        initial_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.initial_count,
+        ),
+        final_count=search_outcome.final_count,
+        final_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.final_count,
+        ),
+        shown_count=_outcome_count(search_outcome, "shown_count", None),
+        remaining_count_capped=_outcome_count(
+            search_outcome, "remaining_count_capped", None,
+        ),
+        desired_count=search_outcome.desired_count,
+        applied_relax_step=search_outcome.applied_relax_step,
+        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+    )
+
+
 BLOCKED_REPLY = "您的账号已被限制使用，如有疑问请联系客服。"
 DELETED_REPLY = "账号已进入删除状态，请联系客服处理。"
 VOICE_NOT_SUPPORTED = "暂不支持语音，请发送文字。"
@@ -1521,30 +1555,11 @@ def _post_search_dispatch(
         # 5.1 验收 #2：shadow 只写日志，不影响 reply。
         # Phase 5 §5.4：补 soft_pref_hits / applied_relax_step / final_count
         # 监控面板字段。
-        log_event(
-            "post_search_decision",
-            external_userid_hash=userid_hash(user_ctx.external_userid),
+        _log_post_search_decision(
             mode="shadow",
-            action=ps_decision.action,
-            decision=ps_decision.action,
-            reasoning=ps_decision.reasoning,
-            direction=search_outcome.direction,
-            snapshot_exhausted=search_outcome.snapshot_exhausted,
-            initial_count=search_outcome.initial_count,
-            initial_visible_count=_outcome_count(
-                search_outcome, "visible_count", search_outcome.initial_count,
-            ),
-            final_count=search_outcome.final_count,
-            final_visible_count=_outcome_count(
-                search_outcome, "visible_count", search_outcome.final_count,
-            ),
-            shown_count=_outcome_count(search_outcome, "shown_count", None),
-            remaining_count_capped=_outcome_count(
-                search_outcome, "remaining_count_capped", None,
-            ),
-            desired_count=search_outcome.desired_count,
-            applied_relax_step=search_outcome.applied_relax_step,
-            soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+            user_ctx=user_ctx,
+            ps_decision=ps_decision,
+            search_outcome=search_outcome,
         )
         return [_reply(
             msg.from_user,
@@ -1555,30 +1570,11 @@ def _post_search_dispatch(
 
     # mode == "on"
     # Phase 5 §5.4：on 模式监控字段同步扩展
-    log_event(
-        "post_search_decision",
-        external_userid_hash=userid_hash(user_ctx.external_userid),
+    _log_post_search_decision(
         mode="on",
-        action=ps_decision.action,
-        decision=ps_decision.action,
-        reasoning=ps_decision.reasoning,
-        direction=search_outcome.direction,
-        snapshot_exhausted=search_outcome.snapshot_exhausted,
-        initial_count=search_outcome.initial_count,
-        initial_visible_count=_outcome_count(
-            search_outcome, "visible_count", search_outcome.initial_count,
-        ),
-        final_count=search_outcome.final_count,
-        final_visible_count=_outcome_count(
-            search_outcome, "visible_count", search_outcome.final_count,
-        ),
-        shown_count=_outcome_count(search_outcome, "shown_count", None),
-        remaining_count_capped=_outcome_count(
-            search_outcome, "remaining_count_capped", None,
-        ),
-        desired_count=search_outcome.desired_count,
-        applied_relax_step=search_outcome.applied_relax_step,
-        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+        user_ctx=user_ctx,
+        ps_decision=ps_decision,
+        search_outcome=search_outcome,
     )
     ctx = PostSearchContext(
         decision=ps_decision,

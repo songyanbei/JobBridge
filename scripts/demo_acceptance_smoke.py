@@ -63,7 +63,13 @@ def wait_for_outbound(pubsub, timeout_seconds: int) -> list[dict]:
     raise TimeoutError("No outbound mock WeCom message received before timeout")
 
 
-def check_mysql_seed(mysql_dsn: str, min_passed_jobs: int) -> dict:
+def check_mysql_seed(
+    mysql_dsn: str,
+    min_passed_jobs: int,
+    *,
+    city_like: str,
+    job_category_like: str,
+) -> dict:
     if not mysql_dsn:
         return {"checked": False, "reason": "mysql_dsn_not_set"}
     try:
@@ -88,7 +94,15 @@ def check_mysql_seed(mysql_dsn: str, min_passed_jobs: int) -> dict:
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT COUNT(*) AS count FROM jobs WHERE audit_status = 'passed'"
+                """
+                SELECT COUNT(*) AS count
+                FROM job
+                WHERE audit_status = 'passed'
+                  AND deleted_at IS NULL
+                  AND city LIKE %s
+                  AND job_category LIKE %s
+                """,
+                (f"%{city_like}%", f"%{job_category_like}%"),
             )
             row = cursor.fetchone() or {}
             passed_jobs = int(row.get("count") or 0)
@@ -97,9 +111,15 @@ def check_mysql_seed(mysql_dsn: str, min_passed_jobs: int) -> dict:
     if passed_jobs < min_passed_jobs:
         raise RuntimeError(
             f"seed check failed: passed_jobs={passed_jobs}, "
-            f"min_passed_jobs={min_passed_jobs}"
+            f"min_passed_jobs={min_passed_jobs}, "
+            f"city_like={city_like}, job_category_like={job_category_like}"
         )
-    return {"checked": True, "passed_jobs": passed_jobs}
+    return {
+        "checked": True,
+        "passed_jobs": passed_jobs,
+        "city_like": city_like,
+        "job_category_like": job_category_like,
+    }
 
 
 def assert_text(payloads: list[dict], expects: list[str], rejects: list[str]) -> None:
@@ -125,16 +145,21 @@ def run(args: argparse.Namespace) -> int:
     r = redis.Redis.from_url(args.redis_url, decode_responses=False)
     r.delete(f"session:{userid}")
 
-    health_check(args.base_url, args.timeout_seconds)
-    seed_status = (
-        {"checked": False, "reason": "skipped"}
-        if args.skip_seed_check
-        else check_mysql_seed(args.mysql_dsn, args.min_passed_jobs)
-    )
-
     channel = f"mock:outbound:{userid}"
-    pubsub = r.pubsub()
+    pubsub = None
     try:
+        health_check(args.base_url, args.timeout_seconds)
+        seed_status = (
+            {"checked": False, "reason": "skipped"}
+            if args.skip_seed_check
+            else check_mysql_seed(
+                args.mysql_dsn,
+                args.min_passed_jobs,
+                city_like=args.seed_city_like,
+                job_category_like=args.seed_job_category_like,
+            )
+        )
+        pubsub = r.pubsub()
         pubsub.subscribe(channel)
         wait_for_subscribe(pubsub, args.timeout_seconds)
         messages = list(args.message or [DEFAULT_SEARCH_MESSAGE])
@@ -167,11 +192,14 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps(diagnostics, ensure_ascii=False), file=sys.stderr)
         return 1
     finally:
-        try:
-            pubsub.unsubscribe(channel)
-            pubsub.close()
-        except Exception:
-            pass
+        if not args.keep_session:
+            r.delete(f"session:{userid}")
+        if pubsub is not None:
+            try:
+                pubsub.unsubscribe(channel)
+                pubsub.close()
+            except Exception:
+                pass
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -189,7 +217,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--warmup-message", default="你好")
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--min-passed-jobs", type=int, default=1)
+    parser.add_argument("--seed-city-like", default="苏州")
+    parser.add_argument("--seed-job-category-like", default="电子")
     parser.add_argument("--skip-seed-check", action="store_true")
+    parser.add_argument("--keep-session", action="store_true")
     parser.add_argument("--expect", action="append", default=[])
     parser.add_argument("--reject", action="append", default=[])
     return parser.parse_args(argv)

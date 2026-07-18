@@ -186,6 +186,8 @@ python ../scripts/demo_acceptance_smoke.py \
   --base-url http://127.0.0.1:8000 \
   --redis-url redis://127.0.0.1:6379/0 \
   --mysql-dsn mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge \
+  --seed-city-like "苏州" \
+  --seed-job-category-like "电子" \
   --message "帮我找苏州电子厂岗位，5500以上，最好包吃住" \
   --message "更多" \
   --expect "为您找到" \
@@ -193,8 +195,9 @@ python ../scripts/demo_acceptance_smoke.py \
 ```
 
 The script uses a fresh userid and sends a warmup message first by default so
-the welcome reply does not hide the search flow. Pass `--no-warmup` only when
-you intentionally reuse a prepared session.
+the welcome reply does not hide the search flow. It also removes that session
+after the run; pass `--keep-session` only when you intentionally need to inspect
+Redis state after a failure.
 
 For gate hit/miss acceptance, run once with recommendation rollout values set to
 `100`, restart app and worker, then run again with the same rollout values set
