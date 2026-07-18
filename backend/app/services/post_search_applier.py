@@ -294,7 +294,9 @@ def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
         external_userid_hash=userid_hash(ctx.user_ctx.external_userid),
         direction=ctx.search_outcome.direction,
         soft_pref_hits=sum((ctx.search_outcome.soft_pref_hits or {}).values()),
+        soft_pref_fields=sorted(ctx.search_outcome.soft_pref_hits or {}),
         visible_count=_visible_or_final_count(ctx.search_outcome),
+        shown_count=getattr(ctx.search_outcome, "shown_count", None),
         notice_gate=ctx.experience_flags.soft_preference_notice,
     )
     return f"{notice}\n\n{base}" if base else notice

@@ -180,6 +180,8 @@ Prerequisites:
 - `MOCK_WEWORK_REDIS_URL=<redis-url>`
 - `APP_ENV` is not `production`.
 - Base seed and `scripts/demo_seed_supplement.sql` have been applied.
+- `--mysql-dsn` is required. The smoke fails unless it verifies the
+  `demo_supp_v1` supplement and the minimum counts for scenarios 5, 6, and 8.
 
 ```bash
 python ../scripts/demo_acceptance_smoke.py \
@@ -196,8 +198,10 @@ python ../scripts/demo_acceptance_smoke.py \
 
 The script uses a fresh userid and sends a warmup message first by default so
 the welcome reply does not hide the search flow. It also removes that session
-after the run; pass `--keep-session` only when you intentionally need to inspect
-Redis state after a failure.
+after the run, removes this run's queued payloads, and deletes the MySQL user,
+inbound events, conversation logs, and user-owned records. Pass
+`--keep-session` only when you intentionally need to inspect Redis state after
+a failure; a run with `--skip-seed-check` is never considered successful.
 
 For gate hit/miss acceptance, run once with recommendation rollout values set to
 `100`, restart app and worker, then run again with the same rollout values set

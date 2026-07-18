@@ -69,9 +69,16 @@ def check_mysql_seed(
     *,
     city_like: str,
     job_category_like: str,
+    seed_version: str = "demo_supp_v1",
+    min_supplement_jobs: int = 7,
+    min_step5_jobs: int = 2,
+    min_step6_jobs: int = 2,
+    min_step8_jobs: int = 3,
 ) -> dict:
     if not mysql_dsn:
-        return {"checked": False, "reason": "mysql_dsn_not_set"}
+        raise RuntimeError(
+            "--mysql-dsn is required: the acceptance smoke must verify demo seed data"
+        )
     try:
         import pymysql
     except ImportError as exc:
@@ -95,17 +102,35 @@ def check_mysql_seed(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT COUNT(*) AS count
+                SELECT
+                  COUNT(*) AS passed_jobs,
+                  SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_tag')) = %s THEN 1 ELSE 0 END) AS supplement_jobs,
+                  SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_tag')) = %s AND JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_step')) = '5' THEN 1 ELSE 0 END) AS step5_jobs,
+                  SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_tag')) = %s AND JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_step')) = '6' THEN 1 ELSE 0 END) AS step6_jobs,
+                  SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_tag')) = %s AND JSON_UNQUOTE(JSON_EXTRACT(extra, '$.demo_step')) = '8' THEN 1 ELSE 0 END) AS step8_jobs
                 FROM job
                 WHERE audit_status = 'passed'
                   AND deleted_at IS NULL
                   AND city LIKE %s
                   AND job_category LIKE %s
                 """,
-                (f"%{city_like}%", f"%{job_category_like}%"),
+                (
+                    seed_version,
+                    seed_version,
+                    seed_version,
+                    seed_version,
+                    f"%{city_like}%",
+                    f"%{job_category_like}%",
+                ),
             )
             row = cursor.fetchone() or {}
-            passed_jobs = int(row.get("count") or 0)
+            passed_jobs = int(row.get("passed_jobs") or row.get("count") or 0)
+            supplement_jobs = int(row.get("supplement_jobs") or 0)
+            scenario_counts = {
+                "5": int(row.get("step5_jobs") or 0),
+                "6": int(row.get("step6_jobs") or 0),
+                "8": int(row.get("step8_jobs") or 0),
+            }
     finally:
         conn.close()
     if passed_jobs < min_passed_jobs:
@@ -114,12 +139,98 @@ def check_mysql_seed(
             f"min_passed_jobs={min_passed_jobs}, "
             f"city_like={city_like}, job_category_like={job_category_like}"
         )
+    required_scenarios = {"5": min_step5_jobs, "6": min_step6_jobs, "8": min_step8_jobs}
+    if supplement_jobs < min_supplement_jobs or any(
+        scenario_counts[key] < minimum
+        for key, minimum in required_scenarios.items()
+    ):
+        raise RuntimeError(
+            "seed check failed: "
+            f"seed_version={seed_version}, supplement_jobs={supplement_jobs}, "
+            f"scenario_counts={scenario_counts}, "
+            f"required_supplement_jobs={min_supplement_jobs}, "
+            f"required_scenarios={required_scenarios}"
+        )
     return {
         "checked": True,
+        "seed_version": seed_version,
         "passed_jobs": passed_jobs,
+        "supplement_jobs": supplement_jobs,
+        "scenario_counts": scenario_counts,
         "city_like": city_like,
         "job_category_like": job_category_like,
     }
+
+
+def cleanup_redis_smoke_data(
+    redis_client,
+    userid: str,
+    msg_ids: list[str],
+    *,
+    delete_session: bool = True,
+) -> dict:
+    """Remove only this run's session and queued payloads."""
+    deleted_queue_items = 0
+    for raw_item in redis_client.lrange(QUEUE_INCOMING, 0, -1):
+        try:
+            item = raw_item.decode("utf-8") if isinstance(raw_item, bytes) else raw_item
+            payload = json.loads(item)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if payload.get("from_userid") != userid and payload.get("msg_id") not in msg_ids:
+            continue
+        deleted_queue_items += int(redis_client.lrem(QUEUE_INCOMING, 0, raw_item) or 0)
+    session_deleted = (
+        int(redis_client.delete(f"session:{userid}") or 0)
+        if delete_session else 0
+    )
+    return {
+        "session_deleted": bool(session_deleted),
+        "queue_items_deleted": deleted_queue_items,
+    }
+
+
+def cleanup_mysql_smoke_data(mysql_dsn: str, userid: str, msg_ids: list[str]) -> dict:
+    """Delete rows created by the fresh smoke userid, including failed runs."""
+    if not mysql_dsn:
+        return {"checked": False, "reason": "mysql_dsn_not_set"}
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise RuntimeError("MySQL cleanup requires pymysql in the smoke runtime") from exc
+
+    parsed = urlparse(mysql_dsn)
+    query = parse_qs(parsed.query)
+    database = unquote(parsed.path.lstrip("/"))
+    conn = pymysql.connect(
+        host=parsed.hostname or "127.0.0.1",
+        port=parsed.port or 3306,
+        user=unquote(parsed.username or ""),
+        password=unquote(parsed.password or ""),
+        database=database,
+        charset=query.get("charset", ["utf8mb4"])[0],
+        connect_timeout=5,
+        read_timeout=5,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    deleted: dict[str, int] = {}
+    try:
+        with conn.cursor() as cursor:
+            statements = (
+                ("conversation_log", "DELETE FROM conversation_log WHERE userid = %s", (userid,)),
+                ("wecom_inbound_event", "DELETE FROM wecom_inbound_event WHERE from_userid = %s", (userid,)),
+                ("audit_log", "DELETE FROM audit_log WHERE target_type = 'user' AND target_id = %s", (userid,)),
+                ("resume", "DELETE FROM resume WHERE owner_userid = %s", (userid,)),
+                ("job", "DELETE FROM job WHERE owner_userid = %s", (userid,)),
+                ("user", "DELETE FROM `user` WHERE external_userid = %s", (userid,)),
+            )
+            for table, statement, params in statements:
+                cursor.execute(statement, params)
+                deleted[table] = int(cursor.rowcount or 0)
+        conn.commit()
+    finally:
+        conn.close()
+    return {"checked": True, "deleted": deleted, "msg_ids": len(msg_ids)}
 
 
 def assert_text(payloads: list[dict], expects: list[str], rejects: list[str]) -> None:
@@ -147,17 +258,25 @@ def run(args: argparse.Namespace) -> int:
 
     channel = f"mock:outbound:{userid}"
     pubsub = None
+    message_ids: list[str] = []
+    result: dict | None = None
+    error: Exception | None = None
     try:
         health_check(args.base_url, args.timeout_seconds)
-        seed_status = (
-            {"checked": False, "reason": "skipped"}
-            if args.skip_seed_check
-            else check_mysql_seed(
-                args.mysql_dsn,
-                args.min_passed_jobs,
-                city_like=args.seed_city_like,
-                job_category_like=args.seed_job_category_like,
+        if args.skip_seed_check:
+            raise RuntimeError(
+                "--skip-seed-check is not allowed for a successful acceptance smoke"
             )
+        seed_status = check_mysql_seed(
+            args.mysql_dsn,
+            args.min_passed_jobs,
+            city_like=args.seed_city_like,
+            job_category_like=args.seed_job_category_like,
+            seed_version=args.seed_version,
+            min_supplement_jobs=args.min_supplement_jobs,
+            min_step5_jobs=args.min_step5_jobs,
+            min_step6_jobs=args.min_step6_jobs,
+            min_step8_jobs=args.min_step8_jobs,
         )
         pubsub = r.pubsub()
         pubsub.subscribe(channel)
@@ -168,38 +287,63 @@ def run(args: argparse.Namespace) -> int:
         outbound: list[dict] = []
         for content in messages:
             payload = build_inbound_payload(userid, content)
+            message_ids.append(payload["msg_id"])
             r.rpush(QUEUE_INCOMING, json.dumps(payload, ensure_ascii=False))
             outbound.extend(wait_for_outbound(pubsub, args.timeout_seconds))
         assert_text(outbound, args.expect, args.reject)
-        print(json.dumps({
+        result = {
             "ok": True,
             "userid": userid,
             "channel": channel,
             "reply_count": len(outbound),
             "message_count": len(messages),
             "seed": seed_status,
-        }, ensure_ascii=False))
-        return 0
-    except Exception as exc:  # noqa: BLE001 - CLI should print diagnostics
-        diagnostics = {
-            "ok": False,
-            "userid": userid,
-            "channel": channel,
-            "queue_length": r.llen(QUEUE_INCOMING),
-            "session_exists": bool(r.exists(f"session:{userid}")),
-            "error": str(exc),
         }
-        print(json.dumps(diagnostics, ensure_ascii=False), file=sys.stderr)
-        return 1
+    except Exception as exc:  # noqa: BLE001 - CLI should print diagnostics
+        error = exc
     finally:
-        if not args.keep_session:
-            r.delete(f"session:{userid}")
+        cleanup_errors: list[str] = []
+        try:
+            redis_cleanup = cleanup_redis_smoke_data(
+                r,
+                userid,
+                message_ids,
+                delete_session=not args.keep_session,
+            )
+        except Exception as exc:  # noqa: BLE001 - cleanup must be reported
+            redis_cleanup = None
+            cleanup_errors.append(f"Redis cleanup failed: {exc}")
+        mysql_cleanup = None
+        try:
+            mysql_cleanup = cleanup_mysql_smoke_data(args.mysql_dsn, userid, message_ids)
+        except Exception as exc:  # noqa: BLE001 - cleanup must be reported
+            cleanup_errors.append(f"MySQL cleanup failed: {exc}")
         if pubsub is not None:
             try:
                 pubsub.unsubscribe(channel)
                 pubsub.close()
             except Exception:
                 pass
+        if error is None and cleanup_errors:
+            error = RuntimeError("; ".join(cleanup_errors))
+        if error is not None:
+            diagnostics = {
+                "ok": False,
+                "userid": userid,
+                "channel": channel,
+                "queue_length": r.llen(QUEUE_INCOMING),
+                "session_exists": bool(r.exists(f"session:{userid}")),
+                "redis_cleanup": redis_cleanup,
+                "mysql_cleanup": mysql_cleanup,
+                "cleanup_errors": cleanup_errors,
+                "error": str(error),
+            }
+            print(json.dumps(diagnostics, ensure_ascii=False), file=sys.stderr)
+            return 1
+        result["redis_cleanup"] = redis_cleanup
+        result["mysql_cleanup"] = mysql_cleanup
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -209,7 +353,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--mysql-dsn",
         default="",
-        help="Optional MySQL DSN used to verify demo seed data",
+        help="MySQL DSN used to verify and clean demo seed data (required)",
     )
     parser.add_argument("--user-prefix", default="phase5_smoke")
     parser.add_argument("--timeout-seconds", type=int, default=30)
@@ -219,6 +363,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--min-passed-jobs", type=int, default=1)
     parser.add_argument("--seed-city-like", default="苏州")
     parser.add_argument("--seed-job-category-like", default="电子")
+    parser.add_argument("--seed-version", default="demo_supp_v1")
+    parser.add_argument("--min-supplement-jobs", type=int, default=7)
+    parser.add_argument("--min-step5-jobs", type=int, default=2)
+    parser.add_argument("--min-step6-jobs", type=int, default=2)
+    parser.add_argument("--min-step8-jobs", type=int, default=3)
     parser.add_argument("--skip-seed-check", action="store_true")
     parser.add_argument("--keep-session", action="store_true")
     parser.add_argument("--expect", action="append", default=[])
