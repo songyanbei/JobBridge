@@ -13,7 +13,9 @@ from scripts.demo_acceptance_smoke import (
     check_mysql_seed,
     cleanup_mysql_smoke_data,
     cleanup_redis_smoke_data,
+    create_mysql_inbound_event,
     parse_args,
+    wait_for_worker_done,
 )
 
 
@@ -197,4 +199,102 @@ def test_cleanup_mysql_smoke_data_deletes_user_owned_rows(monkeypatch):
     }
     assert len(calls["statements"]) == 6
     assert calls["committed"] is True
+    assert calls["closed"] is True
+
+
+def test_create_mysql_inbound_event_returns_id_and_commits(monkeypatch):
+    calls = {}
+
+    class FakeCursor:
+        lastrowid = 42
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, statement, params):
+            calls["statement"] = statement
+            calls["params"] = params
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            calls["committed"] = True
+
+        def close(self):
+            calls["closed"] = True
+
+    fake_pymysql = SimpleNamespace(
+        connect=lambda **_kwargs: FakeConnection(),
+        cursors=SimpleNamespace(DictCursor=object),
+    )
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
+    payload = build_inbound_payload("smoke-a", "hello")
+
+    assert create_mysql_inbound_event(
+        "mysql+pymysql://user:pass@127.0.0.1:3306/jobbridge",
+        payload,
+    ) == 42
+    assert "INSERT INTO wecom_inbound_event" in calls["statement"]
+    assert calls["params"][:3] == (payload["msg_id"], "smoke-a", "text")
+    assert calls["committed"] is True
+    assert calls["closed"] is True
+
+
+def test_wait_for_worker_done_collects_all_replies_before_returning(monkeypatch):
+    calls = {"statuses": 0}
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, _statement, _params):
+            calls["statuses"] += 1
+
+        def fetchone(self):
+            return {"status": "processing" if calls["statuses"] == 1 else "done"}
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            calls["closed"] = True
+
+    class FakePubSub:
+        def __init__(self):
+            self.messages = [
+                {"type": "message", "data": '{"text":{"content":"first"}}'},
+                None,
+                {"type": "message", "data": '{"text":{"content":"second"}}'},
+            ]
+
+        def get_message(self, timeout):
+            del timeout
+            if self.messages:
+                return self.messages.pop(0)
+            return None
+
+    fake_pymysql = SimpleNamespace(
+        connect=lambda **_kwargs: FakeConnection(),
+        cursors=SimpleNamespace(DictCursor=object),
+    )
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
+
+    payloads = wait_for_worker_done(
+        FakePubSub(),
+        "mysql+pymysql://user:pass@127.0.0.1:3306/jobbridge",
+        "msg-1",
+        1,
+    )
+
+    assert [item["text"]["content"] for item in payloads] == ["first", "second"]
+    assert calls["statuses"] == 2
     assert calls["closed"] is True
