@@ -187,6 +187,51 @@ def test_relaxation_summary_shows_original_and_relaxed_salary_values():
     assert "薪资下限9500 → 8550" in text
 
 
+def test_job_drop_optional_relaxation_summary_shows_safe_field_changes():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="drop_optional_filters",
+            label="去掉部分次要条件",
+            original_criteria={
+                "job_category": ["电子厂", "普工"],
+                "salary_floor_monthly": 9500,
+                "age": 35,
+            },
+            relaxed_criteria={
+                "job_category": ["电子厂"],
+                "salary_floor_monthly": 8550,
+            },
+            original_visible_count=0,
+            relaxed_visible_count=1,
+            relaxed_shown_count=1,
+        )
+    )
+
+    assert "薪资下限9500 → 8550" in text
+    assert "工种电子厂、普工 → 电子厂" in text
+    assert "年龄35 → 不限" in text
+
+
+def test_worker_drop_optional_relaxation_summary_shows_salary_and_gender_changes():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="drop_optional_filters",
+            label="去掉部分次要条件",
+            original_criteria={
+                "salary_ceiling_monthly": 5000,
+                "gender": "男",
+            },
+            relaxed_criteria={"salary_ceiling_monthly": 5500},
+            original_visible_count=0,
+            relaxed_visible_count=1,
+            relaxed_shown_count=1,
+        )
+    )
+
+    assert "期望薪资上限5000 → 5500" in text
+    assert "性别男 → 不限" in text
+
+
 class TestSearchJobs:
     @patch("app.services.search_service.get_reranker")
     @patch("app.services.search_service._query_jobs")

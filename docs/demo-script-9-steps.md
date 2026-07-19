@@ -290,6 +290,8 @@ backend/.venv/Scripts/python.exe scripts/demo_acceptance_smoke.py \
 
 ```dotenv
 recommendation_experience_enabled=true
+post_search_policy_mode=on
+phase5_rollout_percentage=100
 recommendation_reason_rollout_percentage=100
 recommendation_reason_shadow_enabled=false
 soft_preference_ranking_enabled=true
@@ -298,7 +300,21 @@ soft_preference_reason_rollout_percentage=100
 soft_preference_notice_rollout_percentage=100
 ```
 
-100% 轮应看到可验证的地点/工种/薪资匹配依据和软偏好 notice。再将上述百分比全部改为 `0`，保留 `recommendation_experience_enabled=true`，重启后使用同一消息：岗位结果仍应正常返回，但不应出现匹配依据或软偏好 notice。`recommendation_reason_shadow_enabled=true` 只用于结构化观测，不能让 shadow 回复出现匹配依据。
+100% 轮应看到可验证的地点/工种/薪资匹配依据和软偏好 notice。第二轮明确关闭整体二阶段策略和所有用户 rollout：
+
+```dotenv
+recommendation_experience_enabled=true
+post_search_policy_mode=off
+phase5_rollout_percentage=0
+recommendation_reason_rollout_percentage=0
+recommendation_reason_shadow_enabled=false
+soft_preference_ranking_enabled=true
+soft_preference_ranking_rollout_percentage=0
+soft_preference_reason_rollout_percentage=0
+soft_preference_notice_rollout_percentage=0
+```
+
+重启后使用同一消息：岗位结果仍应正常返回，但不应出现匹配依据或软偏好 notice。若要单独验证 shadow，将 `recommendation_reason_shadow_enabled=true` 置于 `post_search_policy_mode=shadow` 的观测轮；shadow 只写结构化日志，不能让回复出现匹配依据。
 
 ---
 

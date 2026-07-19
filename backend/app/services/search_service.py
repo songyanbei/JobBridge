@@ -143,6 +143,10 @@ def _relax_step_label(direction: str, step: str) -> str:
 
 
 def _format_relaxation_value(value: object) -> str:
+    if value is None:
+        return "不限"
+    if isinstance(value, bool):
+        return "是" if value else "否"
     if isinstance(value, (list, tuple, set)):
         return "、".join(str(item) for item in value)
     return str(value)
@@ -157,18 +161,39 @@ def _relaxation_value_change(summary: RelaxationSummary) -> str:
         )
     elif summary.field == "broaden_job_category":
         keys = (("job_category", "工种"),)
+    elif summary.field == "drop_optional_filters":
+        keys = (
+            ("salary_floor_monthly", "薪资下限"),
+            ("salary_ceiling_monthly", "期望薪资上限"),
+            ("job_category", "工种"),
+            ("gender_required", "性别"),
+            ("gender", "性别"),
+            ("is_long_term", "长期岗位"),
+            ("age", "年龄"),
+        )
     else:
         keys = ()
 
+    changes: list[str] = []
     for key, label in keys:
+        original_present = key in summary.original_criteria
+        relaxed_present = key in summary.relaxed_criteria
         original = summary.original_criteria.get(key)
         relaxed = summary.relaxed_criteria.get(key)
-        if original is not None and relaxed is not None and original != relaxed:
-            return (
-                f"{label}{_format_relaxation_value(original)}"
-                f" → {_format_relaxation_value(relaxed)}"
-            )
-    return ""
+        if original_present == relaxed_present and original == relaxed:
+            continue
+        if not original_present:
+            original = None
+        if not relaxed_present:
+            relaxed = None
+        original_text = _format_relaxation_value(original)
+        relaxed_text = _format_relaxation_value(relaxed)
+        if original_text == relaxed_text:
+            continue
+        changes.append(
+            f"{label}{original_text} → {relaxed_text}"
+        )
+    return "；".join(changes)
 
 
 def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
