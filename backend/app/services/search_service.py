@@ -142,12 +142,43 @@ def _relax_step_label(direction: str, step: str) -> str:
     return labels.get(step, "放宽部分条件")
 
 
+def _format_relaxation_value(value: object) -> str:
+    if isinstance(value, (list, tuple, set)):
+        return "、".join(str(item) for item in value)
+    return str(value)
+
+
+def _relaxation_value_change(summary: RelaxationSummary) -> str:
+    """Render only safe, user-facing criteria whose value actually changed."""
+    if summary.field == "relax_salary_10pct":
+        keys = (
+            ("salary_floor_monthly", "薪资下限"),
+            ("salary_ceiling_monthly", "期望薪资上限"),
+        )
+    elif summary.field == "broaden_job_category":
+        keys = (("job_category", "工种"),)
+    else:
+        keys = ()
+
+    for key, label in keys:
+        original = summary.original_criteria.get(key)
+        relaxed = summary.relaxed_criteria.get(key)
+        if original is not None and relaxed is not None and original != relaxed:
+            return (
+                f"{label}{_format_relaxation_value(original)}"
+                f" → {_format_relaxation_value(relaxed)}"
+            )
+    return ""
+
+
 def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
     original = summary.original_visible_count
     relaxed = summary.relaxed_visible_count
     shown = summary.relaxed_shown_count
+    value_change = _relaxation_value_change(summary)
+    label = f"{summary.label}（{value_change}）" if value_change else summary.label
     parts = [
-        f"原条件下可展示 {original} 条结果，我已为你{summary.label}后重新搜索。",
+        f"原条件下可展示 {original} 条结果，我已为你{label}后重新搜索。",
         f"放宽后本次展示 {shown} 条",
     ]
     if relaxed != shown:

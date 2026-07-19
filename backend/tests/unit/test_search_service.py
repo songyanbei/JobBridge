@@ -23,11 +23,13 @@ from app.services.search_service import (
     _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
+    _render_relaxation_summary_notice,
     _summarize_search_criteria,
     search_jobs,
     search_workers,
     show_more,
 )
+from app.schemas.search import RelaxationSummary
 from app.services.user_service import UserContext
 
 
@@ -167,6 +169,22 @@ class TestFormatResumeResults:
         ]
         text = _format_resume_results(resumes, 0)
         assert "联系方式待补充" in text
+
+
+def test_relaxation_summary_shows_original_and_relaxed_salary_values():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="relax_salary_10pct",
+            label="放宽薪资下限",
+            original_criteria={"salary_floor_monthly": 9500},
+            relaxed_criteria={"salary_floor_monthly": 8550},
+            original_visible_count=0,
+            relaxed_visible_count=2,
+            relaxed_shown_count=2,
+        )
+    )
+
+    assert "薪资下限9500 → 8550" in text
 
 
 class TestSearchJobs:

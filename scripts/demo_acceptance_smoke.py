@@ -131,6 +131,11 @@ def wait_for_worker_done(
                             deadline,
                             time.time() + OUTBOUND_QUIET_SECONDS,
                         )
+                if not payloads:
+                    raise RuntimeError(
+                        "worker reached status=done without an outbound business "
+                        f"reply for msg_id={msg_id}"
+                    )
                 return payloads
     finally:
         conn.close()

@@ -298,3 +298,44 @@ def test_wait_for_worker_done_collects_all_replies_before_returning(monkeypatch)
     assert [item["text"]["content"] for item in payloads] == ["first", "second"]
     assert calls["statuses"] == 2
     assert calls["closed"] is True
+
+
+def test_wait_for_worker_done_rejects_empty_outbound_after_done(monkeypatch):
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, _statement, _params):
+            pass
+
+        def fetchone(self):
+            return {"status": "done"}
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    class EmptyPubSub:
+        def get_message(self, timeout):
+            del timeout
+            return None
+
+    fake_pymysql = SimpleNamespace(
+        connect=lambda **_kwargs: FakeConnection(),
+        cursors=SimpleNamespace(DictCursor=object),
+    )
+    monkeypatch.setitem(sys.modules, "pymysql", fake_pymysql)
+
+    with pytest.raises(RuntimeError, match="without an outbound business reply"):
+        wait_for_worker_done(
+            EmptyPubSub(),
+            "mysql+pymysql://user:pass@127.0.0.1:3306/jobbridge",
+            "msg-empty",
+            1,
+        )

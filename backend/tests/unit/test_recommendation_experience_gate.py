@@ -1,4 +1,6 @@
 """Phase 5 recommendation experience gate tests."""
+from unittest.mock import MagicMock
+
 from app.config import DialoguePolicy, settings
 from app.services.recommendation_experience_gate import (
     compute_recommendation_experience_flags,
@@ -47,6 +49,18 @@ def test_rollout_percentages_are_clamped():
     assert policy.soft_preference_ranking_rollout_percentage == 0
     assert policy.soft_preference_reason_rollout_percentage == 37
     assert policy.soft_preference_notice_rollout_percentage == 0
+
+
+def test_rollout_accepts_non_string_user_context_values(monkeypatch):
+    _set_policy(
+        monkeypatch,
+        recommendation_experience_enabled=True,
+        recommendation_reason_rollout_percentage=100,
+    )
+
+    flags = compute_recommendation_experience_flags(MagicMock())
+
+    assert flags.show_match_reasons is True
 
 
 def test_soft_preference_reasons_and_notice_depend_on_ranking(monkeypatch):

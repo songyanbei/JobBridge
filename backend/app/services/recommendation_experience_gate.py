@@ -35,7 +35,7 @@ class RecommendationExperienceFlags:
 def rollout_bucket(external_userid: str | None) -> int | None:
     if not external_userid:
         return None
-    digest = hashlib.md5(external_userid.encode("utf-8")).hexdigest()
+    digest = hashlib.md5(str(external_userid).encode("utf-8")).hexdigest()
     return int(digest, 16) % 100
 
 
