@@ -112,6 +112,28 @@ class TestPostSearchReduceDefault:
         dims = [item["dimension"] for item in d.suggested_directions]
         assert "city" in dims
 
+    def test_paginate_no_more_uses_outcome_effective_criteria(self):
+        session = _make_session()
+        session.search_criteria = {"city": ["北京市"], "job_category": ["餐饮"]}
+        outcome = _make_outcome(
+            snapshot_exhausted=True,
+            initial_count=0,
+            final_count=0,
+            criteria_used={"city": ["北京市"]},
+        )
+
+        d = post_search_reduce(
+            parse_result=_make_parse(),
+            decision=_make_decision(),
+            session=session,
+            search_outcome=outcome,
+            role="worker",
+        )
+
+        target_fields = [item["target_field"] for item in d.suggested_directions]
+        assert len(target_fields) <= 3
+        assert "job_category" not in target_fields
+
     def test_pure_function_no_session_write(self):
         # 入参 session 不应被改动
         s = _make_session()

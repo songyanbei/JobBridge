@@ -6,6 +6,7 @@
 
 - [ ] 后端 `uvicorn` 已起，`/health` 返回 ok
 - [ ] Worker 进程已起（消费 Redis 队列）
+- [ ] 如演示 Phase5 推荐体验：确认 app 与 worker 使用同一套推荐体验环境变量，并已在调整后重启
 - [ ] 前端运营后台 admin 已登录（admin/admin123）
 - [ ] 企微 webhook（或 mock 工具）能发消息到后端
 - [ ] 演示用账号确认：
@@ -13,6 +14,7 @@
   - 中介：`seed_broker_002`（云国华）
   - 工人：用一个**新的** external_userid（如 `demo_worker_show_001`）触发自动注册
 - [ ] 苏州电子厂岗位密度：10 条（演示前 SQL 复核：`SELECT COUNT(*) FROM job WHERE city='苏州市' AND job_category='电子厂'`）
+- [ ] 命中匹配依据 gate 时，回复里会出现"匹配依据"；未命中时不出现该文案
 
 ---
 
@@ -118,6 +120,8 @@
 >    两班倒
 > ② ……
 > ③ ……
+
+若 `RECOMMENDATION_EXPERIENCE_ENABLED=true` 且匹配依据 rollout 命中，每条结果最多额外出现 2 条"匹配依据"，只说明地点、工种、薪资、包吃住等可验证命中，不解释最终排序。
 
 **口播**：
 - "中介这个角色比较特殊：双向权限——既能发岗位又能查岗位查工人。这条消息触发了 `search_job` 意图"
@@ -229,7 +233,88 @@
 - "用户提了个更高的条件——苏州电子厂 9500 起。系统不会只看岗位下限，而是看岗位薪资区间能不能覆盖 9500"
 - "比如 8600-11000 的岗位，下限低于 9500，但上限覆盖 9500，所以这是符合用户要求的，不应该被错误过滤掉"
 - "这一步展示的是搜索语义的准确性：只有真实低召回时才需要自动放宽，不能让 fallback 掩盖过滤 bug"
-- "如果要演示自动放宽，要单独构造所有岗位上限都低于原始薪资、放宽 10% 后才命中的数据"
+- "如果要演示自动放宽，使用下方 Phase 5 验收补充中的固定输入和 seed，不要临时改线上岗位"
+
+---
+
+## Phase 5 验收补充
+
+### 1. 固定 seed 与完整服务烟测
+
+先完成基础 seed，再追加 Phase 5 补充 seed。烟测必须提供 `--mysql-dsn`，否则不允许判定成功：
+
+```bash
+docker exec -i jobbridge-mysql mysql -u jobbridge -pjobbridge jobbridge < scripts/demo_seed_supplement.sql
+
+backend/.venv/Scripts/python.exe scripts/demo_acceptance_smoke.py \
+  --base-url http://127.0.0.1:8000 \
+  --redis-url redis://127.0.0.1:6379/0 \
+  --mysql-dsn mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge \
+  --message "找苏州电子厂，工资下限 5500，最好包吃住" \
+  --message "更多" \
+  --expect "为您找到" \
+  --reject "身份证" --reject "联系电话" --reject "详细地址"
+```
+
+脚本启动前会校验 `demo_supp_v1`、苏州电子厂补充岗位至少 7 条，以及第 5/6/8 步场景分别至少 2/2/3 条；每条入站消息都必须在 `wecom_inbound_event.status=done` 后收到至少一条出站业务回复。运行结束会清理本次用户的 session、队列消息、入站事件、对话日志和用户数据。
+
+### 2. 自动放宽：固定输入与预期摘要
+
+补充 seed 中的第 8 步岗位最高上限为 12000。用全新用户发送：
+
+```text
+找苏州电子厂，工资下限 12100，包吃住
+```
+
+原条件应为 0 命中，自动放宽 10% 后以 `12100 → 10890` 重新搜索并命中第 8 步岗位。开启推荐体验 gate 后，摘要必须同时包含原条件可见数、`薪资下限12100 → 10890`、放宽后可见数和本次展示数；仍为 0 命中时只出现一次放宽摘要，随后给出建议，不重复拼接放宽说明。
+
+### 3. 分页耗尽与软偏好 notice
+
+在第 5 步结果后连续发送 `更多`，直到候选快照耗尽。最后一次只返回收尾提示，不重复旧岗位，文案形如：
+
+```text
+本轮结果已经看完了。可以试试这些方向重新搜索：...
+```
+
+在推荐体验 master switch 开启、软偏好排序和相关 notice rollout 均为 100 时，用全新用户发送：
+
+```text
+找苏州电子厂，工资下限 5500，包吃住
+```
+
+候选确实命中 `provide_meal/provide_housing` 时，回复应包含 `已优先展示符合「包吃住」偏好的岗位`；软偏好只影响排序和该 notice，不改变硬过滤候选范围。
+
+### 4. rollout=100/0 对照验收
+
+在同一 seed、同一消息下分别重启 app/worker 做两轮：
+
+```dotenv
+recommendation_experience_enabled=true
+post_search_policy_mode=on
+phase5_rollout_percentage=100
+recommendation_reason_rollout_percentage=100
+recommendation_reason_shadow_enabled=false
+soft_preference_ranking_enabled=true
+soft_preference_ranking_rollout_percentage=100
+soft_preference_reason_rollout_percentage=100
+soft_preference_notice_rollout_percentage=100
+```
+
+100% 轮应看到可验证的地点/工种/薪资匹配依据和软偏好 notice。第二轮明确关闭整体二阶段策略和所有用户 rollout：
+
+```dotenv
+recommendation_experience_enabled=true
+post_search_policy_mode=off
+phase5_rollout_percentage=0
+recommendation_reason_rollout_percentage=0
+recommendation_reason_shadow_enabled=false
+soft_preference_ranking_enabled=true
+soft_preference_ranking_rollout_percentage=0
+soft_preference_reason_rollout_percentage=0
+soft_preference_notice_rollout_percentage=0
+```
+
+重启后使用同一消息：岗位结果仍应正常返回，但不应出现匹配依据或软偏好 notice。若要单独验证 shadow，将 `recommendation_reason_shadow_enabled=true` 置于 `post_search_policy_mode=shadow` 的观测轮；shadow 只写结构化日志，不能让回复出现匹配依据。
 
 ---
 

@@ -110,6 +110,15 @@ class _SearchCallSpy:
                 snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
                 available_relax_steps=list(ov.get("available_relax_steps", []) or []),
                 relax_probe_results=list(ov.get("relax_probe_results", []) or []),
+                candidate_count_capped=int(
+                    ov.get("candidate_count_capped", ov.get("final_count", 1)),
+                ),
+                visible_count=int(ov.get("visible_count", ov.get("final_count", 1))),
+                shown_count=int(
+                    ov.get("shown_count", ov.get("visible_count", ov.get("final_count", 1))),
+                ),
+                remaining_count_capped=int(ov.get("remaining_count_capped", 0)),
+                relaxation_summary=ov.get("relaxation_summary"),
             ),
         )
 
@@ -139,6 +148,15 @@ class _SearchCallSpy:
                 snapshot_exhausted=bool(ov.get("snapshot_exhausted", False)),
                 available_relax_steps=list(ov.get("available_relax_steps", []) or []),
                 relax_probe_results=list(ov.get("relax_probe_results", []) or []),
+                candidate_count_capped=int(
+                    ov.get("candidate_count_capped", ov.get("final_count", 1)),
+                ),
+                visible_count=int(ov.get("visible_count", ov.get("final_count", 1))),
+                shown_count=int(
+                    ov.get("shown_count", ov.get("visible_count", ov.get("final_count", 1))),
+                ),
+                remaining_count_capped=int(ov.get("remaining_count_capped", 0)),
+                relaxation_summary=ov.get("relaxation_summary"),
             ),
         )
 
@@ -188,6 +206,7 @@ class _SearchCallSpy:
     def fake_execute_relaxed_search(
         self, original_criteria, step, *,
         direction, raw_query, session, user_ctx, db, user_msg_id=None,
+        experience_flags=None, original_visible_count=0,
     ):
         """Mock execute_relaxed_search；记录调用细节供断言使用。
 
@@ -201,6 +220,7 @@ class _SearchCallSpy:
             "direction": direction,
             "raw_query": raw_query,
             "user_msg_id": user_msg_id,
+            "original_visible_count": original_visible_count,
         })
         cfg = self.current_relaxed_search
         result_count = cfg["result_count"]
@@ -228,6 +248,11 @@ class _SearchCallSpy:
                 snapshot_exhausted=False,
                 available_relax_steps=[],
                 relax_probe_results=[],
+                candidate_count_capped=result_count,
+                visible_count=result_count,
+                shown_count=result_count,
+                remaining_count_capped=0,
+                relaxation_summary=None,
             ),
         )
 
@@ -255,6 +280,11 @@ class _SearchCallSpy:
                 snapshot_exhausted=cfg["snapshot_exhausted"],
                 available_relax_steps=[],
                 relax_probe_results=[],
+                candidate_count_capped=0,
+                visible_count=0,
+                shown_count=0,
+                remaining_count_capped=0,
+                relaxation_summary=None,
             ),
         )
 
@@ -419,7 +449,7 @@ def run_dialogue_case(case: dict) -> dict:
                     # 含特定 header；off / shadow 模式下 reply 仍是 search_result
                     # 原文。
                     "reply_includes_paginate_header": (
-                        "已经是所有匹配结果了。可以试试以下方向" in reply_text
+                        "本轮结果已经看完了。可以试试这些方向" in reply_text
                     ),
                 })
                 prev_search_calls = cur_search_calls

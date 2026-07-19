@@ -261,6 +261,7 @@ def save_snapshot(
     session: SessionState,
     candidate_ids: list[str],
     query_digest: str,
+    effective_criteria: dict | None = None,
 ) -> None:
     """保存候选 ID 快照（由 search_service 在 rerank 后调用）。"""
     now = datetime.now(timezone.utc)
@@ -275,6 +276,7 @@ def save_snapshot(
         query_digest=query_digest,
         created_at=now.isoformat(),
         expires_at=expires.isoformat(),
+        effective_criteria=dict(effective_criteria or session.search_criteria or {}),
     )
     session.shown_items = []
 

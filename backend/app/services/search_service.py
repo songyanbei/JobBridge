@@ -27,10 +27,19 @@ from app.schemas.conversation import SessionState
 from app.schemas.search import (
     FallbackOutcome,
     FallbackSuggestion,
+    RelaxationSummary,
     SearchOutcome,
     SearchResult,
 )
 from app.services import conversation_service, permission_service
+from app.services.recommendation_experience_gate import RecommendationExperienceFlags
+from app.services.recommendation_experience_gate import userid_hash
+from app.services.recommendation_reason_service import (
+    build_match_reasons,
+    project_job_for_explanation,
+    project_resume_for_explanation,
+    render_match_reasons,
+)
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 
@@ -70,6 +79,12 @@ def _is_phase5_policy_enabled_for_user(userid: str | None) -> bool:
     from app.services.intent_service import is_phase5_policy_enabled
 
     return is_phase5_policy_enabled(userid or "")
+
+
+def _normalize_experience_flags(
+    experience_flags: RecommendationExperienceFlags | None,
+) -> RecommendationExperienceFlags:
+    return experience_flags or RecommendationExperienceFlags.disabled()
 
 
 # Stage B：0 命中 fallback 文案（§3.5）。
@@ -112,14 +127,194 @@ _SUGGESTION_LABEL_RESUME = {
 _MAX_SUGGESTIONS = 3
 
 
+def _relax_step_label(direction: str, step: str) -> str:
+    job_labels = {
+        "relax_salary_10pct": "放宽薪资下限",
+        "broaden_job_category": "放宽工种到大类",
+        "drop_optional_filters": "去掉部分次要条件",
+    }
+    resume_labels = {
+        "relax_salary_10pct": "放宽期望薪资上限",
+        "broaden_job_category": "放宽工种到大类",
+        "drop_optional_filters": "去掉部分次要条件",
+    }
+    labels = job_labels if direction == "search_job" else resume_labels
+    return labels.get(step, "放宽部分条件")
+
+
+def _format_relaxation_value(value: object) -> str:
+    if value is None:
+        return "不限"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (list, tuple, set)):
+        return "、".join(str(item) for item in value)
+    return str(value)
+
+
+def _relaxation_value_change(summary: RelaxationSummary) -> str:
+    """Render only safe, user-facing criteria whose value actually changed."""
+    if summary.field == "relax_salary_10pct":
+        keys = (
+            ("salary_floor_monthly", "薪资下限"),
+            ("salary_ceiling_monthly", "期望薪资上限"),
+        )
+    elif summary.field == "broaden_job_category":
+        keys = (("job_category", "工种"),)
+    elif summary.field == "drop_optional_filters":
+        keys = (
+            ("salary_floor_monthly", "薪资下限"),
+            ("salary_ceiling_monthly", "期望薪资上限"),
+            ("job_category", "工种"),
+            ("gender_required", "性别"),
+            ("gender", "性别"),
+            ("is_long_term", "长期岗位"),
+            ("age", "年龄"),
+        )
+    else:
+        keys = ()
+
+    changes: list[str] = []
+    for key, label in keys:
+        original_present = key in summary.original_criteria
+        relaxed_present = key in summary.relaxed_criteria
+        original = summary.original_criteria.get(key)
+        relaxed = summary.relaxed_criteria.get(key)
+        if original_present == relaxed_present and original == relaxed:
+            continue
+        if not original_present:
+            original = None
+        if not relaxed_present:
+            relaxed = None
+        original_text = _format_relaxation_value(original)
+        relaxed_text = _format_relaxation_value(relaxed)
+        if original_text == relaxed_text:
+            continue
+        changes.append(
+            f"{label}{original_text} → {relaxed_text}"
+        )
+    return "；".join(changes)
+
+
+def _render_relaxation_summary_notice(summary: RelaxationSummary) -> str:
+    original = summary.original_visible_count
+    relaxed = summary.relaxed_visible_count
+    shown = summary.relaxed_shown_count
+    value_change = _relaxation_value_change(summary)
+    label = f"{summary.label}（{value_change}）" if value_change else summary.label
+    parts = [
+        f"原条件下可展示 {original} 条结果，我已为你{label}后重新搜索。",
+        f"放宽后本次展示 {shown} 条",
+    ]
+    if relaxed != shown:
+        parts[-1] += f"，当前可见 {relaxed} 条"
+    parts[-1] += "。"
+    return "\n".join(parts)
+
+
+def _build_job_reason_lines_by_id(
+    jobs: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+    soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
+) -> dict[str, list[str]]:
+    return _build_reason_lines_by_id(
+        jobs,
+        criteria,
+        flags,
+        item_type="job",
+        soft_preferences=soft_preferences,
+        external_userid_hash=external_userid_hash,
+    )
+
+
+def _build_resume_reason_lines_by_id(
+    resumes: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+    soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
+) -> dict[str, list[str]]:
+    return _build_reason_lines_by_id(
+        resumes,
+        criteria,
+        flags,
+        item_type="resume",
+        soft_preferences=soft_preferences,
+        external_userid_hash=external_userid_hash,
+    )
+
+
+def _build_reason_lines_by_id(
+    items: list[dict],
+    criteria: dict,
+    flags: RecommendationExperienceFlags,
+    *,
+    item_type: Literal["job", "resume"],
+    soft_preferences: dict | None = None,
+    external_userid_hash: str = "",
+) -> dict[str, list[str]]:
+    can_show_reasons = flags.show_match_reasons or flags.soft_preference_reasons
+    if not (can_show_reasons or flags.build_shadow_reasons):
+        return {}
+
+    reason_lines: dict[str, list[str]] = {}
+    reason_kinds: set[str] = set()
+    for item in items:
+        projected = (
+            project_job_for_explanation(item)
+            if item_type == "job"
+            else project_resume_for_explanation(item)
+        )
+        reasons = build_match_reasons(
+            item=projected,
+            criteria=criteria,
+            item_type=item_type,
+            soft_pref_hits=_item_soft_preference_hits(item, soft_preferences),
+            include_soft_preferences=flags.soft_preference_reasons,
+        )
+        if reasons:
+            reason_lines[str(item.get("id", ""))] = render_match_reasons(reasons)
+            reason_kinds.update(r.kind for r in reasons)
+
+    if reason_lines:
+        log_event(
+            "match_explanation_built",
+            external_userid_hash=external_userid_hash,
+            direction="search_job" if item_type == "job" else "search_worker",
+            item_type=item_type,
+            explanation_count=sum(len(v) for v in reason_lines.values()),
+            reason_kinds=sorted(reason_kinds),
+            shadow_only=not can_show_reasons,
+        )
+    return reason_lines if can_show_reasons else {}
+
+
+def _item_soft_preference_hits(
+    item: dict,
+    soft_preferences: dict | None,
+) -> dict[str, bool]:
+    if not soft_preferences:
+        return {}
+    hits: dict[str, bool] = {}
+    for key, expected in soft_preferences.items():
+        if item.get(key) == expected:
+            hits[key] = True
+    return hits
+
+
 def _extract_soft_prefs_for_rerank(
-    criteria: dict, frame: str,
+    criteria: dict,
+    frame: str,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> tuple[dict, dict[str, float]]:
     """Phase 5 §5.3：受 settings.soft_preference_ranking_enabled 控制。
     关闭时返回空 dict，等价 5.0/5.1/5.2 路径（不传 soft_preferences 给 reranker）。
     开启时调 slot_schema.extract_soft_preferences。
     """
-    if not settings.soft_preference_ranking_enabled:
+    flags = _normalize_experience_flags(experience_flags)
+    if not flags.soft_preference_ranking:
         return {}, {}
     from app.dialogue import slot_schema
     return slot_schema.extract_soft_preferences(criteria, frame=frame)
@@ -243,6 +438,12 @@ def _build_search_outcome(
     soft_pref_hits: dict[str, int] | None = None,
     available_relax_steps: list[str] | None = None,
     relax_probe_results: list[dict] | None = None,
+    candidate_count_capped: int | None = None,
+    visible_count: int | None = None,
+    shown_count: int | None = None,
+    probe_count: int | None = None,
+    remaining_count_capped: int | None = None,
+    relaxation_summary=None,
 ) -> SearchOutcome:
     """构造 SearchOutcome；low_recall_threshold 默认等于 desired_count（top_n）。
 
@@ -259,6 +460,11 @@ def _build_search_outcome(
         final_count=final_count,
         desired_count=desired_count,
         low_recall_threshold=desired_count,
+        candidate_count_capped=candidate_count_capped,
+        visible_count=visible_count,
+        shown_count=shown_count,
+        probe_count=probe_count,
+        remaining_count_capped=remaining_count_capped,
         applied_relax_step=applied_relax_step,
         fallback_suggestions=list(fallback_suggestions or []),
         soft_pref_hits=dict(soft_pref_hits or {}),
@@ -266,6 +472,7 @@ def _build_search_outcome(
         snapshot_exhausted=snapshot_exhausted,
         available_relax_steps=list(available_relax_steps or []),
         relax_probe_results=list(relax_probe_results or []),
+        relaxation_summary=relaxation_summary,
     )
 
 
@@ -280,6 +487,7 @@ def search_jobs(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """工人/中介找岗位。
 
@@ -288,6 +496,7 @@ def search_jobs(
     """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
+    flags = _normalize_experience_flags(experience_flags)
 
     # 硬过滤
     candidates = _query_jobs(criteria, max_candidates, db)
@@ -348,7 +557,9 @@ def search_jobs(
     # Reranker（含结构化打点）
     # Phase 5 §5.3：soft_preference_ranking_enabled=True 时把 criteria 中的
     # 软偏好字段 + ranking_weight 透传给 reranker，让其优先排序匹配软偏好的候选。
-    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "job_search")
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
+        criteria, "job_search", flags,
+    )
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -371,7 +582,7 @@ def search_jobs(
 
     # 保存快照
     digest = conversation_service.compute_query_digest(criteria)
-    conversation_service.save_snapshot(session, ranked_ids, digest)
+    conversation_service.save_snapshot(session, ranked_ids, digest, criteria)
 
     # 取首批
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
@@ -403,7 +614,10 @@ def search_jobs(
 
     # 格式化
     remaining = conversation_service.get_remaining_count(session)
-    reply = _format_job_results(filtered, remaining)
+    reason_lines = _build_job_reason_lines_by_id(
+        filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+    )
+    reply = _format_job_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_JOB.get(outcome.applied_step)
         if notice:
@@ -428,6 +642,10 @@ def search_jobs(
         fallback_suggestions=outcome.suggestions,
         has_more=remaining > 0,
         soft_pref_hits=soft_pref_hits,
+        candidate_count_capped=len(candidates),
+        visible_count=len(filtered),
+        shown_count=len(filtered),
+        remaining_count_capped=remaining,
     )
     return sr, so
 
@@ -439,6 +657,7 @@ def search_workers(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """厂家/中介找工人。
 
@@ -446,6 +665,7 @@ def search_workers(
     """
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
+    flags = _normalize_experience_flags(experience_flags)
 
     candidates = _query_resumes(criteria, max_candidates, db)
     initial_count = len(candidates)
@@ -500,7 +720,9 @@ def search_workers(
 
     candidate_dicts = _resumes_to_dicts(candidates)
 
-    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(criteria, "candidate_search")
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
+        criteria, "candidate_search", flags,
+    )
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -520,7 +742,7 @@ def search_workers(
             ranked_ids.append(cid)
 
     digest = conversation_service.compute_query_digest(criteria)
-    conversation_service.save_snapshot(session, ranked_ids, digest)
+    conversation_service.save_snapshot(session, ranked_ids, digest, criteria)
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
@@ -550,7 +772,10 @@ def search_workers(
     conversation_service.record_shown(session, shown_ids)
 
     remaining = conversation_service.get_remaining_count(session)
-    reply = _format_resume_results(filtered, remaining)
+    reason_lines = _build_resume_reason_lines_by_id(
+        filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+    )
+    reply = _format_resume_results(filtered, remaining, reason_lines)
     if outcome.applied_step:
         notice = _FALLBACK_NOTICE_RESUME.get(outcome.applied_step)
         if notice:
@@ -575,6 +800,10 @@ def search_workers(
         soft_pref_hits=soft_pref_hits,
         available_relax_steps=available_steps,
         relax_probe_results=probe_results,
+        candidate_count_capped=len(candidates),
+        visible_count=len(filtered),
+        shown_count=len(filtered),
+        remaining_count_capped=remaining,
     )
     return sr, so
 
@@ -583,6 +812,7 @@ def show_more(
     session: SessionState,
     user_ctx: UserContext,
     db: Session,
+    experience_flags: RecommendationExperienceFlags | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """show_more：从快照取下一批，跳过失效条目。
 
@@ -594,6 +824,7 @@ def show_more(
     is_job_search = _is_job_search(session, user_ctx)
     direction = "search_job" if is_job_search else "search_worker"
     top_n = _get_config_int("match.top_n", db, 3)
+    flags = _normalize_experience_flags(experience_flags)
 
     if session.candidate_snapshot is None:
         sr = SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
@@ -617,6 +848,11 @@ def show_more(
             desired_count=top_n,
         )
         return sr, so
+
+    snapshot_effective_criteria = getattr(
+        session.candidate_snapshot, "effective_criteria", None,
+    )
+    effective_criteria = dict(snapshot_effective_criteria or {})
 
     collected = []
     attempts = 0
@@ -650,17 +886,28 @@ def show_more(
         collected.extend(filtered)
 
     if not collected:
+        log_event(
+            "show_more_exhausted",
+            external_userid_hash=userid_hash(user_ctx.external_userid),
+            direction=direction,
+            remaining_count_capped=0,
+            snapshot_has_effective_criteria=bool(snapshot_effective_criteria),
+            active_flow=session.active_flow or "",
+        )
         sr = SearchResult(
             reply_text="已经是所有匹配结果了。要不要调整条件重新搜索？",
             result_count=0,
         )
         so = _build_search_outcome(
             direction=direction,
-            criteria_used=session.search_criteria or {},
+            criteria_used=effective_criteria,
             initial_count=0,
             final_count=0,
             desired_count=top_n,
             snapshot_exhausted=True,  # 5.1 reducer 据此决定 paginate_no_more
+            visible_count=0,
+            shown_count=0,
+            remaining_count_capped=0,
         )
         return sr, so
 
@@ -670,9 +917,29 @@ def show_more(
     has_more = remaining > 0
 
     if is_job_search:
-        reply = _format_job_results(collected, remaining)
+        soft_prefs, _ = _extract_soft_prefs_for_rerank(
+            effective_criteria, "job_search", flags,
+        )
+        reason_lines = _build_job_reason_lines_by_id(
+            collected,
+            effective_criteria,
+            flags,
+            soft_prefs,
+            userid_hash(user_ctx.external_userid),
+        )
+        reply = _format_job_results(collected, remaining, reason_lines)
     else:
-        reply = _format_resume_results(collected, remaining)
+        soft_prefs, _ = _extract_soft_prefs_for_rerank(
+            effective_criteria, "candidate_search", flags,
+        )
+        reason_lines = _build_resume_reason_lines_by_id(
+            collected,
+            effective_criteria,
+            flags,
+            soft_prefs,
+            userid_hash(user_ctx.external_userid),
+        )
+        reply = _format_resume_results(collected, remaining, reason_lines)
 
     sr = SearchResult(
         reply_text=reply,
@@ -681,11 +948,14 @@ def show_more(
     )
     so = _build_search_outcome(
         direction=direction,
-        criteria_used=session.search_criteria or {},
+        criteria_used=effective_criteria,
         initial_count=len(collected),
         final_count=len(collected),
         desired_count=top_n,
         has_more=has_more,
+        visible_count=len(collected),
+        shown_count=len(collected),
+        remaining_count_capped=remaining,
     )
     return sr, so
 
@@ -1072,6 +1342,8 @@ def execute_relaxed_search(
     user_ctx: UserContext,
     db: Session,
     user_msg_id: str | None = None,
+    experience_flags: RecommendationExperienceFlags | None = None,
+    original_visible_count: int = 0,
 ) -> tuple[SearchResult, SearchOutcome]:
     """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
 
@@ -1090,6 +1362,7 @@ def execute_relaxed_search(
 
     top_n = _get_config_int("match.top_n", db, 3)
     max_candidates = _get_config_int("match.max_candidates", db, 50)
+    flags = _normalize_experience_flags(experience_flags)
 
     if direction == "search_job":
         candidates = _query_jobs(relaxed, max_candidates, db)
@@ -1099,16 +1372,30 @@ def execute_relaxed_search(
 
     if not candidates:
         # 二次检索仍然 0 命中（极少；用户已经接受放宽了，不再继续放宽）
-        notice_table = (
-            _FALLBACK_NOTICE_JOB if direction == "search_job"
-            else _FALLBACK_NOTICE_RESUME
-        )
-        notice = notice_table.get(step, "")
         no_match_reply = (
             NO_JOB_MATCH_REPLY if direction == "search_job"
             else NO_WORKER_MATCH_REPLY
         )
-        reply = f"{notice}\n\n{no_match_reply}" if notice else no_match_reply
+        summary = RelaxationSummary(
+            field=step,
+            label=_relax_step_label(direction, step),
+            original_criteria=dict(original_criteria or {}),
+            relaxed_criteria=dict(relaxed or {}),
+            original_visible_count=original_visible_count,
+            relaxed_visible_count=0,
+            relaxed_shown_count=0,
+        )
+        reply = f"{_render_relaxation_summary_notice(summary)}\n\n{no_match_reply}"
+        log_event(
+            "auto_relax_applied",
+            external_userid_hash=userid_hash(user_ctx.external_userid),
+            direction=direction,
+            field=step,
+            original_visible_count=original_visible_count,
+            relaxed_visible_count=0,
+            relaxed_shown_count=0,
+            applied=True,
+        )
         sr = SearchResult(reply_text=reply, result_count=0)
         so = _build_search_outcome(
             direction=direction,
@@ -1117,6 +1404,7 @@ def execute_relaxed_search(
             final_count=0,
             desired_count=top_n,
             applied_relax_step=step,
+            relaxation_summary=summary,
         )
         return sr, so
 
@@ -1126,7 +1414,7 @@ def execute_relaxed_search(
         candidate_dicts = _resumes_to_dicts(candidates)
 
     frame = "candidate_search" if direction == "search_worker" else "job_search"
-    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame)
+    soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame, flags)
     rerank_result = _rerank_with_logging(
         query=raw_query,
         candidates=candidate_dicts,
@@ -1145,7 +1433,7 @@ def execute_relaxed_search(
             ranked_ids.append(cid)
 
     digest = conversation_service.compute_query_digest(relaxed)
-    conversation_service.save_snapshot(session, ranked_ids, digest)
+    conversation_service.save_snapshot(session, ranked_ids, digest, relaxed)
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
@@ -1175,13 +1463,35 @@ def execute_relaxed_search(
 
     remaining = conversation_service.get_remaining_count(session)
     if direction == "search_job":
-        reply = _format_job_results(filtered, remaining)
-        notice = _FALLBACK_NOTICE_JOB.get(step)
+        reason_lines = _build_job_reason_lines_by_id(
+            filtered, relaxed, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+        )
+        reply = _format_job_results(filtered, remaining, reason_lines)
     else:
-        reply = _format_resume_results(filtered, remaining)
-        notice = _FALLBACK_NOTICE_RESUME.get(step)
-    if notice:
-        reply = f"{notice}\n\n{reply}"
+        reason_lines = _build_resume_reason_lines_by_id(
+            filtered, relaxed, flags, soft_prefs, userid_hash(user_ctx.external_userid),
+        )
+        reply = _format_resume_results(filtered, remaining, reason_lines)
+    relaxation_summary = RelaxationSummary(
+        field=step,
+        label=_relax_step_label(direction, step),
+        original_criteria=dict(original_criteria or {}),
+        relaxed_criteria=dict(relaxed or {}),
+        original_visible_count=original_visible_count,
+        relaxed_visible_count=len(filtered),
+        relaxed_shown_count=len(filtered),
+    )
+    reply = f"{_render_relaxation_summary_notice(relaxation_summary)}\n\n{reply}"
+    log_event(
+        "auto_relax_applied",
+        external_userid_hash=userid_hash(user_ctx.external_userid),
+        direction=direction,
+        field=step,
+        original_visible_count=original_visible_count,
+        relaxed_visible_count=len(filtered),
+        relaxed_shown_count=len(filtered),
+        applied=True,
+    )
 
     sr = SearchResult(
         reply_text=reply,
@@ -1199,6 +1509,11 @@ def execute_relaxed_search(
         applied_relax_step=step,
         has_more=remaining > 0,
         soft_pref_hits=soft_pref_hits,
+        candidate_count_capped=len(candidates),
+        visible_count=len(filtered),
+        shown_count=len(filtered),
+        remaining_count_capped=remaining,
+        relaxation_summary=relaxation_summary,
     )
     return sr, so
 
@@ -1453,7 +1768,11 @@ def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
 # 格式化
 # ---------------------------------------------------------------------------
 
-def _format_job_results(jobs: list[dict], remaining: int) -> str:
+def _format_job_results(
+    jobs: list[dict],
+    remaining: int,
+    reason_lines_by_id: dict[str, list[str]] | None = None,
+) -> str:
     """按 §10.5 格式化岗位结果（工人视角）。"""
     if not jobs:
         return "暂无匹配结果。"
@@ -1489,6 +1808,8 @@ def _format_job_results(jobs: list[dict], remaining: int) -> str:
         lines.append(f"{marker} {title}")
         lines.append(f"   💰 {salary_str}{benefit_str}")
         lines.append(f"   📍 {location}")
+        for reason_line in (reason_lines_by_id or {}).get(str(j.get("id", "")), []):
+            lines.append(reason_line)
 
         shift = j.get("shift_pattern", "")
         hours = j.get("work_hours", "")
@@ -1503,7 +1824,11 @@ def _format_job_results(jobs: list[dict], remaining: int) -> str:
     return "\n".join(lines)
 
 
-def _format_resume_results(resumes: list[dict], remaining: int) -> str:
+def _format_resume_results(
+    resumes: list[dict],
+    remaining: int,
+    reason_lines_by_id: dict[str, list[str]] | None = None,
+) -> str:
     """按 §10.5 格式化简历结果（厂家/中介视角）。"""
     if not resumes:
         return "暂无匹配结果。"
@@ -1530,6 +1855,8 @@ def _format_resume_results(resumes: list[dict], remaining: int) -> str:
             lines.append(f"   🔧 期望：{cat_str}，{salary}+/月")
         if city_str:
             lines.append(f"   📍 期望城市：{city_str}")
+        for reason_line in (reason_lines_by_id or {}).get(str(r.get("id", "")), []):
+            lines.append(reason_line)
 
         phone = r.get("phone")
         placeholder = r.get("phone_placeholder")

@@ -19,6 +19,10 @@ class CandidateSnapshot(BaseModel):
     query_digest: str = Field(default="", description="search_criteria 的 SHA256 前 12 位")
     created_at: str = Field(default="", description="ISO 8601")
     expires_at: str = Field(default="", description="快照过期时间（created_at + 30 分钟）")
+    effective_criteria: dict = Field(
+        default_factory=dict,
+        description="生成当前候选快照实际使用的检索条件；自动放宽后为放宽后的条件",
+    )
 
 
 class SessionState(BaseModel):

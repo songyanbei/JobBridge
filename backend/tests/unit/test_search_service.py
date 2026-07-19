@@ -23,11 +23,13 @@ from app.services.search_service import (
     _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
+    _render_relaxation_summary_notice,
     _summarize_search_criteria,
     search_jobs,
     search_workers,
     show_more,
 )
+from app.schemas.search import RelaxationSummary
 from app.services.user_service import UserContext
 
 
@@ -128,6 +130,18 @@ class TestFormatJobResults:
         text = _format_job_results([], 0)
         assert "暂无" in text
 
+    def test_match_reasons_are_optional(self):
+        jobs = [{"id": 1, "company": "XX", "job_category": "普工",
+                 "salary_floor_monthly": 5000, "pay_type": "月薪",
+                 "city": "苏州市"}]
+        text = _format_job_results(jobs, 0)
+        assert "匹配依据" not in text
+
+        text_with_reason = _format_job_results(
+            jobs, 0, {"1": ["   匹配依据：地点符合 苏州市"]},
+        )
+        assert "匹配依据：地点符合 苏州市" in text_with_reason
+
 
 class TestFormatResumeResults:
     def test_basic_format(self):
@@ -155,6 +169,67 @@ class TestFormatResumeResults:
         ]
         text = _format_resume_results(resumes, 0)
         assert "联系方式待补充" in text
+
+
+def test_relaxation_summary_shows_original_and_relaxed_salary_values():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="relax_salary_10pct",
+            label="放宽薪资下限",
+            original_criteria={"salary_floor_monthly": 9500},
+            relaxed_criteria={"salary_floor_monthly": 8550},
+            original_visible_count=0,
+            relaxed_visible_count=2,
+            relaxed_shown_count=2,
+        )
+    )
+
+    assert "薪资下限9500 → 8550" in text
+
+
+def test_job_drop_optional_relaxation_summary_shows_safe_field_changes():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="drop_optional_filters",
+            label="去掉部分次要条件",
+            original_criteria={
+                "job_category": ["电子厂", "普工"],
+                "salary_floor_monthly": 9500,
+                "age": 35,
+            },
+            relaxed_criteria={
+                "job_category": ["电子厂"],
+                "salary_floor_monthly": 8550,
+            },
+            original_visible_count=0,
+            relaxed_visible_count=1,
+            relaxed_shown_count=1,
+        )
+    )
+
+    assert "薪资下限9500 → 8550" in text
+    assert "工种电子厂、普工 → 电子厂" in text
+    assert "年龄35 → 不限" in text
+
+
+def test_worker_drop_optional_relaxation_summary_shows_salary_and_gender_changes():
+    text = _render_relaxation_summary_notice(
+        RelaxationSummary(
+            field="drop_optional_filters",
+            label="去掉部分次要条件",
+            original_criteria={
+                "salary_ceiling_monthly": 5000,
+                "gender": "男",
+            },
+            relaxed_criteria={"salary_ceiling_monthly": 5500},
+            original_visible_count=0,
+            relaxed_visible_count=1,
+            relaxed_shown_count=1,
+        )
+    )
+
+    assert "期望薪资上限5000 → 5500" in text
+    assert "性别男 → 不限" in text
 
 
 class TestSearchJobs:

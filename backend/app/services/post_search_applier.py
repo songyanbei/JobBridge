@@ -26,10 +26,12 @@ import logging
 from typing import TYPE_CHECKING
 
 from app.schemas.conversation import ReplyMessage
+from app.services.recommendation_experience_gate import userid_hash
 from app.services.post_search_reducer import (
     PostSearchContext,
     post_search_reduce,
 )
+from app.tasks.common import log_event
 
 if TYPE_CHECKING:
     pass
@@ -41,11 +43,11 @@ logger = logging.getLogger(__name__)
 # 文案模板（phased-plan §跨阶段共同约束 #3：clarification / 降级文案不依赖 LLM）
 # ---------------------------------------------------------------------------
 
-_PAGINATE_FALLBACK_TEMPLATE = "已经是所有匹配结果了。要不要换城市或工种重新搜索？"
+_PAGINATE_FALLBACK_TEMPLATE = "本轮结果已经看完了。可以换城市或工种重新搜索。"
 """criteria 已极简（relaxation_directions 为空）时的兜底文案
 （phased-plan 失败模式表）。"""
 
-_PAGINATE_HEADER = "已经是所有匹配结果了。可以试试以下方向重新搜索："
+_PAGINATE_HEADER = "本轮结果已经看完了。可以试试这些方向重新搜索："
 
 # Phase 5.2：ask_clarification 反问文案（reducer 已通过 clarification.question
 # 给出业务文案；这里的模板仅用于桩输入或 question 缺失时的兜底）。
@@ -129,7 +131,7 @@ def _render_paginate_no_more(ctx: PostSearchContext) -> str:
     directions = ctx.decision.suggested_directions or []
     if not directions:
         return _PAGINATE_FALLBACK_TEMPLATE
-    bullets = [f"- {d['hint_text']}" for d in directions]
+    bullets = [f"- {d['hint_text']}" for d in directions[:3]]
     return _PAGINATE_HEADER + "\n" + "\n".join(bullets)
 
 
@@ -185,6 +187,7 @@ def _handle_ask_clarification(ctx: PostSearchContext) -> list[ReplyMessage]:
         "step": step,
         "original_criteria": dict(ctx.search_outcome.criteria_used),
         "relaxed_criteria": dict(relaxed),
+        "original_visible_count": _visible_or_final_count(ctx.search_outcome),
         # P1 评审 #2：必须持久化主搜索 raw_query + msg_id。确认轮 msg.content
         # 通常是"好的/可以"，不能用作 reranker query；user_msg_id 透传给
         # 二次 _rerank_with_logging 做归因（与主搜索一致）。
@@ -232,6 +235,8 @@ def _handle_auto_relax_and_retry(
         user_ctx=ctx.user_ctx,
         db=ctx.db,
         user_msg_id=ctx.msg.msg_id,
+        experience_flags=ctx.experience_flags,
+        original_visible_count=_visible_or_final_count(ctx.search_outcome),
     )
 
     new_decision = post_search_reduce(
@@ -240,6 +245,7 @@ def _handle_auto_relax_and_retry(
         session=ctx.session,
         search_outcome=new_outcome,
         role=ctx.role,
+        experience_flags=ctx.experience_flags,
     )
     # 第二轮 reducer 必须不再输出 auto_relax_and_retry（避免无限套娃）
     # 第 8 轮 review fix 3：用 raise 而非 assert（生产 -O 模式会剥掉 assert）
@@ -261,6 +267,7 @@ def _handle_auto_relax_and_retry(
         db=ctx.db,
         raw_query=ctx.raw_query,
         role=ctx.role,
+        experience_flags=ctx.experience_flags,
         recursion_depth=ctx.recursion_depth + 1,  # 0 → 1
     )
     return apply_post_search_decision(new_ctx)
@@ -282,12 +289,29 @@ def _render_soft_pref_notice(ctx: PostSearchContext) -> str:
     base = ctx.search_result.reply_text or ""
     if not notice:
         return base
+    log_event(
+        "soft_preference_notice_shown",
+        external_userid_hash=userid_hash(ctx.user_ctx.external_userid),
+        direction=ctx.search_outcome.direction,
+        soft_pref_hits=sum((ctx.search_outcome.soft_pref_hits or {}).values()),
+        soft_pref_fields=sorted(ctx.search_outcome.soft_pref_hits or {}),
+        visible_count=_visible_or_final_count(ctx.search_outcome),
+        shown_count=getattr(ctx.search_outcome, "shown_count", None),
+        notice_gate=ctx.experience_flags.soft_preference_notice,
+    )
     return f"{notice}\n\n{base}" if base else notice
 
 
 # ---------------------------------------------------------------------------
 # helper
 # ---------------------------------------------------------------------------
+
+def _visible_or_final_count(search_outcome) -> int:
+    visible_count = getattr(search_outcome, "visible_count", None)
+    if visible_count is not None:
+        return int(visible_count)
+    return int(getattr(search_outcome, "final_count", 0) or 0)
+
 
 def _reply(userid: str, content: str) -> ReplyMessage:
     """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。"""

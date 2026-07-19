@@ -164,3 +164,47 @@ python -c "from app.wecom.client import WeComClient; print('wecom OK')"
 python -c "from app.wecom.crypto import verify_signature, decrypt_message; print('crypto OK')"
 python -c "from app.wecom.callback import parse_message, WeComMessage; print('callback OK')"
 ```
+
+## Phase 5 Full-Service Async Message Smoke
+
+This smoke test injects a mock WeCom text message into `queue:incoming`, lets the
+real worker consume it, and reads the business reply from Redis Pub/Sub channel
+`mock:outbound:<userid>`. It is intentionally not called an HTTP E2E test
+because the real webhook returns an enqueue ACK rather than the business reply.
+
+Prerequisites:
+
+- Backend app is running and `/health` is reachable.
+- Worker is running against the same Redis/MySQL.
+- `MOCK_WEWORK_OUTBOUND=true`
+- `MOCK_WEWORK_REDIS_URL=<redis-url>`
+- `APP_ENV` is not `production`.
+- Base seed and `scripts/demo_seed_supplement.sql` have been applied.
+- `--mysql-dsn` is required. The smoke fails unless it verifies the
+  `demo_supp_v1` supplement and the minimum counts for scenarios 5, 6, and 8.
+
+```bash
+python ../scripts/demo_acceptance_smoke.py \
+  --base-url http://127.0.0.1:8000 \
+  --redis-url redis://127.0.0.1:6379/0 \
+  --mysql-dsn mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge \
+  --seed-city-like "苏州" \
+  --seed-job-category-like "电子" \
+  --message "帮我找苏州电子厂岗位，5500以上，最好包吃住" \
+  --message "更多" \
+  --expect "为您找到" \
+  --reject "身份证"
+```
+
+The script uses a fresh userid and sends a warmup message first by default so
+the welcome reply does not hide the search flow. It also removes that session
+after the run, removes this run's queued payloads, and deletes the MySQL user,
+inbound events, conversation logs, and user-owned records. Pass
+`--keep-session` only when you intentionally need to inspect Redis state after
+a failure. Each message is linked to a `wecom_inbound_event` and the script
+waits for `status=done` before collecting the next message or cleaning data;
+a run with `--skip-seed-check` is never considered successful.
+
+For gate hit/miss acceptance, run once with recommendation rollout values set to
+`100`, restart app and worker, then run again with the same rollout values set
+to `0` and restart both processes.

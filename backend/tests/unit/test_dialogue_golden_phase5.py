@@ -72,7 +72,7 @@ def test_phase5_off_mode_byte_equivalent_to_pre_5_1():
                     "reply_contains": ["[mock-show-more-exhausted]"],
                     "reply_not_contains": [
                         "下调月薪下限 10%",
-                        "已经是所有匹配结果了。可以试试以下方向",
+                        "本轮结果已经看完了。可以试试这些方向",
                     ],
                 },
             },
@@ -100,7 +100,7 @@ def test_phase5_shadow_mode_does_not_affect_reply():
                     "reply_contains": ["[mock-show-more-exhausted]"],
                     "reply_not_contains": [
                         "下调月薪下限 10%",
-                        "已经是所有匹配结果了。可以试试以下方向",
+                        "本轮结果已经看完了。可以试试这些方向",
                     ],
                 },
             },

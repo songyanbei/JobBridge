@@ -47,6 +47,7 @@ from app.services.intent_service import (
     classify_dialogue,
     classify_intent,
 )
+from app.services.recommendation_experience_gate import userid_hash
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -54,9 +55,68 @@ from app.wecom.callback import WeComMessage
 logger = logging.getLogger(__name__)
 
 
+def _experience_flags_for(
+    user_ctx: UserContext,
+    *,
+    direction: str | None = None,
+    emit_log: bool = False,
+):
+    from app.services.recommendation_experience_gate import (
+        compute_recommendation_experience_flags,
+    )
+
+    return compute_recommendation_experience_flags(
+        user_ctx.external_userid,
+        direction=direction,
+        mode=_settings_module.dialogue_policy.post_search_policy_mode,
+        emit_log=emit_log,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 固定回复文案
 # ---------------------------------------------------------------------------
+
+def _outcome_count(search_outcome, field: str, default: int | None = 0) -> int | None:
+    value = getattr(search_outcome, field, default)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _log_post_search_decision(
+    *,
+    mode: str,
+    user_ctx: UserContext,
+    ps_decision,
+    search_outcome,
+) -> None:
+    log_event(
+        "post_search_decision",
+        external_userid_hash=userid_hash(user_ctx.external_userid),
+        mode=mode,
+        action=ps_decision.action,
+        decision=ps_decision.action,
+        reasoning=ps_decision.reasoning,
+        direction=search_outcome.direction,
+        snapshot_exhausted=search_outcome.snapshot_exhausted,
+        initial_count=search_outcome.initial_count,
+        initial_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.initial_count,
+        ),
+        final_count=search_outcome.final_count,
+        final_visible_count=_outcome_count(
+            search_outcome, "visible_count", search_outcome.final_count,
+        ),
+        shown_count=_outcome_count(search_outcome, "shown_count", None),
+        remaining_count_capped=_outcome_count(
+            search_outcome, "remaining_count_capped", None,
+        ),
+        desired_count=search_outcome.desired_count,
+        applied_relax_step=search_outcome.applied_relax_step,
+        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+    )
+
 
 BLOCKED_REPLY = "您的账号已被限制使用，如有疑问请联系客服。"
 DELETED_REPLY = "账号已进入删除状态，请联系客服处理。"
@@ -925,6 +985,10 @@ def _route_v2_relaxation_response(
         direction = pending.get("direction") or "search_job"
         persisted_raw_query = pending.get("raw_query") or ""
         persisted_user_msg_id = pending.get("user_msg_id")
+        original_visible_count = int(pending.get("original_visible_count") or 0)
+        experience_flags = _experience_flags_for(
+            user_ctx, direction=direction, emit_log=True,
+        )
 
         new_result, new_outcome = _search_service.execute_relaxed_search(
             original_criteria,
@@ -935,6 +999,8 @@ def _route_v2_relaxation_response(
             user_ctx=user_ctx,
             db=db,
             user_msg_id=persisted_user_msg_id,
+            experience_flags=experience_flags,
+            original_visible_count=original_visible_count,
         )
 
         # 二阶段 reducer
@@ -957,6 +1023,7 @@ def _route_v2_relaxation_response(
             session=session,
             search_outcome=new_outcome,
             role=user_ctx.role,
+            experience_flags=experience_flags,
         )
         # 第二轮 reducer 必须不再输出 auto_relax_and_retry
         # 第 8 轮 review fix 3：用 raise 而非 assert（-O 模式会剥）
@@ -978,6 +1045,7 @@ def _route_v2_relaxation_response(
             db=db,
             raw_query=persisted_raw_query,
             role=user_ctx.role,
+            experience_flags=experience_flags,
             recursion_depth=1,
         )
         replies = apply_post_search_decision(ctx)
@@ -1355,7 +1423,17 @@ def _handle_show_more(
     db: Session,
 ) -> list[ReplyMessage]:
     # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
-    result, outcome = search_service.show_more(session, user_ctx, db)
+    direction = (
+        "search_job"
+        if (user_ctx.role == "worker" or session.broker_direction == "search_job")
+        else "search_worker"
+    )
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=direction, emit_log=True,
+    )
+    result, outcome = search_service.show_more(
+        session, user_ctx, db, experience_flags=experience_flags,
+    )
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
@@ -1461,29 +1539,27 @@ def _post_search_dispatch(
             route_intent=legacy_intent,
         )
 
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=search_outcome.direction, emit_log=False,
+    )
     ps_decision = post_search_reduce(
         parse_result=parse_stub,
         decision=decision_stub,
         session=session,
         search_outcome=search_outcome,
         role=user_ctx.role,
+        experience_flags=experience_flags,
     )
 
     if mode == "shadow":
         # 5.1 验收 #2：shadow 只写日志，不影响 reply。
         # Phase 5 §5.4：补 soft_pref_hits / applied_relax_step / final_count
         # 监控面板字段。
-        log_event(
-            "post_search_decision",
+        _log_post_search_decision(
             mode="shadow",
-            action=ps_decision.action,
-            reasoning=ps_decision.reasoning,
-            direction=search_outcome.direction,
-            snapshot_exhausted=search_outcome.snapshot_exhausted,
-            initial_count=search_outcome.initial_count,
-            final_count=search_outcome.final_count,
-            applied_relax_step=search_outcome.applied_relax_step,
-            soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+            user_ctx=user_ctx,
+            ps_decision=ps_decision,
+            search_outcome=search_outcome,
         )
         return [_reply(
             msg.from_user,
@@ -1494,17 +1570,11 @@ def _post_search_dispatch(
 
     # mode == "on"
     # Phase 5 §5.4：on 模式监控字段同步扩展
-    log_event(
-        "post_search_decision",
+    _log_post_search_decision(
         mode="on",
-        action=ps_decision.action,
-        reasoning=ps_decision.reasoning,
-        direction=search_outcome.direction,
-        snapshot_exhausted=search_outcome.snapshot_exhausted,
-        initial_count=search_outcome.initial_count,
-        final_count=search_outcome.final_count,
-        applied_relax_step=search_outcome.applied_relax_step,
-        soft_pref_hits=dict(search_outcome.soft_pref_hits or {}),
+        user_ctx=user_ctx,
+        ps_decision=ps_decision,
+        search_outcome=search_outcome,
     )
     ctx = PostSearchContext(
         decision=ps_decision,
@@ -1518,6 +1588,7 @@ def _post_search_dispatch(
         db=db,
         raw_query=msg.content or "",
         role=user_ctx.role,
+        experience_flags=experience_flags,
         recursion_depth=0,
     )
     replies = apply_post_search_decision(ctx)
@@ -1971,15 +2042,22 @@ def _run_search(
     Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
+    experience_flags = _experience_flags_for(
+        user_ctx, direction=direction, emit_log=True,
+    )
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
     # Phase 5 §5.0：search_jobs/search_workers 现返回 tuple[SearchResult, SearchOutcome]
     if direction == "search_job":
         result, outcome = search_service.search_jobs(
-            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+            composed, raw_query, session, user_ctx, db,
+            user_msg_id=user_msg_id,
+            experience_flags=experience_flags,
         )
     else:
         result, outcome = search_service.search_workers(
-            composed, raw_query, session, user_ctx, db, user_msg_id=user_msg_id,
+            composed, raw_query, session, user_ctx, db,
+            user_msg_id=user_msg_id,
+            experience_flags=experience_flags,
         )
 
     # Phase 5 §5.2：available_relax_steps 现已由 search_jobs/search_workers 在
