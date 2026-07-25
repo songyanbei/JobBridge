@@ -34,6 +34,11 @@ class SessionState(BaseModel):
     shown_items: list[str] = Field(default_factory=list, description="已展示的 ID 集合")
     history: list[dict] = Field(default_factory=list, description='最近 6 轮 [{"role":"user","content":"..."}]')
     updated_at: str = Field(default="", description="ISO 8601")
+    session_version: int = Field(
+        default=0,
+        ge=0,
+        description="Redis session 乐观并发版本；每次成功保存递增",
+    )
     broker_direction: str | None = Field(default=None, description="中介搜索方向 search_job / search_worker")
     follow_up_rounds: int = Field(default=0, description="上传追问轮数计数，最多 2 轮")
 
@@ -110,6 +115,10 @@ class SessionState(BaseModel):
     pending_relaxation: dict | None = Field(
         default=None,
         description="Phase 5 §5.2：跨 turn 放宽确认上下文（与 pending_interruption 独立）",
+    )
+    pending_action: dict | None = Field(
+        default=None,
+        description="受限两动作计划的第二动作：{raw_text, created_at, expires_at}",
     )
 
 

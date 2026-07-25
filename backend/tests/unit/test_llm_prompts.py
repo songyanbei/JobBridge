@@ -67,6 +67,17 @@ class TestIntentPrompt:
             assert intent in prompt, f"Intent value '{intent}' not listed in prompt"
 
 
+class TestDialoguePrompt:
+    def test_role_ambiguity_guards_and_version(self):
+        prompt = prompts.DIALOGUE_PARSE_PROMPT_V2
+        assert "找一个普工" in prompt
+        assert "我要招聘网管" in prompt
+        assert "宁波找技工工作" in prompt
+        assert "给这位师傅找个杭州焊工岗位" in prompt
+        assert "找两个能上夜班的操作工" in prompt
+        assert prompts.DIALOGUE_PROMPT_VERSION == "v0.6"
+
+
 class TestRerankPrompt:
     """Rerank prompt 常量测试。"""
 

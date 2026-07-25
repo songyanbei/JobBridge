@@ -130,6 +130,24 @@ def apply_decision(
     if transition == "enter_search_active":
         # 写入 final_search_criteria 到 session，进入 search_active；
         # 不清 awaiting（awaiting_ops 已经处理）。
+        target_direction = (
+            decision.route_intent
+            if decision.route_intent in {"search_job", "search_worker"}
+            else None
+        )
+        if (
+            session.role == "broker"
+            and target_direction
+            and session.broker_direction
+            and target_direction != session.broker_direction
+        ):
+            # 两个方向的结果快照、翻页游标和放宽确认同样不能复用。
+            session.candidate_snapshot = None
+            session.shown_items = []
+            session.last_criteria = {}
+            session.pending_relaxation = None
+            conversation_service.clear_search_awaiting(session)
+            session.broker_direction = target_direction
         session.search_criteria = dict(decision.final_search_criteria or {})
         # 进入 search_active 让 message_router 后续 _route_search_active 走
         if session.search_criteria:

@@ -136,7 +136,10 @@ IMAGE_DOWNLOAD_FAILED = "图片处理失败，请稍后重试。"
 # Stage A：上传草稿相关固定文案（详见 docs/multi-turn-upload-stage-a-implementation.md §3.4）
 PENDING_CANCELLED_REPLY = "已取消，岗位草稿已丢弃。"
 PENDING_EXPIRED_REPLY = "上次岗位草稿已超时，请整段重新发送岗位信息。"
-PENDING_MAX_ROUNDS_REPLY = "信息仍不完整，请整段重新发送岗位信息。"
+PENDING_MAX_ROUNDS_REPLY = (
+    "信息还没识别完整，草稿已为您保留。"
+    "请直接发送缺少字段的值，或回复“取消草稿”放弃。"
+)
 PENDING_NO_FIELD_REPLY_FMT = "请告诉我具体的{field_name}。"
 
 # Stage C1：upload_conflict 相关文案（spec §2.7 / §9.6）。
@@ -151,7 +154,10 @@ CONFLICT_REPROMPT_FMT = (
     "  · 回复“先{new_kind}”丢弃草稿并执行新请求\n"
     "  · 回复“取消草稿”放弃"
 )
-CONFLICT_DEAD_LOOP_REPLY = "未识别您的选择，已为您丢弃草稿。如需继续操作请整段重新发送。"
+CONFLICT_DEAD_LOOP_REPLY = (
+    "未识别您的选择，已保留原草稿并继续发布。"
+    "请补充尚缺字段，或回复“取消草稿”放弃。"
+)
 CONFLICT_RESUME_FMT = "好的，继续。请告诉我具体的{field_name}。"
 CONFLICT_PROCEED_ACK = "草稿已丢弃，正在为您处理新请求。"
 
@@ -179,12 +185,43 @@ _V2_CLAR_ROLE_NO_PERMISSION = (
 _V2_CLAR_LLM_REQUESTED = (
     "您的描述我没完全理解，方便再说得具体一些吗？比如城市、岗位类型、薪资期望等。"
 )
+
+# 放宽确认是系统刚刚给出的二选一，允许用精确闭集在 LLM 不可用或 v2 关闭时
+# 完成状态机。这里只做整句匹配，禁止 substring 命中，避免把“不要取消搜索”
+# 之类的否定复句误判为拒绝。
+_RELAXATION_ACCEPT_EXACT = frozenset({
+    "好", "好的", "可以", "行", "同意", "确认", "放宽", "是",
+})
+_RELAXATION_REJECT_EXACT = frozenset({
+    "不", "不要", "不用", "不可以", "算了", "取消", "保持原条件", "否",
+})
 # codex review 修订（PR4 P1-3）：脏 slots_delta 全被 schema drop 掉但本轮需要业务动作时,
 # 不再静默继续旧搜索条件，反问让用户重新表达。
 _V2_CLAR_DROPPED_SLOTS_NO_VALID = (
     "您说的字段我没识别出来，方便用更标准的方式再描述一次吗？比如城市、工种、薪资。"
 )
 _V2_CLAR_DEFAULT = "请再说得具体一些，方便我帮您处理。"
+COMPLEX_ACTION_CLARIFICATION_REPLY = (
+    "我识别到您这句话里有多个先后操作。为避免执行错，请一次说一个："
+    "先告诉我现在要做的第一件事；完成后再发下一件。当前会话内容已保留。"
+)
+PENDING_ACTION_SAVED_REPLY = (
+    "我先处理第一件事，并已记住下一步：{action}\n"
+    "完成当前操作后，可回复 /下一步 查看，或直接发送这句话执行；"
+    "回复 /取消下一步 可删除。"
+)
+PENDING_ACTION_VIEW_REPLY = "已保存的下一步是：{action}\n直接发送这句话即可执行。"
+PENDING_ACTION_NONE_REPLY = "当前没有已保存的下一步。"
+PENDING_ACTION_CANCELLED_REPLY = "已取消保存的下一步。"
+PENDING_ACTION_WAIT_REPLY = "请先完成或取消当前发布流程，再执行已保存的下一步。"
+PENDING_ACTION_EXISTS_REPLY = (
+    "当前已经保存了一项下一步，请先执行或回复 /取消下一步，再安排新的组合操作。"
+)
+_PENDING_ACTION_TTL_SECONDS = 30 * 60
+_ACTION_PLAN_SPLIT_RE = re.compile(
+    r"\s*(?:，|,|；|;)?\s*(?:完成后再|不行再|同时还|另外再|然后|接着|顺便|"
+    r"再(?=(?:帮|给|找|看|发布|提交|登记|换)))\s*"
+)
 
 
 # Phase 5 §5.2：turn-scoped 上下文 holder。_handle_text 在 v2_dual_read / primary
@@ -331,13 +368,19 @@ def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
         if mtype == "voice":
             return [_reply(userid, VOICE_NOT_SUPPORTED)]
         if mtype == "event":
-            logger.info("message_router: wecom event received userid=%s content=%s",
-                        userid, msg.content)
+            logger.info(
+                "message_router: wecom event received user_hash=%s",
+                userid_hash(userid),
+            )
             return []
         if mtype in ("file", "video", "link", "location"):
             return [_reply(userid, FILE_NOT_SUPPORTED)]
         # 未知类型兜底
-        logger.warning("message_router: unknown msg_type=%s from userid=%s", mtype, userid)
+        logger.warning(
+            "message_router: unknown msg_type=%s user_hash=%s",
+            mtype,
+            userid_hash(userid),
+        )
         return [_reply(userid, UNKNOWN_TYPE_REPLY)]
     finally:
         _clear_v2_turn_context()
@@ -374,8 +417,138 @@ def _handle_text(
         conversation_service.save_session(userid, session)
         return [_reply(userid, welcome)]
 
+    # 受限两动作计划：第二动作只保存原文，不提前分类或执行。旧 session 没有该字段
+    # 时 Pydantic 默认 None；到期自动清理，不让陈旧动作跨会话误触发。
+    if _is_pending_action_expired(session.pending_action):
+        session.pending_action = None
+    if content == "/取消下一步":
+        had_pending = bool(session.pending_action)
+        session.pending_action = None
+        reply_text = (
+            PENDING_ACTION_CANCELLED_REPLY if had_pending else PENDING_ACTION_NONE_REPLY
+        )
+        conversation_service.record_history(session, "user", content)
+        conversation_service.record_history(session, "assistant", reply_text)
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, reply_text)]
+    if content == "/下一步":
+        action = (session.pending_action or {}).get("raw_text")
+        reply_text = (
+            PENDING_ACTION_VIEW_REPLY.format(action=action)
+            if action else PENDING_ACTION_NONE_REPLY
+        )
+        conversation_service.record_history(session, "user", content)
+        conversation_service.record_history(session, "assistant", reply_text)
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, reply_text)]
+
+    consume_pending_action = False
+    pending_raw = str((session.pending_action or {}).get("raw_text") or "").strip()
+    if pending_raw and content == pending_raw:
+        if session.active_flow in {"upload_collecting", "upload_conflict"}:
+            conversation_service.record_history(session, "user", content)
+            conversation_service.record_history(
+                session, "assistant", PENDING_ACTION_WAIT_REPLY,
+            )
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, PENDING_ACTION_WAIT_REPLY)]
+        # 第二动作是独立动作，不继承第一项搜索的条件、分页或放宽确认。
+        session.search_criteria = {}
+        session.last_criteria = {}
+        session.candidate_snapshot = None
+        session.shown_items = []
+        session.pending_relaxation = None
+        conversation_service.clear_search_awaiting(session)
+        session.active_flow = "idle"
+        consume_pending_action = True
+
+    deferred_action_notice: str | None = None
+
+    def _finalize_action_plan_replies(
+        replies: list[ReplyMessage],
+    ) -> list[ReplyMessage]:
+        """Apply pending-action bookkeeping on both normal and short-return paths."""
+        nonlocal consume_pending_action
+        if replies and deferred_action_notice:
+            replies[0].content = (
+                f"{replies[0].content}\n\n{deferred_action_notice}"
+            )
+        if consume_pending_action:
+            session.pending_action = None
+            consume_pending_action = False
+        return replies
+
+    action_plan = _extract_bounded_action_plan(content)
+    if action_plan is not None:
+        if session.pending_action and not consume_pending_action:
+            conversation_service.record_history(session, "user", content)
+            conversation_service.record_history(
+                session, "assistant", PENDING_ACTION_EXISTS_REPLY,
+            )
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, PENDING_ACTION_EXISTS_REPLY)]
+        first_action, second_action = action_plan
+        now = datetime.now(timezone.utc)
+        session.pending_action = {
+            "raw_text": second_action,
+            "created_at": now.isoformat(),
+            "expires_at": datetime.fromtimestamp(
+                now.timestamp() + _PENDING_ACTION_TTL_SECONDS,
+                tz=timezone.utc,
+            ).isoformat(),
+        }
+        content = first_action
+        msg = dataclasses.replace(msg, content=first_action)
+        deferred_action_notice = PENDING_ACTION_SAVED_REPLY.format(
+            action=second_action,
+        )
+
     # 先把当前用户消息写入 history，再让 LLM 看到完整上下文
     conversation_service.record_history(session, "user", content)
+
+    # 生产降级保护：pending_relaxation 是系统主动给出的二选一上下文。
+    # 即使 dialogue_v2_mode=off、provider 超时或 v2 fallback，精确短回答也应完成
+    # 确认闭环，而不是落成 chitchat 并让 pending 状态悬挂。
+    relaxation_transition = _match_pending_relaxation_response(content, session)
+    if relaxation_transition is not None:
+        from app.services.dialogue_reducer import DialogueDecision
+
+        pending = dict(session.pending_relaxation or {})
+        frame = pending.get("frame")
+        if frame not in {"job_search", "candidate_search"}:
+            frame = (
+                "job_search"
+                if pending.get("direction") == "search_job"
+                else "candidate_search"
+            )
+        decision = DialogueDecision(
+            dialogue_act="respond_relaxation_offer",
+            resolved_frame=frame,
+            route_intent="follow_up",
+            state_transition=relaxation_transition,
+        )
+        replies = _route_v2_relaxation_response(
+            decision, msg, user_ctx, session, db,
+        )
+        replies = _finalize_action_plan_replies(replies)
+        if replies:
+            conversation_service.record_history(
+                session, "assistant", replies[0].content,
+            )
+        conversation_service.save_session(userid, session)
+        return replies
+
+    # 当前 DTO/状态机只承诺单个主动作。空闲/搜索态遇到显式顺序或“顺便”组合时，
+    # 不让 LLM 猜执行顺序；上传态仍交给既有 upload_conflict 闭环处理。
+    if (
+        session.active_flow not in {"upload_collecting", "upload_conflict"}
+        and _requires_action_plan_clarification(content)
+    ):
+        conversation_service.record_history(
+            session, "assistant", COMPLEX_ACTION_CLARIFICATION_REPLY,
+        )
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, COMPLEX_ACTION_CLARIFICATION_REPLY)]
 
     # 阶段二（dialogue-intent-extraction-phased-plan §2.3）：
     # mode=off 时直接走 legacy classify_intent 路径，保持已有调用点 / 测试兼容；
@@ -398,8 +571,11 @@ def _handle_text(
             )
         except Exception as exc:
             logger.exception("message_router: classify_intent failed: %s", exc)
+            replies = _finalize_action_plan_replies(
+                [_reply(userid, SYSTEM_BUSY_REPLY)],
+            )
             conversation_service.save_session(userid, session)
-            return [_reply(userid, SYSTEM_BUSY_REPLY)]
+            return replies
     else:
         try:
             route = classify_dialogue(
@@ -412,8 +588,11 @@ def _handle_text(
             )
         except Exception as exc:
             logger.exception("message_router: classify_dialogue failed: %s", exc)
+            replies = _finalize_action_plan_replies(
+                [_reply(userid, SYSTEM_BUSY_REPLY)],
+            )
             conversation_service.save_session(userid, session)
-            return [_reply(userid, SYSTEM_BUSY_REPLY)]
+            return replies
         intent_result = route.intent_result
         decision = route.decision
         source = route.source
@@ -438,13 +617,19 @@ def _handle_text(
             if decision.clarification:
                 # 直接渲染反问，不走 _route_*
                 reply_text = _render_v2_clarification(decision.clarification, session)
-                conversation_service.record_history(session, "assistant", reply_text)
+                replies = _finalize_action_plan_replies(
+                    [_reply(userid, reply_text)],
+                )
+                conversation_service.record_history(
+                    session, "assistant", replies[0].content,
+                )
                 conversation_service.save_session(userid, session)
-                return [_reply(userid, reply_text)]
+                return replies
             # enter_upload_conflict：直接调现成的 _enter_upload_conflict
             # 既写状态又生成 CONFLICT_PROMPT_FMT，避免在 applier 里复制冲突文案逻辑。
             if decision.state_transition == "enter_upload_conflict":
                 replies = _enter_upload_conflict(intent_result, msg, session)
+                replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
                         session, "assistant", replies[0].content,
@@ -468,6 +653,7 @@ def _handle_text(
                 replies = _route_v2_resolve_conflict(
                     decision, msg, user_ctx, session, db,
                 )
+                replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
                         session, "assistant", replies[0].content,
@@ -486,6 +672,7 @@ def _handle_text(
                 replies = _route_v2_relaxation_response(
                     decision, msg, user_ctx, session, db,
                 )
+                replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
                         session, "assistant", replies[0].content,
@@ -510,6 +697,7 @@ def _handle_text(
                 }
                 apply_decision(decision, session, msg=msg, intent_result=intent_result)
                 replies = _route_v2_cancel_reset(decision, pre_state, msg, session)
+                replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
                         session, "assistant", replies[0].content,
@@ -519,6 +707,50 @@ def _handle_text(
             # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
             # 重复调用也是幂等的：consume_search_awaiting 对已消费字段是 no-op）。
             apply_decision(decision, session, msg=msg, intent_result=intent_result)
+
+    if user_ctx.role == "broker":
+        from app.services.dialogue_reducer import broker_explicit_direction
+
+        anchored_direction = broker_explicit_direction(content)
+        if (
+            anchored_direction is not None
+            and intent_result.intent in {
+                "search_job", "search_worker", "follow_up", "chitchat",
+            }
+        ):
+            if (
+                session.broker_direction in {"search_job", "search_worker"}
+                and session.broker_direction != anchored_direction
+            ):
+                # A legacy/fallback provider can call an explicit object switch a
+                # follow-up. Reset all direction-scoped state before dispatch so
+                # candidate criteria/snapshots never leak into job search or vice
+                # versa.
+                session.search_criteria = {}
+                session.last_criteria = {}
+                session.candidate_snapshot = None
+                session.shown_items = []
+                session.pending_relaxation = None
+                conversation_service.clear_search_awaiting(session)
+                session.active_flow = "idle"
+            anchored_data = dict(intent_result.structured_data or {})
+            anchored_data.update(
+                intent_service.extract_explicit_search_anchors(content),
+            )
+            if anchored_direction == "search_job":
+                ceiling = anchored_data.pop("salary_ceiling_monthly", None)
+                if ceiling is not None:
+                    anchored_data.setdefault("salary_floor_monthly", ceiling)
+            else:
+                floor = anchored_data.pop("salary_floor_monthly", None)
+                if floor is not None:
+                    anchored_data.setdefault("salary_ceiling_monthly", floor)
+            session.broker_direction = anchored_direction
+            intent_result = intent_result.model_copy(update={
+                "intent": anchored_direction,
+                "structured_data": anchored_data,
+                "missing_fields": [],
+            })
 
     intent = intent_result.intent
 
@@ -554,6 +786,7 @@ def _handle_text(
         replies = _route_idle(intent_result, msg, user_ctx, session, db)
 
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
+    replies = _finalize_action_plan_replies(replies)
     if replies:
         conversation_service.record_history(session, "assistant", replies[0].content)
 
@@ -588,7 +821,11 @@ def _dispatch_intent(
         if intent == "chitchat":
             return [_reply(userid, _chitchat_text(user_ctx))]
         # 未知意图兜底
-        logger.warning("message_router: unknown intent=%s userid=%s", intent, userid)
+        logger.warning(
+            "message_router: unknown intent=%s user_hash=%s",
+            intent,
+            userid_hash(userid),
+        )
         return [_reply(userid, FALLBACK_REPLY)]
     except Exception as exc:
         logger.exception("message_router: dispatch intent=%s failed: %s", intent, exc)
@@ -735,7 +972,7 @@ def _route_upload_conflict(
       - 取消草稿 → 清 pending，回 idle
       - 继续发布 → 回 upload_collecting
       - 先找/找工人/找岗位 或 LLM intent ∈ search_* → 执行 pending_interruption
-      - 其他 → 重复确认；累计 1 次仍未识别则丢弃草稿，避免死循环
+      - 其他 → 重复确认；连续 2 次仍未识别则放弃新意图并恢复原草稿
     """
     content = (msg.content or "").strip()
     userid = msg.from_user
@@ -793,10 +1030,13 @@ def _route_upload_conflict(
         forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
         return [_reply(userid, CONFLICT_PROCEED_ACK)] + forwarded
 
-    # 死循环防护
+    # 死循环防护：用户没有明确选择时绝不丢弃草稿。连续两次未识别后，
+    # 放弃本次 interruption，回到原上传流程；草稿仍由显式取消或 TTL 清理。
     session.conflict_followup_rounds += 1
     if session.conflict_followup_rounds >= 2:
-        upload_service.clear_pending_upload(session)
+        session.pending_interruption = None
+        session.conflict_followup_rounds = 0
+        session.active_flow = "upload_collecting"
         return [_reply(userid, CONFLICT_DEAD_LOOP_REPLY)]
 
     awaiting = session.awaiting_field
@@ -1067,6 +1307,67 @@ def _route_v2_relaxation_response(
     return [_reply(userid, "好的。")]
 
 
+def _match_pending_relaxation_response(
+    content: str,
+    session: SessionState,
+) -> str | None:
+    """精确识别系统二选一后的短回答；无 pending 时绝不生效。"""
+    if not session.pending_relaxation:
+        return None
+    normalized = (content or "").strip().rstrip("。！!，,").strip().lower()
+    if normalized in _RELAXATION_ACCEPT_EXACT:
+        return "apply_relaxation"
+    if normalized in _RELAXATION_REJECT_EXACT:
+        return "cancel_relaxation"
+    return None
+
+
+def _extract_bounded_action_plan(content: str) -> tuple[str, str] | None:
+    """Extract exactly two explicit sequential actions; never infer omitted actions."""
+    text = (content or "").strip()
+    if not text:
+        return None
+    parts = [part.strip(" ，,；;") for part in _ACTION_PLAN_SPLIT_RE.split(text)]
+    parts = [part for part in parts if part]
+    if len(parts) != 2:
+        return None
+    first, second = parts
+    if first.startswith("先"):
+        first = first[1:].strip()
+    if len(first) < 2 or len(second) < 2:
+        return None
+    return first, second
+
+
+def _requires_action_plan_clarification(content: str) -> bool:
+    """Reject three-plus or ambiguous action plans that cannot be safely bounded."""
+    text = (content or "").strip()
+    if not text or _extract_bounded_action_plan(text) is not None:
+        return False
+    parts = [part for part in _ACTION_PLAN_SPLIT_RE.split(text) if part.strip()]
+    if len(parts) >= 3:
+        return True
+    return bool(
+        any(marker in text for marker in ("顺便", "同时还", "另外再", "完成后再"))
+        or re.search(r"先.+?(?:然后|接着|不行再|再).+", text)
+    )
+
+
+def _is_pending_action_expired(pending: dict | None) -> bool:
+    if not pending:
+        return False
+    raw = pending.get("expires_at")
+    if not raw:
+        return True
+    try:
+        expires = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) >= expires.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return True
+
+
 def _route_v2_cancel_reset(
     decision,
     pre_state: dict,
@@ -1257,12 +1558,21 @@ def _handle_upload_and_search(
         # 搜索 handler 抛错；保持入库成功语义，active_flow 已在 _run_search 回到 idle
         return replies
     # Phase 5 §5.2：_run_search 现返回 (SearchResult, SearchOutcome)
-    search_result, _so = run_search_outcome
+    search_result, outcome = run_search_outcome
 
     # spec §9.2.1：0 命中也要追加“暂未找到”，并保持 active_flow=idle；
     # 有结果时 _run_search 已将 active_flow 推进到 search_active。
-    if search_result.reply_text:
-        replies.append(_reply(msg.from_user, search_result.reply_text))
+    search_replies = _post_search_dispatch(
+        msg=msg,
+        user_ctx=user_ctx,
+        session=session,
+        db=db,
+        search_result=search_result,
+        search_outcome=outcome,
+        legacy_intent="upload_and_search",
+        turn_asserted_slots={},
+    )
+    replies.extend(search_replies)
     log_event(
         "upload_completed_with_search",
         userid=msg.from_user,
@@ -1279,9 +1589,25 @@ def _handle_search(
     session: SessionState,
     db: Session,
 ) -> list[ReplyMessage]:
+    # Routing, session direction and persisted reply intent must share the same
+    # authoritative value. A legacy/fallback provider can label a worker turn as
+    # search_worker even though the role constraint correctly executes job search.
+    effective_intent = _resolve_search_direction(
+        intent_result.intent, user_ctx, session,
+    )
+    if effective_intent != intent_result.intent:
+        intent_result = intent_result.model_copy(
+            update={"intent": effective_intent, "missing_fields": []},
+        )
     # 首次搜索：把 LLM 抽到的 structured_data 累积到 session.search_criteria
     # 即使本轮因为缺字段追问返回，也要保留部分条件，下一轮 follow_up 才有据可依
     new_criteria = dict(intent_result.structured_data or {})
+    # Explicit dictionary-backed anchors are more reliable than a stochastic
+    # provider label. They only override city/trade values literally present in
+    # this search utterance; all other semantic extraction remains model-driven.
+    new_criteria.update(
+        intent_service.extract_explicit_search_anchors(msg.content or ""),
+    )
     if new_criteria:
         session.search_criteria = {**session.search_criteria, **new_criteria}
 
@@ -1294,7 +1620,7 @@ def _handle_search(
     # 完全靠简历兜底默认条件的场景，仍按 LLM 走（让 _run_search → _apply_default_criteria
     # 注入 worker 简历的 expected_cities / expected_job_categories）。否则会被 legacy
     # 强制要求 city + job_category 而错失资源。
-    frame = _search_frame_for_intent(intent_result.intent)
+    frame = _search_frame_for_intent(effective_intent)
     if frame:
         llm_missing = list(intent_result.missing_fields or [])
         relies_on_defaults = (not new_criteria) and (not llm_missing)
@@ -1317,7 +1643,7 @@ def _handle_search(
         return [_reply(
             msg.from_user,
             _missing_follow_up_text(missing),
-            intent=intent_result.intent,
+            intent=effective_intent,
             criteria_snapshot=_snapshot_meta(session),
         )]
 
@@ -1329,7 +1655,7 @@ def _handle_search(
     # _apply_default_criteria，简历 expected_* 默认条件无机会兜底。
     criteria = dict(session.search_criteria)
     run_search_outcome = _run_search(
-        intent_result.intent, criteria, msg.content or "", user_ctx, session, db,
+        effective_intent, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
     )
     if run_search_outcome is None:
@@ -1344,7 +1670,8 @@ def _handle_search(
         db=db,
         search_result=search_result,
         search_outcome=outcome,
-        legacy_intent=intent_result.intent,
+        legacy_intent=effective_intent,
+        turn_asserted_slots=new_criteria,
     )
 
 
@@ -1359,6 +1686,7 @@ def _handle_follow_up(
     # 当 LLM 没抽出任何字段、且当前文本是裸值（如 "2500"）时，把裸值落到 awaiting
     # 队列里第一个语义匹配的字段。LLM 已抽出有效字段时不进这条路径。
     raw_text = (msg.content or "").strip()
+    criteria_before_turn = dict(session.search_criteria or {})
     awaiting_consumed = _maybe_consume_search_awaiting_with_bare_value(
         intent_result, raw_text, session,
     )
@@ -1388,6 +1716,15 @@ def _handle_follow_up(
     if accepted_keys:
         conversation_service.consume_search_awaiting(session, accepted_keys)
 
+    # legacy follow_up 的 structured_data 是“应用本轮后的完整快照”，不能把所有
+    # 历史字段都当成本轮刚声明。按 before/after diff 生成 provider-independent delta，
+    # 让 post-search 在 legacy/v2/fallback 三条路径上都能保护本轮新条件。
+    turn_asserted_slots = {
+        key: value
+        for key, value in (session.search_criteria or {}).items()
+        if criteria_before_turn.get(key) != value
+    }
+
     # Stage B P1-1：同 _handle_search，不在默认合并前因 search_criteria 为空短路。
     # _run_search 会跑 _apply_default_criteria（含 worker 简历兜底），再交给
     # search_service.has_effective_search_criteria 决定是否真正查询。
@@ -1413,6 +1750,7 @@ def _handle_follow_up(
         search_result=search_result,
         search_outcome=outcome,
         legacy_intent="follow_up",
+        turn_asserted_slots=turn_asserted_slots,
     )
 
 
@@ -1467,6 +1805,7 @@ def _post_search_dispatch(
     search_result,  # SearchResult
     search_outcome,  # SearchOutcome
     legacy_intent: str,
+    turn_asserted_slots: dict | None = None,
 ) -> list[ReplyMessage]:
     """Phase 5 §5.1：post_search_policy_mode 三模式分流入口。
 
@@ -1537,6 +1876,7 @@ def _post_search_dispatch(
             dialogue_act="chitchat",
             resolved_frame="none",
             route_intent=legacy_intent,
+            accepted_slots_delta=dict(turn_asserted_slots or {}),
         )
 
     experience_flags = _experience_flags_for(
@@ -1854,10 +2194,12 @@ def _handle_field_patch(
         session.failed_patch_rounds = 0
         return _commit_pending_or_followup(msg, user_ctx, session, db)
 
-    # 真正的“答非所问”：累计 failed_patch_rounds，>=2 退出
+    # 真正的“答非所问”：累计 failed_patch_rounds。连续两次未识别时进入恢复提示，
+    # 但保留草稿；只有显式取消、TTL 过期或成功入库才能清除用户已填写内容。
     session.failed_patch_rounds += 1
     if session.failed_patch_rounds >= 2:
-        upload_service.clear_pending_upload(session)
+        session.failed_patch_rounds = 0
+        session.active_flow = "upload_collecting"
         return [_reply(userid, PENDING_MAX_ROUNDS_REPLY)]
 
     # 同时维护旧的 follow_up_rounds 作为兼容计数器（spec §2.6 “保留”）
@@ -2183,8 +2525,8 @@ def _load_worker_resume_defaults(external_userid: str, db: Session) -> dict:
         ).order_by(Resume.created_at.desc()).first()
     except Exception:
         logger.exception(
-            "message_router: load worker resume defaults failed userid=%s",
-            external_userid,
+            "message_router: load worker resume defaults failed user_hash=%s",
+            userid_hash(external_userid),
         )
         return {}
     if resume is None:

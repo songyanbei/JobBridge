@@ -396,6 +396,86 @@ class TestSearchDirectionResolution:
         mock_search_workers.assert_called_once()
         assert session.broker_direction == "search_worker"
 
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_jobs")
+    def test_worker_provider_direction_drift_uses_and_logs_job_direction(
+        self, mock_search_jobs, mock_classify, _mock_save, mock_load,
+        mock_id, mock_check, _mock_active,
+    ):
+        mock_id.return_value = _ctx(role="worker")
+        mock_check.return_value = None
+        session = SessionState(role="worker")
+        mock_load.return_value = session
+        mock_classify.return_value = IntentResult(
+            intent="search_worker",
+            structured_data={"city": ["杭州市"], "job_category": ["焊工"]},
+            missing_fields=[],
+            confidence=0.9,
+        )
+        sr = MagicMock(reply_text="岗位结果")
+        from app.schemas.search import SearchOutcome
+        mock_search_jobs.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=1,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
+
+        replies = process(_msg(content="找杭州焊工岗位"), MagicMock())
+
+        mock_search_jobs.assert_called_once()
+        assert replies[0].intent == "search_job"
+
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_jobs")
+    def test_broker_explicit_object_switch_overrides_legacy_follow_up(
+        self, mock_search_jobs, mock_classify, _mock_save, mock_load,
+        mock_id, mock_check, _mock_active,
+    ):
+        mock_id.return_value = _ctx(role="broker")
+        mock_check.return_value = None
+        session = SessionState(
+            role="broker",
+            active_flow="search_active",
+            broker_direction="search_worker",
+            search_criteria={"city": ["苏州市"], "job_category": ["普工"]},
+            candidate_snapshot={
+                "direction": "search_worker",
+                "ids": [1],
+                "query_digest": "old",
+            },
+        )
+        mock_load.return_value = session
+        mock_classify.return_value = IntentResult(
+            intent="follow_up",
+            structured_data={},
+            confidence=0.9,
+        )
+        sr = MagicMock(reply_text="岗位结果")
+        from app.schemas.search import SearchOutcome
+        mock_search_jobs.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=1,
+            final_count=1, desired_count=3, low_recall_threshold=3,
+        ))
+
+        replies = process(
+            _msg(content="给这位师傅找个杭州焊工岗位"), MagicMock(),
+        )
+
+        mock_search_jobs.assert_called_once()
+        assert replies[0].intent == "search_job"
+        assert session.broker_direction == "search_job"
+        assert session.search_criteria["city"] == ["杭州市"]
+        assert session.candidate_snapshot is None
+
 
 class TestBuildWelcome:
     def test_worker_welcome(self):

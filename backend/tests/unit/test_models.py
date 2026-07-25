@@ -4,7 +4,7 @@
 - 所有模型可导入
 - __tablename__ 正确
 - 关键字段存在
-- 元数据中包含全部 11 张表
+- 元数据中包含全部 12 张表
 - 列类型与 DDL 严格一致（UNSIGNED / TINYINT / MEDIUMTEXT 等）
 """
 import sqlalchemy as sa
@@ -23,6 +23,7 @@ from app.models import (
     SystemConfig,
     AdminUser,
     WecomInboundEvent,
+    WecomOutboundOutbox,
 )
 
 EXPECTED_TABLES = {
@@ -37,12 +38,13 @@ EXPECTED_TABLES = {
     "system_config",
     "admin_user",
     "wecom_inbound_event",
+    "wecom_outbound_outbox",
 }
 
 ALL_MODELS = [
     User, Job, Resume, ConversationLog, AuditLog,
     DictCity, DictJobCategory, DictSensitiveWord,
-    SystemConfig, AdminUser, WecomInboundEvent,
+    SystemConfig, AdminUser, WecomInboundEvent, WecomOutboundOutbox,
 ]
 
 
@@ -50,8 +52,8 @@ class TestModelImport:
     """模型导入与表名验证。"""
 
     def test_all_models_importable(self):
-        """所有 11 个模型类可正常导入。"""
-        assert len(ALL_MODELS) == 11
+        """所有 12 个模型类可正常导入。"""
+        assert len(ALL_MODELS) == 12
 
     def test_tablenames(self):
         """每个模型的 __tablename__ 与 DDL 表名一致。"""
@@ -59,7 +61,7 @@ class TestModelImport:
         assert actual == EXPECTED_TABLES
 
     def test_metadata_contains_all_tables(self):
-        """Base.metadata 中注册了全部 11 张表。"""
+        """Base.metadata 中注册了全部 12 张表。"""
         registered = set(Base.metadata.tables.keys())
         assert EXPECTED_TABLES.issubset(registered)
 
@@ -93,12 +95,39 @@ class TestKeyColumns:
 
     def test_wecom_inbound_event_status_enum(self):
         col = self._col(WecomInboundEvent, "status")
-        expected = {"received", "processing", "done", "failed", "dead_letter"}
+        expected = {
+            "received", "processing", "session_pending",
+            "done", "failed", "dead_letter",
+        }
         assert set(col.type.enums) == expected
+
+    def test_wecom_inbound_event_has_durable_session_commit_fields(self):
+        names = set(WecomInboundEvent.__table__.columns.keys())
+        assert {
+            "session_operation",
+            "session_expected_version",
+            "session_payload",
+            "session_apply_attempts",
+            "session_apply_locked_at",
+            "session_next_attempt_at",
+            "session_applied_at",
+        } <= names
 
     def test_wecom_inbound_event_msg_id_unique(self):
         col = self._col(WecomInboundEvent, "msg_id")
         assert col.unique
+
+    def test_wecom_outbox_status_and_event_reply_unique(self):
+        col = self._col(WecomOutboundOutbox, "status")
+        assert set(col.type.enums) == {
+            "pending", "sending", "sent", "dead_letter",
+        }
+        unique_columns = {
+            tuple(column.name for column in constraint.columns)
+            for constraint in WecomOutboundOutbox.__table__.constraints
+            if isinstance(constraint, sa.UniqueConstraint)
+        }
+        assert ("inbound_event_id", "reply_index") in unique_columns
 
     def test_job_delist_reason_enum(self):
         col = self._col(Job, "delist_reason")
@@ -207,6 +236,36 @@ class TestDDLTypeAlignment:
 
     def test_wecom_inbound_event_id_bigint_unsigned(self):
         assert _is_bigint_unsigned(self._col(WecomInboundEvent, "id").type)
+
+    def test_wecom_outbox_ids_and_reply_index_types(self):
+        assert _is_bigint_unsigned(self._col(WecomOutboundOutbox, "id").type)
+        assert _is_bigint_unsigned(
+            self._col(WecomOutboundOutbox, "inbound_event_id").type,
+        )
+        assert _is_smallint_unsigned(
+            self._col(WecomOutboundOutbox, "reply_index").type,
+        )
+
+    def test_wecom_inbound_event_recovery_and_order_indexes(self):
+        indexes = {
+            index.name: tuple(column.name for column in index.columns)
+            for index in WecomInboundEvent.__table__.indexes
+        }
+        assert indexes["idx_status_worker_started"] == (
+            "status", "worker_started_at",
+        )
+        assert indexes["idx_status_worker_finished"] == (
+            "status", "worker_finished_at",
+        )
+        assert indexes["idx_user_status_id"] == (
+            "from_userid", "status", "id",
+        )
+
+    def test_wecom_inbound_event_timestamps_keep_microseconds(self):
+        for name in ("created_at", "worker_started_at", "worker_finished_at"):
+            column_type = self._col(WecomInboundEvent, name).type
+            assert isinstance(column_type, mysql.DATETIME)
+            assert column_type.fsp == 6
 
     # ---- INT UNSIGNED PK ----
 

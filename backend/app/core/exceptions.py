@@ -62,6 +62,12 @@ class LLMParseError(LLMError):
         super().__init__(f"LLM 输出格式异常: {detail}", "LLM_PARSE_ERROR")
 
 
+class LLMCircuitOpen(LLMError):
+    """上游连续失败后快速拒绝，防止超时/重试风暴拖垮消息队列。"""
+    def __init__(self):
+        super().__init__("LLM 服务暂时不可用，请稍后重试", "LLM_CIRCUIT_OPEN")
+
+
 # ---- 内容审核 ----
 
 class ContentRejected(AppError):

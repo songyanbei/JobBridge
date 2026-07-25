@@ -11,6 +11,7 @@ import httpx
 
 from app.config import settings
 from app.core.exceptions import AppError
+from app.core.logging_setup import identifier_hash
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +133,8 @@ class WeComClient:
             import secrets as _mw_secrets  # noqa: E402
             import redis as _mw_redis  # noqa: E402
             logger.warning(
-                "[MOCK-WEWORK] short-circuit send_text to_user=%s len=%d",
-                to_user, len(content or ""),
+                "[MOCK-WEWORK] short-circuit send_text user_hash=%s len=%d",
+                identifier_hash(to_user), len(content or ""),
             )
             _mw_payload = {
                 "touser": to_user,

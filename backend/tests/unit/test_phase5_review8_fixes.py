@@ -18,6 +18,264 @@ from pydantic import ValidationError
 from app.config import settings
 
 
+class TestRelaxationClosedSetFallback:
+    """v2 关闭/失败时，系统二选一后的精确短回答仍能完成确认。"""
+
+    @pytest.mark.parametrize("text", ["好", "好的。", "可以！", "同意", "确认"])
+    def test_exact_accept_phrases(self, text):
+        from app.schemas.conversation import SessionState
+        from app.services.message_router import _match_pending_relaxation_response
+
+        session = SessionState(role="worker", pending_relaxation={"step": "x"})
+        assert _match_pending_relaxation_response(text, session) == "apply_relaxation"
+
+    @pytest.mark.parametrize("text", ["不要", "算了。", "取消", "保持原条件", "否"])
+    def test_exact_reject_phrases(self, text):
+        from app.schemas.conversation import SessionState
+        from app.services.message_router import _match_pending_relaxation_response
+
+        session = SessionState(role="worker", pending_relaxation={"step": "x"})
+        assert _match_pending_relaxation_response(text, session) == "cancel_relaxation"
+
+    @pytest.mark.parametrize(
+        "text",
+        ["不要取消搜索", "可以先看看别的吗", "好的但是先别放宽", "取消草稿"],
+    )
+    def test_complex_sentences_do_not_trigger_exact_fallback(self, text):
+        from app.schemas.conversation import SessionState
+        from app.services.message_router import _match_pending_relaxation_response
+
+        session = SessionState(role="worker", pending_relaxation={"step": "x"})
+        assert _match_pending_relaxation_response(text, session) is None
+
+    def test_no_pending_never_matches(self):
+        from app.schemas.conversation import SessionState
+        from app.services.message_router import _match_pending_relaxation_response
+
+        assert _match_pending_relaxation_response(
+            "好的", SessionState(role="worker"),
+        ) is None
+
+    def test_handle_text_short_circuits_classifier_when_exact_reply_matches(self):
+        from app.schemas.conversation import ReplyMessage, SessionState
+        from app.services import message_router
+
+        session = SessionState(
+            role="worker",
+            pending_relaxation={
+                "frame": "job_search",
+                "direction": "search_job",
+                "step": "relax_salary_10pct",
+            },
+        )
+        msg = MagicMock(
+            from_user="u1", content="好的", msg_id="m1", msg_type="text",
+        )
+        user_ctx = MagicMock(role="worker", should_welcome=False)
+
+        with patch.object(
+            message_router.conversation_service, "load_session", return_value=session,
+        ), patch.object(
+            message_router.conversation_service, "save_session",
+        ), patch.object(
+            message_router, "classify_intent",
+        ) as mock_classify, patch.object(
+            message_router,
+            "_route_v2_relaxation_response",
+            return_value=[ReplyMessage(userid="u1", content="已放宽")],
+        ) as mock_route:
+            replies = message_router._handle_text(msg, user_ctx, MagicMock())
+
+        mock_classify.assert_not_called()
+        assert mock_route.call_args.args[0].state_transition == "apply_relaxation"
+        assert replies[0].content == "已放宽"
+
+
+class TestComplexActionGuard:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "先帮我找苏州普工，不行再看无锡",
+            "找岗位，顺便把我的简历也发了",
+            "先发布这个岗位，然后找两个焊工",
+        ],
+    )
+    def test_two_action_plan_is_bounded_not_rejected(self, text):
+        from app.services.message_router import (
+            _extract_bounded_action_plan,
+            _requires_action_plan_clarification,
+        )
+
+        assert _extract_bounded_action_plan(text) is not None
+        assert _requires_action_plan_clarification(text) is False
+
+    def test_three_action_plan_requires_clarification(self):
+        from app.services.message_router import _requires_action_plan_clarification
+
+        assert _requires_action_plan_clarification(
+            "先找北京普工，不行再看无锡，顺便把我的简历发了",
+        ) is True
+
+    @pytest.mark.parametrize("text", ["先找工人", "再看看", "苏州也可以"])
+    def test_single_action_phrases_do_not_trigger_plan_guard(self, text):
+        from app.services.message_router import _requires_action_plan_clarification
+
+        assert _requires_action_plan_clarification(text) is False
+
+    def test_handle_text_executes_first_and_persists_second(self):
+        from app.llm.base import IntentResult
+        from app.schemas.conversation import ReplyMessage, SessionState
+        from app.services import message_router
+        from app.wecom.callback import WeComMessage
+
+        session = SessionState(role="worker", active_flow="idle")
+        msg = WeComMessage(
+            msg_id="m-plan", from_user="u1", msg_type="text",
+            content="先找苏州普工，然后找杭州焊工岗位",
+        )
+        user_ctx = MagicMock(role="worker", should_welcome=False)
+        with patch.object(
+            message_router.conversation_service, "load_session", return_value=session,
+        ), patch.object(
+            message_router.conversation_service, "save_session",
+        ), patch.object(
+            message_router._settings_module.dialogue_policy, "v2_mode", "off",
+        ), patch.object(
+            message_router, "classify_intent",
+            return_value=IntentResult(intent="search_job", confidence=0.9),
+        ) as classify, patch.object(
+            message_router, "_route_idle",
+            return_value=[ReplyMessage(userid="u1", content="第一项已处理")],
+        ) as route:
+            replies = message_router._handle_text(msg, user_ctx, MagicMock())
+
+        assert classify.call_args.kwargs["text"] == "找苏州普工"
+        assert route.call_args.args[1].content == "找苏州普工"
+        assert session.pending_action["raw_text"] == "找杭州焊工岗位"
+        assert "已记住下一步" in replies[0].content
+
+    def test_v2_clarification_short_return_still_announces_saved_second_action(self):
+        from types import SimpleNamespace
+
+        from app.llm.base import IntentResult
+        from app.schemas.conversation import SessionState
+        from app.services import message_router
+        from app.services.dialogue_reducer import DialogueDecision
+        from app.wecom.callback import WeComMessage
+
+        session = SessionState(
+            role="worker",
+            active_flow="search_active",
+            search_criteria={"city": ["北京市"], "job_category": ["普工"]},
+        )
+        msg = WeComMessage(
+            msg_id="m-plan-clarify",
+            from_user="u1",
+            msg_type="text",
+            content="先找苏州普工，然后找杭州焊工岗位",
+        )
+        decision = DialogueDecision(
+            dialogue_act="modify_search",
+            resolved_frame="job_search",
+            route_intent="follow_up",
+            clarification={
+                "kind": "city_replace_or_add",
+                "old_value": ["北京市"],
+                "new_value": ["苏州市"],
+            },
+            state_transition="none",
+        )
+        route = SimpleNamespace(
+            intent_result=IntentResult(intent="follow_up", confidence=0.9),
+            decision=decision,
+            source="v2_primary",
+            parse_result=None,
+        )
+        user_ctx = MagicMock(role="worker", should_welcome=False)
+
+        with patch.object(
+            message_router.conversation_service, "load_session", return_value=session,
+        ), patch.object(
+            message_router.conversation_service, "save_session",
+        ), patch.object(
+            message_router._settings_module.dialogue_policy, "v2_mode", "primary",
+        ), patch.object(
+            message_router, "classify_dialogue", return_value=route,
+        ):
+            replies = message_router._handle_text(msg, user_ctx, MagicMock())
+        message_router._clear_v2_turn_context()
+
+        assert session.pending_action["raw_text"] == "找杭州焊工岗位"
+        assert "已记住下一步" in replies[0].content
+        assert "苏州市" in replies[0].content
+
+    def test_consumed_pending_action_is_cleared_on_v2_clarification_short_return(self):
+        from types import SimpleNamespace
+
+        from app.llm.base import IntentResult
+        from app.schemas.conversation import SessionState
+        from app.services import message_router
+        from app.services.dialogue_reducer import DialogueDecision
+        from app.wecom.callback import WeComMessage
+
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        session = SessionState(
+            role="worker",
+            active_flow="idle",
+            pending_action={
+                "raw_text": "找杭州焊工岗位",
+                "expires_at": future,
+            },
+        )
+        msg = WeComMessage(
+            msg_id="m-pending-clarify",
+            from_user="u1",
+            msg_type="text",
+            content="找杭州焊工岗位",
+        )
+        decision = DialogueDecision(
+            dialogue_act="start_search",
+            resolved_frame="job_search",
+            route_intent="search_job",
+            clarification={"kind": "llm_requested"},
+            state_transition="none",
+        )
+        route = SimpleNamespace(
+            intent_result=IntentResult(intent="search_job", confidence=0.7),
+            decision=decision,
+            source="v2_primary",
+            parse_result=None,
+        )
+        user_ctx = MagicMock(role="worker", should_welcome=False)
+
+        with patch.object(
+            message_router.conversation_service, "load_session", return_value=session,
+        ), patch.object(
+            message_router.conversation_service, "save_session",
+        ), patch.object(
+            message_router._settings_module.dialogue_policy, "v2_mode", "primary",
+        ), patch.object(
+            message_router, "classify_dialogue", return_value=route,
+        ):
+            message_router._handle_text(msg, user_ctx, MagicMock())
+        message_router._clear_v2_turn_context()
+
+        assert session.pending_action is None
+
+    def test_pending_action_round_trip_and_expiry(self):
+        from app.schemas.conversation import SessionState
+        from app.services.message_router import _is_pending_action_expired
+
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        session = SessionState(
+            role="worker",
+            pending_action={"raw_text": "找杭州焊工岗位", "expires_at": future},
+        )
+        restored = SessionState.model_validate(session.model_dump(mode="json"))
+        assert restored.pending_action["raw_text"] == "找杭州焊工岗位"
+        assert _is_pending_action_expired(restored.pending_action) is False
+
+
 # ---------------------------------------------------------------------------
 # Fix 1：pending_relaxation TTL 检查
 # ---------------------------------------------------------------------------

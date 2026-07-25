@@ -93,6 +93,8 @@ def create_job_category(db: Session, payload: dict, operator: str) -> DictJobCat
     )
     db.commit()
     db.refresh(cat)
+    from app.services.intent_service import invalidate_job_category_ontology_cache
+    invalidate_job_category_ontology_cache()
     return cat
 
 
@@ -135,6 +137,8 @@ def update_job_category(db: Session, cat_id: int, payload: dict, operator: str) 
     )
     db.commit()
     db.refresh(cat)
+    from app.services.intent_service import invalidate_job_category_ontology_cache
+    invalidate_job_category_ontology_cache()
     return cat
 
 
@@ -156,6 +160,8 @@ def delete_job_category(db: Session, cat_id: int, operator: str) -> None:
         before=before, after=None, reason="dict_job_category.delete",
     )
     db.commit()
+    from app.services.intent_service import invalidate_job_category_ontology_cache
+    invalidate_job_category_ontology_cache()
 
 
 # ---------------------------------------------------------------------------

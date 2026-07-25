@@ -6,18 +6,71 @@
 import hashlib
 import json
 import logging
+from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from app.core.redis_client import (
+    current_user_lock_fence,
     delete_session as redis_delete_session,
+    delete_session_if_version as redis_delete_session_if_version,
     get_session as redis_get_session,
-    save_session as redis_save_session,
+    save_session_if_version as redis_save_session_if_version,
 )
 from app.schemas.conversation import CandidateSnapshot, SessionState
 
 logger = logging.getLogger(__name__)
 
 MAX_HISTORY_MESSAGES = 12  # 最近 6 轮对话 = 12 条 message
+
+
+class SessionVersionConflict(RuntimeError):
+    """当前处理者持有的 session 已过期，禁止覆盖较新的状态。"""
+
+
+@dataclass
+class StagedSessionCommit:
+    userid: str
+    operation: str
+    expected_version: int
+    payload: dict | None
+
+
+@dataclass
+class _SessionStage:
+    userid: str
+    expected_version: int
+    operation: str = "none"
+    payload: dict | None = None
+
+
+_session_stage: ContextVar[_SessionStage | None] = ContextVar(
+    "conversation_session_stage",
+    default=None,
+)
+
+
+def begin_session_staging(userid: str) -> Token:
+    """开始一个 Worker turn 的延迟 session 提交边界。"""
+    current = redis_get_session(userid)
+    expected = int((current or {}).get("session_version") or 0)
+    return _session_stage.set(
+        _SessionStage(userid=userid, expected_version=expected),
+    )
+
+
+def end_session_staging(token: Token) -> StagedSessionCommit | None:
+    """结束 staging 并返回最终一次 save/delete 意图。"""
+    stage = _session_stage.get()
+    _session_stage.reset(token)
+    if stage is None or stage.operation == "none":
+        return None
+    return StagedSessionCommit(
+        userid=stage.userid,
+        operation=stage.operation,
+        expected_version=stage.expected_version,
+        payload=dict(stage.payload) if stage.payload is not None else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +163,90 @@ def create_session(userid: str, role: str) -> SessionState:
 
 
 def save_session(userid: str, session: SessionState) -> None:
-    """保存 session 到 Redis（自动续期 TTL）。"""
+    """使用版本 CAS 保存 session（自动续期 TTL）。"""
+    stage = _session_stage.get()
+    if stage is not None:
+        if userid != stage.userid:
+            raise RuntimeError("one worker turn cannot stage multiple users")
+        # 删除用户数据的指令优先；route 末尾的惯例 save 不得把已删除 session 重建。
+        if stage.operation == "delete":
+            return
+        target_version = stage.expected_version + 1
+        if session.session_version not in (stage.expected_version, target_version):
+            raise SessionVersionConflict(
+                "session version changed inside staged worker turn",
+            )
+        session.updated_at = datetime.now(timezone.utc).isoformat()
+        payload = session.model_copy(
+            update={"session_version": target_version},
+        ).model_dump(mode="json")
+        session.session_version = target_version
+        stage.operation = "save"
+        stage.payload = payload
+        return
+
     session.updated_at = datetime.now(timezone.utc).isoformat()
-    redis_save_session(userid, session.model_dump(mode="json"))
+    expected_version = session.session_version
+    next_version = expected_version + 1
+    payload = session.model_copy(update={"session_version": next_version}).model_dump(
+        mode="json",
+    )
+    if not redis_save_session_if_version(
+        userid, payload, expected_version,
+        lock_fence=current_user_lock_fence(),
+    ):
+        logger.error(
+            "session version conflict: user_hash=%s expected_version=%d",
+            hashlib.sha256(userid.encode("utf-8")).hexdigest()[:12],
+            expected_version,
+        )
+        raise SessionVersionConflict(
+            f"session version changed while processing (expected={expected_version})",
+        )
+    session.session_version = next_version
 
 
 def clear_session(userid: str) -> None:
     """完全删除 Redis session。"""
+    stage = _session_stage.get()
+    if stage is not None:
+        if userid != stage.userid:
+            raise RuntimeError("one worker turn cannot stage multiple users")
+        stage.operation = "delete"
+        stage.payload = None
+        return
     redis_delete_session(userid)
+
+
+def apply_staged_session(commit: StagedSessionCommit) -> bool:
+    """应用 durable session commit；调用方负责持有当前 user lock。"""
+    fence = current_user_lock_fence()
+    if commit.operation == "delete":
+        return redis_delete_session_if_version(
+            commit.userid,
+            commit.expected_version,
+            lock_fence=fence,
+        )
+    if commit.operation == "save" and commit.payload is not None:
+        return redis_save_session_if_version(
+            commit.userid,
+            commit.payload,
+            commit.expected_version,
+            lock_fence=fence,
+            # A Redis outage can outlive SESSION_TTL. While this event remains
+            # session_pending, the durable per-user order gate prevents a later
+            # turn from advancing state, so restoring an expired key is safe.
+            allow_missing=True,
+        )
+    raise ValueError(f"invalid staged session operation: {commit.operation}")
+
+
+def is_staged_session_applied(commit: StagedSessionCommit) -> bool:
+    """识别“Redis 已成功、DB 状态回写前崩溃”的幂等恢复窗口。"""
+    current = redis_get_session(commit.userid)
+    if commit.operation == "delete":
+        return current is None
+    return current == commit.payload
 
 
 # ---------------------------------------------------------------------------

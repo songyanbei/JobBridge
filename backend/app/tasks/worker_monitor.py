@@ -10,10 +10,16 @@
 """
 from __future__ import annotations
 
+import json
+import time
+
 from loguru import logger
+from sqlalchemy import func, text
 
 from app.config import settings
 from app.core.redis_client import QUEUE_DEAD_LETTER, QUEUE_INCOMING, get_redis
+from app.db import SessionLocal
+from app.models import WecomInboundEvent, WecomOutboundOutbox
 from app.tasks.common import log_event, task_lock
 
 
@@ -46,7 +52,7 @@ def check_heartbeat() -> None:
 
 
 def check_queue_backlog() -> None:
-    """``queue:incoming`` 长度超过阈值触发告警。"""
+    """按队列长度和最老消息年龄双阈值巡检。"""
     with task_lock("worker_monitor.queue_backlog", ttl=45) as acquired:
         if not acquired:
             return
@@ -59,6 +65,29 @@ def check_queue_backlog() -> None:
                     "queue_backlog",
                     f"⚠️ {QUEUE_INCOMING} 积压 {n} 条，阈值 {threshold}",
                 )
+            oldest_age_seconds = None
+            if n > 0:
+                raw = r.lindex(QUEUE_INCOMING, 0)
+                if isinstance(raw, (str, bytes)):
+                    try:
+                        payload = json.loads(raw)
+                        enqueued_at = float(payload.get("_enqueued_at") or 0)
+                        if enqueued_at > 0:
+                            oldest_age_seconds = max(0, int(time.time() - enqueued_at))
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        logger.warning("queue backlog head has no valid enqueue timestamp")
+            max_age = settings.monitor_queue_incoming_max_age_seconds
+            if oldest_age_seconds is not None and oldest_age_seconds > max_age:
+                _alert(
+                    "queue_oldest_age",
+                    f"⚠️ {QUEUE_INCOMING} 最老消息等待 {oldest_age_seconds}s，阈值 {max_age}s",
+                )
+            log_event(
+                "queue_depth_age",
+                queue=QUEUE_INCOMING,
+                depth=n,
+                oldest_age_seconds=oldest_age_seconds,
+            )
         except Exception:
             logger.exception("check_queue_backlog failed")
 
@@ -78,6 +107,86 @@ def check_dead_letter() -> None:
                 )
         except Exception:
             logger.exception("check_dead_letter failed")
+
+
+def check_outbox() -> None:
+    """告警 durable outbox 死信和超龄未发送回复。"""
+    with task_lock("worker_monitor.outbox", ttl=45) as acquired:
+        if not acquired:
+            return
+        db = SessionLocal()
+        try:
+            dead = db.query(func.count(WecomOutboundOutbox.id)).filter(
+                WecomOutboundOutbox.status == "dead_letter",
+            ).scalar() or 0
+            oldest_age = db.query(
+                func.timestampdiff(
+                    text("SECOND"),
+                    func.min(WecomOutboundOutbox.created_at),
+                    func.now(6),
+                ),
+            ).filter(
+                WecomOutboundOutbox.status.in_(("pending", "sending")),
+            ).scalar()
+            oldest_age = int(oldest_age or 0)
+            if dead:
+                _alert(
+                    "outbox_dead_letter",
+                    f"❗ 企微回复出站箱存在 {int(dead)} 条死信，需人工处理",
+                )
+            threshold = settings.monitor_outbox_pending_max_age_seconds
+            if oldest_age > threshold:
+                _alert(
+                    "outbox_pending_age",
+                    f"⚠️ 企微回复最长未发送 {oldest_age}s，阈值 {threshold}s",
+                )
+            log_event(
+                "outbox_health",
+                dead_letter_count=int(dead),
+                oldest_pending_age_seconds=oldest_age,
+            )
+        except Exception:
+            logger.exception("check_outbox failed")
+        finally:
+            db.close()
+
+
+def check_session_commits() -> None:
+    """Alert when a durable Redis session transition cannot be applied promptly."""
+    with task_lock("worker_monitor.session_commits", ttl=45) as acquired:
+        if not acquired:
+            return
+        db = SessionLocal()
+        try:
+            pending = db.query(func.count(WecomInboundEvent.id)).filter(
+                WecomInboundEvent.status == "session_pending",
+            ).scalar() or 0
+            oldest_age = db.query(
+                func.timestampdiff(
+                    text("SECOND"),
+                    func.min(WecomInboundEvent.created_at),
+                    func.now(6),
+                ),
+            ).filter(
+                WecomInboundEvent.status == "session_pending",
+            ).scalar()
+            oldest_age = int(oldest_age or 0)
+            threshold = settings.monitor_session_commit_pending_max_age_seconds
+            if oldest_age > threshold:
+                _alert(
+                    "session_commit_pending_age",
+                    f"⚠️ 会话提交有 {int(pending)} 条待恢复，最长等待 "
+                    f"{oldest_age}s，阈值 {threshold}s",
+                )
+            log_event(
+                "session_commit_health",
+                pending_count=int(pending),
+                oldest_pending_age_seconds=oldest_age,
+            )
+        except Exception:
+            logger.exception("check_session_commits failed")
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import UserBlocked
+from app.core.logging_setup import identifier_hash
 from app.models import AuditLog, ConversationLog, Job, Resume, User
 from app.services import conversation_service
 
@@ -61,7 +62,10 @@ def identify_or_register(
         )
         db.add(user)
         db.flush()
-        logger.info("user_service: auto-registered worker %s", external_userid)
+        logger.info(
+            "user_service: auto-registered worker user_hash=%s",
+            identifier_hash(external_userid),
+        )
         return UserContext(
             external_userid=external_userid,
             role="worker",
@@ -228,5 +232,8 @@ def delete_user_data(external_userid: str, db: Session) -> str:
 
     db.flush()
 
-    logger.info("user_service: deleted user data for %s", external_userid)
+    logger.info(
+        "user_service: deleted user data user_hash=%s",
+        identifier_hash(external_userid),
+    )
     return "已收到删除请求，您的资料已进入删除流程。如需恢复，请联系客服。"

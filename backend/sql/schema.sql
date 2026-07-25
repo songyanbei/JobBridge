@@ -348,21 +348,62 @@ CREATE TABLE `wecom_inbound_event` (
     `msg_type`           ENUM('text','image','voice','video','file','link','location','event','other') NOT NULL COMMENT '消息类型（原始企微 MsgType，一期仅 text/image/voice/event 走业务路径，其余走"不支持"分支）',
     `media_id`           VARCHAR(128)    DEFAULT NULL                 COMMENT '媒体消息的 media_id（image/voice/video/file 类型有效；crash 恢复时用于补下载）',
     `content_brief`      VARCHAR(500)    DEFAULT NULL                 COMMENT '消息摘要（文本取前 500 字）',
-    `status`             ENUM('received','processing','done','failed','dead_letter') NOT NULL DEFAULT 'received' COMMENT '处理状态',
+    `status`             ENUM('received','processing','session_pending','done','failed','dead_letter') NOT NULL DEFAULT 'received' COMMENT '处理状态',
     `retry_count`        TINYINT UNSIGNED NOT NULL DEFAULT 0          COMMENT '已重试次数',
-    `worker_started_at`  DATETIME        DEFAULT NULL                 COMMENT 'Worker 开始处理时间',
-    `worker_finished_at` DATETIME        DEFAULT NULL                 COMMENT 'Worker 处理完成时间',
+    `session_operation`  VARCHAR(8)      DEFAULT NULL,
+    `session_expected_version` INT UNSIGNED DEFAULT NULL,
+    `session_payload`    JSON            DEFAULT NULL,
+    `session_apply_attempts` INT UNSIGNED NOT NULL DEFAULT 0,
+    `session_apply_locked_at` DATETIME(6) DEFAULT NULL,
+    `session_next_attempt_at` DATETIME(6) DEFAULT NULL,
+    `session_applied_at` DATETIME(6)     DEFAULT NULL,
+    `worker_started_at`  DATETIME(6)     DEFAULT NULL                 COMMENT 'Worker 开始处理时间',
+    `worker_finished_at` DATETIME(6)     DEFAULT NULL                 COMMENT 'Worker 处理完成时间',
     `error_message`      TEXT            DEFAULT NULL                 COMMENT '失败原因',
-    `created_at`         DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '回调到达时间',
+    `created_at`         DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) COMMENT '回调到达时间',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_msg_id`    (`msg_id`),
     KEY `idx_status_time`     (`status`, `created_at`),
-    KEY `idx_from_user`       (`from_userid`, `created_at`)
+    KEY `idx_status_worker_started`  (`status`, `worker_started_at`),
+    KEY `idx_status_worker_finished` (`status`, `worker_finished_at`),
+    KEY `idx_from_user`       (`from_userid`, `created_at`),
+    KEY `idx_user_status_id`  (`from_userid`, `status`, `id`),
+    KEY `idx_session_commit_due` (`status`, `session_next_attempt_at`, `session_apply_locked_at`, `id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='企微入站事件表';
 
 
 -- ============================================================================
--- 12. event_log 外部事件回传日志（Phase 5 §5.9）
+-- 12. wecom_outbound_outbox 企微回复事务出站箱
+-- ============================================================================
+DROP TABLE IF EXISTS `wecom_outbound_outbox`;
+CREATE TABLE `wecom_outbound_outbox` (
+    `id`                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `inbound_event_id`  BIGINT UNSIGNED NOT NULL COMMENT '来源 wecom_inbound_event.id',
+    `reply_index`       SMALLINT UNSIGNED NOT NULL COMMENT '同一入站事件内回复顺序',
+    `userid`            VARCHAR(64) NOT NULL COMMENT '接收者 external_userid',
+    `msg_type`          VARCHAR(16) NOT NULL DEFAULT 'text',
+    `content`           MEDIUMTEXT NOT NULL,
+    `intent`            VARCHAR(32) DEFAULT NULL,
+    `criteria_snapshot` JSON DEFAULT NULL,
+    `status`            ENUM('pending','sending','sent','dead_letter') NOT NULL DEFAULT 'pending',
+    `attempt_count`     TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at`   DATETIME(6) DEFAULT NULL,
+    `locked_at`         DATETIME(6) DEFAULT NULL,
+    `provider_msg_id`   VARCHAR(128) DEFAULT NULL,
+    `last_error`        TEXT DEFAULT NULL,
+    `created_at`        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `sent_at`           DATETIME(6) DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_outbox_event_reply` (`inbound_event_id`, `reply_index`),
+    KEY `idx_outbox_status_due` (`status`, `next_attempt_at`, `id`),
+    KEY `idx_outbox_status_locked` (`status`, `locked_at`),
+    KEY `idx_outbox_event` (`inbound_event_id`, `id`),
+    KEY `idx_outbox_user_status_id` (`userid`, `status`, `id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='企微回复事务出站箱';
+
+
+-- ============================================================================
+-- 13. event_log 外部事件回传日志（Phase 5 §5.9）
 -- ============================================================================
 -- 用途：接收小程序点击等外部事件回传，用于数据看板"详情点击率"指标
 -- ============================================================================

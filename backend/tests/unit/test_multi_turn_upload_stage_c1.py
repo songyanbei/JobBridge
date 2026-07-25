@@ -244,7 +244,7 @@ class TestActiveFlowSelfHeal:
 # ---------------------------------------------------------------------------
 
 class TestFailedPatchRoundsLifecycle:
-    """failed_patch_rounds：失败 +1，补到字段重置，chitchat 不动，连续 2 次清。"""
+    """failed_patch_rounds：失败 +1，补到字段重置，连续 2 次恢复但不丢草稿。"""
 
     @patch("app.services.message_router.upload_service.is_pending_upload_expired",
            return_value=False)
@@ -271,7 +271,7 @@ class TestFailedPatchRoundsLifecycle:
 
     @patch("app.services.message_router.upload_service.is_pending_upload_expired",
            return_value=False)
-    def test_failed_patch_clears_at_max(self, _):
+    def test_failed_patch_preserves_draft_at_recovery_threshold(self, _):
         ctx = _ctx("factory")
         session = SessionState(
             role="factory",
@@ -289,8 +289,9 @@ class TestFailedPatchRoundsLifecycle:
             intent, _msg("还行吧"), ctx, session, MagicMock(),
         )
         assert replies[0].content == PENDING_MAX_ROUNDS_REPLY
-        assert session.pending_upload_intent is None
-        assert session.active_flow == "idle"
+        assert session.pending_upload == {"city": "北京市", "job_category": "餐饮"}
+        assert session.pending_upload_intent == "upload_job"
+        assert session.active_flow == "upload_collecting"
         assert session.failed_patch_rounds == 0
 
     @patch("app.services.message_router.upload_service.is_pending_upload_expired",
@@ -552,7 +553,7 @@ class TestUploadConflictResolution:
     # TestUploadConflictKeywordPrecedence.test_continue_kanken_goes_to_proceed
     # （covering codex review fix P3）。
 
-    def test_dead_loop_protection_clears_after_two_rounds(self):
+    def test_dead_loop_protection_restores_original_draft_after_two_rounds(self):
         ctx = _ctx("factory")
         session = SessionState(
             role="factory",
@@ -575,8 +576,53 @@ class TestUploadConflictResolution:
             intent, _msg("我也不知道"), ctx, session, MagicMock(),
         )
         assert replies[0].content == CONFLICT_DEAD_LOOP_REPLY
-        assert session.active_flow == "idle"
-        assert session.pending_upload_intent is None
+        assert session.active_flow == "upload_collecting"
+        assert session.pending_upload_intent == "upload_job"
+        assert session.pending_upload == {"city": "北京市"}
+        assert session.pending_interruption is None
+        assert session.conflict_followup_rounds == 0
+
+
+class TestDraftPreservationSequenceInvariant:
+    @patch(
+        "app.services.message_router.upload_service.is_pending_upload_expired",
+        return_value=False,
+    )
+    def test_long_unknown_sequence_never_drops_draft(self, _expired):
+        ctx = _ctx("factory")
+        original = {"city": "北京市", "job_category": "技工"}
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload=dict(original),
+            pending_upload_intent="upload_job",
+            awaiting_field="headcount",
+            pending_started_at=datetime.now(timezone.utc).isoformat(),
+            pending_expires_at=_future_iso(),
+        )
+        unknown = IntentResult(intent="follow_up", structured_data={}, confidence=0.1)
+
+        for index in range(40):
+            if index % 4 == 2:
+                session.active_flow = "upload_conflict"
+                session.pending_interruption = {
+                    "intent": "search_worker",
+                    "structured_data": {},
+                    "criteria_patch": [],
+                    "raw_text": "看看人",
+                }
+                session.conflict_followup_rounds = 1
+                message_router._route_upload_conflict(
+                    unknown, _msg(f"不清楚{index}"), ctx, session, MagicMock(),
+                )
+            else:
+                message_router._route_upload_collecting(
+                    unknown, _msg(f"不清楚{index}"), ctx, session, MagicMock(),
+                )
+
+            assert session.pending_upload_intent == "upload_job"
+            assert session.pending_upload == original
+            assert session.active_flow == "upload_collecting"
 
 
 class TestPendingInterruptionSerializationRoundTrip:

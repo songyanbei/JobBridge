@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -58,6 +59,15 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 RERANK_PROMPT_VERSION = "v1"
+_queue_backlog_hint: ContextVar[int] = ContextVar("queue_backlog_hint", default=0)
+
+
+def set_queue_backlog_hint(depth: int):
+    return _queue_backlog_hint.set(max(0, int(depth)))
+
+
+def reset_queue_backlog_hint(token) -> None:
+    _queue_backlog_hint.reset(token)
 
 
 def _json_scalar(value: object) -> str:
@@ -352,15 +362,30 @@ def _rerank_with_logging(
     """统一封装 reranker.rerank，附带 loguru 结构化打点。
 
     Phase 7：``llm_call`` 日志含 input_tokens / output_tokens / user_msg_id，
-    便于成本分析、定位单条消息对应的检索链路；``parse_failed`` 回落为空结果以
-    保持搜索调用不中断，日志仍反映真实失败类型。
+    便于成本分析、定位单条消息对应的检索链路。任何 reranker 故障都回落为空
+    ``ranked_items``；调用方会把 SQL 候选按稳定查询顺序补回，保证排序服务故障
+    不会让已有业务候选不可用。
     """
-    reranker = get_reranker()
     start = time.perf_counter()
     status = "ok"
     result: RerankResult | None = None
-    parse_failed = False
     try:
+        threshold = max(0, int(settings.reranker_queue_degrade_threshold or 0))
+        queue_depth = _queue_backlog_hint.get()
+        if threshold and queue_depth >= threshold:
+            status = "backlog_degraded"
+            result = RerankResult(
+                ranked_items=[], reply_text="", raw_response="",
+            )
+            log_event(
+                "reranker_backlog_degraded",
+                queue_depth=queue_depth,
+                threshold=threshold,
+                call_site=call_site,
+            )
+            return result
+
+        reranker = get_reranker()
         # Phase 5 §5.3：soft_preferences 非空时透传给 reranker（v2.1 prompt）；
         # 为空时严格走 v2.0 路径。两条路径都通过 keyword-only 参数。
         rerank_kwargs = {
@@ -373,15 +398,19 @@ def _rerank_with_logging(
             rerank_kwargs["soft_preferences"] = soft_preferences
             rerank_kwargs["ranking_weights"] = ranking_weights
         result = reranker.rerank(**rerank_kwargs)
-    except LLMTimeout:
+    except LLMTimeout as exc:
         status = "timeout"
-        raise
+        logger.warning("reranker timeout at %s; using deterministic fallback", call_site)
+        result = RerankResult(
+            ranked_items=[], reply_text="", raw_response="",
+            input_tokens=getattr(exc, "input_tokens", None),
+            output_tokens=getattr(exc, "output_tokens", None),
+        )
     except LLMParseError as exc:
         # 空结果回落，后续业务按 0 召回处理；不再 raise 以对齐 intent 侧策略。
         # provider 在 raise 前已把 token 挂到 exc.input_tokens / exc.output_tokens，
         # 这里回读到 fallback RerankResult，保证 log_event 记录真实 token 用量。
         status = "parse_failed"
-        parse_failed = True
         result = RerankResult(
             ranked_items=[],
             reply_text="",
@@ -389,14 +418,26 @@ def _rerank_with_logging(
             input_tokens=getattr(exc, "input_tokens", None),
             output_tokens=getattr(exc, "output_tokens", None),
         )
-    except LLMError:
+    except LLMError as exc:
         status = "http_error"
-        raise
-    except Exception:
+        logger.warning("reranker HTTP error at %s; using deterministic fallback", call_site)
+        result = RerankResult(
+            ranked_items=[], reply_text="", raw_response="",
+            input_tokens=getattr(exc, "input_tokens", None),
+            output_tokens=getattr(exc, "output_tokens", None),
+        )
+    except Exception as exc:
         # 非 LLMError 家族的意外异常（如 provider 实现 bug、类型错误等）。
-        # 单独打 unknown_error 便于日志归因与告警分级。
+        # 可用性优先：同样退回 SQL 顺序，但保留 exception stack 供告警归因。
         status = "unknown_error"
-        raise
+        logger.exception(
+            "reranker unexpected error at %s; using deterministic fallback", call_site,
+        )
+        result = RerankResult(
+            ranked_items=[], reply_text="", raw_response="",
+            input_tokens=getattr(exc, "input_tokens", None),
+            output_tokens=getattr(exc, "output_tokens", None),
+        )
     finally:
         log_event(
             "llm_call",

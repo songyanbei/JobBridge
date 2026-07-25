@@ -129,7 +129,7 @@ def _ref_constants() -> dict[str, Any]:
     from app.services import intent_service as _is
     from app.llm import prompts as _p
     return {
-        "JOB_CATEGORY_CANONICAL": _is._JOB_CATEGORY_CANONICAL,
+        "JOB_CATEGORY_CANONICAL": _is._get_job_category_canonical_values(),
         "SALARY_MIN": _is._SALARY_MIN,
         "SALARY_MAX": _is._SALARY_MAX,
         "AGE_MIN": _is._AGE_MIN,

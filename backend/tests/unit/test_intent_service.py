@@ -12,6 +12,25 @@ from app.services.intent_service import (
     _sanitize_intent_result,
     classify_intent,
 )
+from app.services import intent_service
+
+
+def test_explicit_search_anchors_restore_city_and_trade_from_dictionaries():
+    with patch.object(
+        intent_service,
+        "_get_city_lookup",
+        return_value={"杭州": "杭州市", "杭州市": "杭州市"},
+    ), patch.object(
+        intent_service,
+        "_get_job_category_ontology",
+        return_value=({"焊工": "焊工", "技工": "技工"}, frozenset({"焊工", "技工"})),
+    ):
+        assert intent_service.extract_explicit_search_anchors(
+            "找杭州焊工岗位",
+        ) == {
+            "city": ["杭州市"],
+            "job_category": ["焊工"],
+        }
 
 
 class TestMatchCommand:
@@ -230,3 +249,27 @@ class TestPhase4SanitizeSplit:
         # 城市 / 工种被搜索分支强制为 list（与 Phase 1 测试断言一致）
         assert sanitized.structured_data["city"] == ["西安市"]
         assert sanitized.structured_data["job_category"] == ["餐饮"]
+
+
+class TestJobCategoryOntology:
+    def test_runtime_aliases_normalize_to_enabled_canonical(self, monkeypatch):
+        monkeypatch.setattr(
+            intent_service,
+            "_JOB_CATEGORY_ONTOLOGY_CACHE",
+            ({"焊工": "技工", "技术工": "技工", "技工": "技工"}, frozenset({"技工"})),
+        )
+        assert intent_service._normalize_job_category_value("焊工") == "技工"
+        assert intent_service._normalize_job_category_value("技术工") == "技工"
+
+    def test_invalidation_refreshes_schema_and_prompt_caches(self, monkeypatch):
+        from app.dialogue import slot_schema
+        from app.llm import prompts
+
+        intent_service._JOB_CATEGORY_ONTOLOGY_CACHE = ({}, frozenset({"旧类"}))
+        with patch.object(slot_schema, "_reset_cache_for_tests") as reset_schema, \
+             patch.object(prompts, "_reset_dialogue_parse_prompt_v2_cache_for_tests") as reset_prompt:
+            intent_service.invalidate_job_category_ontology_cache()
+
+        assert intent_service._JOB_CATEGORY_ONTOLOGY_CACHE is None
+        reset_schema.assert_called_once()
+        reset_prompt.assert_called_once()

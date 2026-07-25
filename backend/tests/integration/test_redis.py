@@ -1,5 +1,6 @@
 """Redis 集成测试（需要真实 Redis）。"""
 import json
+import time
 
 import pytest
 
@@ -7,14 +8,59 @@ from app.core.redis_client import (
     get_redis,
     get_session,
     save_session,
+    save_session_if_version,
     delete_session,
     check_msg_duplicate,
     check_rate_limit,
     enqueue_message,
     dequeue_message,
     user_lock,
+    current_user_lock_fence,
+    UserLockLost,
     QUEUE_INCOMING,
 )
+
+
+def test_real_user_lock_lease_renews_beyond_original_ttl(monkeypatch):
+    """A second owner must not enter even after the first lease's initial TTL elapsed."""
+    from app.core import redis_client
+
+    monkeypatch.setattr(redis_client, "LOCK_TTL", 2)
+    monkeypatch.setattr(redis_client, "LOCK_RENEW_INTERVAL_SECONDS", 0.25)
+    userid = "integration-lock-renewal"
+    get_redis().delete(f"{redis_client.LOCK_PREFIX}{userid}")
+
+    with redis_client.user_lock(userid, timeout=0) as first:
+        assert first
+        time.sleep(2.6)
+        first.assert_owned()
+        with redis_client.user_lock(userid, timeout=0) as second:
+            assert not second
+
+    with redis_client.user_lock(userid, timeout=0) as after_release:
+        assert after_release
+
+
+def test_real_session_cas_is_fenced_by_lock_owner():
+    userid = "integration-fenced-session"
+    delete_session(userid)
+    try:
+        with user_lock(userid, timeout=0) as lease:
+            assert lease
+            fence = current_user_lock_fence()
+            assert fence is not None
+            assert save_session_if_version(
+                userid, {"role": "worker", "session_version": 1}, 0,
+                lock_fence=fence,
+            )
+
+        with pytest.raises(UserLockLost):
+            save_session_if_version(
+                userid, {"role": "worker", "session_version": 2}, 1,
+                lock_fence=fence,
+            )
+    finally:
+        delete_session(userid)
 
 pytestmark = pytest.mark.integration
 
@@ -41,6 +87,20 @@ class TestSessionOperations:
         save_session("test_user_002", {"role": "factory"})
         delete_session("test_user_002")
         assert get_session("test_user_002") is None
+
+    def test_version_cas_rejects_stale_writer(self):
+        userid = "test_user_cas_001"
+        delete_session(userid)
+        try:
+            assert save_session_if_version(
+                userid, {"role": "worker", "session_version": 1}, 0,
+            ) is True
+            assert save_session_if_version(
+                userid, {"role": "worker", "session_version": 2}, 0,
+            ) is False
+            assert get_session(userid)["session_version"] == 1
+        finally:
+            delete_session(userid)
 
 
 class TestDedup:
@@ -112,19 +172,20 @@ class TestUserLock:
     def test_acquire_and_release(self):
         """正常获取和释放锁。"""
         with user_lock("test_lock_001", timeout=5) as acquired:
-            assert acquired is True
+            assert bool(acquired) is True
+            acquired.assert_owned()
 
     def test_lock_is_exclusive(self):
         """锁持有期间，同一 user 的第二次获取应超时失败。"""
         with user_lock("test_lock_002", timeout=5) as acquired_outer:
-            assert acquired_outer is True
+            assert bool(acquired_outer) is True
             # 内层尝试获取同一 user 的锁，timeout=1 秒后应失败
             with user_lock("test_lock_002", timeout=1) as acquired_inner:
-                assert acquired_inner is False
+                assert bool(acquired_inner) is False
 
     def test_different_users_independent(self):
         """不同 user 的锁互不干扰。"""
         with user_lock("test_lock_003a", timeout=5) as a:
             with user_lock("test_lock_003b", timeout=5) as b:
-                assert a is True
-                assert b is True
+                assert bool(a) is True
+                assert bool(b) is True

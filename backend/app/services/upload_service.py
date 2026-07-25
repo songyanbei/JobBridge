@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.llm.base import IntentResult
+from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
 from app.models import Job, Resume, SystemConfig
 from app.services import audit_service, conversation_service
@@ -292,8 +293,8 @@ def attach_image(
 
     kind = "岗位" if entity_type == "job" else "简历"
     logger.info(
-        "upload_service.attach_image: userid=%s entity=%s id=%s images_count=%d",
-        external_userid, entity_type, record.id, len(images),
+        "upload_service.attach_image: user_hash=%s entity=%s id=%s images_count=%d",
+        identifier_hash(external_userid), entity_type, record.id, len(images),
     )
     return f"图片已附加到您最近一条{kind}信息（第 {len(images)} 张）。"
 

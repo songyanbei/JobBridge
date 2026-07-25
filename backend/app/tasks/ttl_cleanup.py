@@ -5,10 +5,12 @@
 2. 简历过期软删：expires_at < NOW() 且 deleted_at IS NULL → deleted_at=NOW()
 3. 岗位软删后 ``ttl.hard_delete.delay_days`` 天硬删（分批）
 4. 简历软删后 ``ttl.hard_delete.delay_days`` 天硬删 + storage.delete() 附件
-5. 用户主动删除后 ``ttl.hard_delete.delay_days`` 天硬删其 resume / conversation_log 残留，user 保留
+5. 用户主动删除后 ``ttl.hard_delete.delay_days`` 天硬删其 resume /
+   conversation_log / outbox / 终态 inbound 残留，user 保留
 6. conversation_log > ``ttl.conversation_log.days`` 天硬删
-7. wecom_inbound_event > ``ttl.wecom_inbound_event.days`` 天硬删
-8. audit_log > ``ttl.audit_log.days`` 天硬删
+7. 已发送 outbox > ``ttl.wecom_inbound_event.days`` 天硬删；出站死信按 audit TTL 保留
+8. wecom_inbound_event > ``ttl.wecom_inbound_event.days`` 天硬删
+9. audit_log > ``ttl.audit_log.days`` 天硬删
 
 约束：
 - 分批（LIMIT 500 per batch）+ 每批独立 commit，避免锁表。
@@ -24,6 +26,7 @@ from typing import Any
 from loguru import logger
 from sqlalchemy import text
 
+from app.core.logging_setup import identifier_hash
 from app.db import SessionLocal
 from app.storage import get_storage
 from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
@@ -202,7 +205,7 @@ def _extract_image_keys(images: Any) -> list[str]:
 
 
 def _hard_delete_deleted_users(db, delay_days: int) -> int:
-    """用户主动 /删除我的信息 7 天后，硬删其 resume / conversation_log 残留，user 记录保留。
+    """用户主动 /删除我的信息后，硬删其业务与消息内容残留，user 记录保留。
 
     7 天计时起点（对齐 phase7-main.md §3.1 模块 C）：
     - 主：User.extra['deleted_at']（UTC 字符串 `YYYY-MM-DD HH:MM:SS`）→ STR_TO_DATE 解析后
@@ -266,7 +269,10 @@ def _hard_delete_deleted_users(db, delay_days: int) -> int:
                 f"owner_userid = {_escape_literal(uid)}",
             )
         except Exception:
-            logger.exception(f"ttl_cleanup: hard delete resume failed userid={uid}")
+            logger.exception(
+                "ttl_cleanup: hard delete resume failed user_hash={}",
+                identifier_hash(uid),
+            )
         # 硬删其 conversation_log 残留
         try:
             total_deleted += _batch_hard_delete(
@@ -275,10 +281,61 @@ def _hard_delete_deleted_users(db, delay_days: int) -> int:
                 f"userid = {_escape_literal(uid)}",
             )
         except Exception:
-            logger.exception(f"ttl_cleanup: hard delete conversation_log failed userid={uid}")
+            logger.exception(
+                "ttl_cleanup: hard delete conversation_log failed user_hash={}",
+                identifier_hash(uid),
+            )
+        # outbox 同样含原始回复文本和用户标识，必须纳入删除用户的数据清除边界。
+        try:
+            total_deleted += _batch_hard_delete(
+                db,
+                "wecom_outbound_outbox",
+                f"userid = {_escape_literal(uid)}",
+            )
+        except Exception:
+            logger.exception(
+                "ttl_cleanup: hard delete outbox failed user_hash={}",
+                identifier_hash(uid),
+            )
+        # inbound_event 也含用户标识和文本摘要。仅删除终态记录；若仍有可恢复
+        # 状态则保留并交给 worker/告警处理，避免合规清理制造业务半提交。
+        try:
+            total_deleted += _batch_hard_delete(
+                db,
+                "wecom_inbound_event",
+                f"from_userid = {_escape_literal(uid)} "
+                "AND status IN ('done','dead_letter')",
+            )
+        except Exception:
+            logger.exception(
+                "ttl_cleanup: hard delete inbound failed user_hash={}",
+                identifier_hash(uid),
+            )
 
     log_event("ttl_cleanup_deleted_users", userid_count=len(userids), rows_deleted=total_deleted)
     return total_deleted
+
+
+def _hard_delete_terminal_inbound(db, retention_days: int) -> int:
+    """Delete only fully recoverable terminal events past retention.
+
+    ``received``/``processing``/``failed`` and ``session_pending`` are durable
+    recovery sources and must never disappear because of age alone. A ``done``
+    event also remains the visibility gate for its transactional outbox, so keep
+    it while any reply is still pending or sending.
+    """
+    days = int(retention_days)
+    return _batch_hard_delete(
+        db,
+        "wecom_inbound_event",
+        "status IN ('done','dead_letter') "
+        f"AND created_at < NOW() - INTERVAL {days} DAY "
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM wecom_outbound_outbox o "
+        "WHERE o.inbound_event_id = wecom_inbound_event.id "
+        "AND o.status IN ('pending','sending')"
+        ")",
+    )
 
 
 def _escape_literal(value: str) -> str:
@@ -342,12 +399,27 @@ def run() -> None:
                 ),
             )
             _safe_step(
-                "hard_delete_inbound",
+                "hard_delete_outbox_sent",
                 stats,
                 lambda: _batch_hard_delete(
-                    db, "wecom_inbound_event",
+                    db, "wecom_outbound_outbox",
+                    "status='sent' AND "
                     f"created_at < NOW() - INTERVAL {int(inbound_days)} DAY",
                 ),
+            )
+            _safe_step(
+                "hard_delete_outbox_dead_letter",
+                stats,
+                lambda: _batch_hard_delete(
+                    db, "wecom_outbound_outbox",
+                    "status='dead_letter' AND "
+                    f"created_at < NOW() - INTERVAL {int(audit_days)} DAY",
+                ),
+            )
+            _safe_step(
+                "hard_delete_inbound",
+                stats,
+                lambda: _hard_delete_terminal_inbound(db, inbound_days),
             )
             _safe_step(
                 "hard_delete_audit_log",
