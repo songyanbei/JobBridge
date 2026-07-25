@@ -180,6 +180,43 @@ class TestBatchHardDelete:
         assert db.execute.call_count == 1
 
 
+def test_inbound_cleanup_preserves_recovery_and_unsent_outbox(monkeypatch):
+    captured = {}
+
+    def fake_delete(db, table, where):
+        captured.update(table=table, where=where)
+        return 7
+
+    monkeypatch.setattr(ttl_cleanup, "_batch_hard_delete", fake_delete)
+
+    assert ttl_cleanup._hard_delete_terminal_inbound(MagicMock(), 30) == 7
+    assert captured["table"] == "wecom_inbound_event"
+    where = captured["where"]
+    assert "status IN ('done','dead_letter')" in where
+    assert "session_pending" not in where
+    assert "NOT EXISTS" in where
+    assert "o.status IN ('pending','sending')" in where
+
+
+def test_deleted_user_cleanup_includes_only_terminal_inbound(monkeypatch):
+    db = MagicMock()
+    db.execute.return_value.fetchall.return_value = [("u1",)]
+    calls = []
+
+    def fake_delete(_db, table, where):
+        calls.append((table, where))
+        return 1
+
+    monkeypatch.setattr(ttl_cleanup, "_batch_hard_delete", fake_delete)
+    monkeypatch.setattr(ttl_cleanup, "log_event", MagicMock())
+
+    assert ttl_cleanup._hard_delete_deleted_users(db, 7) == 4
+    inbound = [where for table, where in calls if table == "wecom_inbound_event"]
+    assert len(inbound) == 1
+    assert "from_userid = 'u1'" in inbound[0]
+    assert "status IN ('done','dead_letter')" in inbound[0]
+
+
 # ---------------------------------------------------------------------------
 # _escape_literal
 # ---------------------------------------------------------------------------

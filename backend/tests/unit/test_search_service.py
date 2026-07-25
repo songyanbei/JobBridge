@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm.base import RerankResult
 from app.schemas.conversation import CandidateSnapshot, SessionState
 from app.services.search_service import (
@@ -23,6 +24,7 @@ from app.services.search_service import (
     _json_scalar,
     _probe_job_suggestions,
     _probe_resume_suggestions,
+    _rerank_with_logging,
     _render_relaxation_summary_notice,
     _summarize_search_criteria,
     search_jobs,
@@ -30,7 +32,62 @@ from app.services.search_service import (
     show_more,
 )
 from app.schemas.search import RelaxationSummary
+from app.services import search_service
 from app.services.user_service import UserContext
+
+
+class TestRerankerAvailabilityFallback:
+    """排序模型故障不得使已有 SQL 候选不可用。"""
+
+    @pytest.mark.parametrize(
+        ("error", "expected_status"),
+        [
+            (LLMTimeout(), "timeout"),
+            (LLMParseError("bad json"), "parse_failed"),
+            (LLMError("upstream 500"), "http_error"),
+            (RuntimeError("provider bug"), "unknown_error"),
+        ],
+    )
+    @patch("app.services.search_service.log_event")
+    @patch("app.services.search_service.get_reranker")
+    def test_all_provider_failures_return_deterministic_fallback(
+        self, mock_factory, mock_log, error, expected_status,
+    ):
+        mock_factory.return_value.rerank.side_effect = error
+
+        result = _rerank_with_logging(
+            query="苏州普工",
+            candidates=[{"id": 1}, {"id": 2}],
+            role="worker",
+            top_n=2,
+            call_site="availability_test",
+        )
+
+        assert result.ranked_items == []
+        assert mock_log.call_args.args[0] == "llm_call"
+        assert mock_log.call_args.kwargs["status"] == expected_status
+
+    @patch("app.services.search_service.log_event")
+    @patch("app.services.search_service.get_reranker")
+    def test_backlog_degrades_before_calling_reranker(self, mock_factory, mock_log):
+        original = search_service.settings.reranker_queue_degrade_threshold
+        search_service.settings.reranker_queue_degrade_threshold = 10
+        token = search_service.set_queue_backlog_hint(20)
+        try:
+            result = _rerank_with_logging(
+                query="苏州普工",
+                candidates=[{"id": 1}],
+                role="worker",
+                top_n=1,
+                call_site="backlog_test",
+            )
+        finally:
+            search_service.reset_queue_backlog_hint(token)
+            search_service.settings.reranker_queue_degrade_threshold = original
+
+        assert result.ranked_items == []
+        mock_factory.assert_not_called()
+        assert mock_log.call_args.kwargs["status"] == "backlog_degraded"
 
 
 def _fresh_expires() -> str:

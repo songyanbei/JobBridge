@@ -71,6 +71,23 @@ def build_scheduler() -> BackgroundScheduler:
         coalesce=True,
     )
 
+    # ---- durable outbox 死信/超龄巡检（60s） ----
+    sched.add_job(
+        worker_monitor.check_outbox,
+        IntervalTrigger(seconds=60),
+        id="outbox_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        worker_monitor.check_session_commits,
+        IntervalTrigger(seconds=60),
+        id="session_commit_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
     # ---- 出站补偿队列长度巡检（600s） ----
     sched.add_job(
         send_retry_drain.check_backlog,

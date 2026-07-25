@@ -69,6 +69,13 @@ class TestDialoguePolicyDefaults:
         assert DialoguePolicy(primary_rollout_percentage=-1).primary_rollout_percentage == 0
         assert DialoguePolicy(primary_rollout_percentage=25).primary_rollout_percentage == 25
 
+    def test_legacy_primary_rollout_env_is_mapped(self, monkeypatch):
+        monkeypatch.setenv("DIALOGUE_V2_MODE", "primary")
+        monkeypatch.setenv("DIALOGUE_V2_PRIMARY_ROLLOUT_PERCENTAGE", "100")
+        configured = Settings(_env_file=None)
+        assert configured.dialogue_policy.v2_mode == "primary"
+        assert configured.dialogue_v2_primary_rollout_percentage == 100
+
     def test_acqp_invalid_falls_back_to_clarify(self):
         for bogus in ["bogus", "", "REPLACE", None]:
             p = DialoguePolicy(ambiguous_city_query_policy=bogus)
@@ -254,3 +261,18 @@ class TestMonkeypatchCompat:
         finally:
             s.ambiguous_city_query_policy = original
         assert s.ambiguous_city_query_policy == "clarify"
+
+
+def test_infrastructure_timeout_defaults_and_credential_escaping():
+    s = Settings(
+        db_user="user@example",
+        db_password="p@ss:/#?",
+        redis_password="r@ss:/#?",
+    )
+
+    assert s.db_connect_timeout_seconds == 2
+    assert s.db_pool_timeout_seconds == 3
+    assert s.redis_connect_timeout_seconds == 1.0
+    assert s.redis_socket_timeout_seconds == 2.0
+    assert "user%40example:p%40ss%3A%2F%23%3F@" in s.db_url
+    assert ":r%40ss%3A%2F%23%3F@" in s.redis_url

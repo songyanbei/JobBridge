@@ -91,6 +91,26 @@ class TestCheckQueueBacklog:
 
             mock_alert.assert_not_called()
 
+    def test_oldest_message_age_alerts_even_when_depth_is_low(
+        self, fake_redis, monkeypatch,
+    ):
+        monkeypatch.setattr(worker_monitor.settings, "monitor_queue_incoming_threshold", 50)
+        monkeypatch.setattr(
+            worker_monitor.settings, "monitor_queue_incoming_max_age_seconds", 120,
+        )
+        fake_redis.llen.return_value = 1
+        fake_redis.lindex.return_value = '{"_enqueued_at": 800}'
+
+        with patch.object(worker_monitor, "task_lock", return_value=_ctx_acquired(True)), \
+             patch.object(worker_monitor.time, "time", return_value=1000), \
+             patch.object(worker_monitor, "_alert") as mock_alert, \
+             patch.object(worker_monitor, "log_event") as mock_log:
+            worker_monitor.check_queue_backlog()
+
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.args[0] == "queue_oldest_age"
+        assert mock_log.call_args.kwargs["oldest_age_seconds"] == 200
+
 
 # ---------------------------------------------------------------------------
 # check_dead_letter
@@ -115,6 +135,63 @@ class TestCheckDeadLetter:
             worker_monitor.check_dead_letter()
 
             mock_alert.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# check_outbox
+# ---------------------------------------------------------------------------
+
+class TestCheckOutbox:
+    def test_dead_and_stale_pending_both_alert(self, monkeypatch):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.side_effect = [2, 400]
+        monkeypatch.setattr(
+            worker_monitor.settings,
+            "monitor_session_commit_pending_max_age_seconds",
+            300,
+        )
+
+        with patch.object(worker_monitor, "task_lock", return_value=_ctx_acquired(True)), \
+             patch.object(worker_monitor, "SessionLocal", return_value=db), \
+             patch.object(worker_monitor, "_alert") as mock_alert:
+            worker_monitor.check_outbox()
+
+        assert [call.args[0] for call in mock_alert.call_args_list] == [
+            "outbox_dead_letter",
+            "outbox_pending_age",
+        ]
+        db.close.assert_called_once()
+
+    def test_healthy_outbox_no_alert(self):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.side_effect = [0, None]
+
+        with patch.object(worker_monitor, "task_lock", return_value=_ctx_acquired(True)), \
+             patch.object(worker_monitor, "SessionLocal", return_value=db), \
+             patch.object(worker_monitor, "_alert") as mock_alert:
+            worker_monitor.check_outbox()
+
+        mock_alert.assert_not_called()
+
+
+class TestCheckSessionCommits:
+    def test_stale_pending_session_commit_alerts(self, monkeypatch):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.side_effect = [3, 420]
+        monkeypatch.setattr(
+            worker_monitor.settings,
+            "monitor_outbox_pending_max_age_seconds",
+            300,
+        )
+
+        with patch.object(worker_monitor, "task_lock", return_value=_ctx_acquired(True)), \
+             patch.object(worker_monitor, "SessionLocal", return_value=db), \
+             patch.object(worker_monitor, "_alert") as mock_alert:
+            worker_monitor.check_session_commits()
+
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.args[0] == "session_commit_pending_age"
+        db.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

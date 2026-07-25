@@ -16,6 +16,7 @@ from app.core.redis_client import (
     clear_event_idem,
     mark_event_idem,
 )
+from app.core.logging_setup import identifier_hash
 from app.models import EventLog, SystemConfig
 from app.services.admin_log_service import write_admin_log
 
@@ -84,7 +85,10 @@ def record_click(
         db.add(entry)
         db.commit()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("event_service: event_log write failed userid=%s", userid)
+        logger.exception(
+            "event_service: event_log write failed user_hash=%s",
+            identifier_hash(userid),
+        )
         db.rollback()
         # 释放幂等 key，允许下次同事件重试写库
         try:

@@ -26,7 +26,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.orm import Session
+from sqlalchemy import and_, exists, func, null, or_, text
+from sqlalchemy.orm import Session, aliased
 
 from app.core.redis_client import (
     QUEUE_DEAD_LETTER,
@@ -37,10 +38,17 @@ from app.core.redis_client import (
     get_redis,
     user_lock,
 )
+from app.core.logging_setup import configure_loguru, identifier_hash
 from app.db import SessionLocal
-from app.models import AuditLog, ConversationLog, WecomInboundEvent
+from app.models import (
+    AuditLog,
+    ConversationLog,
+    WecomInboundEvent,
+    WecomOutboundOutbox,
+)
 from app.schemas.conversation import ReplyMessage
-from app.services import message_router
+from app.services import conversation_service, message_router, search_service
+from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 from app.wecom.client import WeComClient, WeComError
 
@@ -50,13 +58,23 @@ logger = logging.getLogger(__name__)
 # 常量
 # ---------------------------------------------------------------------------
 
-BLPOP_TIMEOUT_SECONDS = 5        # 阻塞超时，便于检查退出信号和 send_retry 队列
+BLPOP_TIMEOUT_SECONDS = 1        # 小于 Redis socket timeout，便于检查退出/辅助队列
 HEARTBEAT_INTERVAL = 60
 HEARTBEAT_TTL = 120
 MAX_RETRY = 2
 SEND_RETRY_BACKOFFS = [60, 120, 300]  # 秒，指数退避
 MAX_SEND_RETRY = 3
 CONVERSATION_LOG_TTL_DAYS = 30
+AUX_QUEUE_EVERY_MESSAGES = 10
+RECOVERY_SCAN_INTERVAL_SECONDS = 30
+RECOVERY_RECEIVED_STALE_SECONDS = 10
+RECOVERY_PROCESSING_STALE_SECONDS = 180
+OUTBOX_SENDING_STALE_SECONDS = 180
+OUTBOX_CLAIM_BATCH_SIZE = 20
+OUTBOX_MAX_ATTEMPTS = 5
+OUTBOX_RETRY_BACKOFFS = [30, 60, 120, 300, 600]
+SESSION_COMMIT_STALE_SECONDS = 180
+SESSION_COMMIT_RETRY_BACKOFFS = [5, 15, 30, 60, 300]
 
 DEAD_LETTER_REPLY = "系统繁忙，请稍后再试。"
 
@@ -74,6 +92,7 @@ class Worker:
         self._heartbeat_thread: threading.Thread | None = None
         self._redis = get_redis()
         self._wecom_client = WeComClient()
+        self._last_recovery_scan = 0.0
 
     # -----------------------------------------------------------------------
     # 启停
@@ -124,41 +143,87 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def _startup_recovery(self) -> None:
-        """将上次 crash 残留的 status=processing 记录重入队列。
-
-        ⚠️ 当前 Phase 4 设计默认单 Worker 运行。如果未来横向扩容成 N 个 Worker，
-        每个 Worker 启动时都会看到全部 processing 记录并尝试重入队列，可能导致
-        同一条消息被多个 Worker 重复入队（但最终由 user_lock + conversation_log
-        UNIQUE 兜底，行为是幂等的）。若后续确认要多 Worker，再引入 owner_worker_id
-        字段按归属过滤。
-        """
+        """Recover stale durable events without stealing active work."""
         db = SessionLocal()
         try:
-            rows = db.query(WecomInboundEvent).filter(
-                WecomInboundEvent.status == "processing",
-            ).all()
+            # Use the database clock for every durable timestamp comparison.
+            # Containers commonly run UTC while MySQL is configured with a local
+            # timezone; mixing those clocks can recover active work eight hours
+            # early (or leave stale work untouched for eight hours).
+            received_before = func.timestampadd(
+                text("SECOND"), -RECOVERY_RECEIVED_STALE_SECONDS, func.now(6),
+            )
+            processing_before = func.timestampadd(
+                text("SECOND"), -RECOVERY_PROCESSING_STALE_SECONDS, func.now(6),
+            )
+            rows = (
+                db.query(WecomInboundEvent)
+                .filter(or_(
+                    and_(
+                        WecomInboundEvent.status == "received",
+                        WecomInboundEvent.created_at <= received_before,
+                    ),
+                    and_(
+                        WecomInboundEvent.status == "processing",
+                        or_(
+                            WecomInboundEvent.worker_started_at.is_(None),
+                            WecomInboundEvent.worker_started_at <= processing_before,
+                        ),
+                    ),
+                    # A retry is marked failed only after its replacement queue
+                    # item has been written. If a worker then crashes after BLPOP
+                    # but before changing it back to processing, that item would
+                    # otherwise be lost forever.
+                    and_(
+                        WecomInboundEvent.status == "failed",
+                        or_(
+                            WecomInboundEvent.worker_finished_at.is_(None),
+                            WecomInboundEvent.worker_finished_at <= processing_before,
+                        ),
+                    ),
+                ))
+                .with_for_update(skip_locked=True)
+                .limit(100)
+                .all()
+            )
             if not rows:
+                db.commit()
+                self._last_recovery_scan = time.monotonic()
                 return
+            claimed: list[tuple[str, dict]] = []
             for row in rows:
-                queue_msg = _inbound_event_to_queue_msg(row)
+                claimed.append((row.msg_id, _inbound_event_to_queue_msg(row)))
+                # Commit the durable claim before touching Redis. If the process
+                # dies after this commit, the processing-stale branch recovers it
+                # later. The inverse order can enqueue the same 100 rows on every
+                # failed DB commit and create an unbounded queue storm.
+                row.status = "processing"
+                row.worker_started_at = func.now(6)
+            db.commit()
+
+            for msg_id, queue_msg in claimed:
                 try:
                     enqueue_message(
                         json.dumps(queue_msg, ensure_ascii=False), QUEUE_INCOMING,
                     )
-                    row.status = "received"
-                    row.worker_started_at = None
                     logger.warning(
-                        "worker: startup recovery requeue msg_id=%s", row.msg_id,
+                        "worker: startup recovery requeue msg_id=%s", msg_id,
                     )
                 except Exception:
                     logger.exception(
-                        "worker: startup recovery failed msg_id=%s", row.msg_id,
+                        "worker: startup recovery failed msg_id=%s", msg_id,
                     )
-            db.commit()
+                    self._mark_event_recovery_due(
+                        queue_msg.get("inbound_event_id"),
+                        error_message="startup recovery enqueue failed",
+                    )
         except Exception:
             db.rollback()
             logger.exception("worker: startup_recovery scan failed")
         finally:
+            # A DB/Redis outage must not turn the main loop into a hot recovery
+            # retry loop. The next bounded scan runs after the normal interval.
+            self._last_recovery_scan = time.monotonic()
             db.close()
 
     # -----------------------------------------------------------------------
@@ -166,7 +231,13 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def _main_loop(self) -> None:
+        processed_since_aux = 0
         while self._running:
+            if (
+                time.monotonic() - self._last_recovery_scan
+                >= RECOVERY_SCAN_INTERVAL_SECONDS
+            ):
+                self._startup_recovery()
             try:
                 item = self._redis.blpop(QUEUE_INCOMING, timeout=BLPOP_TIMEOUT_SECONDS)
             except Exception:
@@ -177,8 +248,8 @@ class Worker:
             if item is None:
                 # 空闲：优先处理"即发即弃"的限流通知（best-effort，不进重试队列）
                 # 再处理 send_retry（带指数退避的出站重试）
-                self._process_rate_limit_notify_once()
-                self._process_send_retry_once()
+                self._service_aux_queues()
+                processed_since_aux = 0
                 continue
 
             # item = (queue_name, payload_json)
@@ -189,34 +260,132 @@ class Worker:
                 continue
 
             self._process_message(msg_data)
+            processed_since_aux += 1
+            if processed_since_aux >= AUX_QUEUE_EVERY_MESSAGES:
+                # 持续 inbound 流量下也给通知/发送重试固定时间片，避免只有队列
+                # 完全清空时才消费而永久饥饿。
+                self._service_aux_queues()
+                processed_since_aux = 0
+
+    def _service_aux_queues(self) -> None:
+        self._process_rate_limit_notify_once()
+        self._process_session_commit_once()
+        self._process_outbox_once()
+        self._process_send_retry_once()
 
     # -----------------------------------------------------------------------
     # 单条消息处理
     # -----------------------------------------------------------------------
 
     def _process_message(self, msg_data: dict) -> None:
+        process_started = time.perf_counter()
         userid = msg_data.get("from_userid") or ""
         inbound_event_id = msg_data.get("inbound_event_id")
         retry_count = int(msg_data.get("_retry_count") or 0)
 
         if not userid:
-            logger.warning("worker: msg_data without from_userid: %s", msg_data)
+            logger.warning(
+                "worker: queue payload without from_userid msg_id=%s keys=%s",
+                msg_data.get("msg_id"),
+                sorted(msg_data),
+            )
             return
 
-        # 分布式锁：同一 userid 串行（blocking_timeout=5 秒）
-        with user_lock(userid, timeout=5) as acquired:
-            if not acquired:
-                logger.info("worker: user_lock busy, requeue userid=%s", userid)
-                try:
-                    time.sleep(0.5)
-                    enqueue_message(
-                        json.dumps(msg_data, ensure_ascii=False), QUEUE_INCOMING,
-                    )
-                except Exception:
-                    logger.exception("worker: requeue after lock fail failed")
-                return
+        try:
+            enqueued_at = float(msg_data.get("_enqueued_at") or 0)
+        except (TypeError, ValueError):
+            enqueued_at = 0
+        queue_wait_ms = (
+            max(0, int((time.time() - enqueued_at) * 1000))
+            if enqueued_at > 0 else None
+        )
+        user_hash = identifier_hash(userid)
+        lock_started = time.perf_counter()
+        outcome = "unknown"
 
-            self._process_locked(msg_data, inbound_event_id, retry_count, userid)
+        # 分布式锁：同一 userid 串行（blocking_timeout=5 秒）
+        try:
+            with user_lock(userid, timeout=5) as lock_lease:
+                lock_wait_ms = int((time.perf_counter() - lock_started) * 1000)
+                if not lock_lease:
+                    outcome = "lock_busy_requeued"
+                    logger.info(
+                        "worker: user_lock busy, requeue user_hash=%s", user_hash,
+                    )
+                    try:
+                        time.sleep(0.5)
+                        enqueue_message(
+                            json.dumps(msg_data, ensure_ascii=False), QUEUE_INCOMING,
+                        )
+                    except Exception:
+                        outcome = "lock_busy_requeue_failed"
+                        logger.exception("worker: requeue after lock fail failed")
+                        self._preserve_event_for_recovery(inbound_event_id)
+                    return
+
+                # Redis lock guarantees“同一时刻只有一个”，但不保证等待者按入队
+                # 顺序获得锁。以 durable inbound_event.id 作单调序列门禁，后到消息
+                # 若发现同用户仍有更早未完成事件，只重入队而不触碰 session/DB。
+                if self._has_earlier_unfinished_event(userid, inbound_event_id):
+                    outcome = "out_of_order_requeued"
+                    try:
+                        enqueue_message(
+                            json.dumps(msg_data, ensure_ascii=False), QUEUE_INCOMING,
+                        )
+                    except Exception:
+                        outcome = "out_of_order_requeue_failed"
+                        logger.exception(
+                            "worker: ordered requeue failed msg_id=%s",
+                            msg_data.get("msg_id"),
+                        )
+                        self._preserve_event_for_recovery(inbound_event_id)
+                    return
+
+                outcome = self._process_locked(
+                    msg_data, inbound_event_id, retry_count, userid, lock_lease,
+                )
+        finally:
+            log_event(
+                "message_processing",
+                msg_id=msg_data.get("msg_id"),
+                user_hash=user_hash,
+                queue_wait_ms=queue_wait_ms,
+                lock_wait_ms=int((time.perf_counter() - lock_started) * 1000)
+                if "lock_wait_ms" not in locals() else lock_wait_ms,
+                process_duration_ms=int((time.perf_counter() - process_started) * 1000),
+                retry_count=retry_count,
+                outcome=outcome,
+            )
+
+    def _has_earlier_unfinished_event(
+        self, userid: str, inbound_event_id: Any,
+    ) -> bool:
+        """Whether a durable earlier message for this user still owns sequence priority."""
+        if not inbound_event_id:
+            return False
+        db = SessionLocal()
+        try:
+            return db.query(WecomInboundEvent.id).filter(
+                WecomInboundEvent.from_userid == userid,
+                WecomInboundEvent.id < int(inbound_event_id),
+                WecomInboundEvent.status.in_(
+                    ("received", "processing", "session_pending", "failed"),
+                ),
+            ).first() is not None
+        except Exception:
+            # Availability must not silently defeat ordering. Requeue and retry the
+            # read rather than process a possibly stale turn.
+            logger.exception(
+                "worker: earlier-event order check failed msg_id=%s",
+                inbound_event_id,
+            )
+            return True
+        finally:
+            db.close()
+
+    def _preserve_event_for_recovery(self, inbound_event_id: Any) -> None:
+        """Make a popped-but-not-requeued event visible to startup recovery."""
+        self._mark_event_recovery_due(inbound_event_id)
 
     def _process_locked(
         self,
@@ -224,11 +393,40 @@ class Worker:
         inbound_event_id: Any,
         retry_count: int,
         userid: str,
-    ) -> None:
+        lock_lease: Any = None,
+    ) -> str:
         db: Session = SessionLocal()
+        business_committed = False
         try:
+            # Redis is an at-least-once queue. A crash between enqueue and the DB
+            # claim can leave a duplicate payload behind. The per-user lease
+            # serializes contenders, and this durable terminal check prevents the
+            # later copy from repeating publish/search side effects.
+            if inbound_event_id:
+                event_status = db.query(WecomInboundEvent.status).filter(
+                    WecomInboundEvent.id == inbound_event_id,
+                ).scalar()
+                if event_status in ("done", "dead_letter"):
+                    logger.info(
+                        "worker: terminal duplicate skipped id=%s status=%s",
+                        inbound_event_id,
+                        event_status,
+                    )
+                    return "duplicate_terminal_skipped"
+                if event_status == "session_pending":
+                    applied = self._apply_session_commit_for_event(
+                        inbound_event_id, userid,
+                    )
+                    if applied:
+                        self._deliver_outbox_for_event(inbound_event_id)
+                        return "session_pending_recovered"
+                    return "session_pending_waiting"
+
             # inbound_event → processing
             self._mark_event_processing(db, inbound_event_id)
+            # 独立提交处理起点；若和 router 的慢 LLM 事务一起提交，数据库看到的
+            # worker_started_at 会接近“处理完成”，queue/process 两项指标失真。
+            db.commit()
 
             msg = _build_wecom_message(msg_data)
 
@@ -236,30 +434,87 @@ class Worker:
             if msg.msg_type == "image" and msg.media_id:
                 self._download_and_attach_image(msg)
 
-            # 调路由
-            replies = message_router.process(msg, db)
+            # 调路由；把 pop 后的队列深度作为 turn-scoped hint 传给 reranker。
+            # ContextVar 隔离 future thread/task，避免每次排序再额外访问 Redis。
+            try:
+                backlog_depth = int(self._redis.llen(QUEUE_INCOMING) or 0)
+            except Exception:
+                backlog_depth = 0
+            backlog_token = search_service.set_queue_backlog_hint(backlog_depth)
+            stage_token = conversation_service.begin_session_staging(userid)
+            staged_session = None
+            try:
+                replies = message_router.process(msg, db)
+            finally:
+                staged_session = conversation_service.end_session_staging(
+                    stage_token,
+                )
+                search_service.reset_queue_backlog_hint(backlog_token)
 
-            # 提交 router 写入的 DB 改动（user / upload / delete 等）
-            db.commit()
+            # Router 只暂存了 session 意图；DB 提交前再次验证租约。续租线程一旦
+            # 发现 extend 失败会置 lost_event，使旧 Worker 走 rollback + 可恢复重试。
+            if hasattr(lock_lease, "assert_owned"):
+                lock_lease.assert_owned()
 
-            # 发送回复（失败走 send_retry，不回滚整单）
-            sent_ok = self._send_replies(replies)
-
-            # 写 conversation_log
+            # 业务写入、对话日志、回复意图和 inbound done 必须在同一个事务提交。
+            # 提交后即使进程崩溃，terminal gate 不会重跑 router；未发送回复由
+            # durable outbox 扫描恢复。
             self._write_conversation_log(db, msg, replies)
+            if inbound_event_id:
+                self._stage_outbox(db, inbound_event_id, replies)
+            if inbound_event_id and staged_session is not None:
+                self._stage_session_commit(
+                    db, inbound_event_id, staged_session,
+                )
+            else:
+                self._mark_event_done(db, inbound_event_id)
             db.commit()
+            business_committed = True
 
-            # inbound_event → done
-            self._mark_event_done(db, inbound_event_id)
-            db.commit()
+            # Session 必须先落 Redis 并把 durable event 标 done，outbox 才可见。
+            # Redis 短断时业务事务已经安全提交，后续 turn 被 session_pending 顺序
+            # 门禁阻塞，由辅助扫描恢复，不会重跑发布/搜索。
+            session_ready = True
+            if inbound_event_id and staged_session is not None:
+                session_ready = self._apply_session_commit_for_event(
+                    inbound_event_id, userid,
+                )
+            elif not inbound_event_id and staged_session is not None:
+                session_ready = conversation_service.apply_staged_session(
+                    staged_session,
+                )
+            sent_ok = False
+            if session_ready:
+                sent_ok = (
+                    self._deliver_outbox_for_event(inbound_event_id)
+                    if inbound_event_id
+                    else self._send_replies(replies)
+                )
             logger.info(
-                "worker: processed msg_id=%s userid=%s replies=%d send_ok=%s",
-                msg.msg_id, userid, len(replies), sent_ok,
+                "worker: processed msg_id=%s user_hash=%s replies=%d send_ok=%s",
+                msg.msg_id, identifier_hash(userid), len(replies), sent_ok,
             )
+            return "processed" if session_ready else "session_commit_pending"
         except Exception as exc:
             db.rollback()
-            logger.exception("worker: processing failed userid=%s: %s", userid, exc)
+            if business_committed:
+                # Never send an already-committed publish/search turn through the
+                # generic retry path. Its durable session/outbox state is the sole
+                # recovery source; replaying the router could duplicate business
+                # side effects.
+                logger.exception(
+                    "worker: post-commit recovery failed user_hash=%s: %s",
+                    identifier_hash(userid),
+                    exc,
+                )
+                return "post_commit_recovery_pending"
+            logger.exception(
+                "worker: processing failed user_hash=%s: %s",
+                identifier_hash(userid),
+                exc,
+            )
             self._handle_error(msg_data, inbound_event_id, retry_count, exc)
+            return "processing_failed"
         finally:
             db.close()
 
@@ -286,6 +541,426 @@ class Worker:
     # -----------------------------------------------------------------------
     # 回复发送（失败补偿）
     # -----------------------------------------------------------------------
+
+    def _stage_session_commit(
+        self,
+        db: Session,
+        inbound_event_id: Any,
+        commit: conversation_service.StagedSessionCommit,
+    ) -> None:
+        updated = db.query(WecomInboundEvent).filter(
+            WecomInboundEvent.id == inbound_event_id,
+        ).update({
+            "status": "session_pending",
+            "session_operation": commit.operation,
+            "session_expected_version": commit.expected_version,
+            "session_payload": commit.payload,
+            "session_apply_attempts": 0,
+            "session_apply_locked_at": None,
+            "session_next_attempt_at": None,
+            "session_applied_at": None,
+            "worker_finished_at": None,
+        })
+        if updated != 1:
+            raise RuntimeError(
+                f"unable to stage session commit for event {inbound_event_id}",
+            )
+
+    def _claim_session_commits(
+        self,
+        *,
+        inbound_event_id: Any = None,
+        limit: int = 10,
+    ) -> list[dict]:
+        db = SessionLocal()
+        try:
+            now = func.now(6)
+            stale_before = func.timestampadd(
+                text("SECOND"), -SESSION_COMMIT_STALE_SECONDS, now,
+            )
+            query = db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.status == "session_pending",
+                or_(
+                    WecomInboundEvent.session_next_attempt_at.is_(None),
+                    WecomInboundEvent.session_next_attempt_at <= now,
+                ),
+                or_(
+                    WecomInboundEvent.session_apply_locked_at.is_(None),
+                    WecomInboundEvent.session_apply_locked_at <= stale_before,
+                ),
+            )
+            if inbound_event_id:
+                query = query.filter(
+                    WecomInboundEvent.id == int(inbound_event_id),
+                )
+            rows = (
+                query.order_by(WecomInboundEvent.id)
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+                .all()
+            )
+            claimed: list[dict] = []
+            for row in rows:
+                row.session_apply_locked_at = now
+                row.session_apply_attempts = int(
+                    row.session_apply_attempts or 0,
+                ) + 1
+                claimed.append({
+                    "event_id": int(row.id),
+                    "userid": row.from_userid,
+                    "attempts": int(row.session_apply_attempts),
+                    "commit": conversation_service.StagedSessionCommit(
+                        userid=row.from_userid,
+                        operation=str(row.session_operation or ""),
+                        expected_version=int(
+                            row.session_expected_version or 0,
+                        ),
+                        payload=(
+                            dict(row.session_payload)
+                            if row.session_payload is not None
+                            else None
+                        ),
+                    ),
+                })
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback()
+            logger.exception("worker: claim durable session commits failed")
+            return []
+        finally:
+            db.close()
+
+    def _mark_session_commit_applied(self, event_id: int) -> bool:
+        db = SessionLocal()
+        try:
+            updated = db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == event_id,
+                WecomInboundEvent.status == "session_pending",
+            ).update({
+                "status": "done",
+                # The payload can contain transient search/draft PII. It is only
+                # needed until Redis confirms the transition, so do not retain it
+                # for the normal inbound-event TTL.
+                "session_operation": None,
+                "session_expected_version": None,
+                "session_payload": null(),
+                "session_apply_locked_at": None,
+                "session_next_attempt_at": None,
+                "session_applied_at": func.now(6),
+                "worker_finished_at": func.now(6),
+                "error_message": None,
+            })
+            db.commit()
+            return updated == 1
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: mark durable session commit applied failed event_id=%s",
+                event_id,
+            )
+            return False
+        finally:
+            db.close()
+
+    def _mark_session_commit_retry(self, item: dict, error: Exception) -> None:
+        db = SessionLocal()
+        try:
+            attempts = int(item["attempts"])
+            backoff = SESSION_COMMIT_RETRY_BACKOFFS[
+                min(attempts - 1, len(SESSION_COMMIT_RETRY_BACKOFFS) - 1)
+            ]
+            db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == item["event_id"],
+                WecomInboundEvent.status == "session_pending",
+            ).update({
+                "session_apply_locked_at": None,
+                "session_next_attempt_at": func.timestampadd(
+                    text("SECOND"), backoff, func.now(6),
+                ),
+                "error_message": f"{type(error).__name__}: {error}"[:1000],
+            })
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: persist session commit retry failed event_id=%s",
+                item.get("event_id"),
+            )
+        finally:
+            db.close()
+
+    def _apply_session_commit_item(self, item: dict) -> bool:
+        commit = item["commit"]
+        try:
+            applied = conversation_service.apply_staged_session(commit)
+            if not applied:
+                applied = conversation_service.is_staged_session_applied(commit)
+            if not applied:
+                raise conversation_service.SessionVersionConflict(
+                    "durable session CAS rejected",
+                )
+        except Exception as exc:
+            self._mark_session_commit_retry(item, exc)
+            return False
+        return self._mark_session_commit_applied(item["event_id"])
+
+    def _apply_session_commit_for_event(
+        self,
+        inbound_event_id: Any,
+        userid: str,
+    ) -> bool:
+        claimed = self._claim_session_commits(
+            inbound_event_id=inbound_event_id,
+            limit=1,
+        )
+        if not claimed:
+            # Another worker may have completed it between the status read and
+            # claim. Read the durable terminal state instead of assuming failure.
+            db = SessionLocal()
+            try:
+                status = db.query(WecomInboundEvent.status).filter(
+                    WecomInboundEvent.id == inbound_event_id,
+                ).scalar()
+                return status == "done"
+            finally:
+                db.close()
+        item = claimed[0]
+        if item["userid"] != userid:
+            self._mark_session_commit_retry(
+                item, RuntimeError("session commit userid mismatch"),
+            )
+            return False
+        return self._apply_session_commit_item(item)
+
+    def _process_session_commit_once(self) -> None:
+        for item in self._claim_session_commits():
+            try:
+                with user_lock(item["userid"], timeout=5) as lease:
+                    if not lease:
+                        self._mark_session_commit_retry(
+                            item, RuntimeError("user lock busy"),
+                        )
+                        continue
+                    lease.assert_owned()
+                    self._apply_session_commit_item(item)
+            except Exception as exc:
+                self._mark_session_commit_retry(item, exc)
+
+    def _stage_outbox(
+        self,
+        db: Session,
+        inbound_event_id: Any,
+        replies: list[ReplyMessage],
+    ) -> None:
+        """在 router 业务事务中持久化有序回复意图。"""
+        for index, reply in enumerate(replies):
+            db.add(WecomOutboundOutbox(
+                inbound_event_id=int(inbound_event_id),
+                reply_index=index,
+                userid=reply.userid,
+                msg_type=reply.msg_type,
+                content=reply.content,
+                intent=reply.intent,
+                criteria_snapshot=reply.criteria_snapshot,
+                status="pending",
+            ))
+
+    def _claim_outbox(
+        self,
+        *,
+        inbound_event_id: Any = None,
+        limit: int = OUTBOX_CLAIM_BATCH_SIZE,
+    ) -> list[dict]:
+        """原子认领到期 outbox；stale sending 在 Worker crash 后可恢复。"""
+        db = SessionLocal()
+        try:
+            now = func.now(6)
+            stale_before = func.timestampadd(
+                text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
+            )
+            due = or_(
+                and_(
+                    WecomOutboundOutbox.status == "pending",
+                    or_(
+                        WecomOutboundOutbox.next_attempt_at.is_(None),
+                        WecomOutboundOutbox.next_attempt_at <= now,
+                    ),
+                ),
+                and_(
+                    WecomOutboundOutbox.status == "sending",
+                    WecomOutboundOutbox.locked_at <= stale_before,
+                ),
+            )
+            earlier = aliased(WecomOutboundOutbox)
+            no_earlier_unsent_for_user = ~exists().where(and_(
+                earlier.userid == WecomOutboundOutbox.userid,
+                earlier.id < WecomOutboundOutbox.id,
+                earlier.status.in_(("pending", "sending")),
+            ))
+            query = db.query(WecomOutboundOutbox).join(
+                WecomInboundEvent,
+                WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
+            ).filter(
+                due,
+                no_earlier_unsent_for_user,
+                WecomInboundEvent.status == "done",
+            )
+            if inbound_event_id:
+                query = query.filter(
+                    WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
+                )
+            rows = (
+                query.order_by(
+                    WecomOutboundOutbox.inbound_event_id,
+                    WecomOutboundOutbox.reply_index,
+                )
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+                .all()
+            )
+            claimed: list[dict] = []
+            for row in rows:
+                row.status = "sending"
+                row.locked_at = now
+                row.attempt_count = int(row.attempt_count or 0) + 1
+                claimed.append({
+                    "id": int(row.id),
+                    "userid": row.userid,
+                    "content": row.content,
+                    "attempt_count": int(row.attempt_count),
+                })
+            db.commit()
+            return claimed
+        except Exception:
+            db.rollback()
+            logger.exception("worker: claim outbox failed")
+            return []
+        finally:
+            db.close()
+
+    def _mark_outbox_sent(self, outbox_id: int, provider_msg_id: str | None) -> bool:
+        db = SessionLocal()
+        try:
+            updated = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.id == outbox_id,
+                WecomOutboundOutbox.status == "sending",
+            ).update({
+                "status": "sent",
+                "provider_msg_id": (provider_msg_id or "")[:128] or None,
+                "sent_at": func.now(6),
+                "locked_at": None,
+                "next_attempt_at": None,
+                "last_error": None,
+            })
+            db.commit()
+            return updated == 1
+        except Exception:
+            db.rollback()
+            # Provider may already have accepted the message. Leaving the row in
+            # sending makes it recoverable but can duplicate after the stale TTL.
+            logger.exception(
+                "worker: mark outbox sent failed id=%s; duplicate risk on recovery",
+                outbox_id,
+            )
+            return False
+        finally:
+            db.close()
+
+    def _mark_outbox_failed(
+        self,
+        item: dict,
+        error: Exception,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        db = SessionLocal()
+        try:
+            attempts = int(item["attempt_count"])
+            dead = terminal or attempts >= OUTBOX_MAX_ATTEMPTS
+            values: dict = {
+                "status": "dead_letter" if dead else "pending",
+                "locked_at": None,
+                "last_error": f"{type(error).__name__}: {error}"[:1000],
+            }
+            if dead:
+                values["next_attempt_at"] = None
+            else:
+                backoff = OUTBOX_RETRY_BACKOFFS[
+                    min(attempts - 1, len(OUTBOX_RETRY_BACKOFFS) - 1)
+                ]
+                values["next_attempt_at"] = func.timestampadd(
+                    text("SECOND"), backoff, func.now(6),
+                )
+            db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.id == item["id"],
+                WecomOutboundOutbox.status == "sending",
+            ).update(values)
+            db.commit()
+            if dead:
+                self._write_send_failed_audit(
+                    item["userid"], item["content"], attempts,
+                )
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: mark outbox failed failed id=%s",
+                item.get("id"),
+            )
+        finally:
+            db.close()
+
+    def _deliver_outbox_item(self, item: dict) -> bool:
+        try:
+            response = self._wecom_client.send_text(
+                item["userid"], item["content"],
+            )
+        except WeComError as exc:
+            if getattr(exc, "errcode", 0) == 42001:
+                try:
+                    self._wecom_client.invalidate_token()
+                    response = self._wecom_client.send_text(
+                        item["userid"], item["content"],
+                    )
+                except Exception as retry_exc:
+                    self._mark_outbox_failed(item, retry_exc)
+                    return False
+            elif getattr(exc, "errcode", 0) in (60111, 84061, 40031):
+                self._mark_user_inactive(item["userid"])
+                self._mark_outbox_failed(item, exc, terminal=True)
+                return False
+            else:
+                self._mark_outbox_failed(item, exc)
+                return False
+        except Exception as exc:
+            self._mark_outbox_failed(item, exc)
+            return False
+
+        return self._mark_outbox_sent(
+            item["id"],
+            response.get("msgid") if isinstance(response, dict) else None,
+        )
+
+    def _deliver_outbox_for_event(self, inbound_event_id: Any) -> bool:
+        # The per-user NOT EXISTS gate intentionally exposes at most the earliest
+        # reply. Loop so a normal multi-part response is still delivered promptly
+        # and in order; stop after a failure because that row remains the fence.
+        results: list[bool] = []
+        while True:
+            claimed = self._claim_outbox(inbound_event_id=inbound_event_id)
+            if not claimed:
+                break
+            batch_results = [
+                self._deliver_outbox_item(item) for item in claimed
+            ]
+            results.extend(batch_results)
+            if not all(batch_results):
+                break
+        return all(results)
+
+    def _process_outbox_once(self) -> None:
+        for item in self._claim_outbox():
+            self._deliver_outbox_item(item)
 
     def _send_replies(self, replies: list[ReplyMessage]) -> bool:
         all_ok = True
@@ -322,8 +997,8 @@ class Worker:
         # 用户不存在或已退出：不重试
         if errcode in (60111, 84061, 40031):
             logger.warning(
-                "worker: recipient unreachable userid=%s errcode=%s",
-                reply.userid, errcode,
+                "worker: recipient unreachable user_hash=%s errcode=%s",
+                identifier_hash(reply.userid), errcode,
             )
             self._mark_user_inactive(reply.userid)
             return False
@@ -335,8 +1010,8 @@ class Worker:
 
         # 其它错误：入 send_retry
         logger.warning(
-            "worker: send_text failed, enqueue retry userid=%s errcode=%s msg=%s",
-            reply.userid, errcode, exc,
+            "worker: send_text failed, enqueue retry user_hash=%s errcode=%s msg=%s",
+            identifier_hash(reply.userid), errcode, exc,
         )
         self._enqueue_send_retry(reply, backoff=60)
         return False
@@ -375,7 +1050,10 @@ class Worker:
             db.commit()
         except Exception:
             db.rollback()
-            logger.exception("worker: mark_user_inactive failed userid=%s", userid)
+            logger.exception(
+                "worker: mark_user_inactive failed user_hash=%s",
+                identifier_hash(userid),
+            )
         finally:
             db.close()
 
@@ -415,8 +1093,8 @@ class Worker:
         except Exception as exc:
             # 不重试：限流场景下失败再重试只会雪崩
             logger.warning(
-                "worker: rate_limit_notify send failed (drop) userid=%s err=%s",
-                userid, exc,
+                "worker: rate_limit_notify send failed (drop) user_hash=%s err=%s",
+                identifier_hash(userid), exc,
             )
 
     # -----------------------------------------------------------------------
@@ -456,7 +1134,11 @@ class Worker:
 
         try:
             self._wecom_client.send_text(userid, content)
-            logger.info("worker: send_retry success userid=%s retries=%d", userid, retry_count)
+            logger.info(
+                "worker: send_retry success user_hash=%s retries=%d",
+                identifier_hash(userid),
+                retry_count,
+            )
             return
         except WeComError as exc:
             errcode = getattr(exc, "errcode", 0)
@@ -509,7 +1191,9 @@ class Worker:
                 WecomInboundEvent.id == event_id,
             ).update({
                 "status": "processing",
-                "worker_started_at": datetime.now(timezone.utc),
+                # 与 created_at 的 MySQL CURRENT_TIMESTAMP 使用同一数据库时钟，
+                # 避免容器 UTC 与 DB Asia/Shanghai 混写后 queue latency 变成 -8h。
+                "worker_started_at": func.now(6),
             })
         except Exception:
             logger.exception("worker: mark_event_processing failed id=%s", event_id)
@@ -522,7 +1206,7 @@ class Worker:
                 WecomInboundEvent.id == event_id,
             ).update({
                 "status": "done",
-                "worker_finished_at": datetime.now(timezone.utc),
+                "worker_finished_at": func.now(6),
             })
         except Exception:
             logger.exception("worker: mark_event_done failed id=%s", event_id)
@@ -540,7 +1224,7 @@ class Worker:
                 "status": new_status,
                 "error_message": error_msg[:1000],
                 "retry_count": retry_count,
-                "worker_finished_at": datetime.now(timezone.utc),
+                "worker_finished_at": func.now(6),
             })
             db.commit()
         except Exception:
@@ -564,14 +1248,65 @@ class Worker:
             db.query(WecomInboundEvent).filter(
                 WecomInboundEvent.id == event_id,
             ).update({
+                "status": "processing",
                 "error_message": error_msg[:1000],
                 "retry_count": retry_count,
+                # A Redis requeue failure means no worker still owns this event.
+                # Make it eligible at the next periodic scan instead of waiting
+                # the full active-processing stale window (180s).
+                "worker_started_at": func.timestampadd(
+                    text("SECOND"),
+                    -(
+                        RECOVERY_PROCESSING_STALE_SECONDS
+                        - RECOVERY_SCAN_INTERVAL_SECONDS
+                    ),
+                    func.now(6),
+                ),
             })
             db.commit()
+            self._last_recovery_scan = time.monotonic()
         except Exception:
             db.rollback()
             logger.exception(
                 "worker: update_retry_and_error failed id=%s", event_id,
+            )
+        finally:
+            db.close()
+
+    def _mark_event_recovery_due(
+        self,
+        event_id: Any,
+        *,
+        error_message: str | None = None,
+    ) -> None:
+        """Persist a lost queue handoff for recovery on the next bounded scan."""
+        if not event_id:
+            return
+        db = SessionLocal()
+        try:
+            values: dict = {
+                "status": "processing",
+                "worker_started_at": func.timestampadd(
+                    text("SECOND"),
+                    -(
+                        RECOVERY_PROCESSING_STALE_SECONDS
+                        - RECOVERY_SCAN_INTERVAL_SECONDS
+                    ),
+                    func.now(6),
+                ),
+            }
+            if error_message:
+                values["error_message"] = error_message[:1000]
+            db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == event_id,
+            ).update(values)
+            db.commit()
+            self._last_recovery_scan = time.monotonic()
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: failed to make event recovery-due id=%s",
+                event_id,
             )
         finally:
             db.close()
@@ -733,6 +1468,7 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
         "inbound_event_id": row.id,
         "_retry_count": int(row.retry_count or 0),
         "_recovered": True,
+        "_enqueued_at": time.time(),
     }
 
 
@@ -763,6 +1499,7 @@ def main() -> None:
             level=logging.INFO,
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         )
+    configure_loguru(os.getenv("APP_ENV", "development"))
     Worker().start()
 
 

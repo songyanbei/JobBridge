@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from sqlalchemy.exc import IntegrityError
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
+from app.core.logging_setup import identifier_hash
 from app.core.redis_client import (
     QUEUE_INCOMING,
     QUEUE_RATE_LIMIT_NOTIFY,
@@ -59,6 +62,13 @@ _RATE_LIMIT_NOTIFY_DEDUP_SECONDS = 60
 
 # webhook 热路径的配置缓存 TTL（作为 Redis config_cache 未命中时的回源保护）
 _CONFIG_CACHE_TTL = 60
+_LOCAL_CONFIG_FALLBACK: dict[str, int] = {
+    "rate_limit.window_seconds": 10,
+    "rate_limit.max_count": 5,
+}
+_LOCAL_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE_UNAVAILABLE_UNTIL = 0.0
+_CONFIG_CACHE_RETRY_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +164,14 @@ async def receive_callback(
         logger.exception("webhook: parse_message failed: %s", exc)
         return _success_response()
 
+    # Redis and SQLAlchemy clients are synchronous. Keep them off the asyncio
+    # event loop so concurrent callbacks can still be decrypted/accepted while
+    # an infrastructure operation is waiting on its bounded timeout.
+    return await run_in_threadpool(_accept_message, msg, start_ts)
+
+
+def _accept_message(msg: WeComMessage, start_ts: float) -> Response:
+    """Durably accept and enqueue one parsed callback on a worker thread."""
     if not msg.msg_id:
         # event 类型等没有 MsgId，直接忽略，不入队不记录
         logger.info("webhook: skipping msg without msg_id, type=%s", msg.msg_type)
@@ -162,8 +180,17 @@ async def receive_callback(
     # 5. 幂等检查（L1 Redis）
     try:
         if check_msg_duplicate(msg.msg_id):
-            logger.info("webhook: duplicate msg_id=%s, skip", msg.msg_id)
-            return _success_response()
+            # SETNX is only a cache hint, not the durable acceptance record. A
+            # previous attempt may have set the key and then failed to write DB.
+            # Skipping solely on Redis would acknowledge and permanently lose
+            # every subsequent WeCom retry for that message.
+            if _inbound_event_exists(msg.msg_id):
+                logger.info("webhook: duplicate msg_id=%s, skip", msg.msg_id)
+                return _success_response()
+            logger.warning(
+                "webhook: stale L1 dedup marker without durable event msg_id=%s",
+                msg.msg_id,
+            )
     except Exception:
         # Redis 不可用 → 靠下面 inbound_event UNIQUE(msg_id) 兜底
         logger.exception("webhook: check_msg_duplicate failed (degraded to L2)")
@@ -181,13 +208,29 @@ async def receive_callback(
         allowed = True
 
     if not allowed:
-        logger.info("webhook: rate-limited userid=%s", msg.from_user)
+        logger.info(
+            "webhook: rate-limited user_hash=%s",
+            identifier_hash(msg.from_user),
+        )
         _async_rate_limit_notify(msg.from_user)
         # 被限流的消息不写 inbound_event，不入队
         return _success_response()
 
     # 7. 写 wecom_inbound_event
     inbound_event_id = _insert_inbound_event(msg)
+    if inbound_event_id is None:
+        # Do not acknowledge a message that has neither a durable event nor a
+        # recoverable queue identity. A non-2xx response lets WeCom retry; the
+        # stale Redis dedup marker is explicitly checked against DB above.
+        logger.error(
+            "webhook: durable acceptance failed, request upstream retry msg_id=%s",
+            msg.msg_id,
+        )
+        return Response(
+            content="temporary failure",
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            media_type="text/plain",
+        )
 
     # 8. 入队
     queue_msg = {
@@ -198,6 +241,8 @@ async def receive_callback(
         "media_id": msg.media_id,
         "create_time": msg.create_time,
         "inbound_event_id": inbound_event_id,
+        # Worker 用于计算真实排队时延；重试时保留原值，反映端到端积压。
+        "_enqueued_at": time.time(),
     }
     try:
         enqueue_message(json.dumps(queue_msg, ensure_ascii=False), QUEUE_INCOMING)
@@ -207,8 +252,8 @@ async def receive_callback(
 
     elapsed_ms = (time.monotonic() - start_ts) * 1000
     logger.info(
-        "webhook: accepted msg_id=%s userid=%s type=%s elapsed_ms=%.1f",
-        msg.msg_id, msg.from_user, msg.msg_type, elapsed_ms,
+        "webhook: accepted msg_id=%s user_hash=%s type=%s elapsed_ms=%.1f",
+        msg.msg_id, identifier_hash(msg.from_user), msg.msg_type, elapsed_ms,
     )
     return _success_response()
 
@@ -258,6 +303,24 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         db.close()
 
 
+def _inbound_event_exists(msg_id: str) -> bool:
+    """Return whether Redis's L1 dedup marker has a durable DB counterpart."""
+    db = SessionLocal()
+    try:
+        return db.query(WecomInboundEvent.id).filter(
+            WecomInboundEvent.msg_id == msg_id,
+        ).first() is not None
+    except Exception:
+        # On an uncertain DB read, continue to the INSERT path. Its UNIQUE key
+        # remains the authoritative L2 idempotency check.
+        logger.exception(
+            "webhook: durable dedup lookup failed msg_id=%s", msg_id,
+        )
+        return False
+    finally:
+        db.close()
+
+
 def _build_brief(msg: WeComMessage) -> str:
     """生成 content_brief：文本截断前 500；媒体类型仅做类型提示，实际 media_id 走独立列。"""
     if msg.msg_type == "text":
@@ -288,15 +351,42 @@ def _get_config_int(key: str, default: int) -> int:
     使用 Redis `config_cache:{key}` 做唯一缓存层，由 `system_config_service.update`
     更新配置后主动 invalidate。避免进程内缓存导致的多实例配置不一致与变更不生效。
     """
-    cached = get_cached_config(key)
+    global _CONFIG_CACHE_UNAVAILABLE_UNTIL
+    with _LOCAL_CONFIG_LOCK:
+        if time.monotonic() < _CONFIG_CACHE_UNAVAILABLE_UNTIL:
+            return _LOCAL_CONFIG_FALLBACK.get(key, default)
+
+    try:
+        cached = get_cached_config(key)
+    except Exception:
+        # Redis outage is exactly when opening a fresh synchronous DB connection
+        # on every callback causes an event-loop/thread-pool collapse. Use the
+        # process's last known value (or the safe default) until Redis recovers.
+        logger.warning(
+            "webhook: config cache unavailable, use local fallback key=%s", key,
+            exc_info=True,
+        )
+        with _LOCAL_CONFIG_LOCK:
+            _CONFIG_CACHE_UNAVAILABLE_UNTIL = (
+                time.monotonic() + _CONFIG_CACHE_RETRY_SECONDS
+            )
+            return _LOCAL_CONFIG_FALLBACK.get(key, default)
+
+    with _LOCAL_CONFIG_LOCK:
+        _CONFIG_CACHE_UNAVAILABLE_UNTIL = 0.0
+
     if cached is not None:
         try:
-            return int(cached)
+            value = int(cached)
+            with _LOCAL_CONFIG_LOCK:
+                _LOCAL_CONFIG_FALLBACK[key] = value
+            return value
         except (ValueError, TypeError):
             # 缓存异常值，继续回源 DB
             pass
 
-    value = default
+    with _LOCAL_CONFIG_LOCK:
+        value = _LOCAL_CONFIG_FALLBACK.get(key, default)
     db = SessionLocal()
     try:
         cfg = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
@@ -304,14 +394,27 @@ def _get_config_int(key: str, default: int) -> int:
             try:
                 value = int(cfg.config_value)
             except (ValueError, TypeError):
-                value = default
+                logger.warning(
+                    "webhook: invalid integer config key=%s value=%r",
+                    key,
+                    cfg.config_value,
+                )
     except Exception:
         logger.exception("webhook: read system_config %s failed (use default)", key)
     finally:
         db.close()
 
-    # 回填 Redis 缓存供下次命中；失败静默
-    set_cached_config(key, str(value), ttl=_CONFIG_CACHE_TTL)
+    with _LOCAL_CONFIG_LOCK:
+        _LOCAL_CONFIG_FALLBACK[key] = value
+
+    # 回填 Redis 缓存供下次命中；失败时本地 last-known 仍可继续服务。
+    try:
+        set_cached_config(key, str(value), ttl=_CONFIG_CACHE_TTL)
+    except Exception:
+        logger.warning(
+            "webhook: config cache backfill failed key=%s", key,
+            exc_info=True,
+        )
     return value
 
 

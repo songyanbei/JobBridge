@@ -16,8 +16,9 @@ from app.llm.providers._base import (
     parse_rerank_response,
     VALID_INTENTS,
     call_llm_api,
+    _reset_llm_circuits,
 )
-from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
+from app.core.exceptions import LLMCircuitOpen, LLMError, LLMParseError, LLMTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +210,9 @@ class TestParseRerankResponse:
 
 class TestCallLlmApi:
 
+    def setup_method(self):
+        _reset_llm_circuits()
+
     @patch("app.llm.providers._base.httpx.post")
     def test_success_first_try(self, mock_post):
         mock_post.return_value = httpx.Response(
@@ -238,6 +242,48 @@ class TestCallLlmApi:
         with pytest.raises(httpx.TimeoutException):
             call_llm_api(url="https://example.com", headers={}, payload={}, timeout=10)
         assert mock_post.call_count == 2
+
+    @patch("app.llm.providers._base.settings.llm_circuit_failure_threshold", 2)
+    @patch("app.llm.providers._base.httpx.post")
+    def test_circuit_opens_and_fast_fails(self, mock_post):
+        mock_post.side_effect = httpx.TimeoutException("timeout")
+        for _ in range(2):
+            with pytest.raises(httpx.TimeoutException):
+                call_llm_api(
+                    url="https://circuit.example.com", headers={}, payload={}, timeout=10,
+                )
+
+        with pytest.raises(LLMCircuitOpen):
+            call_llm_api(
+                url="https://circuit.example.com", headers={}, payload={}, timeout=10,
+            )
+        assert mock_post.call_count == 4
+
+    @patch("app.llm.providers._base.settings.llm_circuit_recovery_seconds", 1)
+    @patch("app.llm.providers._base.settings.llm_circuit_failure_threshold", 1)
+    @patch("app.llm.providers._base.time.monotonic")
+    @patch("app.llm.providers._base.httpx.post")
+    def test_half_open_probe_recovers_circuit(self, mock_post, monotonic):
+        monotonic.side_effect = [0, 0, 2]
+        mock_post.side_effect = [
+            httpx.HTTPStatusError(
+                "500",
+                request=httpx.Request("POST", "https://half-open.example.com"),
+                response=httpx.Response(500),
+            ),
+            httpx.Response(
+                200, json={"ok": True},
+                request=httpx.Request("POST", "https://half-open.example.com"),
+            ),
+        ]
+        with pytest.raises(httpx.HTTPStatusError):
+            call_llm_api(
+                url="https://half-open.example.com", headers={}, payload={}, timeout=10,
+            )
+        response = call_llm_api(
+            url="https://half-open.example.com", headers={}, payload={}, timeout=10,
+        )
+        assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------

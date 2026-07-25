@@ -438,16 +438,106 @@ class WecomInboundEvent(Base):
     )
     content_brief = sa.Column(sa.String(500), nullable=True, comment="消息摘要（文本取前 500 字）")
     status = sa.Column(
-        sa.Enum("received", "processing", "done", "failed", "dead_letter", name="wecom_event_status"),
+        sa.Enum(
+            "received", "processing", "session_pending",
+            "done", "failed", "dead_letter",
+            name="wecom_event_status",
+        ),
         nullable=False, server_default="received", comment="处理状态",
     )
     retry_count = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default=sa.text("0"), comment="已重试次数")
-    worker_started_at = sa.Column(sa.DateTime, nullable=True, comment="Worker 开始处理时间")
-    worker_finished_at = sa.Column(sa.DateTime, nullable=True, comment="Worker 处理完成时间")
+    session_operation = sa.Column(sa.String(8), nullable=True)
+    session_expected_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    session_payload = sa.Column(sa.JSON, nullable=True)
+    session_apply_attempts = sa.Column(
+        mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"),
+    )
+    session_apply_locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_applied_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    worker_started_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=True, comment="Worker 开始处理时间",
+    )
+    worker_finished_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=True, comment="Worker 处理完成时间",
+    )
     error_message = sa.Column(sa.Text, nullable=True, comment="失败原因")
-    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), comment="回调到达时间")
+    created_at = sa.Column(
+        mysql.DATETIME(fsp=6),
+        nullable=False,
+        server_default=sa.text("CURRENT_TIMESTAMP(6)"),
+        comment="回调到达时间",
+    )
 
     __table_args__ = (
         sa.Index("idx_status_time", "status", "created_at"),
+        sa.Index("idx_status_worker_started", "status", "worker_started_at"),
+        sa.Index("idx_status_worker_finished", "status", "worker_finished_at"),
         sa.Index("idx_from_user", "from_userid", "created_at"),
+        sa.Index("idx_user_status_id", "from_userid", "status", "id"),
+        sa.Index(
+            "idx_session_commit_due",
+            "status", "session_next_attempt_at", "session_apply_locked_at", "id",
+        ),
+    )
+
+
+# ============================================================================
+# 13. WecomOutboundOutbox 企微出站事务箱
+# ============================================================================
+
+class WecomOutboundOutbox(Base):
+    """与入站业务事务一起提交、由 Worker 异步投递的回复。
+
+    企微 message/send 不支持客户端幂等键，因此该表保证“回复意图不丢、业务路由
+    不重跑”；若 HTTP 响应丢失而企微实际已接收，重试仍可能产生重复消息。
+    """
+
+    __tablename__ = "wecom_outbound_outbox"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    inbound_event_id = sa.Column(
+        mysql.BIGINT(unsigned=True), nullable=False,
+        comment="来源 wecom_inbound_event.id",
+    )
+    reply_index = sa.Column(
+        mysql.SMALLINT(unsigned=True), nullable=False,
+        comment="同一入站事件内的回复顺序，从 0 开始",
+    )
+    userid = sa.Column(sa.String(64), nullable=False, comment="接收者 external_userid")
+    msg_type = sa.Column(sa.String(16), nullable=False, server_default="text")
+    content = sa.Column(mysql.MEDIUMTEXT, nullable=False)
+    intent = sa.Column(sa.String(32), nullable=True)
+    criteria_snapshot = sa.Column(sa.JSON, nullable=True)
+    status = sa.Column(
+        sa.Enum(
+            "pending", "sending", "sent", "dead_letter",
+            name="wecom_outbox_status",
+        ),
+        nullable=False,
+        server_default="pending",
+    )
+    attempt_count = sa.Column(
+        mysql.TINYINT(unsigned=True), nullable=False, server_default=sa.text("0"),
+    )
+    next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    provider_msg_id = sa.Column(sa.String(128), nullable=True)
+    last_error = sa.Column(sa.Text, nullable=True)
+    created_at = sa.Column(
+        mysql.DATETIME(fsp=6),
+        nullable=False,
+        server_default=sa.text("CURRENT_TIMESTAMP(6)"),
+    )
+    sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "inbound_event_id", "reply_index",
+            name="uk_outbox_event_reply",
+        ),
+        sa.Index("idx_outbox_status_due", "status", "next_attempt_at", "id"),
+        sa.Index("idx_outbox_status_locked", "status", "locked_at"),
+        sa.Index("idx_outbox_event", "inbound_event_id", "id"),
+        sa.Index("idx_outbox_user_status_id", "userid", "status", "id"),
     )

@@ -630,7 +630,7 @@ class TestPendingMaxRoundsFromFallback:
     @patch("app.services.message_router.classify_intent")
     @patch("app.services.message_router.search_service.search_workers")
     @patch("app.services.upload_service._create_job")
-    def test_max_rounds_exit_clears_pending(
+    def test_max_rounds_recovery_preserves_pending(
         self,
         mock_create_job,
         mock_search_workers,
@@ -662,9 +662,11 @@ class TestPendingMaxRoundsFromFallback:
         replies = process(_msg("还行吧"), MagicMock())
 
         assert replies[0].content == PENDING_MAX_ROUNDS_REPLY
-        # pending 已清
-        assert session.pending_upload == {}
-        assert session.pending_upload_intent is None
+        # 未显式取消时必须保留草稿，并重置失败计数供用户继续补充。
+        assert session.pending_upload == {"city": "北京市", "job_category": "餐饮"}
+        assert session.pending_upload_intent == "upload_job"
+        assert session.failed_patch_rounds == 0
+        assert session.active_flow == "upload_collecting"
         # 不入库、不搜索
         mock_create_job.assert_not_called()
         mock_search_workers.assert_not_called()

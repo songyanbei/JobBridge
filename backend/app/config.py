@@ -5,6 +5,7 @@
 """
 import os
 from typing import Literal
+from urllib.parse import quote, quote_plus
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -147,6 +148,7 @@ _LEGACY_DIALOGUE_FIELD_MAP = {
     "dialogue_v2_shadow_sample_rate": "shadow_sample_rate",
     "dialogue_v2_userid_whitelist": "userid_whitelist",
     "dialogue_v2_hash_buckets": "hash_buckets",
+    "dialogue_v2_primary_rollout_percentage": "primary_rollout_percentage",
     "ambiguous_city_query_policy": "ambiguous_city_query_policy",
     "low_confidence_threshold": "low_confidence_threshold",
     "search_awaiting_ttl_seconds": "search_awaiting_ttl_seconds",
@@ -184,12 +186,16 @@ class Settings(BaseSettings):
     db_name: str = "jobbridge"
     db_user: str = "jobbridge"
     db_password: str = "jobbridge"
+    db_connect_timeout_seconds: int = 2
+    db_read_timeout_seconds: int = 5
+    db_write_timeout_seconds: int = 5
+    db_pool_timeout_seconds: int = 3
 
     @property
     def db_url(self) -> str:
         return (
-            f"mysql+pymysql://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}?charset=utf8mb4"
+            f"mysql+pymysql://{quote_plus(self.db_user)}:{quote_plus(self.db_password)}"
+            f"@{self.db_host}:{self.db_port}/{quote_plus(self.db_name)}?charset=utf8mb4"
         )
 
     # ---- Redis ----
@@ -198,10 +204,12 @@ class Settings(BaseSettings):
     redis_db: int = 0
     redis_password: str = ""
     redis_max_connections: int = 50  # 连接池上限，按并发量调整
+    redis_connect_timeout_seconds: float = 1.0
+    redis_socket_timeout_seconds: float = 2.0
 
     @property
     def redis_url(self) -> str:
-        auth = f":{self.redis_password}@" if self.redis_password else ""
+        auth = f":{quote(self.redis_password, safe='')}@" if self.redis_password else ""
         return f"redis://{auth}{self.redis_host}:{self.redis_port}/{self.redis_db}"
 
     # ---- 企业微信 ----
@@ -218,6 +226,9 @@ class Settings(BaseSettings):
     llm_intent_model: str = "qwen-turbo"
     llm_reranker_model: str = "qwen-plus"
     llm_timeout_seconds: int = 30
+    llm_circuit_failure_threshold: int = 5
+    llm_circuit_recovery_seconds: int = 30
+    reranker_queue_degrade_threshold: int = 10
 
     # ---- 对象存储 ----
     oss_provider: str = "local"
@@ -302,6 +313,16 @@ class Settings(BaseSettings):
     def dialogue_v2_hash_buckets(self, value: int) -> None:
         self.dialogue_policy = self.dialogue_policy.model_copy(
             update={"hash_buckets": DialoguePolicy._clamp_pct(value)},
+        )
+
+    @property
+    def dialogue_v2_primary_rollout_percentage(self) -> int:
+        return self.dialogue_policy.primary_rollout_percentage
+
+    @dialogue_v2_primary_rollout_percentage.setter
+    def dialogue_v2_primary_rollout_percentage(self, value: int) -> None:
+        self.dialogue_policy = self.dialogue_policy.model_copy(
+            update={"primary_rollout_percentage": DialoguePolicy._clamp_pct(value)},
         )
 
     @property
@@ -495,6 +516,9 @@ class Settings(BaseSettings):
     scheduler_timezone: str = "Asia/Shanghai"
     daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送
     monitor_queue_incoming_threshold: int = 50
+    monitor_queue_incoming_max_age_seconds: int = 120
+    monitor_outbox_pending_max_age_seconds: int = 300
+    monitor_session_commit_pending_max_age_seconds: int = 300
     monitor_send_retry_threshold: int = 20
     monitor_alert_dedupe_seconds: int = 600
 

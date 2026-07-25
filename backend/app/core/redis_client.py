@@ -7,12 +7,19 @@
 - Phase 5：审核工作台软锁、Undo 暂存、事件回传幂等、管理员登录失败计数
 """
 import json
+import hashlib
+import logging
+import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Generator
 
 import redis
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # 全局 Redis 连接池（延迟初始化，首次使用时创建）
 _pool: redis.ConnectionPool | None = None
@@ -25,6 +32,9 @@ def _get_pool() -> redis.ConnectionPool:
             settings.redis_url,
             decode_responses=True,
             max_connections=settings.redis_max_connections,
+            socket_connect_timeout=settings.redis_connect_timeout_seconds,
+            socket_timeout=settings.redis_socket_timeout_seconds,
+            health_check_interval=30,
         )
     return _pool
 
@@ -57,10 +67,101 @@ def save_session(userid: str, session: dict) -> None:
     r.setex(f"{SESSION_PREFIX}{userid}", SESSION_TTL, json.dumps(session, ensure_ascii=False))
 
 
+_SAVE_SESSION_CAS_SCRIPT = """
+if ARGV[4] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[4] then
+    return -1
+end
+local current = redis.call('GET', KEYS[1])
+local expected = tonumber(ARGV[1])
+if current then
+    local decoded = cjson.decode(current)
+    local version = tonumber(decoded['session_version'] or 0)
+    if version ~= expected then
+        return 0
+    end
+elseif expected ~= 0 and ARGV[5] ~= '1' then
+    return 0
+end
+redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
+return 1
+"""
+
+_DELETE_SESSION_CAS_SCRIPT = """
+if ARGV[2] ~= '' and redis.call('GET', KEYS[2]) ~= ARGV[2] then
+    return -1
+end
+local current = redis.call('GET', KEYS[1])
+local expected = tonumber(ARGV[1])
+if not current then
+    return expected == 0 and 1 or 0
+end
+local decoded = cjson.decode(current)
+local version = tonumber(decoded['session_version'] or 0)
+if version ~= expected then
+    return 0
+end
+redis.call('DEL', KEYS[1])
+return 1
+"""
+
+
+def save_session_if_version(
+    userid: str,
+    session: dict,
+    expected_version: int,
+    lock_fence: tuple[str, Any] | None = None,
+    *,
+    allow_missing: bool = False,
+) -> bool:
+    """原子保存 session；仅当前版本等于 ``expected_version`` 时成功。
+
+    旧 session 没有 ``session_version`` 时按 0 处理。该 CAS 是用户锁之外的
+    fencing 防线：即使旧 Worker 因续租故障继续运行，也不能覆盖新 Worker 已提交
+    的会话状态。
+    """
+    r = get_redis()
+    lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
+    result = r.eval(
+        _SAVE_SESSION_CAS_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        lock_key,
+        int(expected_version),
+        SESSION_TTL,
+        json.dumps(session, ensure_ascii=False),
+        lock_token,
+        "1" if allow_missing else "0",
+    )
+    if int(result) == -1:
+        raise UserLockLost("user lock fence rejected session commit")
+    return bool(result)
+
+
 def delete_session(userid: str) -> None:
     """清除用户会话状态。"""
     r = get_redis()
     r.delete(f"{SESSION_PREFIX}{userid}")
+
+
+def delete_session_if_version(
+    userid: str,
+    expected_version: int,
+    lock_fence: tuple[str, Any] | None = None,
+) -> bool:
+    """仅当 session 版本和用户锁 owner 都匹配时原子删除。"""
+    r = get_redis()
+    lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
+    result = r.eval(
+        _DELETE_SESSION_CAS_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        lock_key,
+        int(expected_version),
+        lock_token,
+    )
+    if int(result) == -1:
+        raise UserLockLost("user lock fence rejected session delete")
+    return bool(result)
 
 
 # ---------------------------------------------------------------------------
@@ -138,10 +239,83 @@ def check_rate_limit(userid: str, window: int = 10, max_count: int = 5) -> bool:
 
 LOCK_PREFIX = "lock:"
 LOCK_TTL = 30  # 30 秒，防止死锁
+LOCK_RENEW_INTERVAL_SECONDS = 10
+
+
+class UserLockLost(RuntimeError):
+    """用户锁已丢失；当前处理结果不得继续提交。"""
+
+
+@dataclass
+class UserLockLease:
+    acquired: bool
+    lock: Any
+    lost_event: threading.Event
+    lock_id: str
+    lock_key: str | None = None
+    token: Any = None
+
+    def __bool__(self) -> bool:
+        return self.acquired
+
+    def assert_owned(self) -> None:
+        """提交副作用前验证租约仍属于当前处理者。"""
+        if not self.acquired or self.lost_event.is_set():
+            raise UserLockLost(f"user lock lease lost: lock_id={self.lock_id}")
+        try:
+            owned = self.lock.owned()
+        except redis.exceptions.RedisError as exc:
+            self.lost_event.set()
+            raise UserLockLost(
+                f"unable to verify user lock: lock_id={self.lock_id}",
+            ) from exc
+        if not owned:
+            self.lost_event.set()
+            raise UserLockLost(f"user lock no longer owned: lock_id={self.lock_id}")
+
+    def fence(self) -> tuple[str, Any]:
+        self.assert_owned()
+        if not self.lock_key or self.token in (None, "", b""):
+            raise UserLockLost(f"user lock has no fence token: lock_id={self.lock_id}")
+        return self.lock_key, self.token
+
+
+_current_user_lock_lease: ContextVar[UserLockLease | None] = ContextVar(
+    "current_user_lock_lease", default=None,
+)
+
+
+def current_user_lock_fence() -> tuple[str, Any] | None:
+    lease = _current_user_lock_lease.get()
+    return lease.fence() if lease is not None else None
+
+
+def _renew_user_lock(
+    lock,
+    stop_event: threading.Event,
+    lost_event: threading.Event,
+    lock_id: str,
+) -> None:
+    """在消息处理期间续租用户锁，避免慢 LLM 调用超过固定租约。
+
+    ``thread_local=False`` 让续租线程和持有线程共享同一 lock token。续租失败
+    后停止重试并记录错误；后续 P1 fencing/version CAS 会进一步阻止过期持有者
+    提交，本函数先消除正常慢请求下必然过期的窗口。
+    """
+    while not stop_event.wait(LOCK_RENEW_INTERVAL_SECONDS):
+        try:
+            if not lock.extend(LOCK_TTL, replace_ttl=True):
+                logger.error("user_lock renewal returned false: lock_id=%s", lock_id)
+                lost_event.set()
+                return
+        except (redis.exceptions.LockError, redis.exceptions.RedisError):
+            lost_event.set()
+            logger.exception("user_lock renewal failed: lock_id=%s", lock_id)
+            return
 
 
 @contextmanager
-def user_lock(userid: str, timeout: int = 10) -> Generator[bool, None, None]:
+def user_lock(userid: str, timeout: int = 10) -> Generator[UserLockLease, None, None]:
     """Per-user 分布式锁，保证同一用户消息串行处理。
 
     Usage:
@@ -153,16 +327,55 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[bool, None, None]:
     """
     r = get_redis()
     lock_key = f"{LOCK_PREFIX}{userid}"
-    lock = r.lock(lock_key, timeout=LOCK_TTL, blocking_timeout=timeout)
-    acquired = lock.acquire(blocking=True)
+    lock_id = hashlib.sha256(lock_key.encode("utf-8")).hexdigest()[:12]
+    # thread_local=False：redis-py 默认把 token 放在线程局部变量中；续租线程需要
+    # 访问同一 token，否则 extend 会错误地认为当前线程不持有锁。
+    lock = r.lock(
+        lock_key,
+        timeout=LOCK_TTL,
+        blocking_timeout=timeout,
+        thread_local=False,
+    )
     try:
-        yield acquired
+        acquired = lock.acquire(blocking=True)
+    except redis.exceptions.RedisError:
+        # Redis 短断时不能让异常穿透并终止 Worker 主循环。按“未获得锁”返回，
+        # Worker 会尝试重入队；若重入队同样失败，则把 durable event 标成
+        # processing 交给启动恢复。
+        logger.exception("user_lock acquire failed: lock_id=%s", lock_id)
+        yield UserLockLease(False, lock, threading.Event(), lock_id, lock_key)
+        return
+    stop_renewal = threading.Event()
+    lost_event = threading.Event()
+    token = getattr(getattr(lock, "local", None), "token", None)
+    lease = UserLockLease(acquired, lock, lost_event, lock_id, lock_key, token)
+    renewal_thread: threading.Thread | None = None
+    if acquired:
+        renewal_thread = threading.Thread(
+            target=_renew_user_lock,
+            args=(lock, stop_renewal, lost_event, lock_id),
+            name="user-lock-renewal",
+            daemon=True,
+        )
+        renewal_thread.start()
+    context_token = _current_user_lock_lease.set(lease) if acquired else None
+    try:
+        yield lease
     finally:
+        if context_token is not None:
+            _current_user_lock_lease.reset(context_token)
         if acquired:
+            stop_renewal.set()
+            if renewal_thread is not None:
+                renewal_thread.join(timeout=1)
             try:
                 lock.release()
             except redis.exceptions.LockNotOwnedError:
-                pass  # TTL 已过期自动释放
+                logger.error("user_lock lost before release: lock_id=%s", lock_id)
+            except redis.exceptions.RedisError:
+                # 业务提交前已有 lease.assert_owned fencing；释放阶段网络失败只会
+                # 让锁等 TTL 自动过期，不能反向把已完成消息变成 Worker 崩溃。
+                logger.exception("user_lock release failed: lock_id=%s", lock_id)
 
 
 # ---------------------------------------------------------------------------

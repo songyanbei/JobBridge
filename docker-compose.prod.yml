@@ -44,7 +44,8 @@ services:
       app:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/nginx-health"]
+      # 同时验证反代链路；仅检查 nginx 自身会漏掉上游 DNS/IP 失效导致的 502。
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/health"]
       interval: 15s
       timeout: 3s
       retries: 3

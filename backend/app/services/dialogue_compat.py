@@ -59,6 +59,15 @@ def decision_to_intent_result(
         return IntentResult(intent="chitchat", confidence=0.0)
 
     if act == "start_search":
+        # Reducer may deliberately reset an existing broker search when an explicit
+        # object switches direction. Its route_intent is authoritative in that case.
+        if decision.route_intent in {"search_job", "search_worker"}:
+            return IntentResult(
+                intent=decision.route_intent,
+                structured_data=accepted,
+                missing_fields=list(decision.missing_slots or []),
+                confidence=0.9,
+            )
         if has_existing:
             # 已有 criteria 时 start_search 仍按 follow_up 处理，避免清旧条件
             return IntentResult(
@@ -83,6 +92,17 @@ def decision_to_intent_result(
         )
 
     if act in {"modify_search", "answer_missing_slot"}:
+        if (
+            decision.route_intent in {"search_job", "search_worker"}
+            and session.broker_direction in {"search_job", "search_worker"}
+            and decision.route_intent != session.broker_direction
+        ):
+            return IntentResult(
+                intent=decision.route_intent,
+                structured_data=final_criteria,
+                missing_fields=list(decision.missing_slots or []),
+                confidence=0.9,
+            )
         return IntentResult(
             intent="follow_up",
             structured_data=final_criteria,

@@ -4,13 +4,66 @@
 """
 import json
 import logging
+import threading
+import time
+from dataclasses import dataclass
 
 import httpx
 
-from app.core.exceptions import LLMParseError
+from app.config import settings
+from app.core.exceptions import LLMCircuitOpen, LLMParseError
 from app.llm.base import DialogueParseResult, IntentResult, RerankResult
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _CircuitState:
+    failures: int = 0
+    open_until: float = 0.0
+    probe_in_flight: bool = False
+
+
+_circuit_lock = threading.Lock()
+_circuits: dict[str, _CircuitState] = {}
+
+
+def _reset_llm_circuits() -> None:
+    """测试/运维热重载辅助：清除本进程 circuit 状态。"""
+    with _circuit_lock:
+        _circuits.clear()
+
+
+def _before_llm_call(key: str) -> None:
+    now = time.monotonic()
+    with _circuit_lock:
+        state = _circuits.setdefault(key, _CircuitState())
+        if state.open_until <= 0:
+            return
+        if now < state.open_until or state.probe_in_flight:
+            raise LLMCircuitOpen()
+        # 恢复窗口后只允许一个 half-open 探针，防止并发洪峰同时穿透。
+        state.probe_in_flight = True
+
+
+def _record_llm_success(key: str) -> None:
+    with _circuit_lock:
+        _circuits[key] = _CircuitState()
+
+
+def _record_llm_failure(key: str) -> None:
+    threshold = max(1, int(settings.llm_circuit_failure_threshold))
+    recovery = max(1, int(settings.llm_circuit_recovery_seconds))
+    with _circuit_lock:
+        state = _circuits.setdefault(key, _CircuitState())
+        state.failures += 1
+        state.probe_in_flight = False
+        if state.failures >= threshold:
+            state.open_until = time.monotonic() + recovery
+            logger.error(
+                "LLM circuit opened after %d failures; recovery_seconds=%d",
+                state.failures, recovery,
+            )
 
 # 合法 intent 值白名单
 VALID_INTENTS = frozenset({
@@ -44,6 +97,8 @@ def call_llm_api(
 
     超时或网络错误时自动重试一次，两次都失败则抛出 httpx 异常。
     """
+    circuit_key = url
+    _before_llm_call(circuit_key)
     for attempt in range(2):
         try:
             resp = httpx.post(
@@ -53,13 +108,16 @@ def call_llm_api(
                 timeout=timeout,
             )
             resp.raise_for_status()
+            _record_llm_success(circuit_key)
             return resp
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             if attempt == 0:
                 logger.warning("LLM API attempt %d failed: %s, retrying...", attempt + 1, exc)
                 continue
+            _record_llm_failure(circuit_key)
             raise
         except httpx.HTTPStatusError:
+            _record_llm_failure(circuit_key)
             raise
 
 

@@ -660,6 +660,57 @@ class TestPhase5HashBucket:
         # 命中桶 → reducer 输出 paginate_no_more → applier 渲染降级建议
         assert "本轮结果已经看完了。可以试试这些方向" in replies[0].content
 
+    def test_legacy_asserted_salary_requires_confirmation_before_relaxing(
+        self, monkeypatch,
+    ):
+        """legacy 没有 v2 decision 时，也必须保护本轮刚声明的硬条件。"""
+        from app.services import message_router
+        from app.schemas.search import SearchOutcome, SearchResult
+        from app.schemas.conversation import SessionState
+
+        monkeypatch.setattr(settings, "post_search_policy_mode", "on")
+        monkeypatch.setattr(
+            settings,
+            "dialogue_policy",
+            settings.dialogue_policy.model_copy(
+                update={"phase5_rollout_percentage": 100},
+            ),
+        )
+        msg = MagicMock(from_user="u-test", content="月薪至少6000", msg_id="m-1")
+        user_ctx = MagicMock(role="worker", external_userid="u-test")
+        session = SessionState(
+            role="worker",
+            search_criteria={
+                "city": ["苏州市"],
+                "job_category": ["普工"],
+                "salary_floor_monthly": 6000,
+            },
+        )
+        outcome = SearchOutcome(
+            direction="search_job",
+            criteria_used=dict(session.search_criteria),
+            initial_count=0,
+            final_count=0,
+            desired_count=3,
+            low_recall_threshold=3,
+            available_relax_steps=["relax_salary_10pct"],
+        )
+
+        replies = message_router._post_search_dispatch(
+            msg=msg,
+            user_ctx=user_ctx,
+            session=session,
+            db=MagicMock(),
+            search_result=SearchResult(reply_text="没有结果", result_count=0),
+            search_outcome=outcome,
+            legacy_intent="follow_up",
+            turn_asserted_slots={"salary_floor_monthly": 6000},
+        )
+
+        assert "放宽" in replies[0].content
+        assert "重新搜索吗" in replies[0].content
+        assert session.pending_relaxation is not None
+
     def test_post_search_dispatch_uses_user_ctx_external_userid(self, monkeypatch):
         """msg.from_user 与 user_ctx.external_userid 不一致时，只以后者判桶。"""
         from app.services import message_router

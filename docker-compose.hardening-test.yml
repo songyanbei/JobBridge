@@ -1,0 +1,22 @@
+services:
+  app:
+    image: jobbridge-app:latest
+    environment:
+      APP_ENV: test
+      DB_HOST: mysql
+      DB_PORT: 3306
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MOCK_WEWORK_OUTBOUND: "true"
+      MOCK_WEWORK_REDIS_URL: redis://redis:6379/0
+
+  worker:
+    image: jobbridge-worker:latest
+    environment:
+      APP_ENV: test
+      DB_HOST: mysql
+      DB_PORT: 3306
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MOCK_WEWORK_OUTBOUND: "true"
+      MOCK_WEWORK_REDIS_URL: redis://redis:6379/0

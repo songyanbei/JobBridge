@@ -22,7 +22,10 @@ from app.api.webhook import router as webhook_router
 def client():
     app = FastAPI()
     app.include_router(webhook_router)
-    return TestClient(app)
+    # Endpoint behavior tests mock the rate limiter itself; keep the independent
+    # config-source unit tests below responsible for Redis/DB fallback behavior.
+    with patch("app.api.webhook._get_rate_limit_params", return_value=(10, 5)):
+        yield TestClient(app)
 
 
 # ---------------------------------------------------------------------------
@@ -93,13 +96,14 @@ class TestReceiveCallback:
 
     @patch("app.api.webhook.enqueue_message")
     @patch("app.api.webhook._insert_inbound_event", return_value=42)
+    @patch("app.api.webhook._inbound_event_exists", return_value=True)
     @patch("app.api.webhook.check_rate_limit", return_value=True)
     @patch("app.api.webhook.check_msg_duplicate", return_value=True)
     @patch("app.api.webhook.decrypt_message")
     @patch("app.api.webhook.verify_signature", return_value=True)
     def test_post_duplicate_msg_short_circuits(
         self, mock_verify, mock_decrypt, mock_dup, mock_rate,
-        mock_insert, mock_enq, client,
+        mock_exists, mock_insert, mock_enq, client,
     ):
         mock_decrypt.return_value = _fake_plaintext()
         resp = client.post(
@@ -112,6 +116,30 @@ class TestReceiveCallback:
         mock_rate.assert_not_called()
         mock_insert.assert_not_called()
         mock_enq.assert_not_called()
+
+    @patch("app.api.webhook.enqueue_message")
+    @patch("app.api.webhook._insert_inbound_event", return_value=43)
+    @patch("app.api.webhook._inbound_event_exists", return_value=False)
+    @patch("app.api.webhook.check_rate_limit", return_value=True)
+    @patch("app.api.webhook.check_msg_duplicate", return_value=True)
+    @patch("app.api.webhook.decrypt_message")
+    @patch("app.api.webhook.verify_signature", return_value=True)
+    def test_stale_l1_marker_does_not_drop_upstream_retry(
+        self, mock_verify, mock_decrypt, mock_dup, mock_rate,
+        mock_exists, mock_insert, mock_enq, client,
+    ):
+        mock_decrypt.return_value = _fake_plaintext()
+
+        resp = client.post(
+            "/webhook/wecom",
+            params={"msg_signature": "s", "timestamp": "t", "nonce": "n"},
+            content=_FAKE_XML,
+        )
+
+        assert resp.status_code == 200
+        mock_exists.assert_called_once()
+        mock_insert.assert_called_once()
+        mock_enq.assert_called_once()
 
     @patch("app.api.webhook._async_rate_limit_notify")
     @patch("app.api.webhook.enqueue_message")
@@ -221,6 +249,27 @@ class TestRateLimitNotify:
         assert resp.text == "success"
 
     @patch("app.api.webhook.enqueue_message")
+    @patch("app.api.webhook._insert_inbound_event", return_value=None)
+    @patch("app.api.webhook.check_rate_limit", return_value=True)
+    @patch("app.api.webhook.check_msg_duplicate", return_value=False)
+    @patch("app.api.webhook.decrypt_message")
+    @patch("app.api.webhook.verify_signature", return_value=True)
+    def test_post_durable_insert_failure_returns_retryable_503(
+        self, mock_verify, mock_decrypt, mock_dup, mock_rate,
+        mock_insert, mock_enq, client,
+    ):
+        mock_decrypt.return_value = _fake_plaintext()
+
+        resp = client.post(
+            "/webhook/wecom",
+            params={"msg_signature": "s", "timestamp": "t", "nonce": "n"},
+            content=_FAKE_XML,
+        )
+
+        assert resp.status_code == 503
+        mock_enq.assert_not_called()
+
+    @patch("app.api.webhook.enqueue_message")
     @patch("app.api.webhook._insert_inbound_event", return_value=42)
     @patch("app.api.webhook.check_rate_limit", return_value=True)
     @patch("app.api.webhook.check_msg_duplicate",
@@ -251,13 +300,26 @@ class TestRateLimitNotify:
 class TestRateLimitParams:
     """Phase 5 起：webhook 通过 Redis `config_cache:{key}` 共享配置缓存，
 
-    不再维护进程内 dict，因此 system_config_service 更新配置后可立即命中新值。
+    Redis 正常时共享配置立即生效；Redis 故障时使用进程内 last-known/default，
+    防止 webhook 为每条消息阻塞等待数据库连接。
     """
+
+    @pytest.fixture(autouse=True)
+    def _reset_cache_breaker(self):
+        with patch(
+            "app.api.webhook._CONFIG_CACHE_UNAVAILABLE_UNTIL", 0.0,
+        ):
+            yield
 
     def test_default_values_when_db_unavailable(self):
         from app.api import webhook as webhook_mod
 
         with (
+            patch.dict(
+                webhook_mod._LOCAL_CONFIG_FALLBACK,
+                {"rate_limit.window_seconds": 10, "rate_limit.max_count": 5},
+                clear=True,
+            ),
             patch("app.api.webhook.get_cached_config", return_value=None),
             patch("app.api.webhook.set_cached_config"),
             patch("app.api.webhook.SessionLocal") as mock_session_factory,
@@ -276,6 +338,11 @@ class TestRateLimitParams:
             return {"rate_limit.window_seconds": "20", "rate_limit.max_count": "7"}.get(key)
 
         with (
+            patch.dict(
+                webhook_mod._LOCAL_CONFIG_FALLBACK,
+                {"rate_limit.window_seconds": 10, "rate_limit.max_count": 5},
+                clear=True,
+            ),
             patch("app.api.webhook.get_cached_config", side_effect=cache_get),
             patch("app.api.webhook.set_cached_config") as mock_set,
             patch("app.api.webhook.SessionLocal") as mock_session_factory,
@@ -298,6 +365,11 @@ class TestRateLimitParams:
             return db
 
         with (
+            patch.dict(
+                webhook_mod._LOCAL_CONFIG_FALLBACK,
+                {"rate_limit.window_seconds": 10, "rate_limit.max_count": 5},
+                clear=True,
+            ),
             patch("app.api.webhook.get_cached_config", return_value=None),
             patch("app.api.webhook.set_cached_config") as mock_set,
             patch("app.api.webhook.SessionLocal", side_effect=factory),
@@ -307,3 +379,46 @@ class TestRateLimitParams:
             assert max_count == 15
             # 每个 key 都应回填 Redis
             assert mock_set.call_count == 2
+
+    def test_redis_outage_uses_last_known_without_opening_db(self):
+        from app.api import webhook as webhook_mod
+
+        with (
+            patch.dict(
+                webhook_mod._LOCAL_CONFIG_FALLBACK,
+                {"rate_limit.window_seconds": 30, "rate_limit.max_count": 9},
+                clear=True,
+            ),
+            patch(
+                "app.api.webhook.get_cached_config",
+                side_effect=ConnectionError("redis unavailable"),
+            ),
+            patch("app.api.webhook.SessionLocal") as mock_session_factory,
+        ):
+            assert webhook_mod._get_rate_limit_params() == (30, 9)
+            mock_session_factory.assert_not_called()
+
+    def test_cache_backfill_failure_keeps_db_value_and_local_fallback(self):
+        from app.api import webhook as webhook_mod
+
+        db = MagicMock()
+        cfg = MagicMock(config_value="12")
+        db.query.return_value.filter.return_value.first.return_value = cfg
+        with (
+            patch.dict(
+                webhook_mod._LOCAL_CONFIG_FALLBACK,
+                {"rate_limit.window_seconds": 10, "rate_limit.max_count": 5},
+                clear=True,
+            ),
+            patch("app.api.webhook.get_cached_config", return_value=None),
+            patch(
+                "app.api.webhook.set_cached_config",
+                side_effect=ConnectionError("redis unavailable"),
+            ),
+            patch("app.api.webhook.SessionLocal", return_value=db),
+        ):
+            assert webhook_mod._get_rate_limit_params() == (12, 12)
+            assert webhook_mod._LOCAL_CONFIG_FALLBACK == {
+                "rate_limit.window_seconds": 12,
+                "rate_limit.max_count": 12,
+            }

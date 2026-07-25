@@ -20,10 +20,16 @@ class Base(DeclarativeBase):
 
 engine = create_engine(
     settings.db_url,
+    connect_args={
+        "connect_timeout": settings.db_connect_timeout_seconds,
+        "read_timeout": settings.db_read_timeout_seconds,
+        "write_timeout": settings.db_write_timeout_seconds,
+    },
     pool_pre_ping=True,       # 自动探活，防止 MySQL 8 小时超时断连
     pool_recycle=3600,        # 1 小时回收连接
     pool_size=10,
     max_overflow=20,
+    pool_timeout=settings.db_pool_timeout_seconds,
     echo=settings.is_development,  # 开发环境打印 SQL
 )
 

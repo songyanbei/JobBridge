@@ -22,6 +22,7 @@ reduce(parse_result, session, role) 是**纯函数**：
 from __future__ import annotations
 
 import logging
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -45,6 +46,72 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
+
+# broker 同时能找岗位和找工人，模型偶尔会把“工人”这个词本身误当成搜索对象。
+# 这里只覆盖语义关系足够明确的句式：谁是岗位的受益人，或谁是招聘方。模糊表达
+# （例如“看看苏州电工”）仍交给 LLM + session.broker_direction，不做关键词猜测。
+_BROKER_JOB_BENEFICIARY_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        (
+            r"(?:^|[，,。；;！？!?\s])"
+            r"(?:我(?:这边|这里|手上)?|这边|手上)?"
+            r"(?:有|来了?|带着?)"
+            r"(?:一|两|几)?(?:个|位|名)?"
+            r"(?:工人|师傅|求职者|打工者)"
+            r".{0,24}?(?:想|要|希望|打算|准备)(?:去|到|在|找|换|做)"
+        ),
+        (
+            r"(?:帮|替|给)"
+            r"(?:这|那|一|一个|这位|那位|这名|那名)?(?:个|位|名)?"
+            r"(?:工人|师傅|求职者|打工者)"
+            r".{0,12}?(?:找|看看|推荐)"
+            r".{0,12}?(?:工作|岗位|职位|活)"
+        ),
+        (
+            r"(?:工人|师傅|求职者|打工者)"
+            r".{0,8}?(?:想找|要找|希望找|想换|要换)"
+            r".{0,8}?(?:工作|岗位|职位|活)"
+        ),
+    )
+)
+
+_BROKER_RECRUITER_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        (
+            r"(?:帮|替|给).{0,8}?"
+            r"(?:企业|工厂|厂家|公司|招聘方|老板)"
+            r".{0,12}?(?:找|招|招聘|物色|推荐)"
+            r".{0,16}?(?:工人|师傅|员工|人选|候选人)"
+        ),
+        (
+            r"(?:企业|工厂|厂家|公司|招聘方|老板)"
+            r".{0,10}?(?:要|想|需要|缺|招聘|招|找)"
+            r".{0,16}?(?:工人|师傅|员工|人选|候选人)"
+        ),
+        (
+            r"(?:找|招|招聘|物色)"
+            r"(?:一|两|几|\d+)?(?:个|位|名)?"
+            r"[^，,。；;！？!?]{0,16}?(?:工人|师傅|员工|人选|候选人)"
+        ),
+    )
+)
+
+
+def broker_explicit_direction(raw_text: str) -> str | None:
+    """Return the direction encoded by an unambiguous broker subject/object phrase."""
+    if not raw_text:
+        return None
+    job_hit = any(
+        pattern.search(raw_text) for pattern in _BROKER_JOB_BENEFICIARY_PATTERNS
+    )
+    worker_hit = any(
+        pattern.search(raw_text) for pattern in _BROKER_RECRUITER_PATTERNS
+    )
+    if job_hit == worker_hit:
+        return None
+    return "search_job" if job_hit else "search_worker"
 
 # 阶段三：低置信度兜底关心的关键字段集合从 slot_schema 派生（hard + askable
 # 的 search frame 字段），避免硬编码与 schema drift。
@@ -293,6 +360,118 @@ def _build_pending_interruption(
     }
 
 
+def _apply_broker_direction_anchor(
+    parse_result: DialogueParseResult,
+    role: str,
+    raw_text: str,
+) -> DialogueParseResult:
+    """用明确的主客体句式约束 broker 搜索方向。
+
+    该护栏只处理 search act，且仅在岗位受益人和招聘方两个锚点恰好命中一侧时
+    生效；双侧都命中或都不命中时保留模型判断。方向改写时同步映射薪资字段，
+    避免原 frame 的 ceiling/floor 字段在 schema 校验时被静默丢弃。
+    """
+    if (
+        role != "broker"
+        or parse_result.dialogue_act
+        not in {"start_search", "modify_search", "answer_missing_slot"}
+        or not raw_text.strip()
+    ):
+        return parse_result
+
+    explicit_direction = broker_explicit_direction(raw_text)
+    if explicit_direction is None:
+        return parse_result
+
+    target_frame = (
+        "job_search"
+        if explicit_direction == "search_job"
+        else "candidate_search"
+    )
+    if parse_result.frame_hint == target_frame:
+        return parse_result
+
+    slots = dict(parse_result.slots_delta or {})
+    if target_frame == "job_search" and "salary_ceiling_monthly" in slots:
+        slots.setdefault("salary_floor_monthly", slots.pop("salary_ceiling_monthly"))
+    elif target_frame == "candidate_search" and "salary_floor_monthly" in slots:
+        slots.setdefault("salary_ceiling_monthly", slots.pop("salary_floor_monthly"))
+
+    logger.info(
+        "dialogue_v2_broker_direction_guard: frame=%s -> %s",
+        parse_result.frame_hint,
+        target_frame,
+    )
+    return parse_result.model_copy(
+        update={"frame_hint": target_frame, "slots_delta": slots},
+    )
+
+
+def _apply_single_direction_role_guard(
+    parse_result: DialogueParseResult,
+    role: str,
+    raw_text: str,
+) -> DialogueParseResult:
+    """把 worker/factory 的搜索 frame 约束到其唯一授权方向。
+
+    这两个角色不存在 broker 式双向歧义：worker 只能找岗位，factory 只能找
+    工人。对 search act 纠正模型漂移比返回无权限提示更符合用户字面动作，也避免
+    同一句话因 provider 随机性偶发失败。
+    """
+    if not raw_text.strip() or parse_result.dialogue_act not in {
+        "start_search", "modify_search", "answer_missing_slot",
+    }:
+        return parse_result
+    target_frame = {
+        "worker": "job_search",
+        "factory": "candidate_search",
+    }.get(role)
+    if (
+        target_frame is None
+        or parse_result.frame_hint not in {"job_search", "candidate_search"}
+        or parse_result.frame_hint == target_frame
+    ):
+        return parse_result
+
+    # 明确请求了角色无权执行的反方向动作时，保留模型 frame，让后续权限层返回
+    # role_no_permission；只纠正没有这种字面证据的 provider 漂移。
+    explicit_wrong_direction = (
+        role == "factory"
+        and bool(re.search(
+            r"(?:找|看看|推荐).{0,10}(?:工作|岗位|职位|活)"
+            r"|(?:我|本人|工人|师傅).{0,10}(?:想|要|希望).{0,12}"
+            r"(?:工作|岗位|职位|活)",
+            raw_text,
+        ))
+    ) or (
+        role == "worker"
+        and bool(re.search(
+            r"(?:找|招|招聘|需要|缺).{0,16}"
+            r"(?:工人|师傅|候选人|人选|员工)"
+            r"|(?:企业|工厂|厂家|公司|招聘方|老板).{0,16}"
+            r"(?:找|招|招聘)",
+            raw_text,
+        ))
+    )
+    if explicit_wrong_direction:
+        return parse_result
+
+    slots = dict(parse_result.slots_delta or {})
+    if target_frame == "job_search" and "salary_ceiling_monthly" in slots:
+        slots.setdefault("salary_floor_monthly", slots.pop("salary_ceiling_monthly"))
+    elif target_frame == "candidate_search" and "salary_floor_monthly" in slots:
+        slots.setdefault("salary_ceiling_monthly", slots.pop("salary_floor_monthly"))
+    logger.info(
+        "dialogue_v2_role_direction_guard: role=%s frame=%s -> %s",
+        role,
+        parse_result.frame_hint,
+        target_frame,
+    )
+    return parse_result.model_copy(
+        update={"frame_hint": target_frame, "slots_delta": slots},
+    )
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -307,9 +486,15 @@ def reduce(
 ) -> DialogueDecision:
     """把 LLM parse 结果裁决成后端 decision。
 
-    raw_text 仅用于 awaiting tie-break 裸值（_try_match_bare_value），
-    不用于改变 dialogue_act / frame_hint 的语义。
+    raw_text 用于 awaiting tie-break 裸值，以及 broker 明确主客体句式的方向护栏；
+    后者不处理模糊表达，也不改变 dialogue_act。
     """
+    parse_result = _apply_single_direction_role_guard(
+        parse_result, role, raw_text,
+    )
+    parse_result = _apply_broker_direction_anchor(
+        parse_result, role, raw_text,
+    )
     act = parse_result.dialogue_act
     frame_hint = parse_result.frame_hint
 
@@ -473,6 +658,22 @@ def _reduce_main(
     # search_criteria 推（避免「裸数值补槽」frame_hint=none 的情况丢 frame）
     resolved_frame = _resolve_frame(act, frame_hint, session, role)
 
+    # Broker 的两种搜索面向不同实体，筛选条件不能跨方向继承。用户明确从
+    # “找工人”切到“找岗位”（或反向）时，把本轮视为一次全新的搜索。
+    broker_direction_switch = (
+        role == "broker"
+        and act in {"start_search", "modify_search", "answer_missing_slot"}
+        and resolved_frame in {"job_search", "candidate_search"}
+        and session.broker_direction in {"search_job", "search_worker"}
+        and (
+            (resolved_frame == "job_search" and session.broker_direction != "search_job")
+            or (
+                resolved_frame == "candidate_search"
+                and session.broker_direction != "search_worker"
+            )
+        )
+    )
+
     # 搜索类 act 但 frame 解析不到 → 反问而不是静默 0 命中（adversarial review C5）。
     # 触发条件：start_search/modify_search/answer_missing_slot 且 resolved_frame=none。
     if (
@@ -535,7 +736,9 @@ def _reduce_main(
         }
 
     # 4.3 决定 resolved_merge_policy（仅对 accepted 中存在的 key）
-    old_criteria = dict(session.search_criteria or {})
+    old_criteria = (
+        {} if broker_direction_switch else dict(session.search_criteria or {})
+    )
     resolved_policy: dict[str, str] = {}
     final_criteria = dict(old_criteria)
     for field, new_value in accepted.items():
@@ -594,6 +797,13 @@ def _reduce_main(
     route_intent = _derive_route_intent(
         act, resolved_frame, session, has_existing_criteria=bool(old_criteria),
     )
+    if broker_direction_switch:
+        # The provider may call an explicit new-object request "modify_search".
+        # Once the backend has anchored a different broker frame, preserving
+        # follow_up would immediately route back through the old direction.
+        route_intent = (
+            "search_job" if resolved_frame == "job_search" else "search_worker"
+        )
 
     # 4.9 state_transition：start_search 在 idle 时进入 search_active；
     # 这里仅描述意图，applier 才真正写 active_flow。

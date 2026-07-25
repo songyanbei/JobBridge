@@ -275,6 +275,19 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 - factory（厂家）：通常 frame=candidate_search 或 job_upload。
 - broker（中介）：可同时使用 search/upload；按文本字面意图选 frame。
 
+## 角色歧义消解（高优先级）
+- worker：出现「找工作 / 找活 / 找岗位 / 想做 X 工作」一律优先 job_search；
+  只有明确说「提交/登记/发布简历、这是我的简历/个人资料」才是 resume_upload。
+- factory：出现「找工人 / 招工人 / 招聘一个 X / 我要招聘 X」默认
+  candidate_search；只有明确说「发布/登记岗位、岗位信息如下、帮我发招聘信息」
+  才是 job_upload。「找 N 个/名 + 工种」中的宾语是人，也必须是 candidate_search。
+  不要因为文本里同时有城市、薪资就自动判为 job_upload。
+- broker：「找工人 / 找一个工人 / 找一个普工 / 招一个 X」是 candidate_search；
+  「找岗位 / 找工作 / 找活 / 帮工人找 X 工作」是 job_search。不要用上一轮
+  broker_direction 覆盖本轮这些明确宾语；「给这位/这个工人或师傅找岗位」也是
+  job_search。「有个工人/师傅想去 X 做 Y」描述的是替该人找岗位，也必须是
+  job_search，不是搜索这个工人。只有本轮是裸补充条件时才沿用上一方向。
+
 ## 最近对话历史
 {history}
 
@@ -360,6 +373,34 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 示例 13（同上反问场景，用户拒绝）：
 用户消息：算了不要了
 {{"dialogue_act": "respond_relaxation_offer", "frame_hint": "none", "slots_delta": {{}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null, "relaxation_response": "reject"}}
+
+示例 14（broker 明确找一个工人，不是帮工人找工作）：
+用户消息：找一个电子厂流水线普工，地点杭州，底薪4500，包吃住
+{{"dialogue_act": "start_search", "frame_hint": "candidate_search", "slots_delta": {{"city": ["杭州市"], "job_category": ["普工"], "salary_ceiling_monthly": 4500, "provide_meal": true, "provide_housing": true}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 15（broker 帮工人找活）：
+用户消息：帮一个工人找苏州电子厂的活，5500以上
+{{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["苏州市"], "job_category": ["普工"], "salary_floor_monthly": 5500}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 16（factory 招聘一个人，未明确发布岗位）：
+用户消息：我要招聘网管，北京工作，底薪3000
+{{"dialogue_act": "start_search", "frame_hint": "candidate_search", "slots_delta": {{"city": ["北京市"], "job_category": ["技工"], "salary_ceiling_monthly": 3000}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.9, "conflict_action": null}}
+
+示例 17（worker 找工作，不是提交简历）：
+用户消息：宁波找技工工作，4500以上
+{{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["宁波市"], "job_category": ["技工"], "salary_floor_monthly": 4500}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 18（broker 给明确的人找岗位）：
+用户消息：给这位师傅找个杭州焊工岗位
+{{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["杭州市"], "job_category": ["技工"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 19（factory 找若干名某工种人员）：
+用户消息：找两个能上夜班的操作工
+{{"dialogue_act": "start_search", "frame_hint": "candidate_search", "slots_delta": {{"job_category": ["普工"], "shift_pattern": "夜班"}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 20（broker 手上有工人想找岗位，工人是受益人而不是搜索对象）：
+用户消息：有个工人想去苏州做电工
+{{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["苏州市"], "job_category": ["技工"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
 """
 
 
@@ -544,9 +585,12 @@ RERANK_PROMPT_VERSION = "v2.1"
 # 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。
 # v0.3 (2026-05-02)：在"重要约束"加防幻觉条款 + 加 resume_upload 锚点示例（示例 11），
 #                   与 INTENT v2.8 同步修复 expected_cities 脑补漂移。
+# v0.4 (2026-07-22)：补三角色 search/upload 歧义消解和 broker 宾语方向锚点。
+# v0.5 (2026-07-22)：补 factory 数量+工种、broker 为明确人员找岗位锚点。
+# v0.6 (2026-07-25)：补 broker“有个工人想去 X 做 Y”的受益人方向锚点。
 # v0.2 (Stage 3)：字段清单段落改为启动期由 slot_schema 渲染（一次性）；fallback 文案保留。
 # v0.1 2026-05-01：DialogueParseResult v2 首版（hard-coded 字段清单）。
-DIALOGUE_PROMPT_VERSION = "v0.3"
+DIALOGUE_PROMPT_VERSION = "v0.6"
 
 
 def build_criteria_snapshot_meta() -> dict:

@@ -144,6 +144,9 @@ _JOB_CATEGORY_SYNONYMS: dict[str, str] = {
     "快递": "物流仓储", "装卸": "物流仓储", "拣货": "物流仓储",
     # 普工
     "操作工": "普工", "产线": "普工", "流水线": "普工", "计件工": "普工",
+    # 技工
+    "技术工": "技工", "焊工": "技工", "电工": "技工", "钳工": "技工",
+    "车床": "技工", "叉车": "技工", "叉车工": "技工", "网管": "技工",
     # 电子厂
     "smt": "电子厂", "组装": "电子厂", "质检": "电子厂", "焊锡": "电子厂",
     # 保洁
@@ -173,6 +176,58 @@ _SALARY_MIN = 500
 _SALARY_MAX = 200_000
 _AGE_MIN = 14
 _AGE_MAX = 80
+
+# 工种 ontology 与 dict_job_category 共用真源。静态集合/同义词只作为 DB 不可用
+# 时的启动兜底；正常运行从表中读取 name + aliases，使运营修改实际影响解析。
+_JOB_CATEGORY_ONTOLOGY_CACHE: tuple[dict[str, str], frozenset[str]] | None = None
+
+
+def _get_job_category_ontology() -> tuple[dict[str, str], frozenset[str]]:
+    global _JOB_CATEGORY_ONTOLOGY_CACHE
+    if _JOB_CATEGORY_ONTOLOGY_CACHE is not None:
+        return _JOB_CATEGORY_ONTOLOGY_CACHE
+
+    fallback_mapping = {name: name for name in _JOB_CATEGORY_CANONICAL}
+    fallback_mapping.update(_JOB_CATEGORY_SYNONYMS)
+    try:
+        from app.db import SessionLocal
+        from app.models import DictJobCategory
+        with SessionLocal() as db:
+            rows = db.query(DictJobCategory).filter(DictJobCategory.enabled == 1).all()
+        canonical = frozenset(row.name for row in rows if row.name)
+        if not canonical:
+            return fallback_mapping, _JOB_CATEGORY_CANONICAL
+        mapping = {name: name for name in canonical}
+        for row in rows:
+            if not row.name:
+                continue
+            for alias in (row.aliases or []):
+                if isinstance(alias, str) and alias.strip():
+                    mapping.setdefault(alias.strip(), row.name)
+                    mapping.setdefault(alias.strip().lower(), row.name)
+        # 兼容尚未同步进旧库 aliases 的应用兜底词，但只映射到当前启用大类。
+        for alias, name in _JOB_CATEGORY_SYNONYMS.items():
+            if name in canonical:
+                mapping.setdefault(alias, name)
+        _JOB_CATEGORY_ONTOLOGY_CACHE = (mapping, canonical)
+        return _JOB_CATEGORY_ONTOLOGY_CACHE
+    except Exception as exc:  # DB 故障不能阻断意图解析，也不缓存以便后续恢复
+        logger.warning("intent_service: load job category ontology failed: %s", exc)
+        return fallback_mapping, _JOB_CATEGORY_CANONICAL
+
+
+def _get_job_category_canonical_values() -> frozenset[str]:
+    return _get_job_category_ontology()[1]
+
+
+def invalidate_job_category_ontology_cache() -> None:
+    """运营变更工种字典后，使 normalize/schema/prompt 在本进程内同步刷新。"""
+    global _JOB_CATEGORY_ONTOLOGY_CACHE
+    _JOB_CATEGORY_ONTOLOGY_CACHE = None
+    from app.dialogue import slot_schema
+    from app.llm import prompts
+    slot_schema._reset_cache_for_tests()
+    prompts._reset_dialogue_parse_prompt_v2_cache_for_tests()
 
 # Bug 4：搜索 / follow_up 上 expected_* → city / job_category 的兜底重映射。
 # 即使 prompt 已明确，仍保留服务端兜底以应对 LLM 漂移；不做反向映射（上传简历
@@ -280,6 +335,51 @@ def _normalize_city_value(value):
     if not text:
         return text
     return _get_city_lookup().get(text) or _COMMON_CITY_ALIASES.get(text, text)
+
+
+def extract_explicit_search_anchors(text: str) -> dict[str, list[str]]:
+    """Extract deterministic city/trade mentions as a guard against LLM omission.
+
+    This is not a replacement classifier: it only uses enabled dictionary names
+    and aliases that literally occur in an already-classified search utterance.
+    Longest non-overlapping matches win, preserving multi-city requests.
+    """
+    if not text:
+        return {}
+
+    def _literal_matches(mapping: dict[str, str]) -> list[str]:
+        candidates: list[tuple[int, int, str, str]] = []
+        lowered = text.lower()
+        for alias, canonical in mapping.items():
+            token = str(alias or "").strip()
+            if len(token) < 2:
+                continue
+            pos = lowered.find(token.lower())
+            if pos >= 0:
+                candidates.append((pos, -len(token), token, canonical))
+        candidates.sort()
+        occupied: list[tuple[int, int]] = []
+        values: list[str] = []
+        for pos, neg_len, token, canonical in candidates:
+            end = pos - neg_len
+            if any(pos < used_end and end > used_start for used_start, used_end in occupied):
+                continue
+            occupied.append((pos, end))
+            if canonical not in values:
+                values.append(canonical)
+        return values
+
+    city_mapping = dict(_COMMON_CITY_ALIASES)
+    city_mapping.update(_get_city_lookup())
+    job_mapping, _canonical = _get_job_category_ontology()
+    cities = _literal_matches(city_mapping)
+    categories = _literal_matches(job_mapping)
+    result: dict[str, list[str]] = {}
+    if cities:
+        result["city"] = cities
+    if categories:
+        result["job_category"] = categories
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -631,13 +731,14 @@ def _normalize_job_category_value(value):
     text = value.strip()
     if not text:
         return None
-    if text in _JOB_CATEGORY_CANONICAL:
+    mapping, canonical_values = _get_job_category_ontology()
+    if text in canonical_values:
         return text
-    mapped = _JOB_CATEGORY_SYNONYMS.get(text) or _JOB_CATEGORY_SYNONYMS.get(text.lower())
+    mapped = mapping.get(text) or mapping.get(text.lower())
     if mapped:
         return mapped
     # 子串包含命中（处理“厨师A岗 / 包装/分拣组”这类拼接表达）。
-    for syn, canonical in _JOB_CATEGORY_SYNONYMS.items():
+    for syn, canonical in mapping.items():
         if syn in text or syn in text.lower():
             return canonical
     logger.warning("intent_service: unknown job_category=%s, keep as-is", text)

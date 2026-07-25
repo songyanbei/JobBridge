@@ -49,7 +49,10 @@ def _basic_msg_data(msg_id="m1", userid="u1", content="你好", event_id=42):
 def worker():
     with patch("app.services.worker.get_redis"), \
          patch("app.services.worker.WeComClient"):
-        return Worker()
+        instance = Worker()
+        instance._last_recovery_scan = time.monotonic()
+        instance._has_earlier_unfinished_event = MagicMock(return_value=False)
+        return instance
 
 
 # ---------------------------------------------------------------------------
@@ -107,20 +110,219 @@ class TestProcessMessageHappyPath:
         db = MagicMock()
         mock_session_factory.return_value = db
 
-        # 发送成功
-        worker._wecom_client.send_text.return_value = {"errcode": 0}
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=None,
+        ), patch.object(
+            worker, "_deliver_outbox_for_event", return_value=True,
+        ) as deliver:
+            worker._process_message(_basic_msg_data())
+
+        mock_router.process.assert_called_once()
+        deliver.assert_called_once_with(42)
+        worker._wecom_client.send_text.assert_not_called()
+        # processing marker + (router/log/outbox/done) atomic transaction
+        assert db.commit.call_count == 2
+
+    @patch("app.services.worker.log_event")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    @patch("app.services.worker.user_lock")
+    def test_emits_queue_and_processing_latency(
+        self, mock_lock_cm, mock_router, mock_session_factory, mock_log, worker,
+    ):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=True)
+        cm.__exit__ = MagicMock(return_value=False)
+        mock_lock_cm.return_value = cm
+        mock_router.process.return_value = []
+        mock_session_factory.return_value = MagicMock()
+        payload = _basic_msg_data()
+        payload["_enqueued_at"] = time.time() - 2
+
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=None,
+        ):
+            worker._process_message(payload)
+
+        fields = mock_log.call_args.kwargs
+        assert mock_log.call_args.args[0] == "message_processing"
+        assert fields["queue_wait_ms"] >= 1900
+        assert fields["outcome"] == "processed"
+
+    @patch("app.services.worker.log_event")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    @patch("app.services.worker.user_lock")
+    def test_terminal_duplicate_is_skipped_before_router_and_send(
+        self, mock_lock_cm, mock_router, mock_session_factory, mock_log, worker,
+    ):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=True)
+        cm.__exit__ = MagicMock(return_value=False)
+        mock_lock_cm.return_value = cm
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.return_value = "done"
+        mock_session_factory.return_value = db
 
         worker._process_message(_basic_msg_data())
 
-        mock_router.process.assert_called_once()
-        worker._wecom_client.send_text.assert_called_once_with("u1", "hello")
-        # 至少 commit 3 次（router、log、done）
-        assert db.commit.call_count >= 3
+        mock_router.process.assert_not_called()
+        worker._wecom_client.send_text.assert_not_called()
+        assert mock_log.call_args.kwargs["outcome"] == "duplicate_terminal_skipped"
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    def test_lost_lock_allows_only_processing_marker_commit(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        mock_router.process.return_value = [
+            ReplyMessage(userid="u1", content="hello"),
+        ]
+        db = MagicMock()
+        mock_session_factory.return_value = db
+        lease = MagicMock(spec=["assert_owned"])
+        lease.assert_owned.side_effect = RuntimeError("lease lost")
+
+        with patch.object(worker, "_handle_error") as handle_error:
+            worker._process_locked(_basic_msg_data(), 42, 0, "u1", lease)
+
+        # Only the independent worker_started_at/status marker is committed; router
+        # business writes are rolled back after the lease assertion fails.
+        assert db.commit.call_count == 1
+        db.rollback.assert_called_once()
+        worker._wecom_client.send_text.assert_not_called()
+        handle_error.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
 # 锁竞争重入
 # ---------------------------------------------------------------------------
+
+class TestDurableSessionCommit:
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    def test_business_commit_failure_never_applies_staged_redis_session(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        db.commit.side_effect = [None, RuntimeError("mysql commit failed")]
+        mock_session_factory.return_value = db
+        mock_router.process.return_value = []
+        commit = MagicMock()
+
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=commit,
+        ), patch.object(
+            worker, "_stage_session_commit",
+        ), patch.object(
+            worker, "_apply_session_commit_for_event",
+        ) as apply_session, patch.object(
+            worker, "_handle_error",
+        ):
+            outcome = worker._process_locked(
+                _basic_msg_data(), 42, 0, "u1", MagicMock(),
+            )
+
+        assert outcome == "processing_failed"
+        apply_session.assert_not_called()
+        db.rollback.assert_called_once()
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    def test_redis_apply_failure_leaves_outbox_hidden_and_returns_pending(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        mock_session_factory.return_value = db
+        mock_router.process.return_value = [
+            ReplyMessage(userid="u1", content="hello"),
+        ]
+        commit = MagicMock()
+
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=commit,
+        ), patch.object(
+            worker, "_stage_session_commit",
+        ) as stage, patch.object(
+            worker, "_apply_session_commit_for_event", return_value=False,
+        ), patch.object(
+            worker, "_deliver_outbox_for_event",
+        ) as deliver:
+            outcome = worker._process_locked(
+                _basic_msg_data(), 42, 0, "u1", MagicMock(),
+            )
+
+        assert outcome == "session_commit_pending"
+        stage.assert_called_once_with(db, 42, commit)
+        deliver.assert_not_called()
+        assert db.commit.call_count == 2
+
+    def test_recovery_is_idempotent_after_redis_cas_before_db_mark(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "commit": MagicMock(),
+        }
+        with patch(
+            "app.services.worker.conversation_service.apply_staged_session",
+            return_value=False,
+        ), patch(
+            "app.services.worker.conversation_service.is_staged_session_applied",
+            return_value=True,
+        ), patch.object(
+            worker, "_mark_session_commit_applied", return_value=True,
+        ) as mark_applied, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as mark_retry:
+            assert worker._apply_session_commit_item(item) is True
+
+        mark_applied.assert_called_once_with(42)
+        mark_retry.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    def test_post_commit_exception_never_requeues_business_router(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        mock_session_factory.return_value = db
+        mock_router.process.return_value = []
+
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=None,
+        ), patch.object(
+            worker,
+            "_deliver_outbox_for_event",
+            side_effect=RuntimeError("recovery database unavailable"),
+        ), patch.object(worker, "_handle_error") as handle_error:
+            outcome = worker._process_locked(
+                _basic_msg_data(), 42, 0, "u1", MagicMock(),
+            )
+
+        assert outcome == "post_commit_recovery_pending"
+        handle_error.assert_not_called()
+        mock_router.process.assert_called_once()
+
 
 class TestLockContention:
     @patch("app.services.worker.enqueue_message")
@@ -138,6 +340,57 @@ class TestLockContention:
         args, _ = mock_enq.call_args
         payload = json.loads(args[0])
         assert payload["from_userid"] == "u1"
+
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.user_lock")
+    def test_later_same_user_event_requeues_without_processing(
+        self, mock_lock_cm, mock_enq, worker,
+    ):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=True)
+        cm.__exit__ = MagicMock(return_value=False)
+        mock_lock_cm.return_value = cm
+        worker._has_earlier_unfinished_event.return_value = True
+
+        with patch.object(worker, "_process_locked") as process_locked:
+            worker._process_message(_basic_msg_data(event_id=43))
+
+        process_locked.assert_not_called()
+        mock_enq.assert_called_once()
+
+    @patch("app.services.worker.enqueue_message", side_effect=RuntimeError("down"))
+    @patch("app.services.worker.user_lock")
+    def test_ordered_requeue_failure_preserves_durable_event(
+        self, mock_lock_cm, _mock_enq, worker,
+    ):
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=True)
+        cm.__exit__ = MagicMock(return_value=False)
+        mock_lock_cm.return_value = cm
+        worker._has_earlier_unfinished_event.return_value = True
+
+        with patch.object(worker, "_preserve_event_for_recovery") as preserve:
+            worker._process_message(_basic_msg_data(event_id=43))
+
+        preserve.assert_called_once_with(43)
+
+
+class TestAuxQueueFairness:
+    def test_busy_inbound_loop_still_services_aux_queues(self, worker, monkeypatch):
+        monkeypatch.setattr("app.services.worker.AUX_QUEUE_EVERY_MESSAGES", 1)
+        worker._redis.blpop.return_value = (
+            "queue:incoming",
+            json.dumps(_basic_msg_data()),
+        )
+
+        def stop_after_one(_payload):
+            worker._running = False
+
+        with patch.object(worker, "_process_message", side_effect=stop_after_one), \
+             patch.object(worker, "_service_aux_queues") as service:
+            worker._main_loop()
+
+        service.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +450,24 @@ class TestErrorHandling:
         args, kwargs = mock_keep.call_args
         assert args[0] == 42
         assert args[1] == 1  # retry_count + 1
+
+    @patch("app.services.worker.SessionLocal")
+    def test_failed_retry_handoff_becomes_due_on_next_recovery_scan(
+        self, mock_factory, worker,
+    ):
+        db = MagicMock()
+        update = db.query.return_value.filter.return_value.update
+        mock_factory.return_value = db
+
+        worker._update_retry_and_error_keep_processing(
+            42, 1, "RedisError: unavailable",
+        )
+
+        values = update.call_args.args[0]
+        assert values["status"] == "processing"
+        assert "worker_started_at" in values
+        assert values["retry_count"] == 1
+        db.commit.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +531,89 @@ class TestSendErrorHandling:
         ok = worker._send_one(reply)
         assert ok is False
         worker._redis.rpush.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# durable transactional outbox
+# ---------------------------------------------------------------------------
+
+class TestTransactionalOutbox:
+    def test_stage_outbox_preserves_reply_order_and_metadata(self, worker):
+        from app.models import WecomOutboundOutbox
+
+        db = MagicMock()
+        replies = [
+            ReplyMessage(
+                userid="u1",
+                content="first",
+                intent="search_job",
+                criteria_snapshot={"criteria": {"city": ["苏州市"]}},
+            ),
+            ReplyMessage(userid="u1", content="second"),
+        ]
+
+        worker._stage_outbox(db, 42, replies)
+
+        rows = [call.args[0] for call in db.add.call_args_list]
+        assert all(isinstance(row, WecomOutboundOutbox) for row in rows)
+        assert [row.reply_index for row in rows] == [0, 1]
+        assert rows[0].inbound_event_id == 42
+        assert rows[0].intent == "search_job"
+        assert rows[0].criteria_snapshot["criteria"]["city"] == ["苏州市"]
+
+    def test_event_delivery_attempts_every_claim_even_if_one_fails(self, worker):
+        claimed = [
+            {"id": 1, "userid": "u1", "content": "a", "attempt_count": 1},
+            {"id": 2, "userid": "u1", "content": "b", "attempt_count": 1},
+        ]
+        with patch.object(worker, "_claim_outbox", side_effect=[claimed, []]), \
+             patch.object(
+                 worker, "_deliver_outbox_item", side_effect=[False, True],
+             ) as deliver:
+            ok = worker._deliver_outbox_for_event(42)
+
+        assert ok is False
+        assert deliver.call_count == 2
+
+    def test_success_records_provider_message_id(self, worker):
+        item = {"id": 1, "userid": "u1", "content": "a", "attempt_count": 1}
+        worker._wecom_client.send_text.return_value = {"errcode": 0, "msgid": "wx-1"}
+
+        with patch.object(worker, "_mark_outbox_sent", return_value=True) as sent:
+            assert worker._deliver_outbox_item(item) is True
+
+        sent.assert_called_once_with(1, "wx-1")
+
+    def test_network_failure_returns_row_to_durable_retry(self, worker):
+        item = {"id": 1, "userid": "u1", "content": "a", "attempt_count": 1}
+        error = RuntimeError("timeout after send")
+        worker._wecom_client.send_text.side_effect = error
+
+        with patch.object(worker, "_mark_outbox_failed") as failed:
+            assert worker._deliver_outbox_item(item) is False
+
+        failed.assert_called_once_with(item, error)
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
+    def test_atomic_commit_failure_never_attempts_outbox_delivery(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        mock_router.process.return_value = [
+            ReplyMessage(userid="u1", content="hello"),
+        ]
+        db = MagicMock()
+        db.commit.side_effect = [None, RuntimeError("atomic commit failed")]
+        mock_session_factory.return_value = db
+        lease = MagicMock(spec=["assert_owned"])
+
+        with patch.object(worker, "_handle_error") as handle_error, \
+             patch.object(worker, "_deliver_outbox_for_event") as deliver:
+            worker._process_locked(_basic_msg_data(), 42, 0, "u1", lease)
+
+        deliver.assert_not_called()
+        db.rollback.assert_called_once()
+        handle_error.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -361,15 +715,129 @@ class TestStartupRecovery:
         zombie.retry_count = 0
         from datetime import datetime, timezone
         zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
-        db.query.return_value.filter.return_value.all.return_value = [zombie]
+        db.query.return_value.filter.return_value.with_for_update.return_value.limit.return_value.all.return_value = [zombie]
         mock_factory.return_value = db
 
         worker._startup_recovery()
 
         assert mock_enq.call_count == 1
-        assert zombie.status == "received"
-        assert zombie.worker_started_at is None
+        assert zombie.status == "processing"
+        assert zombie.worker_started_at is not None
         db.commit.assert_called_once()
+
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.SessionLocal")
+    def test_successful_scan_advances_interval_and_repeat_scan_is_empty(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        zombie = MagicMock()
+        zombie.msg_id = "m-repeat"
+        zombie.from_userid = "u1"
+        zombie.msg_type = "text"
+        zombie.content_brief = "hello"
+        zombie.media_id = None
+        zombie.id = 43
+        zombie.retry_count = 0
+        from datetime import datetime, timezone
+        zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
+        query = (
+            db.query.return_value.filter.return_value
+            .with_for_update.return_value.limit.return_value
+        )
+        query.all.side_effect = [[zombie], []]
+        mock_factory.return_value = db
+        before = time.monotonic()
+
+        worker._startup_recovery()
+        first_scan_at = worker._last_recovery_scan
+        worker._startup_recovery()
+
+        assert mock_enq.call_count == 1
+        assert first_scan_at >= before
+        assert worker._last_recovery_scan >= first_scan_at
+
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.SessionLocal")
+    def test_scan_failure_is_interval_bounded(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        db.query.side_effect = RuntimeError("db unavailable")
+        mock_factory.return_value = db
+        before = time.monotonic()
+
+        worker._startup_recovery()
+
+        mock_enq.assert_not_called()
+        assert worker._last_recovery_scan >= before
+        db.rollback.assert_called_once()
+
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.SessionLocal")
+    def test_claim_commit_failure_never_enqueues(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        zombie = MagicMock(
+            msg_id="m-commit-fail",
+            from_userid="u1",
+            msg_type="text",
+            content_brief="hello",
+            media_id=None,
+            id=44,
+            retry_count=0,
+        )
+        from datetime import datetime, timezone
+        zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
+        (
+            db.query.return_value.filter.return_value
+            .with_for_update.return_value.limit.return_value.all
+        ).return_value = [zombie]
+        db.commit.side_effect = RuntimeError("commit failed")
+        mock_factory.return_value = db
+
+        worker._startup_recovery()
+
+        mock_enq.assert_not_called()
+        db.rollback.assert_called_once()
+
+    @patch(
+        "app.services.worker.enqueue_message",
+        side_effect=RuntimeError("redis unavailable"),
+    )
+    @patch("app.services.worker.SessionLocal")
+    def test_enqueue_failure_leaves_committed_processing_claim(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        zombie = MagicMock(
+            msg_id="m-redis-fail",
+            from_userid="u1",
+            msg_type="text",
+            content_brief="hello",
+            media_id=None,
+            id=45,
+            retry_count=0,
+        )
+        from datetime import datetime, timezone
+        zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
+        (
+            db.query.return_value.filter.return_value
+            .with_for_update.return_value.limit.return_value.all
+        ).return_value = [zombie]
+        mock_factory.return_value = db
+
+        with patch.object(worker, "_mark_event_recovery_due") as mark_due:
+            worker._startup_recovery()
+
+        mock_enq.assert_called_once()
+        db.commit.assert_called_once()
+        db.rollback.assert_not_called()
+        assert zombie.status == "processing"
+        mark_due.assert_called_once_with(
+            45, error_message="startup recovery enqueue failed",
+        )
 
     @patch("app.services.worker.enqueue_message")
     @patch("app.services.worker.SessionLocal")
@@ -386,7 +854,7 @@ class TestStartupRecovery:
         zombie.retry_count = 0
         from datetime import datetime, timezone
         zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
-        db.query.return_value.filter.return_value.all.return_value = [zombie]
+        db.query.return_value.filter.return_value.with_for_update.return_value.limit.return_value.all.return_value = [zombie]
         mock_factory.return_value = db
 
         worker._startup_recovery()
@@ -413,7 +881,7 @@ class TestStartupRecovery:
         zombie.retry_count = 0
         from datetime import datetime, timezone
         zombie.created_at = datetime(2026, 4, 10, tzinfo=timezone.utc)
-        db.query.return_value.filter.return_value.all.return_value = [zombie]
+        db.query.return_value.filter.return_value.with_for_update.return_value.limit.return_value.all.return_value = [zombie]
         mock_factory.return_value = db
 
         worker._startup_recovery()

@@ -20,6 +20,7 @@ from app.api.events import router as events_router
 from app.api.webhook import router as webhook_router
 from app.config import settings
 from app.core.exceptions import AppError, BusinessException
+from app.core.logging_setup import configure_loguru
 from app.core.responses import fail
 from app.db import engine
 from app.tasks import scheduler as task_scheduler
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     - 启动阶段：`task_scheduler.start()` 构造 BackgroundScheduler 并注册任务。
     - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
     """
+    configure_loguru(settings.app_env)
     task_scheduler.start()
     try:
         yield
