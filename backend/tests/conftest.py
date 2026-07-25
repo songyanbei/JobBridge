@@ -6,6 +6,8 @@ import pytest
 
 # 确保 backend/app 可被 import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Repository-level acceptance helpers live under scripts/.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 
 # ---------------------------------------------------------------------------
