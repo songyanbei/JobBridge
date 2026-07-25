@@ -1,0 +1,6 @@
+services:
+  worker:
+    environment:
+      LLM_API_BASE: http://app:18080/v1
+      LLM_TIMEOUT_SECONDS: 1
+      LLM_CIRCUIT_FAILURE_THRESHOLD: 20
