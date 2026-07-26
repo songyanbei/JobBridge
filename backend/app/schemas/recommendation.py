@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -14,6 +15,34 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Direction = Literal["search_job", "search_worker"]
 Assignment = Literal["legacy", "stable", "candidate"]
+ExecutionMode = Literal["off", "shadow", "on"]
+
+#: §9.4 `recommendation_request.request_kind` 的合法取值。
+RequestKind = Literal[
+    "initial_search", "auto_relaxed", "confirmed_relaxed", "show_more"
+]
+#: §9.5 `recommendation_search_attempt.attempt_kind` 的合法取值。
+#: 注意没有 ``show_more``——show_more 复用父 request 的 served attempt，不产生新 attempt。
+AttemptKind = Literal[
+    "initial", "relax_probe", "auto_relaxed", "confirmed_relaxed", "shadow_candidate"
+]
+#: §9.5 `recommendation_search_attempt.llm_status` 的合法取值（没有 ``completed``）。
+LlmAttemptStatus = Literal["ok", "timeout", "http_error", "parse_failed", "skipped"]
+
+#: request_kind → attempt_kind。show_more 正常不建 attempt；只有父 request 丢失、
+#: 不得不重新物化候选池时才落到这里的 ``initial``。
+ATTEMPT_KIND_BY_REQUEST_KIND: dict[str, str] = {
+    "initial_search": "initial",
+    "auto_relaxed": "auto_relaxed",
+    "confirmed_relaxed": "confirmed_relaxed",
+    "show_more": "initial",
+}
+
+#: §9.6 `recommendation_delivery.status` 的合法取值。
+DELIVERY_STATUSES: tuple[str, ...] = (
+    "prepared", "pending", "sending", "retry_wait",
+    "sent", "permanent_failed", "unknown",
+)
 
 
 class StrategyTemplate(str, Enum):
@@ -251,15 +280,153 @@ class RecommendationDeliveryContext(BaseModel):
         return value
 
 
+# ---------------------------------------------------------------------------
+# §9.6 `recommendation_delivery.recommendation_context` 封闭白名单
+# ---------------------------------------------------------------------------
+# 上面的 ``RecommendationDeliveryContext`` 是**进程内**契约（router → worker），可以
+# 带 delivery_id/viewer_userid/owner_userid；下面这组常量和 ``project_delivery_context``
+# 才是**落库**口径。方案禁止 JSON 列里出现姓名、企业名、电话、地址、原始 query、
+# 候选描述、work_experience 或完整回复，因此 viewer_userid、item 级 owner_userid、
+# 原始 direction 都不进列（direction 见 §9.4，消费侧从 recommendation_request 取）。
+
+DELIVERY_CONTEXT_KEYS: frozenset[str] = frozenset({
+    "strategy_version_id", "algorithm_version", "assignment", "query_digest", "items",
+})
+DELIVERY_CONTEXT_ITEM_KEYS: frozenset[str] = frozenset({
+    "target_type", "target_id", "position",
+    "is_exploration", "reason_codes", "final_score", "score_detail",
+})
+#: score components 必须是数值；reason_codes 是枚举串。
+DELIVERY_CONTEXT_SCORE_KEYS: frozenset[str] = frozenset({
+    "match_score", "quality_score", "freshness_score", "exposure_opportunity",
+    "base_score", "repeat_factor", "repeat_adjusted_score",
+    "is_exploration", "reason_codes",
+})
+
+
+def _context_mapping(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _context_number(value: Any) -> float | None:
+    #: bool 是 int 的子类，单独排掉，否则 True 会变成 1.0 的“分数”。
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _context_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _context_token(value: Any, limit: int) -> str:
+    return str(value)[:limit] if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
+
+
+def _context_reason_codes(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(code)[:64] for code in value if isinstance(code, str) and code]
+
+
+def _project_score_detail(value: Any) -> dict[str, Any] | None:
+    detail = _context_mapping(value)
+    if not detail:
+        return None
+    projected: dict[str, Any] = {}
+    for key in ("match_score", "quality_score", "freshness_score",
+                "exposure_opportunity", "base_score", "repeat_factor",
+                "repeat_adjusted_score"):
+        number = _context_number(detail.get(key))
+        if number is not None:
+            projected[key] = number
+    projected["is_exploration"] = bool(detail.get("is_exploration", False))
+    projected["reason_codes"] = _context_reason_codes(detail.get("reason_codes"))
+    return projected
+
+
+def _project_delivery_item(value: Any) -> dict[str, Any]:
+    item = _context_mapping(value)
+    projected: dict[str, Any] = {
+        "target_type": _context_token(item.get("target_type"), 16),
+        "target_id": _context_int(item.get("target_id")),
+        "position": _context_int(item.get("position")) or 0,
+        "is_exploration": bool(item.get("is_exploration", False)),
+        "reason_codes": _context_reason_codes(item.get("reason_codes")),
+    }
+    final_score = _context_number(item.get("final_score"))
+    if final_score is not None:
+        projected["final_score"] = final_score
+    detail = _project_score_detail(item.get("score_detail"))
+    if detail is not None:
+        projected["score_detail"] = detail
+    return projected
+
+
+def assert_delivery_context_whitelisted(payload: Mapping[str, Any]) -> None:
+    """守住 §9.6 的封闭清单，任何多出来的键都直接报错。
+
+    投影函数自己也会调用它，这样以后给 ``RecommendationDeliveryContext``
+    加字段时不会有人“顺手”把新字段漏进落库 JSON。
+    """
+    extra = set(payload) - DELIVERY_CONTEXT_KEYS
+    if extra:
+        raise ValueError(
+            f"recommendation_context has non-whitelisted keys: {sorted(extra)}"
+        )
+    for item in payload.get("items") or []:
+        item_extra = set(item) - DELIVERY_CONTEXT_ITEM_KEYS
+        if item_extra:
+            raise ValueError(
+                f"recommendation_context item has non-whitelisted keys: {sorted(item_extra)}"
+            )
+        detail_extra = set(item.get("score_detail") or {}) - DELIVERY_CONTEXT_SCORE_KEYS
+        if detail_extra:
+            raise ValueError(
+                f"recommendation_context score_detail has non-whitelisted keys: "
+                f"{sorted(detail_extra)}"
+            )
+
+
+def project_delivery_context(context: Any) -> dict[str, Any]:
+    """把投递上下文投影成 §9.6 允许落库的最小 JSON。
+
+    只输出白名单键，其余（``delivery_id``/``request_id``/``snapshot_id`` 已经是
+    delivery 的列，``viewer_userid``/``owner_userid``/``direction`` 属于清单外）
+    一律丢弃。这是 ``recommendation_delivery.recommendation_context`` 的唯一写入口。
+    """
+    payload = _context_mapping(context)
+    raw_items = payload.get("items")
+    projected: dict[str, Any] = {
+        "assignment": _context_token(payload.get("assignment"), 16),
+        "algorithm_version": _context_token(payload.get("algorithm_version"), 32),
+        "query_digest": _context_token(payload.get("query_digest"), 16),
+        "strategy_version_id": _context_int(payload.get("strategy_version_id")),
+        "items": [
+            _project_delivery_item(item)
+            for item in (raw_items if isinstance(raw_items, (list, tuple)) else [])
+        ],
+    }
+    assert_delivery_context_whitelisted(projected)
+    return projected
+
+
 class RecommendationRequestFact(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
     source_inbound_msg_id: str
-    request_index: int = 0
-    request_kind: Literal[
-        "initial_search", "auto_relaxed", "confirmed_relaxed", "show_more"
-    ]
+    #: ``None`` = 调用方没有显式编号，持久化层退回 ``reply_index``。写死 0 会让同一条
+    #: 入站消息的第二个推荐决策撞上 ``(source_inbound_msg_id, request_index)`` 唯一键。
+    request_index: int | None = Field(default=None, ge=0)
+    request_kind: RequestKind
     parent_request_id: str | None = None
     viewer_userid: str
     direction: Direction
@@ -271,6 +438,39 @@ class RecommendationRequestFact(BaseModel):
     served_top_ids: list[str] = Field(default_factory=list)
     is_zero_result: bool = False
     total_latency_ms: int = Field(default=0, ge=0)
+    #: §7.5 off 只关闭新排序不关闭可观测性：legacy/off/shadow 请求同样写事实，
+    #: 此时 served_assignment/algorithm_version 固定 legacy、strategy_version_id 为空。
+    execution_mode: ExecutionMode = "off"
+    served_assignment: Assignment = "legacy"
+    served_strategy_version_id: int | None = None
+    candidate_strategy_version_id: int | None = None
+    snapshot_id: str | None = None
+    result_count: int = Field(default=0, ge=0)
+    #: §9.4：仅 show_more 使用，分页耗尽不得写成业务零结果。
+    show_more_exhausted: bool = False
+    served_owner_count: int = Field(default=0, ge=0)
+    served_max_owner_items: int = Field(default=0, ge=0)
+    served_exploration_count: int = Field(default=0, ge=0)
+    #: §9.5：最终被采用的那次查询尝试的类型；auto_relaxed 与 confirmed_relaxed
+    #: 必须区分（系统自动放宽 vs 用户确认放宽）。
+    attempt_kind: AttemptKind = "initial"
+    #: §9.5：本次请求跑过的放宽探查步；probe attempt 不得被 served_attempt_id 引用。
+    relax_probe_steps: list[str] = Field(default_factory=list)
+    #: §9.5 attempt 事实。``criteria_digest`` 是 CHAR(64) 的**有效条件**规范化摘要，
+    #: 不是 16 位 ``query_digest``；留空时持久化层按固定域分隔重新算一个 64 位摘要。
+    criteria_digest: str = ""
+    attempt_no: int = Field(default=0, ge=0)
+    #: 本 attempt 固定的 ``request_now_utc``（打分时刻），不是落库时刻。
+    scoring_time_utc: datetime | None = None
+    llm_status: LlmAttemptStatus = "skipped"
+    llm_input_tokens: int | None = Field(default=None, ge=0)
+    llm_output_tokens: int | None = Field(default=None, ge=0)
+    llm_timeout_budget_ms: int | None = Field(default=None, ge=0)
+    llm_retry_count: int = Field(default=0, ge=0)
+    ranking_fallback: str | None = None
+    ranking_latency_ms: int = Field(default=0, ge=0)
+    #: 本 attempt 自己的耗时；``total_latency_ms`` 是整个 request 的耗时。
+    attempt_latency_ms: int = Field(default=0, ge=0)
 
 
 class RecommendationSimulationRequest(BaseModel):

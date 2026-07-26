@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -34,6 +35,7 @@ from app.llm.prompts import PROMPT_VERSION
 from app.models import Resume
 from app.schemas.conversation import ReplyMessage, SessionState
 from app.schemas.recommendation import (
+    ATTEMPT_KIND_BY_REQUEST_KIND,
     RecommendationDeliveryContext,
     RecommendationRequestFact,
 )
@@ -242,6 +244,28 @@ from contextvars import ContextVar as _ContextVar
 _v2_parse_result: _ContextVar = _ContextVar("_v2_parse_result", default=None)
 _v2_decision: _ContextVar = _ContextVar("_v2_decision", default=None)
 
+# §9.4 `recommendation_request.total_latency_ms`：请求总耗时从本轮第一次真实检索
+# 开始计时。自动放宽会在同一 request 内跑第二次检索，所以只在检索入口 start 一次，
+# applier 递归时不重置。
+_recommendation_clock: _ContextVar = _ContextVar("_recommendation_clock", default=None)
+
+
+def _start_recommendation_clock() -> None:
+    """在真正发起检索前打点；同一 turn 内重复调用只保留最早一次。"""
+    if _recommendation_clock.get() is None:
+        _recommendation_clock.set(time.monotonic())
+
+
+def _reset_recommendation_clock() -> None:
+    _recommendation_clock.set(None)
+
+
+def _recommendation_elapsed_ms() -> int:
+    started = _recommendation_clock.get()
+    if started is None:
+        return 0
+    return max(0, int((time.monotonic() - started) * 1000))
+
 
 def _set_v2_turn_context(parse_result, decision) -> None:
     _v2_parse_result.set(parse_result)
@@ -364,6 +388,7 @@ def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
 
     # 4. 按消息类型分流
     # Phase 5 §5.2：用 try/finally 清空 turn-scoped v2 context，避免跨 turn 泄漏。
+    _reset_recommendation_clock()
     try:
         mtype = msg.msg_type or ""
         if mtype == "text":
@@ -389,6 +414,7 @@ def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
         return [_reply(userid, UNKNOWN_TYPE_REPLY)]
     finally:
         _clear_v2_turn_context()
+        _reset_recommendation_clock()
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1264,7 @@ def _route_v2_relaxation_response(
             user_ctx, direction=direction, emit_log=True,
         )
 
+        _start_recommendation_clock()
         new_result, new_outcome = _search_service.execute_relaxed_search(
             original_criteria,
             step,
@@ -1297,18 +1324,19 @@ def _route_v2_relaxation_response(
             recursion_depth=1,
         )
         replies = apply_post_search_decision(ctx)
+        # 用户确认放宽后的这次检索是新的 confirmed_relaxed request（§9.4）；
+        # 请求事实必须写（含零结果），delivery 只挂给真渲染了候选的那条回复。
         recommendation_fields = _recommendation_reply_fields(
             new_result,
             user_ctx.external_userid,
             msg.msg_id,
             request_kind="confirmed_relaxed",
             parent_request_id=pending.get("parent_request_id"),
+            search_outcome=new_outcome,
         )
-        if recommendation_fields:
-            replies = [
-                reply.model_copy(update=recommendation_fields)
-                for reply in replies
-            ]
+        replies = _attach_recommendation_fields(
+            replies, recommendation_fields, new_result,
+        )
 
         # 函数自身清 pending_relaxation（不依赖 apply_decision）
         session.pending_relaxation = None
@@ -1674,6 +1702,7 @@ def _handle_search(
     # 否则 worker "看看新岗位" 这类空 structured_data 场景永远进不到
     # _apply_default_criteria，简历 expected_* 默认条件无机会兜底。
     criteria = dict(session.search_criteria)
+    _start_recommendation_clock()
     run_search_outcome = _run_search(
         effective_intent, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
@@ -1753,6 +1782,7 @@ def _handle_follow_up(
     # - digest 未变：相当于"再搜一次"，快照会被同样 digest 重置，对用户无感
     # - follow_up 没有显式方向，沿用 session.broker_direction（首次 search 时已写）
     criteria = dict(session.search_criteria)
+    _start_recommendation_clock()
     run_search_outcome = _run_search(
         None, criteria, msg.content or "", user_ctx, session, db,
         user_msg_id=msg.msg_id,
@@ -1789,6 +1819,7 @@ def _handle_show_more(
     experience_flags = _experience_flags_for(
         user_ctx, direction=direction, emit_log=True,
     )
+    _start_recommendation_clock()
     result, outcome = search_service.show_more(
         session, user_ctx, db, experience_flags=experience_flags,
     )
@@ -1840,16 +1871,20 @@ def _post_search_dispatch(
     5%/25%/50%/100% 灰度阶梯真正生效。
     """
     mode = _settings_module.dialogue_policy.post_search_policy_mode
+    # §9.5 P1-25：search_service 自己走完 fallback 步得到的结果是"系统自动放宽"，
+    # 用户从未确认过，必须记 auto_relaxed；confirmed_relaxed 只属于
+    # _route_v2_relaxation_response 里用户回"好的"之后的那次新请求。
     recommendation_fields = _recommendation_reply_fields(
         search_result,
         user_ctx.external_userid,
         msg.msg_id,
         request_kind=(
             "show_more" if legacy_intent == "show_more"
-            else "confirmed_relaxed"
+            else "auto_relaxed"
             if getattr(search_outcome, "applied_relax_step", None)
             else "initial_search"
         ),
+        search_outcome=search_outcome,
     )
 
     if mode == "off":
@@ -1858,7 +1893,9 @@ def _post_search_dispatch(
             search_result.reply_text,
             intent=legacy_intent,
             criteria_snapshot=_snapshot_meta(session),
-            **recommendation_fields,
+            **_fields_for_body(
+                recommendation_fields, search_result.reply_text, search_result,
+            ),
         )]
 
     # Phase 5 §5.4：on 模式下进一步用 phase5_rollout_percentage hash 桶判定。
@@ -1873,7 +1910,9 @@ def _post_search_dispatch(
                 search_result.reply_text,
                 intent=legacy_intent,
                 criteria_snapshot=_snapshot_meta(session),
-                **recommendation_fields,
+                **_fields_for_body(
+                    recommendation_fields, search_result.reply_text, search_result,
+                ),
             )]
 
     # shadow / on 都需要构造 ctx + 调 reducer
@@ -1939,7 +1978,9 @@ def _post_search_dispatch(
             search_result.reply_text,
             intent=legacy_intent,
             criteria_snapshot=_snapshot_meta(session),
-            **recommendation_fields,
+            **_fields_for_body(
+                recommendation_fields, search_result.reply_text, search_result,
+            ),
         )]
 
     # mode == "on"
@@ -1968,21 +2009,62 @@ def _post_search_dispatch(
     replies = apply_post_search_decision(ctx)
     # applier 返回的 ReplyMessage 没有 intent / criteria_snapshot，由本函数补齐
     # 以保持与旧路径同构（便于 worker 落库 / 监控大盘）。
+    #
+    # P1-10：推荐上下文不能无条件补到每一条 recommendation_context 为空的回复上。
+    # ask_clarification / paginate_no_more / suggest_relaxation 不含任何候选，
+    # 挂上 delivery 就会派生出凭空的曝光事实（§10.1 行 2210-2211）。请求事实仍要写
+    # 一条（§7.5），但只挂在真正渲染了候选的那条回复上；都没渲染时挂在第一条。
+    return _attach_recommendation_fields(
+        replies,
+        recommendation_fields,
+        search_result,
+        intent=legacy_intent,
+        criteria_snapshot=_snapshot_meta(session),
+    )
+
+
+def _attach_recommendation_fields(
+    replies: list[ReplyMessage],
+    recommendation_fields: dict,
+    search_result,
+    *,
+    intent: str | None = None,
+    criteria_snapshot: dict | None = None,
+) -> list[ReplyMessage]:
+    """把请求事实/delivery 挂到正确的那一条回复上（§7.5 + §10.1）。
+
+    - 一次请求只写一条 request 事实，因此只挂一条回复；
+    - ``delivery_id`` / ``recommendation_context`` 只挂给正文里真的渲染了候选的
+      回复，其余回复只拿请求事实（或什么都不拿）。
+    - applier 已经自己挂过（自动放宽二次检索）时不再覆盖。
+    """
+    already_attached = any(
+        reply.recommendation_request is not None
+        or reply.recommendation_context is not None
+        for reply in replies
+    )
+    target_index = next(
+        (
+            index for index, reply in enumerate(replies)
+            if _reply_renders_candidates(reply.content, search_result)
+        ),
+        0,
+    )
     enriched: list[ReplyMessage] = []
-    for r in replies:
-        updates = (
-            {}
-            if r.recommendation_context is not None
-            else dict(recommendation_fields)
-        )
-        if r.intent is None:
+    for index, reply in enumerate(replies):
+        updates: dict = {}
+        if not already_attached and index == target_index:
+            updates.update(_fields_for_body(
+                recommendation_fields, reply.content, search_result,
+            ))
+        if intent is not None and reply.intent is None:
             updates.update({
-                "intent": legacy_intent,
-                "criteria_snapshot": _snapshot_meta(session),
+                "intent": intent,
+                "criteria_snapshot": criteria_snapshot,
             })
         if updates:
-            r = r.model_copy(update=updates)
-        enriched.append(r)
+            reply = reply.model_copy(update=updates)
+        enriched.append(reply)
     return enriched
 
 
@@ -2764,60 +2846,203 @@ def _history_reply_content(reply: ReplyMessage) -> str:
     )
 
 
+#: 只有真的把候选写进正文的回复才创建 delivery（§10.1），其余字段是纯请求事实。
+_DELIVERY_ONLY_FIELDS = ("delivery_id", "recommendation_context")
+
+
+def _request_only_fields(fields: dict) -> dict:
+    """去掉 delivery 相关字段，只保留请求事实（§10.1 不创建 delivery 的分支）。"""
+    return {
+        key: value for key, value in fields.items()
+        if key not in _DELIVERY_ONLY_FIELDS
+    }
+
+
+def _fields_for_body(fields: dict, content: str | None, search_result) -> dict:
+    """按这条回复正文是否真的渲染了候选，决定给不给 delivery 字段。"""
+    if not fields:
+        return {}
+    if _reply_renders_candidates(content, search_result):
+        return fields
+    return _request_only_fields(fields)
+
+
+def _reply_renders_candidates(content: str | None, search_result) -> bool:
+    """本条回复的正文里是否真的渲染了候选。
+
+    §10.1.1：上下文只包含本次真正写入回复的候选。``ask_clarification`` /
+    ``paginate_no_more`` / ``suggest_relaxation`` 这类纯文本回复不含任何候选，
+    给它们挂 delivery 会凭空派生出曝光事实，污染 CTR 分母和曝光均衡输入。
+    """
+    if not getattr(search_result, "recommendation_items", None):
+        return False
+    body = (getattr(search_result, "reply_text", "") or "").strip()
+    return bool(body) and body in (content or "")
+
+
+def _is_recommendation_search(search_result, search_outcome) -> bool:
+    """本轮是否发生过一次真实的推荐搜索（含零结果）。
+
+    §7.5：off/legacy 只关闭新排序，不关闭可观测性，因此零结果与 legacy 请求同样
+    要写 request 事实。但"快照已过期/没有可继续查看的结果"这类根本没查过库的
+    回复不是搜索，不能伪造事实去污染零结果率。
+    """
+    if getattr(search_result, "recommendation_items", None):
+        return True
+    if int(getattr(search_result, "result_count", 0) or 0) > 0:
+        return True
+    if getattr(search_outcome, "snapshot_exhausted", False):
+        return True
+    criteria = getattr(search_outcome, "criteria_used", None) or {}
+    return search_service.has_effective_search_criteria(criteria)
+
+
 def _recommendation_reply_fields(
     search_result,
     userid: str,
     source_inbound_msg_id: str,
     request_kind: str = "initial_search",
     parent_request_id: str | None = None,
+    *,
+    search_outcome=None,
+    attempt_kind: str | None = None,
+    request_index: int | None = None,
+    total_latency_ms: int | None = None,
 ) -> dict:
-    """Carry the recommendation contract from search to the durable outbox."""
+    """Carry the recommendation contract from search to the durable outbox.
+
+    两件事必须分开：
+    - **request 事实**：只要发生过一次真实推荐搜索就要产生，包括零结果和
+      legacy/off/shadow（§7.5 行 1498-1500）。legacy 情形下 assignment 与
+      algorithm_version 固定 ``legacy``、strategy_version_id 为 None。
+    - **delivery**（加密正文 + 曝光派生）：只有本次回复真的把候选写进正文时才建
+      （§10.1 行 2210-2211），所以 ``delivery_id`` / ``recommendation_context``
+      只在 items 非空时返回，并由调用方挂到真正渲染候选的那条回复上。
+    """
+    if not _is_recommendation_search(search_result, search_outcome):
+        return {}
     items = list(getattr(search_result, "recommendation_items", []) or [])
     assignment = getattr(search_result, "strategy_assignment", None)
-    if not items or not assignment or getattr(assignment, "assignment", "legacy") == "legacy":
-        return {}
-    result_request_id = getattr(search_result, "request_id", None)
-    parent_request_id = parent_request_id or result_request_id
-    request_id = (
-        str(uuid.uuid4())
-        if request_kind in {"show_more", "confirmed_relaxed"}
-        else result_request_id or str(uuid.uuid4())
+    direction = (
+        getattr(assignment, "direction", None)
+        or getattr(search_outcome, "direction", None)
     )
+    if direction not in {"search_job", "search_worker"}:
+        return {}
+    viewer_userid = str(userid or "")
+    if not viewer_userid:
+        # 没有 viewer 就无法归因，写进去只会污染请求级指标。
+        logger.warning(
+            "recommendation request fact skipped: empty viewer_userid msg_id=%s",
+            source_inbound_msg_id,
+        )
+        return {}
+
+    served_assignment = getattr(assignment, "assignment", "legacy") or "legacy"
+    is_legacy = served_assignment == "legacy"
+    algorithm_version = (
+        "legacy" if is_legacy
+        else (getattr(assignment, "algorithm_version", None) or "recommendation-v1")
+    )
+    strategy_version_id = (
+        None if is_legacy else getattr(assignment, "strategy_version_id", None)
+    )
+    query_digest = str(getattr(search_result, "query_digest", "") or "")
+    snapshot_id = getattr(search_result, "snapshot_id", None)
+    result_request_id = getattr(search_result, "request_id", None)
+    if request_kind in {"show_more", "confirmed_relaxed"}:
+        # §9.4：查看更多和"用户确认放宽"各自是新的 request，parent 指向原 request。
+        request_id = str(uuid.uuid4())
+        parent_request_id = parent_request_id or result_request_id
+    else:
+        # §9.4 行 1839-1840：初次搜索后自动放宽仍然只有一条 request，沿用初次搜索的
+        # request_id（后续放宽只是它的第二个 attempt），因此不能再挂 parent。
+        request_id = parent_request_id or result_request_id or str(uuid.uuid4())
+        parent_request_id = None
+
+    # §9.4 请求级聚合：owner 集中度与探索位从实际服务的 items 直接算。
+    owner_counts: dict[str, int] = {}
+    for item in items:
+        owner = getattr(item, "owner_userid", None)
+        if owner:
+            owner_counts[owner] = owner_counts.get(owner, 0) + 1
+    candidate_ids = [str(cid) for cid in (
+        getattr(search_result, "candidate_ids", None) or []
+    )][:50]
+    # legacy 不产生 RecommendationItem，服务数量取 SearchResult.result_count，
+    # 否则 legacy 请求会被恒判为业务零结果。
+    result_count = len(items) or int(getattr(search_result, "result_count", 0) or 0)
+    exhausted = bool(getattr(search_outcome, "snapshot_exhausted", False))
+    probe_steps = [
+        str(probe.get("step"))
+        for probe in (getattr(search_outcome, "relax_probe_results", None) or [])
+        if isinstance(probe, dict) and probe.get("step")
+    ]
+
+    fact = RecommendationRequestFact(
+        request_id=request_id,
+        source_inbound_msg_id=source_inbound_msg_id,
+        request_index=request_index,
+        request_kind=request_kind,
+        parent_request_id=parent_request_id,
+        viewer_userid=viewer_userid,
+        direction=direction,
+        query_digest=query_digest,
+        execution_mode=getattr(assignment, "execution_mode", None) or "off",
+        served_assignment=served_assignment,
+        served_strategy_version_id=strategy_version_id,
+        candidate_strategy_version_id=getattr(
+            assignment, "candidate_version_id", None,
+        ),
+        algorithm_version=algorithm_version,
+        snapshot_id=snapshot_id,
+        candidate_count=len(candidate_ids),
+        candidate_ids=candidate_ids,
+        precision_pool_ids=[str(pid) for pid in (
+            getattr(search_result, "precision_pool_ids", None) or []
+        )][:50],
+        served_top_ids=[str(item.target_id) for item in items],
+        served_owner_count=len(owner_counts),
+        served_max_owner_items=max(owner_counts.values(), default=0),
+        served_exploration_count=sum(
+            1 for item in items if getattr(item, "is_exploration", False)
+        ),
+        result_count=result_count,
+        # §9.4：show_more 的零结果固定 false，耗尽走 show_more_exhausted。
+        is_zero_result=(False if request_kind == "show_more" else result_count == 0),
+        show_more_exhausted=(exhausted if request_kind == "show_more" else False),
+        attempt_kind=(
+            attempt_kind
+            or ATTEMPT_KIND_BY_REQUEST_KIND.get(request_kind, "initial")
+        ),
+        relax_probe_steps=probe_steps,
+        total_latency_ms=(
+            _recommendation_elapsed_ms() if total_latency_ms is None
+            else max(0, int(total_latency_ms))
+        ),
+    )
+
+    fields: dict = {"recommendation_request": fact}
+    if assignment is not None:
+        fields["strategy_assignment"] = assignment
+    if not items:
+        # 零结果 / legacy：只有请求事实，不建 delivery，也就不会派生虚假曝光。
+        return fields
     context = RecommendationDeliveryContext(
         delivery_id=str(uuid.uuid4()),
         request_id=request_id,
-        snapshot_id=getattr(search_result, "snapshot_id", None),
-        viewer_userid=userid,
-        direction=assignment.direction,
-        assignment=assignment.assignment,
-        strategy_version_id=assignment.strategy_version_id,
-        algorithm_version=assignment.algorithm_version,
-        query_digest=getattr(search_result, "query_digest", ""),
+        snapshot_id=snapshot_id,
+        viewer_userid=viewer_userid,
+        direction=direction,
+        assignment=served_assignment,
+        strategy_version_id=strategy_version_id,
+        algorithm_version=algorithm_version,
+        query_digest=query_digest,
         items=items,
     )
-    return {
-        "delivery_id": context.delivery_id,
-        "recommendation_context": context,
-        "recommendation_request": RecommendationRequestFact(
-            request_id=request_id,
-            source_inbound_msg_id=source_inbound_msg_id,
-            request_kind=request_kind,
-            parent_request_id=(
-                parent_request_id
-                if request_kind in {"show_more", "confirmed_relaxed", "auto_relaxed"}
-                else None
-            ),
-            viewer_userid=userid,
-            direction=assignment.direction,
-            query_digest=getattr(search_result, "query_digest", ""),
-            algorithm_version=assignment.algorithm_version,
-            candidate_count=len(getattr(search_result, "candidate_ids", [])),
-            candidate_ids=getattr(search_result, "candidate_ids", []),
-            precision_pool_ids=getattr(search_result, "precision_pool_ids", []),
-            served_top_ids=[str(item.target_id) for item in items],
-        ),
-        "strategy_assignment": assignment,
-    }
+    fields["delivery_id"] = context.delivery_id
+    fields["recommendation_context"] = context
+    return fields
 
 
 def _reply(

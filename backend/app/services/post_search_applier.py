@@ -93,7 +93,8 @@ def apply_post_search_decision(
         return [_reply(msg_userid, ctx.search_result.reply_text, ctx.search_result)]
 
     if action == "paginate_no_more":
-        return [_reply(msg_userid, _render_paginate_no_more(ctx), ctx.search_result)]
+        # §10.1：本分支只输出降级文案，正文里没有任何候选，不得携带推荐上下文。
+        return [_reply(msg_userid, _render_paginate_no_more(ctx))]
 
     if action == "ask_clarification":
         return _handle_ask_clarification(ctx)
@@ -102,7 +103,8 @@ def apply_post_search_decision(
         return _handle_auto_relax_and_retry(ctx)
 
     if action == "suggest_relaxation":
-        return [_reply(msg_userid, _render_suggest_relaxation(ctx), ctx.search_result)]
+        # §10.1：只给放宽方向、不返回候选，同样不得携带推荐上下文。
+        return [_reply(msg_userid, _render_suggest_relaxation(ctx))]
 
     if action == "show_results_with_soft_pref_notice":
         return [_reply(msg_userid, _render_soft_pref_notice(ctx), ctx.search_result)]
@@ -275,18 +277,22 @@ def _handle_auto_relax_and_retry(
         recursion_depth=ctx.recursion_depth + 1,  # 0 → 1
     )
     replies = apply_post_search_decision(new_ctx)
-    from app.services.message_router import _recommendation_reply_fields
+    # §9.4：自动放宽仍然只有一条 request（kind=auto_relaxed），attempt 0 是
+    # initial、后续才是 auto_relaxed；请求事实即使二次检索仍然零结果也要写。
+    # §10.1：delivery 只挂给正文里真的渲染了候选的那条回复，否则会凭空派生曝光。
+    from app.services.message_router import (
+        _attach_recommendation_fields,
+        _recommendation_reply_fields,
+    )
     fields = _recommendation_reply_fields(
         new_result,
         ctx.user_ctx.external_userid,
         ctx.msg.msg_id,
         request_kind="auto_relaxed",
         parent_request_id=getattr(ctx.search_result, "request_id", None),
+        search_outcome=new_outcome,
     )
-    return [
-        reply.model_copy(update=fields) if fields else reply
-        for reply in replies
-    ]
+    return _attach_recommendation_fields(replies, fields, new_result)
 
 
 def _render_suggest_relaxation(ctx: PostSearchContext) -> str:
@@ -330,23 +336,18 @@ def _visible_or_final_count(search_outcome) -> int:
 
 
 def _reply(userid: str, content: str, search_result=None) -> ReplyMessage:
-    """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。"""
-    updates = {}
-    if search_result is not None:
-        updates = {
-            "recommendation_context": getattr(
-                search_result, "recommendation_context", None,
-            ),
-            "strategy_assignment": getattr(
-                search_result, "strategy_assignment", None,
-            ),
-        }
-        # SearchResult carries the ranking contract; message_router will attach
-        # the delivery/request identifiers after the applier returns.
-        updates["_search_result_contract"] = search_result
+    """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。
+
+    ``search_result`` 只在本条回复的正文真的渲染了候选时才传；此时把排序契约
+    （strategy_assignment）带上，delivery/request 标识由 message_router 在
+    applier 返回后统一挂（§10.1：不含候选的回复不创建 delivery）。
+    """
     reply = ReplyMessage(userid=userid, content=content)
-    # Pydantic forbids undeclared fields, so only copy declared fields here.
-    return reply.model_copy(update={
-        key: value for key, value in updates.items()
-        if key != "_search_result_contract" and value is not None
-    })
+    if search_result is None or not getattr(
+        search_result, "recommendation_items", None,
+    ):
+        return reply
+    assignment = getattr(search_result, "strategy_assignment", None)
+    if assignment is None:
+        return reply
+    return reply.model_copy(update={"strategy_assignment": assignment})

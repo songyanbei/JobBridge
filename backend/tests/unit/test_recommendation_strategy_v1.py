@@ -35,10 +35,15 @@ def test_legacy_search_result_defaults():
     assert result.snapshot_id is None
 
 
-def test_recommendation_body_is_encrypted():
-    token = encrypt_body("recommendation secret")
-    assert "recommendation secret" not in token
-    assert decrypt_body(token) == "recommendation secret"
+def test_recommendation_body_is_encrypted(monkeypatch):
+    # §9.6：信封的 AAD 绑定 delivery_id/userid/purpose，加解密必须成对给出。
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "recommendation_content_key_ring", "1:unit-test-key")
+    monkeypatch.setattr(settings, "recommendation_content_key_active_version", 1)
+    envelope = encrypt_body("recommendation secret", delivery_id="d-1", userid="u1")
+    assert b"recommendation secret" not in envelope
+    assert decrypt_body(envelope, delivery_id="d-1", userid="u1") == "recommendation secret"
 
 
 def test_shadow_never_changes_served_assignment():
