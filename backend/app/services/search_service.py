@@ -1769,6 +1769,23 @@ def execute_relaxed_search(
                 "snapshot_id": decision.snapshot_id,
                 "assignment": decision.assignment,
                 "precision_pool_ids": ranked_ids[:20],
+                "candidate_scores": {
+                    item.candidate_id: {
+                        "final_score": item.repeat_adjusted_score,
+                        "is_exploration": item.is_exploration,
+                        "reason_codes": list(item.reason_codes),
+                        "score_detail": {
+                            "match_score": item.match_score,
+                            "quality_score": item.quality_score,
+                            "freshness_score": item.freshness_score,
+                            "exposure_opportunity": item.exposure_opportunity,
+                            "base_score": item.base_score,
+                            "repeat_factor": item.repeat_factor,
+                            "diversity_penalty": item.diversity_penalty,
+                        },
+                    }
+                    for item in ordered
+                },
             }
     except Exception:
         logger.exception("relaxed recommendation-v1 failed closed")
@@ -1787,7 +1804,8 @@ def execute_relaxed_search(
             v1_meta["assignment"].assignment if v1_meta else "legacy"
         ),
         ranking_metadata={
-            "precision_pool_ids": v1_meta["precision_pool_ids"]
+            "precision_pool_ids": v1_meta["precision_pool_ids"],
+            "candidate_scores": v1_meta["candidate_scores"],
         } if v1_meta else {},
     )
 

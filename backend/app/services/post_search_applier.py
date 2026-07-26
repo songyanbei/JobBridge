@@ -90,10 +90,10 @@ def apply_post_search_decision(
         )
 
     if action == "no_action":
-        return [_reply(msg_userid, ctx.search_result.reply_text)]
+        return [_reply(msg_userid, ctx.search_result.reply_text, ctx.search_result)]
 
     if action == "paginate_no_more":
-        return [_reply(msg_userid, _render_paginate_no_more(ctx))]
+        return [_reply(msg_userid, _render_paginate_no_more(ctx), ctx.search_result)]
 
     if action == "ask_clarification":
         return _handle_ask_clarification(ctx)
@@ -102,10 +102,10 @@ def apply_post_search_decision(
         return _handle_auto_relax_and_retry(ctx)
 
     if action == "suggest_relaxation":
-        return [_reply(msg_userid, _render_suggest_relaxation(ctx))]
+        return [_reply(msg_userid, _render_suggest_relaxation(ctx), ctx.search_result)]
 
     if action == "show_results_with_soft_pref_notice":
-        return [_reply(msg_userid, _render_soft_pref_notice(ctx))]
+        return [_reply(msg_userid, _render_soft_pref_notice(ctx), ctx.search_result)]
 
     # 5.4 后续可能扩 show_results；当前仍走未实现 fallback。
     # 本子阶段未实现的 action：fallback no_action + 告警日志（phased-plan
@@ -115,7 +115,7 @@ def apply_post_search_decision(
         "fallback no_action 直出 search_result.reply_text",
         action,
     )
-    return [_reply(msg_userid, ctx.search_result.reply_text)]
+    return [_reply(msg_userid, ctx.search_result.reply_text, ctx.search_result)]
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,18 @@ def _handle_auto_relax_and_retry(
         experience_flags=ctx.experience_flags,
         recursion_depth=ctx.recursion_depth + 1,  # 0 → 1
     )
-    return apply_post_search_decision(new_ctx)
+    replies = apply_post_search_decision(new_ctx)
+    from app.services.message_router import _recommendation_reply_fields
+    fields = _recommendation_reply_fields(
+        new_result,
+        ctx.user_ctx.external_userid,
+        ctx.msg.msg_id,
+        request_kind="confirmed_relaxed",
+    )
+    return [
+        reply.model_copy(update=fields) if fields else reply
+        for reply in replies
+    ]
 
 
 def _render_suggest_relaxation(ctx: PostSearchContext) -> str:
@@ -313,6 +324,24 @@ def _visible_or_final_count(search_outcome) -> int:
     return int(getattr(search_outcome, "final_count", 0) or 0)
 
 
-def _reply(userid: str, content: str) -> ReplyMessage:
+def _reply(userid: str, content: str, search_result=None) -> ReplyMessage:
     """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。"""
-    return ReplyMessage(userid=userid, content=content)
+    updates = {}
+    if search_result is not None:
+        updates = {
+            "recommendation_context": getattr(
+                search_result, "recommendation_context", None,
+            ),
+            "strategy_assignment": getattr(
+                search_result, "strategy_assignment", None,
+            ),
+        }
+        # SearchResult carries the ranking contract; message_router will attach
+        # the delivery/request identifiers after the applier returns.
+        updates["_search_result_contract"] = search_result
+    reply = ReplyMessage(userid=userid, content=content)
+    # Pydantic forbids undeclared fields, so only copy declared fields here.
+    return reply.model_copy(update={
+        key: value for key, value in updates.items()
+        if key != "_search_result_contract" and value is not None
+    })

@@ -90,7 +90,7 @@ def recent_user_exposures(
 
 def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed_at: datetime | None = None) -> int:
     """Idempotently materialize all items from a sent delivery."""
-    if delivery.status != "sent":
+    if delivery.status not in ("sent", "redacted"):
         return 0
     context = delivery.recommendation_context or {}
     items = context.get("items") or []
@@ -144,7 +144,7 @@ def claim_impression_deliveries(
     now = func.now(6)
     rows = db.query(RecommendationDelivery).filter(
         RecommendationDelivery.status.in_(("sent", "redacted")),
-        RecommendationDelivery.impression_state.in_(("pending", "retry")),
+        RecommendationDelivery.impression_state.in_(("pending", "retry", "deriving")),
         RecommendationDelivery.impression_next_attempt_at <= now,
         or_(
             RecommendationDelivery.lease_expires_at.is_(None),

@@ -147,4 +147,3 @@ def rank_candidate_dicts(
         for index, item in enumerate(top, start=1)
     ]
     return ordered, items
-

@@ -65,12 +65,26 @@ def prepare_delivery(
     request_id = request_id or str(uuid.uuid4())
     attempt_id = str(uuid.uuid4())
     if db.get(RecommendationRequest, request_id) is None:
+        parent_request_id = fact.get("parent_request_id")
+        parent_request = (
+            db.get(RecommendationRequest, parent_request_id)
+            if parent_request_id else None
+        )
+        is_show_more = (
+            fact.get("request_kind") == "show_more"
+            and parent_request is not None
+        )
+        served_attempt_id = (
+            parent_request.served_attempt_id
+            if is_show_more and parent_request else attempt_id
+        )
         db.add(RecommendationRequest(
             request_id=request_id,
             source_inbound_msg_id=source_inbound_msg_id or str(inbound_event_id),
             request_index=int(fact.get("request_index", reply_index)),
             request_kind=str(fact.get("request_kind") or "initial_search"),
-            served_attempt_id=attempt_id,
+            parent_request_id=parent_request_id,
+            served_attempt_id=served_attempt_id,
             snapshot_id=snapshot_id,
             viewer_userid=userid,
             direction=str(ctx.get("direction") or "search_job"),
@@ -85,22 +99,23 @@ def prepare_delivery(
             served_top_ids=list(fact.get("served_top_ids") or candidate_ids),
         ))
         db.flush()
-        db.add(RecommendationSearchAttempt(
-            attempt_id=attempt_id,
-            request_id=request_id,
-            attempt_no=1,
-            attempt_kind=str(fact.get("request_kind") or "initial_search"),
-            criteria_digest=str(ctx.get("query_digest") or ""),
-            scoring_time_utc=datetime.now(timezone.utc),
-            candidate_count=int(fact.get("candidate_count", len(candidate_ids))),
-            candidate_ids=list(fact.get("candidate_ids") or candidate_ids),
-            precision_pool_ids=list(fact.get("precision_pool_ids") or candidate_ids),
-            result_count=len(candidate_ids),
-            is_zero_result=not candidate_ids,
-            strategy_version_id=ctx.get("strategy_version_id"),
-            algorithm_version=str(ctx.get("algorithm_version") or "recommendation-v1"),
-            llm_status="completed",
-        ))
+        if not is_show_more:
+            db.add(RecommendationSearchAttempt(
+                attempt_id=attempt_id,
+                request_id=request_id,
+                attempt_no=1,
+                attempt_kind=str(fact.get("request_kind") or "initial_search"),
+                criteria_digest=str(ctx.get("query_digest") or ""),
+                scoring_time_utc=datetime.now(timezone.utc),
+                candidate_count=int(fact.get("candidate_count", len(candidate_ids))),
+                candidate_ids=list(fact.get("candidate_ids") or candidate_ids),
+                precision_pool_ids=list(fact.get("precision_pool_ids") or candidate_ids),
+                result_count=len(candidate_ids),
+                is_zero_result=not candidate_ids,
+                strategy_version_id=ctx.get("strategy_version_id"),
+                algorithm_version=str(ctx.get("algorithm_version") or "recommendation-v1"),
+                llm_status="completed",
+            ))
     resolved_delivery_id = delivery_id or str(uuid.uuid4())
     delivery = RecommendationDelivery(
         delivery_id=resolved_delivery_id,

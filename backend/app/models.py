@@ -432,6 +432,10 @@ class EventLog(Base):
     __table_args__ = (
         sa.Index("idx_target", "target_type", "target_id", "occurred_at"),
         sa.Index("idx_user_time", "userid", "occurred_at"),
+        sa.UniqueConstraint(
+            "userid", "event_type", "client_event_id",
+            name="uk_event_client_idempotency",
+        ),
     )
 
 

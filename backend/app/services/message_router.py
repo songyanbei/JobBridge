@@ -538,7 +538,13 @@ def _handle_text(
         replies = _finalize_action_plan_replies(replies)
         if replies:
             conversation_service.record_history(
-                session, "assistant", replies[0].content,
+                session,
+                "assistant",
+                (
+                    "[recommendation_delivery]"
+                    if replies[0].recommendation_context
+                    else replies[0].content
+                ),
             )
         conversation_service.save_session(userid, session)
         return replies
@@ -1299,6 +1305,17 @@ def _route_v2_relaxation_response(
             recursion_depth=1,
         )
         replies = apply_post_search_decision(ctx)
+        recommendation_fields = _recommendation_reply_fields(
+            new_result,
+            user_ctx.external_userid,
+            msg.msg_id,
+            request_kind="confirmed_relaxed",
+        )
+        if recommendation_fields:
+            replies = [
+                reply.model_copy(update=recommendation_fields)
+                for reply in replies
+            ]
 
         # 函数自身清 pending_relaxation（不依赖 apply_decision）
         session.pending_relaxation = None
