@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import BusinessException
 from app.core.redis_client import invalidate_config_cache
 from app.models import SystemConfig
+
+LOCKED_RECOMMENDATION_KEYS = {"match.max_candidates", "match.top_n"}
 from app.services.admin_log_service import write_admin_log
 
 
@@ -73,6 +75,8 @@ def update(
     value_type_override: str | None,
     operator: str,
 ) -> dict:
+    if key in LOCKED_RECOMMENDATION_KEYS:
+        raise ValueError("config_locked_by_recommendation_v1")
     item = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
     if not item:
         raise BusinessException(40401, f"配置项 {key} 不存在")

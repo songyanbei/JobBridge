@@ -3,10 +3,26 @@
 业务代码只依赖本文件中的 ABC 和数据结构，不依赖具体 provider。
 切换供应商只需在 llm/__init__.py 的工厂函数里改注册。
 """
+import asyncio
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+@dataclass(frozen=True)
+class LLMCallPolicy:
+    """Bounded policy for optional asynchronous shadow/rerank calls."""
+
+    deadline_seconds: float = 3.0
+    max_retries: int = 0
+    retry_backoff_seconds: float = 0.0
+    fail_closed: bool = True
+
+
+class LLMDeadlineExceeded(TimeoutError):
+    """Raised when a shadow call exceeds its absolute deadline."""
 
 
 # ---------------------------------------------------------------------------
@@ -239,3 +255,40 @@ class Reranker(ABC):
             RerankResult
         """
         ...
+
+    async def arerank(
+        self,
+        query: str,
+        candidates: list[dict],
+        role: str,
+        top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
+        call_policy: LLMCallPolicy | None = None,
+    ) -> RerankResult:
+        """Async compatibility hook with a hard deadline and zero retries by default."""
+        policy = call_policy or LLMCallPolicy()
+        attempts = max(0, policy.max_retries) + 1
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                async with asyncio.timeout(policy.deadline_seconds):
+                    return await asyncio.to_thread(
+                        self.rerank,
+                        query,
+                        candidates,
+                        role,
+                        top_n,
+                        soft_preferences=soft_preferences,
+                        ranking_weights=ranking_weights,
+                    )
+            except TimeoutError as exc:
+                last_error = LLMDeadlineExceeded(str(exc))
+            except Exception as exc:  # provider errors are surfaced to caller
+                last_error = exc
+            if attempt + 1 < attempts and policy.retry_backoff_seconds:
+                await asyncio.sleep(policy.retry_backoff_seconds)
+        if last_error:
+            raise last_error
+        raise LLMDeadlineExceeded("rerank deadline exceeded")

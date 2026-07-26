@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -32,6 +33,7 @@ from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
 from app.models import Resume
 from app.schemas.conversation import ReplyMessage, SessionState
+from app.schemas.recommendation import RecommendationDeliveryContext
 from app.services import (
     command_service,
     conversation_service,
@@ -1820,6 +1822,9 @@ def _post_search_dispatch(
     5%/25%/50%/100% 灰度阶梯真正生效。
     """
     mode = _settings_module.dialogue_policy.post_search_policy_mode
+    recommendation_fields = _recommendation_reply_fields(
+        search_result, user_ctx.external_userid,
+    )
 
     if mode == "off":
         return [_reply(
@@ -1827,6 +1832,7 @@ def _post_search_dispatch(
             search_result.reply_text,
             intent=legacy_intent,
             criteria_snapshot=_snapshot_meta(session),
+            **recommendation_fields,
         )]
 
     # Phase 5 §5.4：on 模式下进一步用 phase5_rollout_percentage hash 桶判定。
@@ -1841,6 +1847,7 @@ def _post_search_dispatch(
                 search_result.reply_text,
                 intent=legacy_intent,
                 criteria_snapshot=_snapshot_meta(session),
+                **recommendation_fields,
             )]
 
     # shadow / on 都需要构造 ctx + 调 reducer
@@ -1906,6 +1913,7 @@ def _post_search_dispatch(
             search_result.reply_text,
             intent=legacy_intent,
             criteria_snapshot=_snapshot_meta(session),
+            **recommendation_fields,
         )]
 
     # mode == "on"
@@ -1936,11 +1944,14 @@ def _post_search_dispatch(
     # 以保持与旧路径同构（便于 worker 落库 / 监控大盘）。
     enriched: list[ReplyMessage] = []
     for r in replies:
+        updates = dict(recommendation_fields)
         if r.intent is None:
-            r = r.model_copy(update={
+            updates.update({
                 "intent": legacy_intent,
                 "criteria_snapshot": _snapshot_meta(session),
             })
+        if updates:
+            r = r.model_copy(update=updates)
         enriched.append(r)
     return enriched
 
@@ -2714,11 +2725,39 @@ def _snapshot_meta(session: SessionState) -> dict:
     }
 
 
+def _recommendation_reply_fields(search_result, userid: str) -> dict:
+    """Carry the recommendation contract from search to the durable outbox."""
+    items = list(getattr(search_result, "recommendation_items", []) or [])
+    assignment = getattr(search_result, "strategy_assignment", None)
+    if not items or not assignment or getattr(assignment, "assignment", "legacy") == "legacy":
+        return {}
+    request_id = str(uuid.uuid4())
+    context = RecommendationDeliveryContext(
+        delivery_id=str(uuid.uuid4()),
+        request_id=request_id,
+        snapshot_id=getattr(search_result, "snapshot_id", None),
+        viewer_userid=userid,
+        direction=assignment.direction,
+        assignment=assignment.assignment,
+        strategy_version_id=assignment.strategy_version_id,
+        algorithm_version=assignment.algorithm_version,
+        query_digest="",
+        items=items,
+    )
+    return {
+        "delivery_id": context.delivery_id,
+        "recommendation_context": context,
+        "recommendation_request": None,
+        "strategy_assignment": assignment,
+    }
+
+
 def _reply(
     userid: str,
     content: str,
     intent: str | None = None,
     criteria_snapshot: dict | None = None,
+    **recommendation_fields,
 ) -> ReplyMessage:
     """构造 ReplyMessage；intent / criteria_snapshot 将被 Worker 落 conversation_log。"""
     return ReplyMessage(
@@ -2726,4 +2765,5 @@ def _reply(
         content=content,
         intent=intent,
         criteria_snapshot=criteria_snapshot,
+        **recommendation_fields,
     )

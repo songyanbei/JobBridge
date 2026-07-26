@@ -16,12 +16,14 @@ from sqlalchemy.orm import Session
 from app.models import AuditLog
 
 
-_ALLOWED_TARGET_TYPES = {"job", "resume", "user", "system"}
+_ALLOWED_TARGET_TYPES = {"job", "resume", "user", "system", "recommendation_strategy"}
 _ALLOWED_ACTIONS = {
     "auto_pass", "auto_reject",
     "manual_pass", "manual_reject",
     "manual_edit", "undo",
     "appeal", "reinstate",
+    "strategy_publish", "strategy_rollout", "strategy_promote",
+    "strategy_rollback", "strategy_kill_switch",
 }
 
 

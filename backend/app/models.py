@@ -246,6 +246,8 @@ class ConversationLog(Base):
     wecom_msg_id = sa.Column(sa.String(64), nullable=True, unique=True, comment="企微消息 ID（幂等 L3 防线）")
     intent = sa.Column(sa.String(32), nullable=True, comment="识别意图")
     criteria_snapshot = sa.Column(sa.JSON, nullable=True, comment="本轮 criteria 快照")
+    recommendation_delivery_id = sa.Column(sa.String(36), nullable=True)
+    redaction_state = sa.Column(sa.String(24), nullable=True)
     created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
     expires_at = sa.Column(sa.DateTime, nullable=False, comment="默认 created_at + 30 天")
 
@@ -264,7 +266,7 @@ class AuditLog(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     target_type = sa.Column(
-        sa.Enum("job", "resume", "user", "system", name="audit_target_type"),
+        sa.Enum("job", "resume", "user", "system", "recommendation_strategy", name="audit_target_type"),
         nullable=False, comment="审核对象类型（system=系统配置）",
     )
     target_id = sa.Column(sa.String(64), nullable=False, comment="目标 ID")
@@ -274,6 +276,8 @@ class AuditLog(Base):
             "manual_pass", "manual_reject",
             "manual_edit", "undo",
             "appeal", "reinstate",
+            "strategy_publish", "strategy_rollout", "strategy_promote",
+            "strategy_rollback", "strategy_kill_switch",
             name="audit_action",
         ),
         nullable=False,
@@ -378,6 +382,11 @@ class AdminUser(Base):
     username = sa.Column(sa.String(32), nullable=False, unique=True, comment="登录用户名")
     password_hash = sa.Column(sa.String(128), nullable=False, comment="bcrypt 哈希")
     display_name = sa.Column(sa.String(64), nullable=True, comment="显示名")
+    role = sa.Column(
+        sa.Enum("viewer", "operator", "super_admin", name="admin_role"),
+        nullable=False,
+        server_default="super_admin",
+    )
     password_changed = sa.Column(mysql.TINYINT(display_width=1), nullable=False, server_default=sa.text("0"), comment="是否已修改初始密码")
     enabled = sa.Column(mysql.TINYINT(display_width=1), nullable=False, server_default=sa.text("1"))
     last_login_at = sa.Column(sa.DateTime, nullable=True)
@@ -404,6 +413,20 @@ class EventLog(Base):
     target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, comment="目标主键")
     occurred_at = sa.Column(sa.DateTime, nullable=False, comment="客户端上报的发生时间")
     extra = sa.Column(sa.JSON, nullable=True, comment="扩展字段（版本号 / 来源页面等）")
+    delivery_id = sa.Column(sa.String(36), nullable=True)
+    request_id = sa.Column(sa.String(36), nullable=True)
+    snapshot_id = sa.Column(sa.String(36), nullable=True)
+    position = sa.Column(mysql.SMALLINT(unsigned=True), nullable=True)
+    attribution_status = sa.Column(
+        sa.Enum("attributed", "legacy_unattributed", "rejected", name="attribution_status"),
+        nullable=False,
+        server_default="legacy_unattributed",
+    )
+    attributed_strategy_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    attributed_algorithm_version = sa.Column(sa.String(32), nullable=True)
+    attributed_is_exploration = sa.Column(mysql.TINYINT(1), nullable=True)
+    client_event_id = sa.Column(sa.String(64), nullable=True)
+    attribution_dedupe_key = sa.Column(sa.String(64), nullable=True, unique=True)
     created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
@@ -506,7 +529,8 @@ class WecomOutboundOutbox(Base):
     )
     userid = sa.Column(sa.String(64), nullable=False, comment="接收者 external_userid")
     msg_type = sa.Column(sa.String(16), nullable=False, server_default="text")
-    content = sa.Column(mysql.MEDIUMTEXT, nullable=False)
+    content = sa.Column(mysql.MEDIUMTEXT, nullable=True)
+    recommendation_delivery_id = sa.Column(sa.String(36), nullable=True, unique=True)
     intent = sa.Column(sa.String(32), nullable=True)
     criteria_snapshot = sa.Column(sa.JSON, nullable=True)
     status = sa.Column(
@@ -541,3 +565,229 @@ class WecomOutboundOutbox(Base):
         sa.Index("idx_outbox_event", "inbound_event_id", "id"),
         sa.Index("idx_outbox_user_status_id", "userid", "status", "id"),
     )
+
+
+# ============================================================================
+# Recommendation v1 facts and governance
+# ============================================================================
+
+class RecommendationStrategyVersion(Base):
+    __tablename__ = "recommendation_strategy_version"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    direction = sa.Column(sa.String(32), nullable=False)
+    version_no = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    template_key = sa.Column(sa.String(32), nullable=False)
+    status = sa.Column(sa.Enum("draft", "published", "archived", name="recommendation_version_status"), nullable=False, server_default="draft")
+    parameters = sa.Column(sa.JSON, nullable=False)
+    parameters_digest = sa.Column(sa.String(64), nullable=False)
+    last_simulated_digest = sa.Column(sa.String(64), nullable=True)
+    last_simulated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    algorithm_version = sa.Column(sa.String(32), nullable=False, server_default="recommendation-v1")
+    base_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    lock_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    change_reason = sa.Column(sa.String(255), nullable=False)
+    created_by = sa.Column(sa.String(64), nullable=False)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    published_by = sa.Column(sa.String(64), nullable=True)
+    published_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint("direction", "version_no", name="uk_recommendation_version_direction_no"),
+        sa.Index("idx_recommendation_version_status", "direction", "status"),
+    )
+
+
+class RecommendationStrategyRelease(Base):
+    __tablename__ = "recommendation_strategy_release"
+
+    direction = sa.Column(sa.String(32), primary_key=True)
+    execution_mode = sa.Column(sa.Enum("off", "shadow", "on", name="recommendation_execution_mode"), nullable=False, server_default="off")
+    stable_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    candidate_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    rollout_percentage = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    revision = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("1"))
+    lock_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    updated_by = sa.Column(sa.String(64), nullable=False, server_default="system")
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+
+class RecommendationReleaseHistory(Base):
+    __tablename__ = "recommendation_release_history"
+
+    direction = sa.Column(sa.String(32), primary_key=True)
+    revision = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True)
+    operation = sa.Column(sa.String(32), nullable=False)
+    execution_mode = sa.Column(sa.String(16), nullable=False)
+    stable_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    candidate_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    rollout_percentage = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    target_revision = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    change_reason = sa.Column(sa.String(255), nullable=False)
+    created_by = sa.Column(sa.String(64), nullable=False)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+
+
+class RecommendationRuntimeControl(Base):
+    __tablename__ = "recommendation_runtime_control"
+
+    scope = sa.Column(sa.String(16), primary_key=True)
+    kill_switch = sa.Column(mysql.TINYINT(1), nullable=False, server_default=sa.text("0"))
+    revision = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("1"))
+    lock_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    change_reason = sa.Column(sa.String(255), nullable=False, server_default="initial")
+    updated_by = sa.Column(sa.String(64), nullable=False, server_default="system")
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+
+class RecommendationRequest(Base):
+    __tablename__ = "recommendation_request"
+
+    request_id = sa.Column(sa.String(36), primary_key=True)
+    source_inbound_msg_id = sa.Column(sa.String(64), nullable=False)
+    request_index = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
+    request_kind = sa.Column(sa.String(32), nullable=False)
+    parent_request_id = sa.Column(sa.String(36), nullable=True)
+    served_attempt_id = sa.Column(sa.String(36), nullable=True)
+    snapshot_id = sa.Column(sa.String(36), nullable=True)
+    viewer_userid = sa.Column(sa.String(64), nullable=False)
+    direction = sa.Column(sa.String(32), nullable=False)
+    query_digest = sa.Column(sa.String(16), nullable=False)
+    execution_mode = sa.Column(sa.String(16), nullable=False)
+    served_assignment = sa.Column(sa.String(16), nullable=False)
+    served_strategy_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    candidate_strategy_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    algorithm_version = sa.Column(sa.String(32), nullable=False)
+    final_candidate_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    result_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    is_zero_result = sa.Column(mysql.TINYINT(1), nullable=False, server_default=sa.text("0"))
+    show_more_exhausted = sa.Column(mysql.TINYINT(1), nullable=False, server_default=sa.text("0"))
+    total_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    served_top_ids = sa.Column(sa.JSON, nullable=False)
+    served_owner_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    served_max_owner_items = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    served_exploration_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("source_inbound_msg_id", "request_index", name="uk_recommendation_request_inbound_index"),
+        sa.Index("idx_recommendation_request_viewer_time", "viewer_userid", "direction", "created_at"),
+        sa.Index("idx_recommendation_request_attempt", "served_attempt_id"),
+    )
+
+
+class RecommendationSearchAttempt(Base):
+    __tablename__ = "recommendation_search_attempt"
+
+    attempt_id = sa.Column(sa.String(36), primary_key=True)
+    request_id = sa.Column(sa.String(36), nullable=False)
+    attempt_no = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False)
+    attempt_kind = sa.Column(sa.String(32), nullable=False)
+    criteria_digest = sa.Column(sa.String(64), nullable=False)
+    scoring_time_utc = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    candidate_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    candidate_ids = sa.Column(sa.JSON, nullable=False)
+    precision_pool_ids = sa.Column(sa.JSON, nullable=False)
+    result_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    is_zero_result = sa.Column(mysql.TINYINT(1), nullable=False, server_default=sa.text("0"))
+    strategy_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    algorithm_version = sa.Column(sa.String(32), nullable=False)
+    llm_status = sa.Column(sa.String(32), nullable=False, server_default="skipped")
+    llm_input_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    llm_output_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    ranking_fallback = sa.Column(sa.String(32), nullable=True)
+    ranking_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    total_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("request_id", "attempt_no", name="uk_recommendation_attempt_request_no"),
+        sa.Index("idx_recommendation_attempt_kind_time", "created_at", "attempt_kind"),
+    )
+
+
+class RecommendationDelivery(Base):
+    __tablename__ = "recommendation_delivery"
+
+    delivery_id = sa.Column(sa.String(36), primary_key=True)
+    delivery_order = sa.Column(
+        mysql.BIGINT(unsigned=True), nullable=False, unique=True, autoincrement=True,
+    )
+    source_inbound_msg_id = sa.Column(sa.String(64), nullable=False)
+    reply_index = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False)
+    request_id = sa.Column(sa.String(36), nullable=False)
+    snapshot_id = sa.Column(sa.String(36), nullable=True)
+    userid = sa.Column(sa.String(64), nullable=False)
+    content_ciphertext = sa.Column(mysql.MEDIUMBLOB, nullable=True)
+    content_key_version = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("1"))
+    content_hash = sa.Column(sa.String(64), nullable=True)
+    recommendation_context = sa.Column(sa.JSON, nullable=False)
+    status = sa.Column(sa.String(24), nullable=False, server_default="prepared")
+    session_expected_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("0"))
+    session_commit_token = sa.Column(sa.String(36), nullable=False)
+    session_patch_ciphertext = sa.Column(mysql.MEDIUMBLOB, nullable=True)
+    session_commit_state = sa.Column(sa.String(16), nullable=False, server_default="not_applied")
+    session_committed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    wecom_msgid = sa.Column(sa.String(128), nullable=True)
+    wecom_response = sa.Column(sa.JSON, nullable=True)
+    last_error_code = sa.Column(sa.String(32), nullable=True)
+    last_error = sa.Column(sa.String(500), nullable=True)
+    sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    impression_state = sa.Column(sa.String(24), nullable=False, server_default="pending")
+    impression_expected_count = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
+    impression_actual_count = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
+    impression_attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    impression_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    impression_derived_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    impression_last_error = sa.Column(sa.String(500), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("source_inbound_msg_id", "reply_index", name="uk_recommendation_delivery_inbound_index"),
+        sa.Index("idx_recommendation_delivery_user_order", "userid", "delivery_order"),
+        sa.Index("idx_recommendation_delivery_status_due", "status", "next_attempt_at"),
+        sa.Index("idx_recommendation_delivery_impression_due", "status", "impression_state", "impression_next_attempt_at"),
+    )
+
+
+class RecommendationImpression(Base):
+    __tablename__ = "recommendation_impression"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    delivery_id = sa.Column(sa.String(36), nullable=False)
+    request_id = sa.Column(sa.String(36), nullable=False)
+    snapshot_id = sa.Column(sa.String(36), nullable=False)
+    viewer_userid = sa.Column(sa.String(64), nullable=False)
+    direction = sa.Column(sa.String(32), nullable=False)
+    target_type = sa.Column(sa.String(16), nullable=False)
+    target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    position = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False)
+    strategy_version_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    algorithm_version = sa.Column(sa.String(32), nullable=False)
+    assignment = sa.Column(sa.String(16), nullable=False)
+    is_exploration = sa.Column(mysql.TINYINT(1), nullable=False, server_default=sa.text("0"))
+    query_digest = sa.Column(sa.String(16), nullable=False)
+    score_detail = sa.Column(sa.JSON, nullable=True)
+    exposed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("delivery_id", "target_type", "target_id", name="uk_recommendation_impression_delivery_target"),
+        sa.Index("idx_recommendation_impression_viewer_time", "viewer_userid", "target_type", "exposed_at"),
+        sa.Index("idx_recommendation_impression_target_time", "target_type", "target_id", "exposed_at"),
+    )
+
+
+class RecommendationExposureDaily(Base):
+    __tablename__ = "recommendation_exposure_daily"
+
+    stat_date = sa.Column(sa.Date, primary_key=True)
+    target_type = sa.Column(sa.String(16), primary_key=True)
+    target_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True)
+    impression_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())

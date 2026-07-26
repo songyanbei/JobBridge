@@ -17,7 +17,7 @@ from app.core.redis_client import (
     mark_event_idem,
 )
 from app.core.logging_setup import identifier_hash
-from app.models import EventLog, SystemConfig
+from app.models import EventLog, RecommendationDelivery, SystemConfig
 from app.services.admin_log_service import write_admin_log
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,11 @@ def record_click(
     target_type: str,
     target_id: int,
     timestamp: int | None = None,
+    delivery_id: str | None = None,
+    request_id: str | None = None,
+    snapshot_id: str | None = None,
+    position: int | None = None,
+    client_event_id: str | None = None,
 ) -> bool:
     """记录一次小程序点击事件。
 
@@ -74,6 +79,37 @@ def record_click(
         occurred_at = datetime.now()
 
     # 2. 写 event_log
+    attribution = "legacy_unattributed"
+    attributed_version = None
+    attributed_algorithm = None
+    attributed_exploration = None
+    if delivery_id:
+        delivery = db.get(RecommendationDelivery, delivery_id)
+        context = dict(delivery.recommendation_context or {}) if delivery else {}
+        items = list(context.get("items") or [])
+        matched = next((
+            item for item in items
+            if str(item.get("target_type")) == target_type
+            and int(item.get("target_id") or 0) == target_id
+            and (position is None or int(item.get("position") or 0) == position)
+        ), None)
+        if (
+            not delivery or delivery.userid != userid or not matched
+            or (request_id and request_id != delivery.request_id)
+            or (snapshot_id and snapshot_id != delivery.snapshot_id)
+        ):
+            try:
+                clear_event_idem(userid, target_type, target_id)
+            finally:
+                raise ValueError("invalid recommendation click attribution")
+        attribution = "attributed"
+        request_id = delivery.request_id
+        snapshot_id = delivery.snapshot_id
+        position = int(matched.get("position") or 0)
+        attributed_version = context.get("strategy_version_id")
+        attributed_algorithm = context.get("algorithm_version")
+        attributed_exploration = bool(matched.get("is_exploration"))
+
     try:
         entry = EventLog(
             event_type="miniprogram_click",
@@ -81,6 +117,19 @@ def record_click(
             target_type=target_type,
             target_id=target_id,
             occurred_at=occurred_at,
+            delivery_id=delivery_id,
+            request_id=request_id,
+            snapshot_id=snapshot_id,
+            position=position,
+            attribution_status=attribution,
+            attributed_strategy_version_id=attributed_version,
+            attributed_algorithm_version=attributed_algorithm,
+            attributed_is_exploration=attributed_exploration,
+            client_event_id=client_event_id,
+            attribution_dedupe_key=(
+                f"{delivery_id}:{position}:{client_event_id or target_id}"[:64]
+                if delivery_id else None
+            ),
         )
         db.add(entry)
         db.commit()

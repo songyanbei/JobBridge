@@ -86,6 +86,12 @@ const routes = [
         meta: { title: '系统配置', menu: 'config' },
       },
       {
+        path: 'recommendation-strategies',
+        name: 'recommendation-strategies',
+        component: () => import('@/views/recommendation/RecommendationStrategiesView.vue'),
+        meta: { title: '推荐策略', menu: 'recommendation-strategies' },
+      },
+      {
         path: 'reports',
         name: 'reports',
         component: () => import('@/views/reports/ReportsView.vue'),

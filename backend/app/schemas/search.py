@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from app.schemas.recommendation import RecommendationItem, StrategyAssignment
+
 
 # ---------------------------------------------------------------------------
 # 搜索回复 DTO（迁移自 search_service.py）
@@ -32,6 +34,9 @@ class SearchResult:
     reply_text: str
     has_more: bool = False
     result_count: int = 0
+    recommendation_items: list[RecommendationItem] = field(default_factory=list)
+    snapshot_id: str | None = None
+    strategy_assignment: StrategyAssignment | None = None
 
 
 @dataclass(frozen=True)

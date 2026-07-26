@@ -84,6 +84,19 @@ def require_admin_password_changed(
     return current
 
 
+def require_admin_role(*roles: str):
+    """Return a dependency enforcing recommendation-console RBAC."""
+    allowed = set(roles)
+
+    def dependency(current: AdminUser = Depends(require_admin_password_changed)) -> AdminUser:
+        role = getattr(current, "role", "super_admin") or "super_admin"
+        if role not in allowed:
+            raise BusinessException(40301, "权限不足")
+        return current
+
+    return dependency
+
+
 def require_event_api_key(
     x_event_api_key: str | None = Header(default=None, alias="X-Event-Api-Key"),
 ) -> None:

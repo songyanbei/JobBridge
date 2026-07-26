@@ -391,6 +391,14 @@ def save_snapshot(
     candidate_ids: list[str],
     query_digest: str,
     effective_criteria: dict | None = None,
+    *,
+    request_id: str | None = None,
+    snapshot_id: str | None = None,
+    direction: str | None = None,
+    strategy_version_id: str | None = None,
+    algorithm_version: str = "legacy",
+    assignment: str = "legacy",
+    ranking_metadata: dict | None = None,
 ) -> None:
     """保存候选 ID 快照（由 search_service 在 rerank 后调用）。"""
     now = datetime.now(timezone.utc)
@@ -406,6 +414,13 @@ def save_snapshot(
         created_at=now.isoformat(),
         expires_at=expires.isoformat(),
         effective_criteria=dict(effective_criteria or session.search_criteria or {}),
+        request_id=request_id,
+        snapshot_id=snapshot_id,
+        direction=direction,
+        strategy_version_id=strategy_version_id,
+        algorithm_version=algorithm_version,
+        assignment=assignment,
+        ranking_metadata=dict(ranking_metadata or {}),
     )
     session.shown_items = []
 

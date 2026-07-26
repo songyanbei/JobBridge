@@ -32,6 +32,7 @@ from app.schemas.search import (
     SearchOutcome,
     SearchResult,
 )
+from app.schemas.recommendation import StrategyAssignment
 from app.services import conversation_service, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 from app.services.recommendation_experience_gate import userid_hash
@@ -517,6 +518,89 @@ def _build_search_outcome(
     )
 
 
+def _try_recommendation_v1(
+    *,
+    candidate_dicts: list[dict],
+    direction: str,
+    criteria: dict,
+    userid: str,
+    rerank_result: RerankResult,
+    db: Session,
+    raw_query: str,
+):
+    """Run v1 only when its DB release is enabled; any control-plane failure
+    deliberately falls back to the existing legacy caller."""
+    try:
+        from app.services.recommendation_assignment_service import choose_assignment
+        from app.services.recommendation_request_service import precision_pool, rank_candidate_dicts
+        assignment = choose_assignment(db, userid=userid, direction=direction)
+        if assignment.assignment.assignment == "legacy" or not assignment.version:
+            return None
+        query_digest = conversation_service.compute_query_digest(criteria)
+        precision_ids = precision_pool(
+            candidate_dicts,
+            direction=direction,
+            criteria=criteria,
+            userid=userid,
+            query_digest=query_digest,
+        )
+        precision_set = set(precision_ids)
+        precision_candidates = [
+            item for item in candidate_dicts
+            if str(item.get("id")) in precision_set
+        ]
+        semantic_result = _rerank_with_logging(
+            query=raw_query,
+            candidates=precision_candidates,
+            role="worker" if direction == "search_job" else "factory",
+            top_n=len(precision_candidates),
+            call_site=f"recommendation_v1_{direction}",
+        )
+        from app.services.recommendation_exposure_service import (
+            batch_candidate_exposures,
+            recent_user_exposures,
+        )
+        candidate_ids = [str(item.get("id")) for item in candidate_dicts[:50]]
+        target_type = "job" if direction == "search_job" else "resume"
+        request_now_utc = datetime.now(timezone.utc)
+        parameters = assignment.version.parameters
+        exposure_counts = batch_candidate_exposures(
+            db, target_type=target_type, candidate_ids=candidate_ids,
+            request_now_utc=request_now_utc,
+        )
+        recent_exposures = recent_user_exposures(
+            db, viewer_userid=userid, target_type=target_type,
+            candidate_ids=candidate_ids, request_now_utc=request_now_utc,
+            cooldown_hours=int(parameters.get("repeat_cooldown_hours", 24)),
+        )
+        ordered, items = rank_candidate_dicts(
+            candidate_dicts,
+            direction=direction,
+            criteria=criteria,
+            userid=userid,
+            query_digest=query_digest,
+            strategy_version=assignment.version.id,
+            parameters=parameters,
+            semantic_ranked_items=semantic_result.ranked_items,
+            exposure_counts=exposure_counts,
+            recent_exposures=recent_exposures,
+            rotation_date=datetime.now(timezone.utc).date().isoformat(),
+        )
+        return {
+            "ids": [candidate.candidate_id for candidate in ordered],
+            "items": items,
+            "assignment": assignment.assignment,
+            "snapshot_id": assignment.snapshot_id,
+            "request_id": assignment.request_id,
+            "direction": direction,
+            "strategy_version_id": str(assignment.version.id),
+            "algorithm_version": getattr(assignment.version, "algorithm_version", "recommendation-v1"),
+        }
+    except Exception:
+        logger.exception("recommendation-v1 failed closed to legacy")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 公开 API
 # ---------------------------------------------------------------------------
@@ -613,7 +697,16 @@ def search_jobs(
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
-    ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    v1 = _try_recommendation_v1(
+        candidate_dicts=candidate_dicts,
+        direction="search_job",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        rerank_result=rerank_result,
+        db=db,
+        raw_query=raw_query,
+    )
+    ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     # 如果 rerank 只返回了 top_n，把剩余候选补到后面
     ranked_id_set = set(ranked_ids)
     for c in candidate_dicts:
@@ -623,7 +716,18 @@ def search_jobs(
 
     # 保存快照
     digest = conversation_service.compute_query_digest(criteria)
-    conversation_service.save_snapshot(session, ranked_ids, digest, criteria)
+    snapshot_kwargs = {}
+    if v1:
+        snapshot_kwargs = {
+            "request_id": v1.get("request_id"),
+            "snapshot_id": v1.get("snapshot_id"),
+            "direction": v1.get("direction"),
+            "strategy_version_id": v1.get("strategy_version_id"),
+            "algorithm_version": v1.get("algorithm_version", "recommendation-v1"),
+            "assignment": getattr(v1.get("assignment"), "assignment", "legacy"),
+            "ranking_metadata": {"display_top_n": len(v1.get("items", []))},
+        }
+    conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
     # 取首批
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
@@ -668,6 +772,9 @@ def search_jobs(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
+        recommendation_items=(v1["items"] if v1 else []),
+        snapshot_id=(v1["snapshot_id"] if v1 else None),
+        strategy_assignment=(v1["assignment"] if v1 else None),
     )
     # Phase 5 §5.4：统计 ranked_items（即 batch）中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
@@ -775,7 +882,16 @@ def search_workers(
         ranking_weights=ranking_weights,
     )
 
-    ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    v1 = _try_recommendation_v1(
+        candidate_dicts=candidate_dicts,
+        direction="search_worker",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        rerank_result=rerank_result,
+        db=db,
+        raw_query=raw_query,
+    )
+    ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     ranked_id_set = set(ranked_ids)
     for c in candidate_dicts:
         cid = str(c["id"])
@@ -783,7 +899,18 @@ def search_workers(
             ranked_ids.append(cid)
 
     digest = conversation_service.compute_query_digest(criteria)
-    conversation_service.save_snapshot(session, ranked_ids, digest, criteria)
+    snapshot_kwargs = {}
+    if v1:
+        snapshot_kwargs = {
+            "request_id": v1.get("request_id"),
+            "snapshot_id": v1.get("snapshot_id"),
+            "direction": v1.get("direction"),
+            "strategy_version_id": v1.get("strategy_version_id"),
+            "algorithm_version": v1.get("algorithm_version", "recommendation-v1"),
+            "assignment": getattr(v1.get("assignment"), "assignment", "legacy"),
+            "ranking_metadata": {"display_top_n": len(v1.get("items", []))},
+        }
+    conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
@@ -826,6 +953,9 @@ def search_workers(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
+        recommendation_items=(v1["items"] if v1 else []),
+        snapshot_id=(v1["snapshot_id"] if v1 else None),
+        strategy_assignment=(v1["assignment"] if v1 else None),
     )
     # Phase 5 §5.4：统计 ranked_items 中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)

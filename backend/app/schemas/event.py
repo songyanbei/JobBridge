@@ -18,6 +18,11 @@ class MiniProgramClickRequest(BaseModel):
         ),
         examples=[1700000000],
     )
+    delivery_id: str | None = Field(default=None, min_length=36, max_length=36)
+    request_id: str | None = Field(default=None, min_length=36, max_length=36)
+    snapshot_id: str | None = Field(default=None, min_length=36, max_length=36)
+    position: int | None = Field(default=None, ge=1, le=3)
+    client_event_id: str | None = Field(default=None, max_length=64)
 
 
 class MiniProgramClickResponse(BaseModel):

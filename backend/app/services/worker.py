@@ -45,6 +45,7 @@ from app.models import (
     ConversationLog,
     WecomInboundEvent,
     WecomOutboundOutbox,
+    RecommendationDelivery,
 )
 from app.schemas.conversation import ReplyMessage
 from app.services import conversation_service, message_router, search_service
@@ -651,6 +652,11 @@ class Worker:
                 "worker_finished_at": func.now(6),
                 "error_message": None,
             })
+            if updated == 1:
+                db.query(RecommendationDelivery).filter(
+                    RecommendationDelivery.source_inbound_msg_id == str(event_id),
+                    RecommendationDelivery.status == "prepared",
+                ).update({"status": "pending"}, synchronize_session=False)
             db.commit()
             return updated == 1
         except Exception:
@@ -755,6 +761,22 @@ class Worker:
     ) -> None:
         """在 router 业务事务中持久化有序回复意图。"""
         for index, reply in enumerate(replies):
+            if reply.recommendation_context:
+                from app.services.recommendation_delivery_service import prepare_delivery
+                ctx = reply.recommendation_context
+                prepare_delivery(
+                    db,
+                    inbound_event_id=int(inbound_event_id),
+                    reply_index=index,
+                    userid=reply.userid,
+                    body=reply.content,
+                    request_id=ctx.request_id,
+                    snapshot_id=ctx.snapshot_id,
+                    position_count=len(ctx.items),
+                    delivery_id=ctx.delivery_id,
+                    recommendation_context=ctx.model_dump(mode="json"),
+                )
+                continue
             db.add(WecomOutboundOutbox(
                 inbound_event_id=int(inbound_event_id),
                 reply_index=index,
@@ -779,6 +801,21 @@ class Worker:
             stale_before = func.timestampadd(
                 text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
             )
+            ambiguous = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+            ).with_for_update(skip_locked=True).all()
+            for stale in ambiguous:
+                stale.status = "dead_letter"
+                stale.locked_at = None
+                stale.last_error = "ambiguous provider outcome; automatic resend disabled"
+                delivery = db.get(
+                    RecommendationDelivery, stale.recommendation_delivery_id,
+                )
+                if delivery and delivery.status == "sending":
+                    delivery.status = "unknown"
+                    delivery.last_error = stale.last_error
             due = or_(
                 and_(
                     WecomOutboundOutbox.status == "pending",
@@ -790,6 +827,7 @@ class Worker:
                 and_(
                     WecomOutboundOutbox.status == "sending",
                     WecomOutboundOutbox.locked_at <= stale_before,
+                    WecomOutboundOutbox.recommendation_delivery_id.is_(None),
                 ),
             )
             earlier = aliased(WecomOutboundOutbox)
@@ -824,10 +862,24 @@ class Worker:
                 row.status = "sending"
                 row.locked_at = now
                 row.attempt_count = int(row.attempt_count or 0) + 1
+                content = row.content
+                if row.recommendation_delivery_id:
+                    delivery = db.get(RecommendationDelivery, row.recommendation_delivery_id)
+                    if not delivery or not delivery.content_ciphertext:
+                        raise RuntimeError("recommendation delivery body unavailable")
+                    if delivery.status != "pending":
+                        raise RuntimeError(
+                            f"recommendation delivery not sendable: {delivery.status}"
+                        )
+                    delivery.status = "sending"
+                    delivery.attempt_count = int(delivery.attempt_count or 0) + 1
+                    from app.services.recommendation_delivery_service import decrypt_body
+                    content = decrypt_body(delivery.content_ciphertext.decode("ascii"))
                 claimed.append({
                     "id": int(row.id),
                     "userid": row.userid,
-                    "content": row.content,
+                    "content": content or "",
+                    "recommendation_delivery_id": row.recommendation_delivery_id,
                     "attempt_count": int(row.attempt_count),
                 })
             db.commit()
@@ -842,6 +894,8 @@ class Worker:
     def _mark_outbox_sent(self, outbox_id: int, provider_msg_id: str | None) -> bool:
         db = SessionLocal()
         try:
+            row = db.get(WecomOutboundOutbox, outbox_id)
+            delivery_id = row.recommendation_delivery_id if row else None
             updated = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.id == outbox_id,
                 WecomOutboundOutbox.status == "sending",
@@ -853,6 +907,13 @@ class Worker:
                 "next_attempt_at": None,
                 "last_error": None,
             })
+            if updated == 1 and delivery_id:
+                from app.services.recommendation_delivery_service import mark_delivery_sent
+                mark_delivery_sent(db, delivery_id, provider_msg_id)
+                delivery = db.get(RecommendationDelivery, delivery_id)
+                if delivery:
+                    from app.services.recommendation_exposure_service import derive_impressions
+                    derive_impressions(db, delivery)
             db.commit()
             return updated == 1
         except Exception:
@@ -896,6 +957,15 @@ class Worker:
                 WecomOutboundOutbox.id == item["id"],
                 WecomOutboundOutbox.status == "sending",
             ).update(values)
+            delivery_id = item.get("recommendation_delivery_id")
+            if delivery_id:
+                db.query(RecommendationDelivery).filter(
+                    RecommendationDelivery.delivery_id == delivery_id,
+                    RecommendationDelivery.status == "sending",
+                ).update({
+                    "status": "dead_letter" if dead else "pending",
+                    "last_error": values["last_error"],
+                }, synchronize_session=False)
             db.commit()
             if dead:
                 self._write_send_failed_audit(
@@ -1208,6 +1278,10 @@ class Worker:
                 "status": "done",
                 "worker_finished_at": func.now(6),
             })
+            db.query(RecommendationDelivery).filter(
+                RecommendationDelivery.source_inbound_msg_id == str(event_id),
+                RecommendationDelivery.status == "prepared",
+            ).update({"status": "pending"}, synchronize_session=False)
         except Exception:
             logger.exception("worker: mark_event_done failed id=%s", event_id)
 
@@ -1362,10 +1436,20 @@ class Worker:
                         userid=reply.userid,
                         direction="out",
                         msg_type="text",
-                        content=reply.content,
+                        content=(
+                            "[recommendation_delivery]"
+                            if reply.recommendation_context
+                            else reply.content
+                        ),
                         wecom_msg_id=None,
                         intent=reply.intent,
                         criteria_snapshot=reply.criteria_snapshot,
+                        recommendation_delivery_id=reply.delivery_id,
+                        redaction_state=(
+                            "encrypted_delivery"
+                            if reply.recommendation_context
+                            else None
+                        ),
                         expires_at=expires,
                     ))
             except Exception:

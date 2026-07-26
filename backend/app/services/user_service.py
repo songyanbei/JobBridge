@@ -10,7 +10,17 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import UserBlocked
 from app.core.logging_setup import identifier_hash
-from app.models import AuditLog, ConversationLog, Job, Resume, User
+from app.models import (
+    AuditLog,
+    ConversationLog,
+    EventLog,
+    Job,
+    RecommendationDelivery,
+    RecommendationImpression,
+    RecommendationRequest,
+    Resume,
+    User,
+)
 from app.services import conversation_service
 
 logger = logging.getLogger(__name__)
@@ -191,6 +201,29 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     db.query(ConversationLog).filter(
         ConversationLog.userid == external_userid,
     ).update({"expires_at": now})
+
+    # Recommendation privacy contract: remove viewer-level facts immediately
+    # and destroy encrypted delivery bodies/contexts before the normal TTL pass.
+    db.query(RecommendationImpression).filter(
+        RecommendationImpression.viewer_userid == external_userid,
+    ).delete(synchronize_session=False)
+    db.query(EventLog).filter(
+        EventLog.userid == external_userid,
+    ).delete(synchronize_session=False)
+    db.query(RecommendationDelivery).filter(
+        RecommendationDelivery.userid == external_userid,
+    ).update({
+        "content_ciphertext": None,
+        "recommendation_context": {},
+        "status": "redacted",
+    }, synchronize_session=False)
+    pseudonym = f"deleted:{identifier_hash(external_userid)}"[:64]
+    db.query(RecommendationRequest).filter(
+        RecommendationRequest.viewer_userid == external_userid,
+    ).update({
+        "viewer_userid": pseudonym,
+        "served_top_ids": [],
+    }, synchronize_session=False)
 
     # 4. 标记用户状态
     db.query(User).filter(

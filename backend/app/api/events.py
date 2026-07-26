@@ -28,5 +28,10 @@ def miniprogram_click(
         target_type=payload.target_type,
         target_id=payload.target_id,
         timestamp=payload.timestamp,
+        delivery_id=payload.delivery_id,
+        request_id=payload.request_id,
+        snapshot_id=payload.snapshot_id,
+        position=payload.position,
+        client_event_id=payload.client_event_id,
     )
     return ok({"deduped": deduped})
