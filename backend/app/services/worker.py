@@ -873,22 +873,50 @@ class Worker:
             )
             claimed: list[dict] = []
             for row in rows:
-                row.status = "sending"
-                row.locked_at = now
-                row.attempt_count = int(row.attempt_count or 0) + 1
                 content = row.content
                 if row.recommendation_delivery_id:
                     delivery = db.get(RecommendationDelivery, row.recommendation_delivery_id)
                     if not delivery or not delivery.content_ciphertext:
-                        raise RuntimeError("recommendation delivery body unavailable")
+                        row.status = "dead_letter"
+                        row.locked_at = None
+                        row.next_attempt_at = None
+                        row.last_error = "recommendation delivery body unavailable"
+                        if delivery and delivery.status in ("prepared", "pending"):
+                            delivery.status = "expired"
+                            delivery.last_error = row.last_error
+                        continue
                     if delivery.status != "pending":
-                        raise RuntimeError(
+                        row.status = "dead_letter"
+                        row.locked_at = None
+                        row.next_attempt_at = None
+                        row.last_error = (
                             f"recommendation delivery not sendable: {delivery.status}"
                         )
+                        continue
+                    try:
+                        from app.services.recommendation_delivery_service import decrypt_body
+                        content = decrypt_body(delivery.content_ciphertext.decode("ascii"))
+                    except Exception as exc:
+                        row.status = "dead_letter"
+                        row.locked_at = None
+                        row.next_attempt_at = None
+                        row.last_error = f"recommendation decrypt failed: {type(exc).__name__}"
+                        delivery.status = "dead_letter"
+                        delivery.last_error = row.last_error
+                        continue
+                    row.status = "sending"
+                    row.locked_at = now
+                    row.attempt_count = int(row.attempt_count or 0) + 1
                     delivery.status = "sending"
                     delivery.attempt_count = int(delivery.attempt_count or 0) + 1
-                    from app.services.recommendation_delivery_service import decrypt_body
-                    content = decrypt_body(delivery.content_ciphertext.decode("ascii"))
+                    delivery.lease_owner = "wecom-outbox"
+                    delivery.lease_expires_at = func.timestampadd(
+                        text("SECOND"), OUTBOX_SENDING_STALE_SECONDS, now,
+                    )
+                else:
+                    row.status = "sending"
+                    row.locked_at = now
+                    row.attempt_count = int(row.attempt_count or 0) + 1
                 claimed.append({
                     "id": int(row.id),
                     "userid": row.userid,
@@ -1057,6 +1085,39 @@ class Worker:
     def _process_outbox_once(self) -> None:
         for item in self._claim_outbox():
             self._deliver_outbox_item(item)
+        self._process_impressions_once()
+
+    def _process_impressions_once(self) -> None:
+        from app.services.recommendation_exposure_service import (
+            claim_impression_deliveries,
+            derive_impressions,
+            mark_impression_retry,
+        )
+        claim_db = SessionLocal()
+        try:
+            delivery_ids = claim_impression_deliveries(claim_db)
+            claim_db.commit()
+        except Exception:
+            claim_db.rollback()
+            logger.exception("worker: claim impression deliveries failed")
+            delivery_ids = []
+        finally:
+            claim_db.close()
+        for delivery_id in delivery_ids:
+            db = SessionLocal()
+            try:
+                delivery = db.get(RecommendationDelivery, delivery_id)
+                if delivery:
+                    derive_impressions(db, delivery)
+                    delivery.lease_owner = None
+                    delivery.lease_expires_at = None
+                    db.commit()
+            except Exception as exc:
+                db.rollback()
+                mark_impression_retry(db, delivery_id, exc)
+                db.commit()
+            finally:
+                db.close()
 
     def _send_replies(self, replies: list[ReplyMessage]) -> bool:
         all_ok = True

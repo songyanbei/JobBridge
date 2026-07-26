@@ -6,6 +6,7 @@ from typing import Iterable
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
+from sqlalchemy import func, or_, text
 
 from app.models import RecommendationDelivery, RecommendationImpression
 
@@ -135,3 +136,39 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
     delivery.impression_state = "completed" if actual == len(items) else "retry"
     delivery.impression_derived_at = exposed_at if actual == len(items) else None
     return inserted
+
+
+def claim_impression_deliveries(
+    db: Session, *, limit: int = 50, lease_seconds: int = 30,
+) -> list[str]:
+    now = func.now(6)
+    rows = db.query(RecommendationDelivery).filter(
+        RecommendationDelivery.status.in_(("sent", "redacted")),
+        RecommendationDelivery.impression_state.in_(("pending", "retry")),
+        RecommendationDelivery.impression_next_attempt_at <= now,
+        or_(
+            RecommendationDelivery.lease_expires_at.is_(None),
+            RecommendationDelivery.lease_expires_at <= now,
+        ),
+    ).with_for_update(skip_locked=True).limit(limit).all()
+    ids = []
+    for row in rows:
+        row.impression_state = "deriving"
+        row.impression_attempt_count = int(row.impression_attempt_count or 0) + 1
+        row.lease_owner = "impression-worker"
+        row.lease_expires_at = func.timestampadd(text("SECOND"), lease_seconds, now)
+        ids.append(row.delivery_id)
+    return ids
+
+
+def mark_impression_retry(db: Session, delivery_id: str, error: Exception) -> None:
+    delivery = db.get(RecommendationDelivery, delivery_id)
+    if not delivery:
+        return
+    delivery.impression_state = "retry"
+    delivery.impression_last_error = f"{type(error).__name__}: {error}"[:500]
+    delivery.impression_next_attempt_at = func.timestampadd(
+        text("SECOND"), min(300, 2 ** min(delivery.impression_attempt_count, 8)), func.now(6),
+    )
+    delivery.lease_owner = None
+    delivery.lease_expires_at = None

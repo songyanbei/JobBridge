@@ -136,6 +136,8 @@ def mark_delivery_sent(db: Session, delivery_id: str, provider_msg_id: str | Non
         delivery.status = "sent"
         delivery.wecom_msgid = provider_msg_id
         delivery.sent_at = datetime.now(timezone.utc)
+        delivery.lease_owner = None
+        delivery.lease_expires_at = None
 
 
 def redact_delivery(db: Session, delivery_id: str) -> bool:

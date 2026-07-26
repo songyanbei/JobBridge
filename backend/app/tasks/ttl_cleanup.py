@@ -35,21 +35,31 @@ BATCH_SIZE = 500
 
 
 def _redact_expired_recommendation_content(db) -> int:
-    result = db.execute(text(
+    unknown = db.execute(text(
+        "UPDATE recommendation_delivery d "
+        "JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
+        "SET d.status='unknown', d.last_error='sending lease expired after content TTL', "
+        "o.status='dead_letter', o.locked_at=NULL, o.next_attempt_at=NULL, "
+        "o.last_error='ambiguous provider outcome; automatic resend disabled' "
+        "WHERE d.status='sending' AND d.lease_expires_at IS NOT NULL "
+        "AND d.lease_expires_at <= NOW(6) "
+        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
+    ))
+    expired = db.execute(text(
         "UPDATE recommendation_delivery d "
         "LEFT JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
         "SET d.content_ciphertext=NULL, "
-        "d.status=CASE WHEN d.status IN ('prepared','pending','sending') THEN 'expired' "
+        "d.status=CASE WHEN d.status IN ('prepared','pending') THEN 'expired' "
         "             WHEN d.status='sent' THEN 'redacted' ELSE d.status END, "
-        "o.status=CASE WHEN o.status IN ('pending','sending') THEN 'dead_letter' ELSE o.status END, "
+        "o.status=CASE WHEN o.status='pending' THEN 'dead_letter' ELSE o.status END, "
         "o.locked_at=NULL, o.next_attempt_at=NULL, "
-        "o.last_error=CASE WHEN o.status IN ('pending','sending') "
+        "o.last_error=CASE WHEN o.status='pending' "
         "                 THEN 'recommendation delivery expired before send' ELSE o.last_error END "
-        "WHERE d.content_ciphertext IS NOT NULL "
+        "WHERE d.status IN ('prepared','pending','sent','unknown') "
         "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
     ))
     db.commit()
-    return int(result.rowcount or 0)
+    return int(unknown.rowcount or 0) + int(expired.rowcount or 0)
 
 
 # ---------------------------------------------------------------------------

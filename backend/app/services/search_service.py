@@ -601,6 +601,23 @@ def _try_recommendation_v1(
             "query_digest": query_digest,
             "candidate_ids": [str(item.get("id")) for item in candidate_dicts[:50]],
             "precision_pool_ids": precision_ids,
+            "candidate_scores": {
+                item.candidate_id: {
+                    "final_score": item.repeat_adjusted_score,
+                    "is_exploration": item.is_exploration,
+                    "reason_codes": list(item.reason_codes),
+                    "score_detail": {
+                        "match_score": item.match_score,
+                        "quality_score": item.quality_score,
+                        "freshness_score": item.freshness_score,
+                        "exposure_opportunity": item.exposure_opportunity,
+                        "base_score": item.base_score,
+                        "repeat_factor": item.repeat_factor,
+                        "diversity_penalty": item.diversity_penalty,
+                    },
+                }
+                for item in ordered
+            },
         }
     except Exception:
         logger.exception("recommendation-v1 failed closed to legacy")
@@ -748,6 +765,7 @@ def search_jobs(
             "ranking_metadata": {
                 "display_top_n": len(v1.get("items", [])),
                 "precision_pool_ids": v1.get("precision_pool_ids", []),
+                "candidate_scores": v1.get("candidate_scores", {}),
             },
         }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
@@ -952,6 +970,7 @@ def search_workers(
             "ranking_metadata": {
                 "display_top_n": len(v1.get("items", [])),
                 "precision_pool_ids": v1.get("precision_pool_ids", []),
+                "candidate_scores": v1.get("candidate_scores", {}),
             },
         }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
@@ -1167,7 +1186,11 @@ def show_more(
     )
     snapshot = session.candidate_snapshot
     if snapshot and snapshot.algorithm_version != "legacy" and snapshot.assignment != "legacy":
-        from app.schemas.recommendation import RecommendationItem, StrategyAssignment
+        from app.schemas.recommendation import (
+            RecommendationItem,
+            RecommendationScoreDetail,
+            StrategyAssignment,
+        )
         assignment = StrategyAssignment(
             direction=direction,
             execution_mode="on",
@@ -1175,15 +1198,24 @@ def show_more(
             strategy_version_id=snapshot.strategy_version_id,
             algorithm_version=snapshot.algorithm_version,
         )
-        sr.recommendation_items = [
-            RecommendationItem(
+        score_map = snapshot.ranking_metadata.get("candidate_scores", {})
+        recommendation_items = []
+        for index, item in enumerate(collected, 1):
+            score = dict(score_map.get(str(item["id"])) or {})
+            detail = score.get("score_detail")
+            recommendation_items.append(RecommendationItem(
                 target_type="job" if direction == "search_job" else "resume",
                 target_id=int(item["id"]),
                 position=index,
-                final_score=0.0,
-            )
-            for index, item in enumerate(collected, 1)
-        ]
+                final_score=float(score.get("final_score", 0.0)),
+                is_exploration=bool(score.get("is_exploration", False)),
+                reason_codes=list(score.get("reason_codes") or []),
+                score_detail=(
+                    RecommendationScoreDetail.model_validate(detail)
+                    if detail else None
+                ),
+            ))
+        sr.recommendation_items = recommendation_items
         sr.snapshot_id = snapshot.snapshot_id
         sr.request_id = snapshot.request_id
         sr.query_digest = snapshot.query_digest
@@ -1604,8 +1636,21 @@ def execute_relaxed_search(
     else:
         relaxed = _compute_relaxed_criteria_resume(original_criteria, step)
 
-    top_n = _get_config_int("match.top_n", db, 3)
-    max_candidates = _get_config_int("match.max_candidates", db, 50)
+    relaxed_decision = None
+    try:
+        from app.services.recommendation_assignment_service import choose_assignment
+        relaxed_decision = choose_assignment(
+            db, userid=user_ctx.external_userid, direction=direction,
+        )
+    except Exception:
+        pass
+    relaxed_is_v1 = bool(
+        relaxed_decision
+        and relaxed_decision.version
+        and relaxed_decision.assignment.assignment != "legacy"
+    )
+    top_n = 3 if relaxed_is_v1 else _get_config_int("match.top_n", db, 3)
+    max_candidates = 50 if relaxed_is_v1 else _get_config_int("match.max_candidates", db, 50)
     flags = _normalize_experience_flags(experience_flags)
 
     if direction == "search_job":
@@ -1681,10 +1726,29 @@ def execute_relaxed_search(
     try:
         from app.services.recommendation_assignment_service import choose_assignment
         from app.services.recommendation_request_service import rank_candidate_dicts
-        decision = choose_assignment(
+        decision = relaxed_decision or choose_assignment(
             db, userid=user_ctx.external_userid, direction=direction,
         )
         if decision.version and decision.assignment.assignment != "legacy":
+            from app.services.recommendation_exposure_service import (
+                batch_candidate_exposures,
+                recent_user_exposures,
+            )
+            ids = [str(item.get("id")) for item in candidate_dicts[:50]]
+            target_type = "job" if direction == "search_job" else "resume"
+            request_now = datetime.now(timezone.utc)
+            counts = batch_candidate_exposures(
+                db, target_type=target_type, candidate_ids=ids,
+                request_now_utc=request_now,
+            )
+            recents = recent_user_exposures(
+                db, viewer_userid=user_ctx.external_userid,
+                target_type=target_type, candidate_ids=ids,
+                request_now_utc=request_now,
+                cooldown_hours=int(
+                    decision.version.parameters.get("repeat_cooldown_hours", 24)
+                ),
+            )
             ordered, items = rank_candidate_dicts(
                 candidate_dicts,
                 direction=direction,
@@ -1694,6 +1758,8 @@ def execute_relaxed_search(
                 strategy_version=decision.version.id,
                 parameters=decision.version.parameters,
                 semantic_ranked_items=rerank_result.ranked_items,
+                exposure_counts=counts,
+                recent_exposures=recents,
                 rotation_date=datetime.now(timezone.utc).date().isoformat(),
             )
             ranked_ids = [item.candidate_id for item in ordered]

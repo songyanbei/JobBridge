@@ -793,7 +793,12 @@ def _handle_text(
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
     replies = _finalize_action_plan_replies(replies)
     if replies:
-        conversation_service.record_history(session, "assistant", replies[0].content)
+        history_content = (
+            "[recommendation_delivery]"
+            if replies[0].recommendation_context
+            else replies[0].content
+        )
+        conversation_service.record_history(session, "assistant", history_content)
 
     conversation_service.save_session(userid, session)
     return replies
@@ -1826,7 +1831,15 @@ def _post_search_dispatch(
     """
     mode = _settings_module.dialogue_policy.post_search_policy_mode
     recommendation_fields = _recommendation_reply_fields(
-        search_result, user_ctx.external_userid, msg.msg_id,
+        search_result,
+        user_ctx.external_userid,
+        msg.msg_id,
+        request_kind=(
+            "show_more" if legacy_intent == "show_more"
+            else "confirmed_relaxed"
+            if getattr(search_outcome, "applied_relax_step", None)
+            else "initial_search"
+        ),
     )
 
     if mode == "off":
@@ -2729,14 +2742,22 @@ def _snapshot_meta(session: SessionState) -> dict:
 
 
 def _recommendation_reply_fields(
-    search_result, userid: str, source_inbound_msg_id: str,
+    search_result,
+    userid: str,
+    source_inbound_msg_id: str,
+    request_kind: str = "initial_search",
 ) -> dict:
     """Carry the recommendation contract from search to the durable outbox."""
     items = list(getattr(search_result, "recommendation_items", []) or [])
     assignment = getattr(search_result, "strategy_assignment", None)
     if not items or not assignment or getattr(assignment, "assignment", "legacy") == "legacy":
         return {}
-    request_id = getattr(search_result, "request_id", None) or str(uuid.uuid4())
+    parent_request_id = getattr(search_result, "request_id", None)
+    request_id = (
+        str(uuid.uuid4())
+        if request_kind in {"show_more", "confirmed_relaxed"}
+        else parent_request_id or str(uuid.uuid4())
+    )
     context = RecommendationDeliveryContext(
         delivery_id=str(uuid.uuid4()),
         request_id=request_id,
@@ -2755,7 +2776,12 @@ def _recommendation_reply_fields(
         "recommendation_request": RecommendationRequestFact(
             request_id=request_id,
             source_inbound_msg_id=source_inbound_msg_id,
-            request_kind="initial_search",
+            request_kind=request_kind,
+            parent_request_id=(
+                parent_request_id
+                if request_kind in {"show_more", "confirmed_relaxed"}
+                else None
+            ),
             viewer_userid=userid,
             direction=assignment.direction,
             query_digest=getattr(search_result, "query_digest", ""),

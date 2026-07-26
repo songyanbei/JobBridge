@@ -11,6 +11,7 @@ import hashlib
 from datetime import datetime
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.redis_client import (
     EVENT_DEDUPE_TTL_DEFAULT,
@@ -116,8 +117,7 @@ def record_click(
         dedupe_key = hashlib.sha256(
             "|".join([
                 delivery_id or "",
-                str(position or ""),
-                client_event_id or "",
+                "miniprogram_click",
                 target_type,
                 str(target_id),
             ]).encode("utf-8")
@@ -149,6 +149,15 @@ def record_click(
         )
         db.add(entry)
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        if delivery_id:
+            return True
+        try:
+            clear_event_idem(userid, target_type, target_id)
+        except Exception:
+            pass
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.exception(
             "event_service: event_log write failed user_hash=%s",
