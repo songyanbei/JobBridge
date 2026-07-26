@@ -65,7 +65,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-RERANK_PROMPT_VERSION = "v1"
+# §11.5: this used to be a local "v1" literal that shadowed the real prompt
+# version, so every llm_call log event reported a version the prompt had not
+# used since v2.  Re-export the single source of truth instead.
+from app.llm.prompts import RERANK_PROMPT_VERSION  # noqa: E402
 _queue_backlog_hint: ContextVar[int] = ContextVar("queue_backlog_hint", default=0)
 
 
