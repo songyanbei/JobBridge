@@ -1,3 +1,8 @@
+-- Phase 9: exposure facts, daily rollup and click attribution columns.
+-- MySQL 8.0 compatible and safe to apply repeatedly.
+
+SET @schema_name = DATABASE();
+
 CREATE TABLE IF NOT EXISTS recommendation_impression (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   delivery_id CHAR(36) NOT NULL,
@@ -19,14 +24,45 @@ CREATE TABLE IF NOT EXISTS recommendation_impression (
   PRIMARY KEY (id),
   UNIQUE KEY uk_recommendation_impression_delivery_target (delivery_id, target_type, target_id),
   KEY idx_recommendation_impression_viewer_time (viewer_userid, target_type, exposed_at),
-  KEY idx_recommendation_impression_target_time (target_type, target_id, exposed_at)
+  KEY idx_recommendation_impression_target_time (target_type, target_id, exposed_at),
+  KEY idx_recommendation_impression_version_time (strategy_version_id, exposed_at),
+  KEY idx_recommendation_impression_snapshot_position (snapshot_id, position)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-ALTER TABLE recommendation_impression
-  ADD CONSTRAINT fk_recommendation_impression_delivery
-  FOREIGN KEY (delivery_id) REFERENCES recommendation_delivery(delivery_id),
-  ADD CONSTRAINT fk_recommendation_impression_request
-  FOREIGN KEY (request_id) REFERENCES recommendation_request(request_id);
+-- §9.11: impression cascades with its delivery, but pins the request.
+SET @ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = @schema_name
+          AND table_name = 'recommendation_impression'
+          AND constraint_name = 'fk_recommendation_impression_delivery'
+    ),
+    'SELECT 1',
+    'ALTER TABLE `recommendation_impression`
+       ADD CONSTRAINT `fk_recommendation_impression_delivery`
+       FOREIGN KEY (`delivery_id`) REFERENCES `recommendation_delivery`(`delivery_id`)
+       ON DELETE CASCADE'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = @schema_name
+          AND table_name = 'recommendation_impression'
+          AND constraint_name = 'fk_recommendation_impression_request'
+    ),
+    'SELECT 1',
+    'ALTER TABLE `recommendation_impression`
+       ADD CONSTRAINT `fk_recommendation_impression_request`
+       FOREIGN KEY (`request_id`) REFERENCES `recommendation_request`(`request_id`)
+       ON DELETE RESTRICT'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 CREATE TABLE IF NOT EXISTS recommendation_exposure_daily (
   stat_date DATE NOT NULL,
@@ -37,15 +73,47 @@ CREATE TABLE IF NOT EXISTS recommendation_exposure_daily (
   PRIMARY KEY (stat_date, target_type, target_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-ALTER TABLE event_log
-  ADD COLUMN IF NOT EXISTS delivery_id CHAR(36) NULL,
-  ADD COLUMN IF NOT EXISTS request_id CHAR(36) NULL,
-  ADD COLUMN IF NOT EXISTS snapshot_id CHAR(36) NULL,
-  ADD COLUMN IF NOT EXISTS position SMALLINT UNSIGNED NULL,
-  ADD COLUMN IF NOT EXISTS attribution_status VARCHAR(24) NOT NULL DEFAULT 'legacy_unattributed',
-  ADD COLUMN IF NOT EXISTS attributed_strategy_version_id BIGINT UNSIGNED NULL,
-  ADD COLUMN IF NOT EXISTS attributed_algorithm_version VARCHAR(32) NULL,
-  ADD COLUMN IF NOT EXISTS attributed_is_exploration TINYINT(1) NULL,
-  ADD COLUMN IF NOT EXISTS client_event_id VARCHAR(64) NULL,
-  ADD COLUMN IF NOT EXISTS attribution_dedupe_key CHAR(64) NULL,
-  ADD UNIQUE KEY uk_event_attribution_dedupe (attribution_dedupe_key);
+SET @ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = @schema_name
+          AND table_name = 'event_log'
+          AND column_name = 'delivery_id'
+    ),
+    'SELECT 1',
+    'ALTER TABLE `event_log`
+       ADD COLUMN `delivery_id` CHAR(36) NULL,
+       ADD COLUMN `request_id` CHAR(36) NULL,
+       ADD COLUMN `snapshot_id` CHAR(36) NULL,
+       ADD COLUMN `position` SMALLINT UNSIGNED NULL,
+       ADD COLUMN `attribution_status` VARCHAR(24) NOT NULL DEFAULT ''legacy_unattributed'',
+       ADD COLUMN `attributed_strategy_version_id` BIGINT UNSIGNED NULL,
+       ADD COLUMN `attributed_algorithm_version` VARCHAR(32) NULL,
+       ADD COLUMN `attributed_is_exploration` TINYINT(1) NULL,
+       ADD COLUMN `client_event_id` VARCHAR(64) NULL,
+       ADD COLUMN `attribution_dedupe_key` CHAR(64) NULL,
+       ADD UNIQUE KEY `uk_event_attribution_dedupe` (`attribution_dedupe_key`),
+       ADD KEY `idx_event_delivery_target` (`delivery_id`, `target_type`, `target_id`),
+       ADD KEY `idx_event_attributed_version` (`attributed_strategy_version_id`, `event_type`, `occurred_at`),
+       ADD KEY `idx_event_attribution_status` (`attribution_status`, `occurred_at`)'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @ddl = IF(
+    EXISTS(
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_schema = @schema_name
+          AND table_name = 'event_log'
+          AND constraint_name = 'fk_event_recommendation_delivery'
+    ),
+    'SELECT 1',
+    'ALTER TABLE `event_log`
+       ADD CONSTRAINT `fk_event_recommendation_delivery`
+       FOREIGN KEY (`delivery_id`) REFERENCES `recommendation_delivery`(`delivery_id`)
+       ON DELETE SET NULL'
+);
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;

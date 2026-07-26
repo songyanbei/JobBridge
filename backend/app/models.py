@@ -382,10 +382,12 @@ class AdminUser(Base):
     username = sa.Column(sa.String(32), nullable=False, unique=True, comment="登录用户名")
     password_hash = sa.Column(sa.String(128), nullable=False, comment="bcrypt 哈希")
     display_name = sa.Column(sa.String(64), nullable=True, comment="显示名")
+    # §9.10 grandfathers *existing* accounts into super_admin via phase9_004; the
+    # column default stays least-privileged so new accounts must pick a role.
     role = sa.Column(
         sa.Enum("viewer", "operator", "super_admin", name="admin_role"),
         nullable=False,
-        server_default="super_admin",
+        server_default="viewer",
     )
     password_changed = sa.Column(mysql.TINYINT(display_width=1), nullable=False, server_default=sa.text("0"), comment="是否已修改初始密码")
     enabled = sa.Column(mysql.TINYINT(display_width=1), nullable=False, server_default=sa.text("1"))
@@ -432,6 +434,9 @@ class EventLog(Base):
     __table_args__ = (
         sa.Index("idx_target", "target_type", "target_id", "occurred_at"),
         sa.Index("idx_user_time", "userid", "occurred_at"),
+        sa.Index("idx_event_delivery_target", "delivery_id", "target_type", "target_id"),
+        sa.Index("idx_event_attributed_version", "attributed_strategy_version_id", "event_type", "occurred_at"),
+        sa.Index("idx_event_attribution_status", "attribution_status", "occurred_at"),
         sa.UniqueConstraint(
             "userid", "event_type", "client_event_id",
             name="uk_event_client_idempotency",
@@ -678,6 +683,9 @@ class RecommendationRequest(Base):
         sa.Index("idx_recommendation_request_viewer_time", "viewer_userid", "direction", "created_at"),
         sa.Index("idx_recommendation_request_attempt", "served_attempt_id"),
         sa.Index("idx_recommendation_request_parent", "parent_request_id"),
+        sa.Index("idx_recommendation_request_mode_time", "created_at", "direction", "execution_mode"),
+        sa.Index("idx_recommendation_request_kind_zero", "request_kind", "is_zero_result", "created_at"),
+        sa.Index("idx_recommendation_request_version_time", "served_strategy_version_id", "created_at"),
     )
 
 
@@ -700,6 +708,8 @@ class RecommendationSearchAttempt(Base):
     llm_status = sa.Column(sa.String(32), nullable=False, server_default="skipped")
     llm_input_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
     llm_output_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    llm_timeout_budget_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    llm_retry_count = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
     ranking_fallback = sa.Column(sa.String(32), nullable=True)
     ranking_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     total_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
@@ -708,6 +718,8 @@ class RecommendationSearchAttempt(Base):
     __table_args__ = (
         sa.UniqueConstraint("request_id", "attempt_no", name="uk_recommendation_attempt_request_no"),
         sa.Index("idx_recommendation_attempt_kind_time", "created_at", "attempt_kind"),
+        sa.Index("idx_recommendation_attempt_version_time", "strategy_version_id", "created_at"),
+        sa.Index("idx_recommendation_attempt_llm_status", "llm_status", "created_at"),
     )
 
 
@@ -740,6 +752,7 @@ class RecommendationDelivery(Base):
     lease_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     wecom_msgid = sa.Column(sa.String(128), nullable=True)
     wecom_response = sa.Column(sa.JSON, nullable=True)
+    invalid_recipients = sa.Column(sa.JSON, nullable=True)
     last_error_code = sa.Column(sa.String(32), nullable=True)
     last_error = sa.Column(sa.String(500), nullable=True)
     sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
@@ -748,6 +761,10 @@ class RecommendationDelivery(Base):
     impression_actual_count = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
     impression_attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     impression_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    # §9.6: the derivation lease is deliberately separate from the send lease so
+    # the deriver and the dispatcher cannot steal each other's claim.
+    impression_lease_owner = sa.Column(sa.String(64), nullable=True)
+    impression_lease_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     impression_derived_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     impression_last_error = sa.Column(sa.String(500), nullable=True)
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
@@ -757,7 +774,13 @@ class RecommendationDelivery(Base):
         sa.UniqueConstraint("source_inbound_msg_id", "reply_index", name="uk_recommendation_delivery_inbound_index"),
         sa.Index("idx_recommendation_delivery_user_order", "userid", "delivery_order"),
         sa.Index("idx_recommendation_delivery_status_due", "status", "next_attempt_at"),
+        sa.Index("idx_recommendation_delivery_session_recovery", "status", "session_commit_state", "updated_at"),
+        sa.Index("idx_recommendation_delivery_user_status_order", "userid", "status", "delivery_order"),
+        sa.Index("idx_recommendation_delivery_lease", "lease_expires_at", "status"),
         sa.Index("idx_recommendation_delivery_impression_due", "status", "impression_state", "impression_next_attempt_at"),
+        sa.Index("idx_recommendation_delivery_impression_lease", "impression_lease_expires_at", "impression_state"),
+        sa.Index("idx_recommendation_delivery_request", "request_id"),
+        sa.Index("idx_recommendation_delivery_msgid", "wecom_msgid"),
     )
 
 
@@ -786,6 +809,8 @@ class RecommendationImpression(Base):
         sa.UniqueConstraint("delivery_id", "target_type", "target_id", name="uk_recommendation_impression_delivery_target"),
         sa.Index("idx_recommendation_impression_viewer_time", "viewer_userid", "target_type", "exposed_at"),
         sa.Index("idx_recommendation_impression_target_time", "target_type", "target_id", "exposed_at"),
+        sa.Index("idx_recommendation_impression_version_time", "strategy_version_id", "exposed_at"),
+        sa.Index("idx_recommendation_impression_snapshot_position", "snapshot_id", "position"),
     )
 
 
