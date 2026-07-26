@@ -8,7 +8,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin_role
 from app.core.responses import ok
-from app.models import AdminUser, EventLog, RecommendationImpression, RecommendationRequest
+from app.models import (
+    AdminUser,
+    EventLog,
+    RecommendationDelivery,
+    RecommendationImpression,
+    RecommendationRequest,
+)
 
 router = APIRouter(prefix="/admin/recommendation-metrics", tags=["admin-recommendation"])
 
@@ -29,10 +35,18 @@ def metrics(
     requests = request_query.count()
     zero = request_query.filter(RecommendationRequest.is_zero_result.is_(True)).count()
     impressions = impression_query.count()
-    click_query = db.query(EventLog).filter(
+    click_query = db.query(EventLog).join(
+        RecommendationDelivery,
+        RecommendationDelivery.delivery_id == EventLog.delivery_id,
+    ).filter(
         EventLog.occurred_at >= since,
         EventLog.attribution_status == "attributed",
     )
+    if direction:
+        click_query = click_query.filter(
+            RecommendationDelivery.recommendation_context["direction"].as_string()
+            == direction
+        )
     clicks = click_query.count()
     users = impression_query.with_entities(func.count(func.distinct(RecommendationImpression.viewer_userid))).scalar() or 0
     return ok({

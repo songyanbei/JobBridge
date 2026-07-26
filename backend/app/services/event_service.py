@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -112,7 +113,15 @@ def record_click(
         attributed_version = context.get("strategy_version_id")
         attributed_algorithm = context.get("algorithm_version")
         attributed_exploration = bool(matched.get("is_exploration"))
-        dedupe_key = f"{delivery_id}:{position}:{client_event_id or target_id}"[:64]
+        dedupe_key = hashlib.sha256(
+            "|".join([
+                delivery_id or "",
+                str(position or ""),
+                client_event_id or "",
+                target_type,
+                str(target_id),
+            ]).encode("utf-8")
+        ).hexdigest()
         if db.query(EventLog.id).filter(
             EventLog.attribution_dedupe_key == dedupe_key,
         ).first():

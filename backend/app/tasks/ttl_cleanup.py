@@ -36,10 +36,17 @@ BATCH_SIZE = 500
 
 def _redact_expired_recommendation_content(db) -> int:
     result = db.execute(text(
-        "UPDATE recommendation_delivery "
-        "SET content_ciphertext=NULL, status=CASE WHEN status='sent' THEN 'redacted' ELSE status END "
-        "WHERE content_ciphertext IS NOT NULL "
-        "AND content_expires_at IS NOT NULL AND content_expires_at <= NOW(6)"
+        "UPDATE recommendation_delivery d "
+        "LEFT JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
+        "SET d.content_ciphertext=NULL, "
+        "d.status=CASE WHEN d.status IN ('prepared','pending','sending') THEN 'expired' "
+        "             WHEN d.status='sent' THEN 'redacted' ELSE d.status END, "
+        "o.status=CASE WHEN o.status IN ('pending','sending') THEN 'dead_letter' ELSE o.status END, "
+        "o.locked_at=NULL, o.next_attempt_at=NULL, "
+        "o.last_error=CASE WHEN o.status IN ('pending','sending') "
+        "                 THEN 'recommendation delivery expired before send' ELSE o.last_error END "
+        "WHERE d.content_ciphertext IS NOT NULL "
+        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
     ))
     db.commit()
     return int(result.rowcount or 0)

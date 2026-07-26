@@ -745,7 +745,10 @@ def search_jobs(
             "strategy_version_id": v1.get("strategy_version_id"),
             "algorithm_version": v1.get("algorithm_version", "recommendation-v1"),
             "assignment": getattr(v1.get("assignment"), "assignment", "legacy"),
-            "ranking_metadata": {"display_top_n": len(v1.get("items", []))},
+            "ranking_metadata": {
+                "display_top_n": len(v1.get("items", [])),
+                "precision_pool_ids": v1.get("precision_pool_ids", []),
+            },
         }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
@@ -946,7 +949,10 @@ def search_workers(
             "strategy_version_id": v1.get("strategy_version_id"),
             "algorithm_version": v1.get("algorithm_version", "recommendation-v1"),
             "assignment": getattr(v1.get("assignment"), "assignment", "legacy"),
-            "ranking_metadata": {"display_top_n": len(v1.get("items", []))},
+            "ranking_metadata": {
+                "display_top_n": len(v1.get("items", [])),
+                "precision_pool_ids": v1.get("precision_pool_ids", []),
+            },
         }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
@@ -1159,6 +1165,31 @@ def show_more(
         has_more=has_more,
         result_count=len(collected),
     )
+    snapshot = session.candidate_snapshot
+    if snapshot and snapshot.algorithm_version != "legacy" and snapshot.assignment != "legacy":
+        from app.schemas.recommendation import RecommendationItem, StrategyAssignment
+        assignment = StrategyAssignment(
+            direction=direction,
+            execution_mode="on",
+            assignment=snapshot.assignment,
+            strategy_version_id=snapshot.strategy_version_id,
+            algorithm_version=snapshot.algorithm_version,
+        )
+        sr.recommendation_items = [
+            RecommendationItem(
+                target_type="job" if direction == "search_job" else "resume",
+                target_id=int(item["id"]),
+                position=index,
+                final_score=0.0,
+            )
+            for index, item in enumerate(collected, 1)
+        ]
+        sr.snapshot_id = snapshot.snapshot_id
+        sr.request_id = snapshot.request_id
+        sr.query_digest = snapshot.query_digest
+        sr.strategy_assignment = assignment
+        sr.candidate_ids = list(snapshot.candidate_ids)
+        sr.precision_pool_ids = list(snapshot.ranking_metadata.get("precision_pool_ids", []))
     so = _build_search_outcome(
         direction=direction,
         criteria_used=effective_criteria,
@@ -1646,7 +1677,53 @@ def execute_relaxed_search(
             ranked_ids.append(cid)
 
     digest = conversation_service.compute_query_digest(relaxed)
-    conversation_service.save_snapshot(session, ranked_ids, digest, relaxed)
+    v1_meta = None
+    try:
+        from app.services.recommendation_assignment_service import choose_assignment
+        from app.services.recommendation_request_service import rank_candidate_dicts
+        decision = choose_assignment(
+            db, userid=user_ctx.external_userid, direction=direction,
+        )
+        if decision.version and decision.assignment.assignment != "legacy":
+            ordered, items = rank_candidate_dicts(
+                candidate_dicts,
+                direction=direction,
+                criteria=relaxed,
+                userid=user_ctx.external_userid,
+                query_digest=digest,
+                strategy_version=decision.version.id,
+                parameters=decision.version.parameters,
+                semantic_ranked_items=rerank_result.ranked_items,
+                rotation_date=datetime.now(timezone.utc).date().isoformat(),
+            )
+            ranked_ids = [item.candidate_id for item in ordered]
+            v1_meta = {
+                "items": items,
+                "request_id": decision.request_id,
+                "snapshot_id": decision.snapshot_id,
+                "assignment": decision.assignment,
+                "precision_pool_ids": ranked_ids[:20],
+            }
+    except Exception:
+        logger.exception("relaxed recommendation-v1 failed closed")
+    conversation_service.save_snapshot(
+        session, ranked_ids, digest, relaxed,
+        request_id=v1_meta["request_id"] if v1_meta else None,
+        snapshot_id=v1_meta["snapshot_id"] if v1_meta else None,
+        direction=direction if v1_meta else None,
+        strategy_version_id=(
+            v1_meta["assignment"].strategy_version_id if v1_meta else None
+        ),
+        algorithm_version=(
+            v1_meta["assignment"].algorithm_version if v1_meta else "legacy"
+        ),
+        assignment=(
+            v1_meta["assignment"].assignment if v1_meta else "legacy"
+        ),
+        ranking_metadata={
+            "precision_pool_ids": v1_meta["precision_pool_ids"]
+        } if v1_meta else {},
+    )
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
@@ -1710,6 +1787,13 @@ def execute_relaxed_search(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
+        recommendation_items=v1_meta["items"] if v1_meta else [],
+        snapshot_id=v1_meta["snapshot_id"] if v1_meta else None,
+        strategy_assignment=v1_meta["assignment"] if v1_meta else None,
+        request_id=v1_meta["request_id"] if v1_meta else None,
+        query_digest=digest if v1_meta else "",
+        candidate_ids=[str(c["id"]) for c in candidate_dicts] if v1_meta else [],
+        precision_pool_ids=v1_meta["precision_pool_ids"] if v1_meta else [],
     )
     # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
