@@ -8,6 +8,11 @@
 - 空召回：criteria_snapshot.recommend_count==0 占比
 - 待审：job + resume audit_status='pending'
 - 详情点击：event_log.count
+- 收到推荐：recommendation_impression.viewer_userid（§11.9，不再用对话日志估算）
+
+时间口径：自然日一律是 ``settings.scheduler_timezone``（v1 = Asia/Shanghai）业务日，
+边界由 ``app.core.time_utils.business_day_bounds()`` 换算成 naive UTC 后再与
+DATETIME 列比较（§9.12）。本模块不得出现 ``date.today()`` 或无时区 ``datetime.now()``。
 
 性能要求：缓存 60 秒，单次查询 < 500ms（缓存外）。
 """
@@ -15,7 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, func
@@ -23,10 +28,12 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
 from app.core.redis_client import get_redis
+from app.core.time_utils import business_date, business_day_bounds, to_naive_utc
 from app.models import (
     ConversationLog,
     EventLog,
     Job,
+    RecommendationImpression,
     Resume,
     SystemConfig,
     User,
@@ -47,9 +54,13 @@ def _config_int(db: Session, key: str, default: int) -> int:
 
 
 def _day_range(d: date) -> tuple[datetime, datetime]:
-    start = datetime.combine(d, time.min)
-    end = start + timedelta(days=1)
-    return start, end
+    """业务日 ``d`` 的 ``[start, end)``，naive UTC，可直接与 DATETIME 列比较。
+
+    以前这里是 ``datetime.combine(d, time.min)``——那是"宿主机本地日期的零点当成
+    UTC 用"，UTC+8 下每天都会错 8 小时（§9.12）。
+    """
+    start, end = business_day_bounds(d)
+    return to_naive_utc(start), to_naive_utc(end)
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +175,7 @@ def get_dashboard(db: Session, force_refresh: bool = False) -> dict:
     except Exception:
         logger.exception("report dashboard: redis cache read failed (fallback to DB)")
 
-    today = date.today()
+    today = business_date()
     yesterday = today - timedelta(days=1)
     data = {
         # 只有 today 才附带 audit_pending（当前时刻积压数，不可按历史日回溯）
@@ -190,10 +201,10 @@ def get_dashboard(db: Session, force_refresh: bool = False) -> dict:
 
 def get_trends(db: Session, range_str: str, frm: date | None, to: date | None) -> dict:
     if range_str == "7d":
-        end = date.today()
+        end = business_date()
         start = end - timedelta(days=6)
     elif range_str == "30d":
-        end = date.today()
+        end = business_date()
         start = end - timedelta(days=29)
     elif range_str == "custom":
         if not frm or not to:
@@ -218,8 +229,8 @@ def get_trends(db: Session, range_str: str, frm: date | None, to: date | None) -
 
 def get_top(db: Session, dim: str, limit: int = 10) -> list[dict]:
     limit = max(1, min(limit, 50))
-    today = date.today()
-    start = datetime.combine(today - timedelta(days=29), time.min)
+    today = business_date()
+    start, _ = _day_range(today - timedelta(days=29))
 
     if dim == "city":
         rows = db.query(Job.city, func.count(Job.id)).filter(
@@ -244,8 +255,8 @@ def get_top(db: Session, dim: str, limit: int = 10) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def get_funnel(db: Session) -> list[dict]:
-    today = date.today()
-    start = datetime.combine(today - timedelta(days=29), time.min)
+    today = business_date()
+    start, _ = _day_range(today - timedelta(days=29))
 
     registered = db.query(func.count(User.external_userid)).filter(User.registered_at >= start).scalar() or 0
 
@@ -259,18 +270,16 @@ def get_funnel(db: Session) -> list[dict]:
         ConversationLog.intent.in_(SEARCH_INTENTS),
     ).scalar() or 0
 
-    # 收到推荐：direction=out + 含推荐结果
-    out_logs = db.query(ConversationLog.userid, ConversationLog.criteria_snapshot).filter(
-        ConversationLog.created_at >= start,
-        ConversationLog.direction == "out",
-        ConversationLog.intent.in_(SEARCH_INTENTS),
-    ).all()
-    recommend_user_set: set[str] = set()
-    for userid, snap in out_logs:
-        data = snap if isinstance(snap, dict) else _safe_json(snap)
-        if isinstance(data, dict) and int(data.get("recommend_count") or 0) > 0:
-            recommend_user_set.add(userid)
-    recommend_users = len(recommend_user_set)
+    # 收到推荐：§11.9 明确改用曝光事实表，不再依赖"可能发送失败"的对话日志。
+    # conversation_log 的 direction='out' 只表示"系统生成了回复"，企微发送失败或
+    # delivery 卡在 pending/unknown 时那条日志照样存在，用它估算会系统性高估。
+    # recommendation_impression 只在 delivery 持久化为 sent 之后才派生（§14.5），
+    # 因此 distinct viewer_userid 才是真正"收到推荐"的人数。
+    recommend_users = db.query(
+        func.count(func.distinct(RecommendationImpression.viewer_userid)),
+    ).filter(
+        RecommendationImpression.exposed_at >= start,
+    ).scalar() or 0
 
     click_users = db.query(func.count(func.distinct(EventLog.userid))).filter(
         EventLog.occurred_at >= start,

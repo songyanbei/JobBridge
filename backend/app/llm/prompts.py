@@ -579,7 +579,15 @@ INTENT_PROMPT_VERSION = "v2.8"
 # 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
 PROMPT_VERSION = INTENT_PROMPT_VERSION
 PROMPT_DATE = "2026-05-02"
-RERANK_PROMPT_VERSION = "v2.1"
+
+# v2.2 (recommendation-v1, 方案 §11.5)：prompt 文本未变，但**送进 prompt 的候选
+#      契约变了** —— v1 只发 §6.2.1 预评分 Top 20 精排池、固定 top_n=3，返回的 rank
+#      按 §6.3.2 折算成固定语义分（未返回候选 0.50）。同一段 prompt 文本在新旧两种
+#      输入分布下的输出不可直接对比，因此必须 bump，让离线分析能按版本切分。
+#      legacy 路径保持历史候选切片配置，只是共用同一个版本号标记。
+# v2.1 (Phase 5 §5.3)：软偏好排序块。
+# v2.0 (2026-04-13)：首版。
+RERANK_PROMPT_VERSION = "v2.2"
 
 # 阶段二（dialogue-intent-extraction-phased-plan §2）：DialogueParseResult v2 prompt。
 # 与 INTENT_PROMPT_VERSION 解耦，独立 bump，便于 shadow / dual-read 期间对照分析。

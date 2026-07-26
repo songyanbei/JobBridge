@@ -149,9 +149,45 @@ class RecommendationPromoteRequest(BaseModel):
     change_reason: str = Field(min_length=1, max_length=255)
 
 
+class RecommendationPublishCandidateRequest(BaseModel):
+    """§11.7 要求所有写操作都带 change_reason 和 lock_version。
+
+    ``lock_version`` 锁 draft 行，``release_lock_version`` 锁 release 行——发布
+    候选同时会在 §9.3 历史表写一条 ``publish_candidate`` 快照并推进 revision。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    lock_version: int = Field(ge=1)
+    release_lock_version: int = Field(ge=1)
+    change_reason: str = Field(min_length=1, max_length=255)
+
+
 class RecommendationRuntimeControlUpdate(BaseModel):
     enabled: bool
     lock_version: int = Field(ge=1)
+    change_reason: str = Field(min_length=1, max_length=255)
+
+
+AdminRole = Literal["viewer", "operator", "super_admin"]
+
+
+class AdminUserCreateRequest(BaseModel):
+    """创建管理员时必须显式指定角色（§14.8）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=8, max_length=64)
+    role: AdminRole
+    display_name: str | None = Field(default=None, max_length=64)
+    change_reason: str = Field(min_length=1, max_length=255)
+
+
+class AdminRoleAssignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: AdminRole
     change_reason: str = Field(min_length=1, max_length=255)
 
 
@@ -250,6 +286,16 @@ class RecommendationSimulationResponse(BaseModel):
     draft: list[RecommendationItem] = Field(default_factory=list)
     request_id: str | None = None
     side_effects_written: bool = False
+    #: "stable" 或 "legacy"；stable_version_id=NULL 是合法的 legacy 对照（§7.2），
+    #: 对照侧必须给出 legacy 排序而不是空列表。
+    current_basis: Literal["stable", "legacy"] = "legacy"
+    #: 模拟走确定性流水线，不调用 LLM；语义分统一取中性值，据实声明避免误读。
+    simulation_mode: Literal["deterministic"] = "deterministic"
+    llm_invoked: bool = False
+    call_site: str = "recommendation_simulation"
+    exposure_available: bool = True
+    rank_changes: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_summaries: dict[str, Any] = Field(default_factory=dict)
 
 
 class RecommendationStrategyMetrics(BaseModel):

@@ -529,3 +529,98 @@ def set_cached_config(key: str, value: str, ttl: int = CONFIG_CACHE_TTL) -> None
         r.setex(f"{CONFIG_CACHE_PREFIX}{key}", ttl, value)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 推荐 v1：动态总开关分发通道（方案 §7.5 / §11.8）
+# ---------------------------------------------------------------------------
+
+# DB 才是真源；Redis 只是提交之后的加速通道，因此 key 带 30 秒 TTL：Pub/Sub 丢包
+# 由订阅方的 5 秒 DB 轮询收敛，key 过期后读取方自然回源，不会长期钉住旧值。
+RUNTIME_CONTROL_KEY = "recommendation:runtime_control"
+RUNTIME_CONTROL_CHANNEL = "recommendation:runtime_control"
+RUNTIME_CONTROL_TTL_SECONDS = 30
+
+
+def publish_runtime_control(payload: dict) -> bool:
+    """write-through 写 key 并广播 Pub/Sub；失败返回 False 交给调用方降级。
+
+    payload 必须携带 ``revision``，订阅方只接受不小于本地 revision 的更新。
+    """
+    body = json.dumps(payload, ensure_ascii=False, default=str)
+    try:
+        r = get_redis()
+        pipe = r.pipeline()
+        pipe.setex(RUNTIME_CONTROL_KEY, RUNTIME_CONTROL_TTL_SECONDS, body)
+        pipe.publish(RUNTIME_CONTROL_CHANNEL, body)
+        pipe.execute()
+        return True
+    except Exception:
+        logger.warning("runtime control write-through failed", exc_info=True)
+        return False
+
+
+def read_runtime_control() -> dict | None:
+    """读取 Redis 侧总开关快照；key 缺失或 Redis 故障统一返回 None。"""
+    try:
+        raw = get_redis().get(RUNTIME_CONTROL_KEY)
+    except Exception:
+        logger.warning("runtime control read failed", exc_info=True)
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def runtime_control_pubsub():
+    """返回已订阅总开关频道的 pubsub 对象；Redis 不可用时返回 None。"""
+    try:
+        pubsub = get_redis().pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(RUNTIME_CONTROL_CHANNEL)
+        return pubsub
+    except Exception:
+        logger.warning("runtime control subscribe failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 推荐 v1：不可变策略版本缓存（方案 §11.8）
+# ---------------------------------------------------------------------------
+
+# 只缓存"已发布/已归档"这类禁止再修改的 version 行，key 带 version ID，因此缓存
+# 回填永远不会把新指针覆盖成旧指针。可变的 release 指针明确不缓存。
+STRATEGY_VERSION_CACHE_PREFIX = "recommendation:strategy:"
+STRATEGY_VERSION_CACHE_TTL = 600
+
+
+def get_cached_strategy_version(version_id: int | str) -> dict | None:
+    try:
+        raw = get_redis().get(f"{STRATEGY_VERSION_CACHE_PREFIX}{version_id}")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def set_cached_strategy_version(
+    version_id: int | str,
+    payload: dict,
+    ttl: int = STRATEGY_VERSION_CACHE_TTL,
+) -> None:
+    try:
+        get_redis().setex(
+            f"{STRATEGY_VERSION_CACHE_PREFIX}{version_id}",
+            ttl,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
+    except Exception:
+        pass
