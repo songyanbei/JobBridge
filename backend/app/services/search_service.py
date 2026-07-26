@@ -527,6 +527,27 @@ def _build_search_outcome(
     )
 
 
+def _snapshot_is_v1(snapshot) -> bool:
+    """A snapshot produced by recommendation-v1 rather than the legacy ranker."""
+    if snapshot is None:
+        return False
+    return (
+        getattr(snapshot, "algorithm_version", "legacy") != "legacy"
+        or getattr(snapshot, "assignment", "legacy") != "legacy"
+    )
+
+
+def _recommendation_kill_switch(db: Session) -> bool:
+    """§7.5 fail-safe: an unreadable control plane counts as killed."""
+    try:
+        from app.services.recommendation_strategy_service import runtime_kill_switch
+
+        return bool(runtime_kill_switch(db))
+    except Exception:
+        logger.warning("runtime control unreadable; treating as kill switch on", exc_info=True)
+        return True
+
+
 def _try_recommendation_v1(
     *,
     candidate_dicts: list[dict],
@@ -1101,8 +1122,29 @@ def show_more(
     """
     is_job_search = _is_job_search(session, user_ctx)
     direction = "search_job" if is_job_search else "search_worker"
-    top_n = _get_config_int("match.top_n", db, 3)
+    # §5.4.1: a v1 snapshot is pinned to the fixed page size of 3.  Reading the
+    # legacy `match.top_n` here made paging drift off the v1 contract whenever
+    # the historical production value was not 3.
+    snapshot_is_v1 = _snapshot_is_v1(session.candidate_snapshot)
+    top_n = V1_DISPLAY_TOP_N if snapshot_is_v1 else _get_config_int("match.top_n", db, 3)
     flags = _normalize_experience_flags(experience_flags)
+
+    # §7.5: while the kill switch is on, a v1 snapshot must be invalidated
+    # immediately rather than continuing to page out a v1 ordering that the
+    # operator has just disabled.
+    if snapshot_is_v1 and _recommendation_kill_switch(db):
+        session.candidate_snapshot = None
+        session.shown_items = []
+        logger.warning("recommendation kill switch active; invalidated v1 snapshot for show_more")
+        sr = SearchResult(reply_text="搜索结果已过期，请重新搜索。")
+        so = _build_search_outcome(
+            direction=direction,
+            criteria_used={},
+            initial_count=0,
+            final_count=0,
+            desired_count=top_n,
+        )
+        return sr, so
 
     if session.candidate_snapshot is None:
         sr = SearchResult(reply_text="当前没有可以继续查看的结果，请先搜索。")
