@@ -540,11 +540,7 @@ def _handle_text(
             conversation_service.record_history(
                 session,
                 "assistant",
-                (
-                    "[recommendation_delivery]"
-                    if replies[0].recommendation_context
-                    else replies[0].content
-                ),
+                _history_reply_content(replies[0]),
             )
         conversation_service.save_session(userid, session)
         return replies
@@ -632,7 +628,7 @@ def _handle_text(
                     [_reply(userid, reply_text)],
                 )
                 conversation_service.record_history(
-                    session, "assistant", replies[0].content,
+                    session, "assistant", _history_reply_content(replies[0]),
                 )
                 conversation_service.save_session(userid, session)
                 return replies
@@ -643,7 +639,7 @@ def _handle_text(
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
-                        session, "assistant", replies[0].content,
+                        session, "assistant", _history_reply_content(replies[0]),
                     )
                 conversation_service.save_session(userid, session)
                 return replies
@@ -667,7 +663,7 @@ def _handle_text(
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
-                        session, "assistant", replies[0].content,
+                        session, "assistant", _history_reply_content(replies[0]),
                     )
                 conversation_service.save_session(userid, session)
                 return replies
@@ -686,7 +682,7 @@ def _handle_text(
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
-                        session, "assistant", replies[0].content,
+                        session, "assistant", _history_reply_content(replies[0]),
                     )
                 conversation_service.save_session(userid, session)
                 return replies
@@ -711,7 +707,7 @@ def _handle_text(
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
                     conversation_service.record_history(
-                        session, "assistant", replies[0].content,
+                        session, "assistant", _history_reply_content(replies[0]),
                     )
                 conversation_service.save_session(userid, session)
                 return replies
@@ -799,11 +795,7 @@ def _handle_text(
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
     replies = _finalize_action_plan_replies(replies)
     if replies:
-        history_content = (
-            "[recommendation_delivery]"
-            if replies[0].recommendation_context
-            else replies[0].content
-        )
+        history_content = _history_reply_content(replies[0])
         conversation_service.record_history(session, "assistant", history_content)
 
     conversation_service.save_session(userid, session)
@@ -1310,6 +1302,7 @@ def _route_v2_relaxation_response(
             user_ctx.external_userid,
             msg.msg_id,
             request_kind="confirmed_relaxed",
+            parent_request_id=pending.get("parent_request_id"),
         )
         if recommendation_fields:
             replies = [
@@ -1977,7 +1970,11 @@ def _post_search_dispatch(
     # 以保持与旧路径同构（便于 worker 落库 / 监控大盘）。
     enriched: list[ReplyMessage] = []
     for r in replies:
-        updates = dict(recommendation_fields)
+        updates = (
+            {}
+            if r.recommendation_context is not None
+            else dict(recommendation_fields)
+        )
         if r.intent is None:
             updates.update({
                 "intent": legacy_intent,
@@ -2758,22 +2755,33 @@ def _snapshot_meta(session: SessionState) -> dict:
     }
 
 
+def _history_reply_content(reply: ReplyMessage) -> str:
+    """Never persist recommendation plaintext in Redis or durable session payloads."""
+    return (
+        "[recommendation_delivery]"
+        if reply.recommendation_context
+        else reply.content
+    )
+
+
 def _recommendation_reply_fields(
     search_result,
     userid: str,
     source_inbound_msg_id: str,
     request_kind: str = "initial_search",
+    parent_request_id: str | None = None,
 ) -> dict:
     """Carry the recommendation contract from search to the durable outbox."""
     items = list(getattr(search_result, "recommendation_items", []) or [])
     assignment = getattr(search_result, "strategy_assignment", None)
     if not items or not assignment or getattr(assignment, "assignment", "legacy") == "legacy":
         return {}
-    parent_request_id = getattr(search_result, "request_id", None)
+    result_request_id = getattr(search_result, "request_id", None)
+    parent_request_id = parent_request_id or result_request_id
     request_id = (
         str(uuid.uuid4())
         if request_kind in {"show_more", "confirmed_relaxed"}
-        else parent_request_id or str(uuid.uuid4())
+        else result_request_id or str(uuid.uuid4())
     )
     context = RecommendationDeliveryContext(
         delivery_id=str(uuid.uuid4()),
@@ -2796,7 +2804,7 @@ def _recommendation_reply_fields(
             request_kind=request_kind,
             parent_request_id=(
                 parent_request_id
-                if request_kind in {"show_more", "confirmed_relaxed"}
+                if request_kind in {"show_more", "confirmed_relaxed", "auto_relaxed"}
                 else None
             ),
             viewer_userid=userid,

@@ -193,6 +193,10 @@ def _handle_ask_clarification(ctx: PostSearchContext) -> list[ReplyMessage]:
         # 二次 _rerank_with_logging 做归因（与主搜索一致）。
         "raw_query": ctx.raw_query,
         "user_msg_id": ctx.msg.msg_id,
+        "parent_request_id": (
+            getattr(ctx.search_result, "request_id", None)
+            or getattr(ctx.session.candidate_snapshot, "request_id", None)
+        ),
         "expires_at": expires_at,
     }
 
@@ -276,7 +280,8 @@ def _handle_auto_relax_and_retry(
         new_result,
         ctx.user_ctx.external_userid,
         ctx.msg.msg_id,
-        request_kind="confirmed_relaxed",
+        request_kind="auto_relaxed",
+        parent_request_id=getattr(ctx.search_result, "request_id", None),
     )
     return [
         reply.model_copy(update=fields) if fields else reply

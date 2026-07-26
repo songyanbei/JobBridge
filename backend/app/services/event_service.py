@@ -116,8 +116,8 @@ def record_click(
         attributed_exploration = bool(matched.get("is_exploration"))
         dedupe_key = hashlib.sha256(
             "|".join([
-                delivery_id or "",
                 "miniprogram_click",
+                delivery_id or "",
                 target_type,
                 str(target_id),
             ]).encode("utf-8")

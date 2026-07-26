@@ -103,7 +103,7 @@ def prepare_delivery(
             db.add(RecommendationSearchAttempt(
                 attempt_id=attempt_id,
                 request_id=request_id,
-                attempt_no=1,
+                attempt_no=0,
                 attempt_kind=str(fact.get("request_kind") or "initial_search"),
                 criteria_digest=str(ctx.get("query_digest") or ""),
                 scoring_time_utc=datetime.now(timezone.utc),

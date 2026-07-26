@@ -79,3 +79,23 @@ def test_search_request_identity_is_preserved_into_delivery_contract():
     assert fields["recommendation_context"].request_id == "request-1"
     assert fields["recommendation_context"].query_digest == "digest-1"
     assert fields["recommendation_request"].source_inbound_msg_id == "wx-msg-1"
+
+
+def test_recommendation_history_is_always_redacted():
+    from app.schemas.conversation import ReplyMessage
+    from app.services.message_router import _history_reply_content
+    reply = ReplyMessage(
+        userid="u1",
+        content="sensitive recommendation body",
+        recommendation_context={
+            "delivery_id": "d1",
+            "request_id": "r1",
+            "viewer_userid": "u1",
+            "direction": "search_job",
+            "assignment": "candidate",
+            "algorithm_version": "recommendation-v1",
+            "query_digest": "q1",
+            "items": [],
+        },
+    )
+    assert _history_reply_content(reply) == "[recommendation_delivery]"

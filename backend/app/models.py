@@ -677,6 +677,7 @@ class RecommendationRequest(Base):
         sa.UniqueConstraint("source_inbound_msg_id", "request_index", name="uk_recommendation_request_inbound_index"),
         sa.Index("idx_recommendation_request_viewer_time", "viewer_userid", "direction", "created_at"),
         sa.Index("idx_recommendation_request_attempt", "served_attempt_id"),
+        sa.Index("idx_recommendation_request_parent", "parent_request_id"),
     )
 
 
