@@ -7,10 +7,18 @@ from typing import Any, Mapping
 from app.schemas.recommendation import RecommendationItem, RecommendationScoreDetail, RecommendationStrategyParameters
 from app.services.recommendation_diversity_service import apply_repeat_factor, rank_candidates
 from app.services.recommendation_scoring_service import (
+    V1_ALGORITHM_VERSION,
+    V1_DISPLAY_TOP_N,
+    V1_MAX_CANDIDATES,
+    V1_PRECISION_POOL_SIZE,
     ScoredCandidate,
     build_scored_candidate,
+    extract_recommendation_v1_soft_preferences,
     pre_score,
+    quality_score,
+    salary_fit_score,
     semantic_scores,
+    soft_preference_score,
     stable_hash_hex,
 )
 
@@ -23,24 +31,29 @@ def precision_pool(
     userid: str,
     query_digest: str,
 ) -> list[str]:
+    """§6.2.1 deterministic pre-scoring.
+
+    Sort key is `(-pre_score, pre_tie_hash)` where the hash is compared as an
+    ascending hex string, so the Top-20 is fully reproducible for a fixed
+    (viewer, query digest, candidate set).
+    """
     scored = []
     for candidate in candidate_dicts:
-        salary = None
         try:
-            from app.services.recommendation_scoring_service import salary_fit_score, quality_score, soft_preference_score, extract_recommendation_v1_soft_preferences
             salary = salary_fit_score(direction, criteria, candidate)
-            soft = soft_preference_score(extract_recommendation_v1_soft_preferences(criteria, direction), candidate)
+            soft = soft_preference_score(
+                extract_recommendation_v1_soft_preferences(criteria, direction), candidate,
+            )
             quality = quality_score(candidate, direction)
         except Exception:
-            soft = None
-            quality = None
+            salary = soft = quality = None
         scored.append((
             pre_score(salary=salary, soft=soft, quality=quality),
-            stable_hash_hex(userid, direction, query_digest, "recommendation-v1", candidate.get("id")),
+            stable_hash_hex(userid, direction, query_digest, V1_ALGORITHM_VERSION, candidate.get("id")),
             str(candidate.get("id")),
         ))
     scored.sort(key=lambda item: (-item[0], item[1]))
-    return [item[2] for item in scored[:20]]
+    return [item[2] for item in scored[:V1_PRECISION_POOL_SIZE]]
 
 
 def rank_candidate_dicts(
@@ -55,6 +68,8 @@ def rank_candidate_dicts(
     semantic_ranked_items: list[Mapping[str, Any]] | None = None,
     exposure_counts: Mapping[str, int] | None = None,
     recent_exposures: Mapping[str, Any] | None = None,
+    exposure_available: bool = True,
+    precision_pool_ids: list[str] | None = None,
     snapshot_shown_ids: set[str] | None = None,
     rotation_date: str = "",
     now: datetime | None = None,
@@ -64,11 +79,15 @@ def rank_candidate_dicts(
         if parameters is None
         else RecommendationStrategyParameters.model_validate(parameters)
     )
-    candidate_ids = [str(item.get("id")) for item in candidate_dicts]
-    precision_ids = set(precision_pool(
-        candidate_dicts, direction=direction, criteria=criteria,
+    pool = list(candidate_dicts[:V1_MAX_CANDIDATES])
+    candidate_ids = [str(item.get("id")) for item in pool]
+    # The caller normally already computed the precision pool to build the LLM
+    # request; recomputing it here would double the deterministic pre-scoring
+    # work and risk the two copies drifting apart.
+    precision_ids = list(precision_pool_ids) if precision_pool_ids is not None else precision_pool(
+        pool, direction=direction, criteria=criteria,
         userid=userid, query_digest=query_digest,
-    ))
+    )
     semantic = semantic_scores(
         precision_ids,
         semantic_ranked_items,
@@ -76,7 +95,7 @@ def rank_candidate_dicts(
     )
     counts = dict(exposure_counts or {})
     scored: list[ScoredCandidate] = []
-    for candidate in candidate_dicts[:50]:
+    for candidate in pool:
         cid = str(candidate.get("id"))
         item = build_scored_candidate(
             candidate,
@@ -91,9 +110,14 @@ def rank_candidate_dicts(
         )
         scored.append(item)
     # Convert exposure counts into the within-pool percentile opportunity.
-    ordered_counts = {item.candidate_id: item.exposure_count for item in scored}
+    # §6.6: when the exposure service is unavailable every candidate keeps the
+    # strictly neutral 0.5 so the relative order is unchanged.
     from app.services.recommendation_exposure_service import exposure_opportunities
-    opportunities = exposure_opportunities(ordered_counts, candidate_ids)
+    opportunities = (
+        exposure_opportunities({item.candidate_id: item.exposure_count for item in scored}, candidate_ids)
+        if exposure_available
+        else {cid: 0.5 for cid in candidate_ids}
+    )
     for item in scored:
         item.exposure_opportunity = opportunities.get(item.candidate_id, 0.5)
         item.base_score = (
@@ -111,7 +135,7 @@ def rank_candidate_dicts(
     )
     ordered = rank_candidates(
         scored,
-        target=min(3, len(scored)),
+        target=min(V1_DISPLAY_TOP_N, len(scored)),
         configured_owner_limit=params.same_owner_top_n_limit,
         diversity_level=params.diversity_level.value,
         exploration_percentage=params.exploration_percentage,
@@ -122,7 +146,7 @@ def rank_candidate_dicts(
         rotation_date=rotation_date,
         snapshot_shown_ids=snapshot_shown_ids,
     )
-    top = ordered[:3]
+    top = ordered[:V1_DISPLAY_TOP_N]
     items = [
         RecommendationItem(
             target_type="job" if direction == "search_job" else "resume",

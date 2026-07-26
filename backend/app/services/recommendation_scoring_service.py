@@ -74,17 +74,39 @@ def bucket_hit(percentage: int, *parts: Any) -> bool:
     return stable_bucket(*parts) < percentage * 100
 
 
+def _coalesce(value: float | None, default: float) -> float:
+    """`clamp(...) or default` silently rewrites a legitimate 0.0 into the
+    default, which shifts precision-pool membership and ranking.  Only a真正的
+    None may fall back."""
+    return default if value is None else value
+
+
+def normalize_components_detailed(
+    components: Mapping[str, tuple[float | None, float]],
+    *,
+    default: float = 0.5,
+) -> tuple[float, int]:
+    """Return (score, present_component_count).
+
+    Weights are renormalized over the present components only (§6.2.1/§6.3.5);
+    a missing component must never be silently treated as 0.
+    """
+    present = [(score, weight) for score, weight in components.values() if score is not None]
+    if not present:
+        return default, 0
+    numerator = sum(float(score) * weight for score, weight in present)
+    denominator = sum(weight for _, weight in present)
+    if denominator <= 0:
+        return default, 0
+    return _coalesce(clamp(numerator / denominator), default), len(present)
+
+
 def normalize_components(
     components: Mapping[str, tuple[float | None, float]],
     *,
     default: float = 0.5,
 ) -> float:
-    present = [(score, weight) for score, weight in components.values() if score is not None]
-    if not present:
-        return default
-    numerator = sum(float(score) * weight for score, weight in present)
-    denominator = sum(weight for _, weight in present)
-    return clamp(numerator / denominator) or default
+    return normalize_components_detailed(components, default=default)[0]
 
 
 def semantic_scores(
@@ -168,15 +190,21 @@ def soft_preference_score(
     return clamp(weighted_hits / weighted_total)
 
 
-def salary_fit_score(
+def salary_fit_score_detailed(
     direction: Direction,
     criteria: Mapping[str, Any],
     candidate: Mapping[str, Any] | Any,
-) -> float | None:
+) -> tuple[float | None, bool]:
+    """Return (score, hard_filter_contract_broken).
+
+    §6.3.3: a candidate whose pay cannot satisfy the query should already have
+    been removed by the hard filter.  If one still arrives here the salary score
+    is 0 *and* the候选 must be dropped from the result, not merely down-ranked.
+    """
     if direction == "search_job":
         query_salary = criteria.get("salary_floor_monthly")
         if query_salary is None:
-            return None
+            return None, False
         effective_max = _value(candidate, "salary_ceiling_monthly")
         if effective_max is None:
             effective_max = _value(candidate, "salary_floor_monthly")
@@ -184,23 +212,35 @@ def salary_fit_score(
             q = float(query_salary)
             effective_max = float(effective_max)
         except (TypeError, ValueError):
-            return None
+            return None, False
+        if not math.isfinite(q) or not math.isfinite(effective_max):
+            return None, False
         if effective_max < q:
-            return 0.0
-        return 0.5 + 0.5 * min(max((effective_max - q) / max(0.3 * q, 1), 0), 1)
+            return 0.0, True
+        return 0.5 + 0.5 * min(max((effective_max - q) / max(0.3 * q, 1), 0), 1), False
 
     budget = criteria.get("salary_ceiling_monthly")
     expectation = _value(candidate, "salary_expect_floor_monthly")
     if budget is None or expectation is None:
-        return None
+        return None, False
     try:
         budget = float(budget)
         expectation = float(expectation)
     except (TypeError, ValueError):
-        return None
+        return None, False
+    if not math.isfinite(budget) or not math.isfinite(expectation):
+        return None, False
     if expectation > budget:
-        return 0.0
-    return 0.5 + 0.5 * min(max((budget - expectation) / max(0.3 * budget, 1), 0), 1)
+        return 0.0, True
+    return 0.5 + 0.5 * min(max((budget - expectation) / max(0.3 * budget, 1), 0), 1), False
+
+
+def salary_fit_score(
+    direction: Direction,
+    criteria: Mapping[str, Any],
+    candidate: Mapping[str, Any] | Any,
+) -> float | None:
+    return salary_fit_score_detailed(direction, criteria, candidate)[0]
 
 
 def quality_score(candidate: Mapping[str, Any] | Any, direction: Direction) -> float:
@@ -219,7 +259,15 @@ def quality_score(candidate: Mapping[str, Any] | Any, direction: Direction) -> f
     return sum(_has_value(_value(candidate, field)) for field in fields) / len(fields)
 
 
-def freshness_score(created_at: Any, now: datetime | None = None) -> float:
+FRESHNESS_HALF_LIFE_HOURS = 72
+
+
+def freshness_score_detailed(created_at: Any, now: datetime | None = None) -> tuple[float, str | None]:
+    """Return (score, diagnostic_reason).
+
+    §6.5: missing/illegal `created_at` scores 0.5 and records a reason; a future
+    timestamp is treated as age 0 and records a clock anomaly.
+    """
     now = now or datetime.now(timezone.utc)
     try:
         created = created_at
@@ -227,10 +275,31 @@ def freshness_score(created_at: Any, now: datetime | None = None) -> float:
             created = datetime.fromisoformat(created.replace("Z", "+00:00"))
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        age_hours = max((now.astimezone(timezone.utc) - created.astimezone(timezone.utc)).total_seconds() / 3600, 0)
+        delta_hours = (
+            now.astimezone(timezone.utc) - created.astimezone(timezone.utc)
+        ).total_seconds() / 3600
     except (AttributeError, TypeError, ValueError):
-        return 0.5
-    return 2 ** (-age_hours / 72)
+        return 0.5, "freshness_created_at_invalid"
+    reason = "freshness_clock_anomaly" if delta_hours < 0 else None
+    age_hours = max(delta_hours, 0)
+    return 2 ** (-age_hours / FRESHNESS_HALF_LIFE_HOURS), reason
+
+
+def freshness_score(created_at: Any, now: datetime | None = None) -> float:
+    return freshness_score_detailed(created_at, now)[0]
+
+
+def match_score_detailed(
+    *,
+    semantic: float | None,
+    salary: float | None,
+    soft: float | None,
+) -> tuple[float, bool]:
+    """Return (match_score, all_components_missing) per §6.3.5."""
+    value, present = normalize_components_detailed(
+        {"semantic": (clamp(semantic), 0.50), "salary": (clamp(salary), 0.30), "soft": (clamp(soft), 0.20)}
+    )
+    return value, present == 0
 
 
 def match_score(
@@ -239,9 +308,7 @@ def match_score(
     salary: float | None,
     soft: float | None,
 ) -> float:
-    return normalize_components(
-        {"semantic": (clamp(semantic), 0.50), "salary": (clamp(salary), 0.30), "soft": (clamp(soft), 0.20)}
-    )
+    return match_score_detailed(semantic=semantic, salary=salary, soft=soft)[0]
 
 
 def pre_score(
@@ -269,17 +336,24 @@ def base_score(
     total = match_weight + quality_weight + freshness_weight + exposure_weight
     if total <= 0:
         return 0.5
-    return clamp(
-        (
-            match_weight * match
-            + quality_weight * quality
-            + freshness_weight * freshness
-            + exposure_weight * exposure
-        ) / total
-    ) or 0.5
+    return _coalesce(
+        clamp(
+            (
+                match_weight * match
+                + quality_weight * quality
+                + freshness_weight * freshness
+                + exposure_weight * exposure
+            ) / total
+        ),
+        0.5,
+    )
 
 
-@dataclass
+# `eq=False` keeps identity semantics.  The diversity greedy uses `candidate not
+# in near` / `candidate not in selected`, and field-wise equality would both
+# conflate two candidates that happen to score identically and make the dataclass
+# unhashable.
+@dataclass(eq=False)
 class ScoredCandidate:
     candidate_id: str
     owner_userid: str | None
@@ -295,6 +369,12 @@ class ScoredCandidate:
     base_score: float = 0.5
     repeat_factor: float = 1.0
     repeat_adjusted_score: float = 0.5
+    # Diagnostics surfaced into the snapshot / attempt facts.
+    diversity_penalty: float = 0.0
+    repeat_bucket: str = "unseen"
+    layer: str = "near"
+    hard_filter_contract_broken: bool = False
+    match_components_all_missing: bool = False
     is_exploration: bool = False
     reason_codes: list[str] = field(default_factory=list)
 
@@ -311,24 +391,25 @@ def build_scored_candidate(
     exposure_count: int = 0,
     now: datetime | None = None,
 ) -> ScoredCandidate:
-    salary = salary_fit_score(direction, criteria, candidate)
+    salary, contract_broken = salary_fit_score_detailed(direction, criteria, candidate)
     preferences = extract_recommendation_v1_soft_preferences(criteria, direction)
     soft = soft_preference_score(preferences, candidate)
     quality = quality_score(candidate, direction)
-    freshness = freshness_score(_value(candidate, "created_at"), now)
+    freshness, freshness_reason = freshness_score_detailed(_value(candidate, "created_at"), now)
     scored = ScoredCandidate(
         candidate_id=str(candidate_id),
         owner_userid=owner_userid,
         data=candidate,
-        semantic_score=clamp(semantic) or 0.5,
+        semantic_score=_coalesce(clamp(semantic), 0.5),
         salary_score=salary,
         soft_score=soft,
         quality_score=quality,
         freshness_score=freshness,
         exposure_count=int(exposure_count or 0),
-        exposure_opportunity=clamp(exposure_opportunity) or 0.5,
+        exposure_opportunity=_coalesce(clamp(exposure_opportunity), 0.5),
+        hard_filter_contract_broken=contract_broken,
     )
-    scored.match_score = match_score(
+    scored.match_score, scored.match_components_all_missing = match_score_detailed(
         semantic=scored.semantic_score, salary=salary, soft=soft
     )
     scored.base_score = base_score(
@@ -338,4 +419,10 @@ def build_scored_candidate(
         exposure=scored.exposure_opportunity,
     )
     scored.repeat_adjusted_score = scored.base_score
+    if freshness_reason:
+        scored.reason_codes.append(freshness_reason)
+    if contract_broken:
+        scored.reason_codes.append("hard_filter_contract_broken")
+    if scored.match_components_all_missing:
+        scored.reason_codes.append("match_components_all_missing")
     return scored

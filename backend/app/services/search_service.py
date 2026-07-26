@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
+from app.core.time_utils import rotation_date, utc_now
 from app.llm import get_reranker
 from app.llm.base import RerankResult
 from app.models import Job, Resume, SystemConfig, User
@@ -41,6 +42,11 @@ from app.services.recommendation_reason_service import (
     project_job_for_explanation,
     project_resume_for_explanation,
     render_match_reasons,
+)
+from app.services.recommendation_scoring_service import (
+    V1_DISPLAY_TOP_N,
+    V1_MAX_CANDIDATES,
+    V1_PRECISION_POOL_SIZE,
 )
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
@@ -524,7 +530,6 @@ def _try_recommendation_v1(
     direction: str,
     criteria: dict,
     userid: str,
-    rerank_result: RerankResult,
     db: Session,
     raw_query: str,
     assignment_decision=None,
@@ -556,26 +561,38 @@ def _try_recommendation_v1(
             query=raw_query,
             candidates=precision_candidates,
             role="worker" if direction == "search_job" else "factory",
-            top_n=len(precision_candidates),
+            top_n=V1_DISPLAY_TOP_N,
             call_site=f"recommendation_v1_{direction}",
         )
+        candidate_ids = [str(item.get("id")) for item in candidate_dicts[:V1_MAX_CANDIDATES]]
+        target_type = "job" if direction == "search_job" else "resume"
+        request_now_utc = utc_now()
+        parameters = assignment.version.parameters
+        # §10.6: exposure reads are an observability side channel.  A failure
+        # degrades the exposure component to the neutral 0.5 for every candidate
+        # and keeps the request on v1 — it must not drag the whole strategy back
+        # to legacy the way a control-plane failure does.
         from app.services.recommendation_exposure_service import (
             batch_candidate_exposures,
             recent_user_exposures,
         )
-        candidate_ids = [str(item.get("id")) for item in candidate_dicts[:50]]
-        target_type = "job" if direction == "search_job" else "resume"
-        request_now_utc = datetime.now(timezone.utc)
-        parameters = assignment.version.parameters
-        exposure_counts = batch_candidate_exposures(
-            db, target_type=target_type, candidate_ids=candidate_ids,
-            request_now_utc=request_now_utc,
-        )
-        recent_exposures = recent_user_exposures(
-            db, viewer_userid=userid, target_type=target_type,
-            candidate_ids=candidate_ids, request_now_utc=request_now_utc,
-            cooldown_hours=int(parameters.get("repeat_cooldown_hours", 24)),
-        )
+        try:
+            exposure_counts = batch_candidate_exposures(
+                db, target_type=target_type, candidate_ids=candidate_ids,
+                request_now_utc=request_now_utc,
+            )
+            recent_exposures = recent_user_exposures(
+                db, viewer_userid=userid, target_type=target_type,
+                candidate_ids=candidate_ids, request_now_utc=request_now_utc,
+                cooldown_hours=int(parameters.get("repeat_cooldown_hours", 24)),
+            )
+            exposure_available = True
+        except Exception:
+            logger.warning(
+                "recommendation-v1 exposure read failed; falling back to neutral "
+                "exposure opportunity", exc_info=True,
+            )
+            exposure_counts, recent_exposures, exposure_available = {}, {}, False
         ordered, items = rank_candidate_dicts(
             candidate_dicts,
             direction=direction,
@@ -587,7 +604,10 @@ def _try_recommendation_v1(
             semantic_ranked_items=semantic_result.ranked_items,
             exposure_counts=exposure_counts,
             recent_exposures=recent_exposures,
-            rotation_date=datetime.now(timezone.utc).date().isoformat(),
+            exposure_available=exposure_available,
+            precision_pool_ids=precision_ids,
+            rotation_date=rotation_date(request_now_utc),
+            now=request_now_utc,
         )
         return {
             "ids": [candidate.candidate_id for candidate in ordered],
@@ -599,7 +619,7 @@ def _try_recommendation_v1(
             "strategy_version_id": str(assignment.version.id),
             "algorithm_version": getattr(assignment.version, "algorithm_version", "recommendation-v1"),
             "query_digest": query_digest,
-            "candidate_ids": [str(item.get("id")) for item in candidate_dicts[:50]],
+            "candidate_ids": candidate_ids,
             "precision_pool_ids": precision_ids,
             "candidate_scores": {
                 item.candidate_id: {
@@ -649,10 +669,16 @@ def search_jobs(
         )
         is_v1 = assignment_decision.assignment.assignment != "legacy"
     except Exception:
+        logger.warning("recommendation release lookup failed; serving legacy", exc_info=True)
         assignment_decision = None
         is_v1 = False
-    top_n = 3 if is_v1 else _get_config_int("match.top_n", db, 3)
-    max_candidates = 50 if is_v1 else _get_config_int("match.max_candidates", db, 50)
+    # §5.4.1: legacy keeps reading the historical generic config; v1 is pinned to
+    # the code constants.  Both are resolved up front so a v1 failure can still
+    # fall back to genuine legacy behaviour.
+    legacy_top_n = _get_config_int("match.top_n", db, 3)
+    legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
+    top_n = V1_DISPLAY_TOP_N if is_v1 else legacy_top_n
+    max_candidates = V1_MAX_CANDIDATES if is_v1 else legacy_max_candidates
     flags = _normalize_experience_flags(experience_flags)
 
     # 硬过滤
@@ -717,12 +743,25 @@ def search_jobs(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "job_search", flags,
     )
-    rerank_result = (
-        RerankResult(ranked_items=[])
-        if is_v1 else
-        _rerank_with_logging(
+    # v1 runs first because it owns its own precision-pool LLM call.  Only when
+    # it declines (legacy assignment) or fails do we fall back to the legacy
+    # reranker — skipping both would hand the user raw SQL `created_at DESC`.
+    v1 = _try_recommendation_v1(
+        candidate_dicts=candidate_dicts,
+        direction="search_job",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        db=db,
+        raw_query=raw_query,
+        assignment_decision=assignment_decision,
+    ) if is_v1 else None
+    if v1 is None:
+        if is_v1:
+            logger.warning("recommendation-v1 unavailable for search_jobs; serving legacy ranking")
+            top_n = legacy_top_n
+        rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts,
+            candidates=candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_jobs",
@@ -730,19 +769,10 @@ def search_jobs(
             soft_preferences=soft_prefs,
             ranking_weights=ranking_weights,
         )
-    )
+    else:
+        rerank_result = RerankResult(ranked_items=[])
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
-    v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
-        direction="search_job",
-        criteria=criteria,
-        userid=user_ctx.external_userid,
-        rerank_result=rerank_result,
-        db=db,
-        raw_query=raw_query,
-        assignment_decision=assignment_decision,
-    )
     ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     # 如果 rerank 只返回了 top_n，把剩余候选补到后面
     ranked_id_set = set(ranked_ids)
@@ -863,10 +893,15 @@ def search_workers(
         )
         is_v1 = assignment_decision.assignment.assignment != "legacy"
     except Exception:
+        logger.warning("recommendation release lookup failed; serving legacy", exc_info=True)
         assignment_decision = None
         is_v1 = False
-    top_n = 3 if is_v1 else _get_config_int("match.top_n", db, 3)
-    max_candidates = 50 if is_v1 else _get_config_int("match.max_candidates", db, 50)
+    # §5.4.1: legacy keeps reading the historical generic config; v1 is pinned to
+    # the code constants.
+    legacy_top_n = _get_config_int("match.top_n", db, 3)
+    legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
+    top_n = V1_DISPLAY_TOP_N if is_v1 else legacy_top_n
+    max_candidates = V1_MAX_CANDIDATES if is_v1 else legacy_max_candidates
     flags = _normalize_experience_flags(experience_flags)
 
     candidates = _query_resumes(criteria, max_candidates, db)
@@ -925,12 +960,23 @@ def search_workers(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "candidate_search", flags,
     )
-    rerank_result = (
-        RerankResult(ranked_items=[])
-        if is_v1 else
-        _rerank_with_logging(
+    # See search_jobs: v1 first, legacy rerank only as the declined/failed path.
+    v1 = _try_recommendation_v1(
+        candidate_dicts=candidate_dicts,
+        direction="search_worker",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        db=db,
+        raw_query=raw_query,
+        assignment_decision=assignment_decision,
+    ) if is_v1 else None
+    if v1 is None:
+        if is_v1:
+            logger.warning("recommendation-v1 unavailable for search_workers; serving legacy ranking")
+            top_n = legacy_top_n
+        rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts,
+            candidates=candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_workers",
@@ -938,18 +984,9 @@ def search_workers(
             soft_preferences=soft_prefs,
             ranking_weights=ranking_weights,
         )
-    )
+    else:
+        rerank_result = RerankResult(ranked_items=[])
 
-    v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
-        direction="search_worker",
-        criteria=criteria,
-        userid=user_ctx.external_userid,
-        rerank_result=rerank_result,
-        db=db,
-        raw_query=raw_query,
-        assignment_decision=assignment_decision,
-    )
     ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     ranked_id_set = set(ranked_ids)
     for c in candidate_dicts:
@@ -1643,14 +1680,16 @@ def execute_relaxed_search(
             db, userid=user_ctx.external_userid, direction=direction,
         )
     except Exception:
-        pass
+        logger.warning("recommendation release lookup failed; serving legacy", exc_info=True)
     relaxed_is_v1 = bool(
         relaxed_decision
         and relaxed_decision.version
         and relaxed_decision.assignment.assignment != "legacy"
     )
-    top_n = 3 if relaxed_is_v1 else _get_config_int("match.top_n", db, 3)
-    max_candidates = 50 if relaxed_is_v1 else _get_config_int("match.max_candidates", db, 50)
+    legacy_top_n = _get_config_int("match.top_n", db, 3)
+    legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
+    top_n = V1_DISPLAY_TOP_N if relaxed_is_v1 else legacy_top_n
+    max_candidates = V1_MAX_CANDIDATES if relaxed_is_v1 else legacy_max_candidates
     flags = _normalize_experience_flags(experience_flags)
 
     if direction == "search_job":
@@ -1704,91 +1743,50 @@ def execute_relaxed_search(
 
     frame = "candidate_search" if direction == "search_worker" else "job_search"
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame, flags)
-    rerank_result = _rerank_with_logging(
-        query=raw_query,
-        candidates=candidate_dicts,
-        role=user_ctx.role,
-        top_n=top_n,
-        call_site=f"execute_relaxed_search:{direction}",
-        user_msg_id=user_msg_id,
-        soft_preferences=soft_prefs,
-        ranking_weights=ranking_weights,
-    )
-    ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    digest = conversation_service.compute_query_digest(relaxed)
+
+    # The relaxed path shares the exact v1 entry point used by the initial
+    # search, so it inherits the §6.2 "LLM input = precision Top 20" contract and
+    # the §6.3.4 algorithm isolation.  Previously it reranked the whole pool with
+    # the *legacy* soft-preference gate and fed those ranks into v1 as semantic
+    # scores, which broke both contracts at once.
+    v1_meta = _try_recommendation_v1(
+        candidate_dicts=candidate_dicts,
+        direction=direction,
+        criteria=relaxed,
+        userid=user_ctx.external_userid,
+        db=db,
+        raw_query=raw_query,
+        assignment_decision=relaxed_decision,
+    ) if relaxed_is_v1 else None
+
+    if v1_meta is None:
+        if relaxed_is_v1:
+            logger.warning(
+                "recommendation-v1 unavailable for execute_relaxed_search:%s; "
+                "serving legacy ranking", direction,
+            )
+            top_n = legacy_top_n
+        rerank_result = _rerank_with_logging(
+            query=raw_query,
+            candidates=candidate_dicts[:legacy_max_candidates],
+            role=user_ctx.role,
+            top_n=top_n,
+            call_site=f"execute_relaxed_search:{direction}",
+            user_msg_id=user_msg_id,
+            soft_preferences=soft_prefs,
+            ranking_weights=ranking_weights,
+        )
+        ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
+    else:
+        rerank_result = RerankResult(ranked_items=[])
+        ranked_ids = list(v1_meta["ids"])
     ranked_id_set = set(ranked_ids)
     for c in candidate_dicts:
         cid = str(c["id"])
         if cid not in ranked_id_set:
             ranked_ids.append(cid)
 
-    digest = conversation_service.compute_query_digest(relaxed)
-    v1_meta = None
-    try:
-        from app.services.recommendation_assignment_service import choose_assignment
-        from app.services.recommendation_request_service import rank_candidate_dicts
-        decision = relaxed_decision or choose_assignment(
-            db, userid=user_ctx.external_userid, direction=direction,
-        )
-        if decision.version and decision.assignment.assignment != "legacy":
-            from app.services.recommendation_exposure_service import (
-                batch_candidate_exposures,
-                recent_user_exposures,
-            )
-            ids = [str(item.get("id")) for item in candidate_dicts[:50]]
-            target_type = "job" if direction == "search_job" else "resume"
-            request_now = datetime.now(timezone.utc)
-            counts = batch_candidate_exposures(
-                db, target_type=target_type, candidate_ids=ids,
-                request_now_utc=request_now,
-            )
-            recents = recent_user_exposures(
-                db, viewer_userid=user_ctx.external_userid,
-                target_type=target_type, candidate_ids=ids,
-                request_now_utc=request_now,
-                cooldown_hours=int(
-                    decision.version.parameters.get("repeat_cooldown_hours", 24)
-                ),
-            )
-            ordered, items = rank_candidate_dicts(
-                candidate_dicts,
-                direction=direction,
-                criteria=relaxed,
-                userid=user_ctx.external_userid,
-                query_digest=digest,
-                strategy_version=decision.version.id,
-                parameters=decision.version.parameters,
-                semantic_ranked_items=rerank_result.ranked_items,
-                exposure_counts=counts,
-                recent_exposures=recents,
-                rotation_date=datetime.now(timezone.utc).date().isoformat(),
-            )
-            ranked_ids = [item.candidate_id for item in ordered]
-            v1_meta = {
-                "items": items,
-                "request_id": decision.request_id,
-                "snapshot_id": decision.snapshot_id,
-                "assignment": decision.assignment,
-                "precision_pool_ids": ranked_ids[:20],
-                "candidate_scores": {
-                    item.candidate_id: {
-                        "final_score": item.repeat_adjusted_score,
-                        "is_exploration": item.is_exploration,
-                        "reason_codes": list(item.reason_codes),
-                        "score_detail": {
-                            "match_score": item.match_score,
-                            "quality_score": item.quality_score,
-                            "freshness_score": item.freshness_score,
-                            "exposure_opportunity": item.exposure_opportunity,
-                            "base_score": item.base_score,
-                            "repeat_factor": item.repeat_factor,
-                            "diversity_penalty": item.diversity_penalty,
-                        },
-                    }
-                    for item in ordered
-                },
-            }
-    except Exception:
-        logger.exception("relaxed recommendation-v1 failed closed")
     conversation_service.save_snapshot(
         session, ranked_ids, digest, relaxed,
         request_id=v1_meta["request_id"] if v1_meta else None,
@@ -1876,7 +1874,7 @@ def execute_relaxed_search(
         strategy_assignment=v1_meta["assignment"] if v1_meta else None,
         request_id=v1_meta["request_id"] if v1_meta else None,
         query_digest=digest if v1_meta else "",
-        candidate_ids=[str(c["id"]) for c in candidate_dicts] if v1_meta else [],
+        candidate_ids=v1_meta["candidate_ids"] if v1_meta else [],
         precision_pool_ids=v1_meta["precision_pool_ids"] if v1_meta else [],
     )
     # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
@@ -2062,6 +2060,13 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             "description": j.description,
             "created_at": str(j.created_at) if j.created_at else "",
             "owner_userid": j.owner_userid,
+            # recommendation-v1 inputs: §6.4 quality fields and the §6.3.4 soft
+            # preference whitelist.  Omitting them silently caps quality_score
+            # and drops preferences the user explicitly stated.
+            "employment_type": j.employment_type,
+            "accept_couple": j.accept_couple,
+            "accept_student": j.accept_student,
+            "accept_minority": j.accept_minority,
         }
         user_data = users_map.get(j.owner_userid, {})
         d["company"] = user_data.get("company", "")
@@ -2087,6 +2092,14 @@ def _resumes_to_dicts(resumes: list) -> list[dict]:
             "description": r.description,
             "created_at": str(r.created_at) if r.created_at else "",
             "owner_userid": r.owner_userid,
+            # recommendation-v1 inputs: §6.4 quality fields plus the §6.9.2
+            # similarity dimensions (expected_districts / long-short combo).
+            "expected_districts": r.expected_districts or [],
+            "available_from": r.available_from,
+            "accept_night_shift": r.accept_night_shift,
+            "accept_overtime": r.accept_overtime,
+            "accept_long_term": r.accept_long_term,
+            "accept_short_term": r.accept_short_term,
         }
         result.append(d)
     return result
@@ -2112,13 +2125,23 @@ def _build_users_map(user_ids: list[str], db: Session) -> dict[str, dict]:
 # 有效性验证
 # ---------------------------------------------------------------------------
 
+def _restore_input_order(rows: list, requested_ids: list[str]) -> list:
+    """§6.11: `show_more()` must restore database rows into `batch_ids` order.
+
+    `WHERE id IN (...)` returns whatever order the storage engine likes, which
+    would silently discard the ranking the snapshot committed to.
+    """
+    by_id = {str(row.id): row for row in rows}
+    return [by_id[cid] for cid in requested_ids if cid in by_id]
+
+
 def _validate_job_ids(job_ids: list[str], db: Session) -> list:
-    """重新查询 ID 列表，过滤已失效的。"""
+    """重新查询 ID 列表，过滤已失效的，并按输入顺序恢复。"""
     now = datetime.now(timezone.utc)
     int_ids = [int(i) for i in job_ids if i.isdigit()]
     if not int_ids:
         return []
-    return db.query(Job).join(User, Job.owner_userid == User.external_userid).filter(
+    rows = db.query(Job).join(User, Job.owner_userid == User.external_userid).filter(
         Job.id.in_(int_ids),
         Job.audit_status == "passed",
         Job.deleted_at.is_(None),
@@ -2126,15 +2149,16 @@ def _validate_job_ids(job_ids: list[str], db: Session) -> list:
         Job.delist_reason.is_(None),
         User.status == "active",
     ).all()
+    return _restore_input_order(rows, job_ids)
 
 
 def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
-    """重新查询 ID 列表，过滤已失效的。"""
+    """重新查询 ID 列表，过滤已失效的，并按输入顺序恢复。"""
     now = datetime.now(timezone.utc)
     int_ids = [int(i) for i in resume_ids if i.isdigit()]
     if not int_ids:
         return []
-    return db.query(Resume).join(
+    rows = db.query(Resume).join(
         User, Resume.owner_userid == User.external_userid,
     ).filter(
         Resume.id.in_(int_ids),
@@ -2143,6 +2167,7 @@ def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
         Resume.expires_at > now,
         User.status == "active",
     ).all()
+    return _restore_input_order(rows, resume_ids)
 
 
 # ---------------------------------------------------------------------------
