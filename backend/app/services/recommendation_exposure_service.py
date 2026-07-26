@@ -11,6 +11,12 @@ from sqlalchemy.orm import Session
 from app.core.time_utils import ensure_utc, exposure_window_start, to_naive_utc, utc_now
 from app.models import RecommendationDelivery, RecommendationImpression
 
+# §9.6 deliberately keeps `direction` out of the persisted context whitelist, so
+# it cannot be read back from the delivery JSON — it used to be, which left every
+# impression with an empty direction and broke per-direction reporting.  The
+# target type determines it exactly, so no extra lookup is needed.
+_DIRECTION_BY_TARGET_TYPE = {"job": "search_job", "resume": "search_worker"}
+
 # §9.6 的 delivery 状态枚举里没有 ``redacted``，它是写入侧正在移除的历史状态。
 # 读取侧在迁移期继续接受它，否则历史行的曝光派生会永久停摆。
 DERIVABLE_DELIVERY_STATUSES = ("sent", "redacted")
@@ -207,7 +213,7 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
             request_id=delivery.request_id,
             snapshot_id=delivery.snapshot_id or "",
             viewer_userid=delivery.userid,
-            direction=context.get("direction", ""),
+            direction=_DIRECTION_BY_TARGET_TYPE.get(target_type, ""),
             target_type=target_type,
             target_id=target_id,
             position=int(item.get("position", 0) or 0),

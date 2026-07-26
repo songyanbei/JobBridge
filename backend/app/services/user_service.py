@@ -4,24 +4,20 @@
 """
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import UserBlocked
 from app.core.logging_setup import identifier_hash
+from app.core.time_utils import utc_now
 from app.models import (
     AuditLog,
     ConversationLog,
-    EventLog,
     Job,
-    RecommendationDelivery,
-    RecommendationImpression,
-    RecommendationRequest,
     Resume,
     User,
 )
-from app.services import conversation_service
+from app.services import conversation_service, recommendation_privacy_service
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +125,7 @@ def update_last_active(external_userid: str, db: Session) -> None:
     """更新用户活跃时间。"""
     db.query(User).filter(
         User.external_userid == external_userid,
-    ).update({"last_active_at": datetime.now(timezone.utc)})
+    ).update({"last_active_at": utc_now()})
 
 
 def get_user_status(external_userid: str, db: Session) -> dict:
@@ -180,13 +176,22 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     1. 清空 Redis session
     2. 软删除简历
     3. 软删除对话日志（通过 expires_at 设置为当前时间）
-    4. 标记 user.status = deleted
-    5. 写 conversation_log
-    6. 写 audit_log
+    4. 立即清空推荐 delivery 正文与 prepared session patch（方案 §9.11.1 行 2147）
+    5. 标记 user.status = deleted
+    6. 写 conversation_log
+    7. 写 audit_log
+
+    这里**只做脱敏，不删事实行**：推荐 request/attempt/delivery/impression/event
+    与候选侧的反查清理由延迟硬删任务
+    ``app.tasks.recommendation_privacy_cleanup`` 调
+    ``recommendation_privacy_service.delete_recommendation_user_data()`` 完成，
+    严格按 §9.11 的外键顺序执行。命令阶段不做假名化：把 ``viewer_userid`` 改成
+    稳定哈希既违反 §14.12「不得保留稳定哈希」，也会让延迟硬删再也按 userid
+    反查不到这些行。
 
     返回回复文本。
     """
-    now = datetime.now(timezone.utc)
+    now = utc_now()
 
     # 1. 清空 Redis session
     conversation_service.clear_session(external_userid)
@@ -202,35 +207,30 @@ def delete_user_data(external_userid: str, db: Session) -> str:
         ConversationLog.userid == external_userid,
     ).update({"expires_at": now})
 
-    # Recommendation privacy contract: remove viewer-level facts immediately
-    # and destroy encrypted delivery bodies/contexts before the normal TTL pass.
-    db.query(RecommendationImpression).filter(
-        RecommendationImpression.viewer_userid == external_userid,
-    ).delete(synchronize_session=False)
-    db.query(EventLog).filter(
-        EventLog.userid == external_userid,
-    ).delete(synchronize_session=False)
-    db.query(RecommendationDelivery).filter(
-        RecommendationDelivery.userid == external_userid,
-    ).update({
-        "content_ciphertext": None,
-        "recommendation_context": {},
-        "status": "redacted",
-    }, synchronize_session=False)
-    pseudonym = f"deleted:{identifier_hash(external_userid)}"[:64]
-    db.query(RecommendationRequest).filter(
-        RecommendationRequest.viewer_userid == external_userid,
-    ).update({
-        "viewer_userid": pseudonym,
-        "served_top_ids": [],
-    }, synchronize_session=False)
+    # 4. 推荐正文与 session patch 立即销毁，不等 TTL、不等延迟硬删（§9.11.1 行 2147、
+    #    §14.12 行 3392）。失败不能阻断删除命令本身，转由重试队列兜底。
+    try:
+        recommendation_privacy_service.redact_user_recommendation_content(
+            db, external_userid, now=now,
+        )
+    except Exception as exc:
+        # 只记异常类名：ORM 异常会把 SQL 绑定参数（含 userid）一起带进日志。
+        logger.error(
+            "user_service: immediate recommendation redaction failed error=%s",
+            type(exc).__name__,
+        )
+        recommendation_privacy_service.enqueue_privacy_retry(
+            external_userid,
+            batch_id="delete_command",
+            failed_steps=["redact_own_content"],
+        )
 
-    # 4. 标记用户状态
+    # 5. 标记用户状态
     db.query(User).filter(
         User.external_userid == external_userid,
     ).update({"status": "deleted"})
 
-    # 5. 写 conversation_log
+    # 6. 写 conversation_log
     delete_log = ConversationLog(
         userid=external_userid,
         direction="out",
@@ -242,7 +242,7 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     )
     db.add(delete_log)
 
-    # 6. 写 audit_log
+    # 7. 写 audit_log
     audit_entry = AuditLog(
         target_type="user",
         target_id=external_userid,
@@ -252,7 +252,7 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     )
     db.add(audit_entry)
 
-    # 7. 记录硬删倒计时起点到 User.extra['deleted_at']（Phase 7 §3.1 模块 C）。
+    # 8. 记录硬删倒计时起点到 User.extra['deleted_at']（Phase 7 §3.1 模块 C）。
     #    存储为 MySQL 友好的 UTC 字符串，供 ttl_cleanup 用 STR_TO_DATE 解析；
     #    不用 isoformat()（会带 "T" 和时区后缀）。
     user = db.query(User).filter(

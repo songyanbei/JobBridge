@@ -6,6 +6,7 @@
 import logging
 import time
 import threading
+from typing import Any
 
 import httpx
 
@@ -17,12 +18,62 @@ logger = logging.getLogger(__name__)
 
 WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 
+# §10.2「返回体处理」：只有这三个字段允许持久化。请求参数里的 access_token 以及
+# 未来可能新增的任何回包字段都不得落库。
+SEND_RESPONSE_WHITELIST = ("errcode", "errmsg", "response_code")
+
+# 部分失败字段。企微在 errcode=0 的成功响应里用 `|` 分隔列出这些接收者，
+# 单用户发送时命中即表示这条消息根本没有送达。
+SEND_REJECT_FIELDS = ("invaliduser", "unlicenseduser")
+
 
 class WeComError(AppError):
     """企微 API 调用失败。"""
     def __init__(self, message: str, errcode: int = 0):
         self.errcode = errcode
         super().__init__(message, "WECOM_ERROR")
+
+
+def whitelist_send_response(response: Any) -> dict:
+    """把 `/message/send` 响应裁剪成可持久化的白名单字段（§10.2）。"""
+    if not isinstance(response, dict):
+        return {}
+    result: dict = {}
+    for key in SEND_RESPONSE_WHITELIST:
+        if key in response:
+            value = response[key]
+            result[key] = value if isinstance(value, int) else str(value)[:200]
+    return result
+
+
+def parse_invalid_recipients(response: Any) -> dict[str, list[str]]:
+    """解析 invaliduser/unlicenseduser，返回 ``{字段: [userid]}``（无命中则为空）。"""
+    if not isinstance(response, dict):
+        return {}
+    rejected: dict[str, list[str]] = {}
+    for key in SEND_REJECT_FIELDS:
+        raw = response.get(key)
+        if isinstance(raw, (list, tuple)):
+            users = [str(item) for item in raw if str(item)]
+        else:
+            users = [part for part in str(raw or "").split("|") if part]
+        if users:
+            rejected[key] = users
+    return rejected
+
+
+def recipient_rejected(response: Any, userid: str) -> str | None:
+    """单用户发送时返回命中的拒绝字段名，未命中返回 None。
+
+    企微对部分失败仍然返回 errcode=0，若不检查这里，单用户发送会在消息实际
+    没有下发的情况下被记成 sent 并派生出假曝光（§10.2）。
+    """
+    if not userid:
+        return None
+    for key, users in parse_invalid_recipients(response).items():
+        if userid in users:
+            return key
+    return None
 
 
 class WeComClient:
@@ -110,7 +161,10 @@ class WeComClient:
             content: 文本内容
 
         Returns:
-            企微 API 响应字典。
+            企微 API 响应字典（完整回包）。调用方必须用
+            :func:`recipient_rejected` 检查 invaliduser/unlicenseduser：
+            部分失败时 errcode 仍是 0，只看是否抛异常会把未送达的消息记成成功。
+            落库前用 :func:`whitelist_send_response` 裁剪。
 
         Raises:
             WeComError: API 调用失败。

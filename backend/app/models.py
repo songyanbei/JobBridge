@@ -254,6 +254,9 @@ class ConversationLog(Base):
     __table_args__ = (
         sa.Index("idx_user_time", "userid", "created_at"),
         sa.Index("idx_expires", "expires_at"),
+        # §10.1.1: deletion walks back from a delivery to every other user's
+        # recommendation log, so this lookup must not be a full table scan.
+        sa.Index("idx_conversation_recommendation_delivery", "recommendation_delivery_id"),
     )
 
 

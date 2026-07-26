@@ -57,6 +57,7 @@ INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `descri
 ('ttl.audit_log.days',             '180','int',  '审核日志 TTL（天）— Phase 7 新增'),
 ('ttl.wecom_inbound_event.days',   '30', 'int',  '入站事件表 TTL（天）— Phase 7 新增'),
 ('ttl.hard_delete.delay_days',     '7',  'int',  '软删到硬删延迟（天）— Phase 7 新增'),
+('ttl.recommendation_detail.days', '90', 'int',  '推荐明细 TTL（天）— Phase 9 新增（§9.11）'),
 
 -- 匹配引擎参数
 ('match.top_n',                    '3',  'int',  '首轮推荐条数（§10.3）'),
