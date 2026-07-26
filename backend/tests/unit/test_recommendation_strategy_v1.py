@@ -1,4 +1,8 @@
-from app.schemas.recommendation import RecommendationStrategyParameters
+from app.schemas.recommendation import (
+    RecommendationItem,
+    RecommendationStrategyParameters,
+    StrategyAssignment,
+)
 from app.schemas.search import SearchResult
 from app.services.recommendation_scoring_service import stable_bucket, semantic_scores
 from app.services.recommendation_delivery_service import decrypt_body, encrypt_body
@@ -47,3 +51,31 @@ def test_shadow_never_changes_served_assignment():
     assert select_assignment(
         release=release, userid="u1", direction="search_job",
     ) == ("legacy", None)
+
+
+def test_search_request_identity_is_preserved_into_delivery_contract():
+    from app.services.message_router import _recommendation_reply_fields
+    result = SearchResult(
+        reply_text="ok",
+        recommendation_items=[
+            RecommendationItem(
+                target_type="job", target_id=7, position=1, final_score=0.9,
+            ),
+        ],
+        snapshot_id="snapshot-1",
+        request_id="request-1",
+        query_digest="digest-1",
+        candidate_ids=["7", "8"],
+        precision_pool_ids=["7"],
+        strategy_assignment=StrategyAssignment(
+            direction="search_job",
+            execution_mode="on",
+            assignment="candidate",
+            strategy_version_id=2,
+            algorithm_version="recommendation-v1",
+        ),
+    )
+    fields = _recommendation_reply_fields(result, "u1", "wx-msg-1")
+    assert fields["recommendation_context"].request_id == "request-1"
+    assert fields["recommendation_context"].query_digest == "digest-1"
+    assert fields["recommendation_request"].source_inbound_msg_id == "wx-msg-1"

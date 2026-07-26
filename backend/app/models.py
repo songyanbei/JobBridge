@@ -721,6 +721,7 @@ class RecommendationDelivery(Base):
     content_ciphertext = sa.Column(mysql.MEDIUMBLOB, nullable=True)
     content_key_version = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("1"))
     content_hash = sa.Column(sa.String(64), nullable=True)
+    content_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     recommendation_context = sa.Column(sa.JSON, nullable=False)
     status = sa.Column(sa.String(24), nullable=False, server_default="prepared")
     session_expected_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("0"))

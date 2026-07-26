@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_event_api_key
+from app.core.exceptions import BusinessException
 from app.core.responses import ok
 from app.schemas.event import MiniProgramClickRequest
 from app.services import event_service
@@ -22,16 +23,19 @@ def miniprogram_click(
     db: Session = Depends(get_db),
     _: None = Depends(require_event_api_key),
 ):
-    deduped = event_service.record_click(
-        db,
-        userid=payload.userid,
-        target_type=payload.target_type,
-        target_id=payload.target_id,
-        timestamp=payload.timestamp,
-        delivery_id=payload.delivery_id,
-        request_id=payload.request_id,
-        snapshot_id=payload.snapshot_id,
-        position=payload.position,
-        client_event_id=payload.client_event_id,
-    )
+    try:
+        deduped = event_service.record_click(
+            db,
+            userid=payload.userid,
+            target_type=payload.target_type,
+            target_id=payload.target_id,
+            timestamp=payload.timestamp,
+            delivery_id=payload.delivery_id,
+            request_id=payload.request_id,
+            snapshot_id=payload.snapshot_id,
+            position=payload.position,
+            client_event_id=payload.client_event_id,
+        )
+    except ValueError as exc:
+        raise BusinessException(42201, str(exc)) from exc
     return ok({"deduped": deduped})

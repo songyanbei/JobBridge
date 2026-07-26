@@ -28,7 +28,7 @@ DANGER_KEYS = {
 }
 
 # 不允许通过 admin 接口暴露的 key 前缀（防止 .env 秘钥泄漏）
-_HIDDEN_KEYS: set[str] = set()
+_HIDDEN_KEYS: set[str] = set(LOCKED_RECOMMENDATION_KEYS)
 
 
 def list_grouped(db: Session) -> dict:

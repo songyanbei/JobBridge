@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS recommendation_delivery (
   content_ciphertext MEDIUMBLOB NULL,
   content_key_version SMALLINT UNSIGNED NOT NULL DEFAULT 1,
   content_hash CHAR(64) NULL,
+  content_expires_at DATETIME(6) NULL,
   recommendation_context JSON NOT NULL,
   status VARCHAR(24) NOT NULL DEFAULT 'prepared',
   session_expected_version BIGINT UNSIGNED NOT NULL DEFAULT 0,

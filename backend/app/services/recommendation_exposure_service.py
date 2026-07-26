@@ -95,15 +95,17 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
     items = context.get("items") or []
     exposed_at = exposed_at or datetime.now(timezone.utc)
     inserted = 0
+    existing_rows = db.query(
+        RecommendationImpression.target_type,
+        RecommendationImpression.target_id,
+    ).filter(
+        RecommendationImpression.delivery_id == delivery.delivery_id,
+    ).all()
+    existing_keys = {(row[0], int(row[1])) for row in existing_rows}
     for item in items:
         target_type = item.get("target_type")
         target_id = int(item["target_id"])
-        exists = db.query(RecommendationImpression.id).filter(
-            RecommendationImpression.delivery_id == delivery.delivery_id,
-            RecommendationImpression.target_type == target_type,
-            RecommendationImpression.target_id == target_id,
-        ).first()
-        if exists:
+        if (target_type, target_id) in existing_keys:
             continue
         db.add(RecommendationImpression(
             delivery_id=delivery.delivery_id,
@@ -122,10 +124,14 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
             score_detail=item.get("score_detail"),
             exposed_at=exposed_at.replace(tzinfo=None),
         ))
+        existing_keys.add((target_type, target_id))
         inserted += 1
-    delivery.impression_actual_count = len(items)
+    db.flush()
+    actual = db.query(RecommendationImpression.id).filter(
+        RecommendationImpression.delivery_id == delivery.delivery_id,
+    ).count()
+    delivery.impression_actual_count = actual
     delivery.impression_expected_count = len(items)
-    delivery.impression_state = "completed"
-    delivery.impression_derived_at = exposed_at
+    delivery.impression_state = "completed" if actual == len(items) else "retry"
+    delivery.impression_derived_at = exposed_at if actual == len(items) else None
     return inserted
-

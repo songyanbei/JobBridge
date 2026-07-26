@@ -57,7 +57,10 @@ def record_click(
 
     # 1. 幂等 key
     try:
-        first = mark_event_idem(userid, target_type, target_id, ttl=ttl)
+        first = (
+            True if delivery_id
+            else mark_event_idem(userid, target_type, target_id, ttl=ttl)
+        )
     except Exception:
         logger.exception("event_service: redis mark_event_idem failed (fallback to DB write)")
         first = True  # fail-open，允许写库
@@ -109,6 +112,13 @@ def record_click(
         attributed_version = context.get("strategy_version_id")
         attributed_algorithm = context.get("algorithm_version")
         attributed_exploration = bool(matched.get("is_exploration"))
+        dedupe_key = f"{delivery_id}:{position}:{client_event_id or target_id}"[:64]
+        if db.query(EventLog.id).filter(
+            EventLog.attribution_dedupe_key == dedupe_key,
+        ).first():
+            return True
+    else:
+        dedupe_key = None
 
     try:
         entry = EventLog(
@@ -126,10 +136,7 @@ def record_click(
             attributed_algorithm_version=attributed_algorithm,
             attributed_is_exploration=attributed_exploration,
             client_event_id=client_event_id,
-            attribution_dedupe_key=(
-                f"{delivery_id}:{position}:{client_event_id or target_id}"[:64]
-                if delivery_id else None
-            ),
+            attribution_dedupe_key=dedupe_key,
         )
         db.add(entry)
         db.commit()

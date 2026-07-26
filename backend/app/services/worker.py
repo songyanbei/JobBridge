@@ -653,8 +653,14 @@ class Worker:
                 "error_message": None,
             })
             if updated == 1:
+                delivery_ids = db.query(
+                    WecomOutboundOutbox.recommendation_delivery_id,
+                ).filter(
+                    WecomOutboundOutbox.inbound_event_id == event_id,
+                    WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+                )
                 db.query(RecommendationDelivery).filter(
-                    RecommendationDelivery.source_inbound_msg_id == str(event_id),
+                    RecommendationDelivery.delivery_id.in_(delivery_ids),
                     RecommendationDelivery.status == "prepared",
                 ).update({"status": "pending"}, synchronize_session=False)
             db.commit()
@@ -775,6 +781,14 @@ class Worker:
                     position_count=len(ctx.items),
                     delivery_id=ctx.delivery_id,
                     recommendation_context=ctx.model_dump(mode="json"),
+                    source_inbound_msg_id=(
+                        reply.recommendation_request.source_inbound_msg_id
+                        if reply.recommendation_request else str(inbound_event_id)
+                    ),
+                    request_fact=(
+                        reply.recommendation_request.model_dump(mode="json")
+                        if reply.recommendation_request else None
+                    ),
                 )
                 continue
             db.add(WecomOutboundOutbox(
@@ -910,11 +924,23 @@ class Worker:
             if updated == 1 and delivery_id:
                 from app.services.recommendation_delivery_service import mark_delivery_sent
                 mark_delivery_sent(db, delivery_id, provider_msg_id)
-                delivery = db.get(RecommendationDelivery, delivery_id)
-                if delivery:
-                    from app.services.recommendation_exposure_service import derive_impressions
-                    derive_impressions(db, delivery)
             db.commit()
+            if updated == 1 and delivery_id:
+                impression_db = SessionLocal()
+                try:
+                    delivery = impression_db.get(RecommendationDelivery, delivery_id)
+                    if delivery:
+                        from app.services.recommendation_exposure_service import derive_impressions
+                        derive_impressions(impression_db, delivery)
+                        impression_db.commit()
+                except Exception:
+                    impression_db.rollback()
+                    logger.exception(
+                        "worker: impression derivation deferred delivery_id=%s",
+                        delivery_id,
+                    )
+                finally:
+                    impression_db.close()
             return updated == 1
         except Exception:
             db.rollback()
@@ -1278,8 +1304,14 @@ class Worker:
                 "status": "done",
                 "worker_finished_at": func.now(6),
             })
+            delivery_ids = db.query(
+                WecomOutboundOutbox.recommendation_delivery_id,
+            ).filter(
+                WecomOutboundOutbox.inbound_event_id == event_id,
+                WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+            )
             db.query(RecommendationDelivery).filter(
-                RecommendationDelivery.source_inbound_msg_id == str(event_id),
+                RecommendationDelivery.delivery_id.in_(delivery_ids),
                 RecommendationDelivery.status == "prepared",
             ).update({"status": "pending"}, synchronize_session=False)
         except Exception:

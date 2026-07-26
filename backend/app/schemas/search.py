@@ -37,6 +37,10 @@ class SearchResult:
     recommendation_items: list[RecommendationItem] = field(default_factory=list)
     snapshot_id: str | None = None
     strategy_assignment: StrategyAssignment | None = None
+    request_id: str | None = None
+    query_digest: str = ""
+    candidate_ids: list[str] = field(default_factory=list)
+    precision_pool_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

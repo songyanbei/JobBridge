@@ -527,13 +527,16 @@ def _try_recommendation_v1(
     rerank_result: RerankResult,
     db: Session,
     raw_query: str,
+    assignment_decision=None,
 ):
     """Run v1 only when its DB release is enabled; any control-plane failure
     deliberately falls back to the existing legacy caller."""
     try:
         from app.services.recommendation_assignment_service import choose_assignment
         from app.services.recommendation_request_service import precision_pool, rank_candidate_dicts
-        assignment = choose_assignment(db, userid=userid, direction=direction)
+        assignment = assignment_decision or choose_assignment(
+            db, userid=userid, direction=direction,
+        )
         if assignment.assignment.assignment == "legacy" or not assignment.version:
             return None
         query_digest = conversation_service.compute_query_digest(criteria)
@@ -595,6 +598,9 @@ def _try_recommendation_v1(
             "direction": direction,
             "strategy_version_id": str(assignment.version.id),
             "algorithm_version": getattr(assignment.version, "algorithm_version", "recommendation-v1"),
+            "query_digest": query_digest,
+            "candidate_ids": [str(item.get("id")) for item in candidate_dicts[:50]],
+            "precision_pool_ids": precision_ids,
         }
     except Exception:
         logger.exception("recommendation-v1 failed closed to legacy")
@@ -619,8 +625,17 @@ def search_jobs(
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`，
     本子阶段产出 SearchOutcome 但调用方解构后丢弃；5.1 起 message_router 才开始消费。
     """
-    top_n = _get_config_int("match.top_n", db, 3)
-    max_candidates = _get_config_int("match.max_candidates", db, 50)
+    from app.services.recommendation_assignment_service import choose_assignment
+    try:
+        assignment_decision = choose_assignment(
+            db, userid=user_ctx.external_userid, direction="search_job",
+        )
+        is_v1 = assignment_decision.assignment.assignment != "legacy"
+    except Exception:
+        assignment_decision = None
+        is_v1 = False
+    top_n = 3 if is_v1 else _get_config_int("match.top_n", db, 3)
+    max_candidates = 50 if is_v1 else _get_config_int("match.max_candidates", db, 50)
     flags = _normalize_experience_flags(experience_flags)
 
     # 硬过滤
@@ -685,15 +700,19 @@ def search_jobs(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "job_search", flags,
     )
-    rerank_result = _rerank_with_logging(
-        query=raw_query,
-        candidates=candidate_dicts,
-        role=user_ctx.role,
-        top_n=top_n,
-        call_site="search_jobs",
-        user_msg_id=user_msg_id,
-        soft_preferences=soft_prefs,
-        ranking_weights=ranking_weights,
+    rerank_result = (
+        RerankResult(ranked_items=[])
+        if is_v1 else
+        _rerank_with_logging(
+            query=raw_query,
+            candidates=candidate_dicts,
+            role=user_ctx.role,
+            top_n=top_n,
+            call_site="search_jobs",
+            user_msg_id=user_msg_id,
+            soft_preferences=soft_prefs,
+            ranking_weights=ranking_weights,
+        )
     )
 
     # 从 rerank 结果提取排序后的 ID 列表（全量快照）
@@ -705,6 +724,7 @@ def search_jobs(
         rerank_result=rerank_result,
         db=db,
         raw_query=raw_query,
+        assignment_decision=assignment_decision,
     )
     ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     # 如果 rerank 只返回了 top_n，把剩余候选补到后面
@@ -775,6 +795,10 @@ def search_jobs(
         recommendation_items=(v1["items"] if v1 else []),
         snapshot_id=(v1["snapshot_id"] if v1 else None),
         strategy_assignment=(v1["assignment"] if v1 else None),
+        request_id=(v1["request_id"] if v1 else None),
+        query_digest=(v1["query_digest"] if v1 else ""),
+        candidate_ids=(v1["candidate_ids"] if v1 else []),
+        precision_pool_ids=(v1["precision_pool_ids"] if v1 else []),
     )
     # Phase 5 §5.4：统计 ranked_items（即 batch）中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
@@ -811,8 +835,17 @@ def search_workers(
 
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
     """
-    top_n = _get_config_int("match.top_n", db, 3)
-    max_candidates = _get_config_int("match.max_candidates", db, 50)
+    from app.services.recommendation_assignment_service import choose_assignment
+    try:
+        assignment_decision = choose_assignment(
+            db, userid=user_ctx.external_userid, direction="search_worker",
+        )
+        is_v1 = assignment_decision.assignment.assignment != "legacy"
+    except Exception:
+        assignment_decision = None
+        is_v1 = False
+    top_n = 3 if is_v1 else _get_config_int("match.top_n", db, 3)
+    max_candidates = 50 if is_v1 else _get_config_int("match.max_candidates", db, 50)
     flags = _normalize_experience_flags(experience_flags)
 
     candidates = _query_resumes(criteria, max_candidates, db)
@@ -871,15 +904,19 @@ def search_workers(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "candidate_search", flags,
     )
-    rerank_result = _rerank_with_logging(
-        query=raw_query,
-        candidates=candidate_dicts,
-        role=user_ctx.role,
-        top_n=top_n,
-        call_site="search_workers",
-        user_msg_id=user_msg_id,
-        soft_preferences=soft_prefs,
-        ranking_weights=ranking_weights,
+    rerank_result = (
+        RerankResult(ranked_items=[])
+        if is_v1 else
+        _rerank_with_logging(
+            query=raw_query,
+            candidates=candidate_dicts,
+            role=user_ctx.role,
+            top_n=top_n,
+            call_site="search_workers",
+            user_msg_id=user_msg_id,
+            soft_preferences=soft_prefs,
+            ranking_weights=ranking_weights,
+        )
     )
 
     v1 = _try_recommendation_v1(
@@ -890,6 +927,7 @@ def search_workers(
         rerank_result=rerank_result,
         db=db,
         raw_query=raw_query,
+        assignment_decision=assignment_decision,
     )
     ranked_ids = list(v1["ids"]) if v1 else [str(item["id"]) for item in rerank_result.ranked_items]
     ranked_id_set = set(ranked_ids)
@@ -956,6 +994,10 @@ def search_workers(
         recommendation_items=(v1["items"] if v1 else []),
         snapshot_id=(v1["snapshot_id"] if v1 else None),
         strategy_assignment=(v1["assignment"] if v1 else None),
+        request_id=(v1["request_id"] if v1 else None),
+        query_digest=(v1["query_digest"] if v1 else ""),
+        candidate_ids=(v1["candidate_ids"] if v1 else []),
+        precision_pool_ids=(v1["precision_pool_ids"] if v1 else []),
     )
     # Phase 5 §5.4：统计 ranked_items 中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)

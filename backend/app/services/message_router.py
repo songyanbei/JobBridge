@@ -33,7 +33,10 @@ from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
 from app.models import Resume
 from app.schemas.conversation import ReplyMessage, SessionState
-from app.schemas.recommendation import RecommendationDeliveryContext
+from app.schemas.recommendation import (
+    RecommendationDeliveryContext,
+    RecommendationRequestFact,
+)
 from app.services import (
     command_service,
     conversation_service,
@@ -1823,7 +1826,7 @@ def _post_search_dispatch(
     """
     mode = _settings_module.dialogue_policy.post_search_policy_mode
     recommendation_fields = _recommendation_reply_fields(
-        search_result, user_ctx.external_userid,
+        search_result, user_ctx.external_userid, msg.msg_id,
     )
 
     if mode == "off":
@@ -2725,13 +2728,15 @@ def _snapshot_meta(session: SessionState) -> dict:
     }
 
 
-def _recommendation_reply_fields(search_result, userid: str) -> dict:
+def _recommendation_reply_fields(
+    search_result, userid: str, source_inbound_msg_id: str,
+) -> dict:
     """Carry the recommendation contract from search to the durable outbox."""
     items = list(getattr(search_result, "recommendation_items", []) or [])
     assignment = getattr(search_result, "strategy_assignment", None)
     if not items or not assignment or getattr(assignment, "assignment", "legacy") == "legacy":
         return {}
-    request_id = str(uuid.uuid4())
+    request_id = getattr(search_result, "request_id", None) or str(uuid.uuid4())
     context = RecommendationDeliveryContext(
         delivery_id=str(uuid.uuid4()),
         request_id=request_id,
@@ -2741,13 +2746,25 @@ def _recommendation_reply_fields(search_result, userid: str) -> dict:
         assignment=assignment.assignment,
         strategy_version_id=assignment.strategy_version_id,
         algorithm_version=assignment.algorithm_version,
-        query_digest="",
+        query_digest=getattr(search_result, "query_digest", ""),
         items=items,
     )
     return {
         "delivery_id": context.delivery_id,
         "recommendation_context": context,
-        "recommendation_request": None,
+        "recommendation_request": RecommendationRequestFact(
+            request_id=request_id,
+            source_inbound_msg_id=source_inbound_msg_id,
+            request_kind="initial_search",
+            viewer_userid=userid,
+            direction=assignment.direction,
+            query_digest=getattr(search_result, "query_digest", ""),
+            algorithm_version=assignment.algorithm_version,
+            candidate_count=len(getattr(search_result, "candidate_ids", [])),
+            candidate_ids=getattr(search_result, "candidate_ids", []),
+            precision_pool_ids=getattr(search_result, "precision_pool_ids", []),
+            served_top_ids=[str(item.target_id) for item in items],
+        ),
         "strategy_assignment": assignment,
     }
 

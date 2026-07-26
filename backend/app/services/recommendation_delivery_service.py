@@ -54,9 +54,12 @@ def prepare_delivery(
     position_count: int = 0,
     delivery_id: str | None = None,
     recommendation_context: dict | None = None,
+    source_inbound_msg_id: str | None = None,
+    request_fact: dict | None = None,
     ttl_minutes: int = 30,
 ) -> RecommendationDelivery:
     ctx = dict(recommendation_context or {})
+    fact = dict(request_fact or {})
     items = list(ctx.get("items") or [])
     candidate_ids = [str(item.get("target_id")) for item in items]
     request_id = request_id or str(uuid.uuid4())
@@ -64,9 +67,9 @@ def prepare_delivery(
     if db.get(RecommendationRequest, request_id) is None:
         db.add(RecommendationRequest(
             request_id=request_id,
-            source_inbound_msg_id=str(inbound_event_id),
-            request_index=reply_index,
-            request_kind="initial_search",
+            source_inbound_msg_id=source_inbound_msg_id or str(inbound_event_id),
+            request_index=int(fact.get("request_index", reply_index)),
+            request_kind=str(fact.get("request_kind") or "initial_search"),
             served_attempt_id=attempt_id,
             snapshot_id=snapshot_id,
             viewer_userid=userid,
@@ -76,22 +79,22 @@ def prepare_delivery(
             served_assignment=str(ctx.get("assignment") or "candidate"),
             served_strategy_version_id=ctx.get("strategy_version_id"),
             algorithm_version=str(ctx.get("algorithm_version") or "recommendation-v1"),
-            final_candidate_count=len(candidate_ids),
+            final_candidate_count=int(fact.get("candidate_count", len(candidate_ids))),
             result_count=len(candidate_ids),
             is_zero_result=not candidate_ids,
-            served_top_ids=candidate_ids,
+            served_top_ids=list(fact.get("served_top_ids") or candidate_ids),
         ))
         db.flush()
         db.add(RecommendationSearchAttempt(
             attempt_id=attempt_id,
             request_id=request_id,
             attempt_no=1,
-            attempt_kind="initial_search",
+            attempt_kind=str(fact.get("request_kind") or "initial_search"),
             criteria_digest=str(ctx.get("query_digest") or ""),
             scoring_time_utc=datetime.now(timezone.utc),
-            candidate_count=len(candidate_ids),
-            candidate_ids=candidate_ids,
-            precision_pool_ids=candidate_ids,
+            candidate_count=int(fact.get("candidate_count", len(candidate_ids))),
+            candidate_ids=list(fact.get("candidate_ids") or candidate_ids),
+            precision_pool_ids=list(fact.get("precision_pool_ids") or candidate_ids),
             result_count=len(candidate_ids),
             is_zero_result=not candidate_ids,
             strategy_version_id=ctx.get("strategy_version_id"),
@@ -101,12 +104,13 @@ def prepare_delivery(
     resolved_delivery_id = delivery_id or str(uuid.uuid4())
     delivery = RecommendationDelivery(
         delivery_id=resolved_delivery_id,
-        source_inbound_msg_id=str(inbound_event_id),
+        source_inbound_msg_id=source_inbound_msg_id or str(inbound_event_id),
         reply_index=reply_index,
         request_id=request_id,
         snapshot_id=snapshot_id,
         userid=userid,
         content_ciphertext=encrypt_body(body).encode("ascii"),
+        content_expires_at=datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes),
         recommendation_context=ctx or {"position_count": position_count, "items": []},
         session_commit_token=resolved_delivery_id,
         next_attempt_at=datetime.now(timezone.utc),

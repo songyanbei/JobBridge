@@ -34,6 +34,17 @@ from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 BATCH_SIZE = 500
 
 
+def _redact_expired_recommendation_content(db) -> int:
+    result = db.execute(text(
+        "UPDATE recommendation_delivery "
+        "SET content_ciphertext=NULL, status=CASE WHEN status='sent' THEN 'redacted' ELSE status END "
+        "WHERE content_ciphertext IS NOT NULL "
+        "AND content_expires_at IS NOT NULL AND content_expires_at <= NOW(6)"
+    ))
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 # ---------------------------------------------------------------------------
 # system_config 读取
 # ---------------------------------------------------------------------------
@@ -378,6 +389,11 @@ def run() -> None:
             audit_days = cfg["audit_log_days"]
 
             _safe_step("soft_delete_jobs", stats, lambda: _soft_delete_expired_jobs(db))
+            _safe_step(
+                "redact_recommendation_content",
+                stats,
+                lambda: _redact_expired_recommendation_content(db),
+            )
             _safe_step("soft_delete_resumes", stats, lambda: _soft_delete_expired_resumes(db))
             _safe_step("hard_delete_jobs", stats, lambda: _hard_delete_expired_jobs(db, delay))
             _safe_step(
