@@ -62,6 +62,15 @@ REQUIRED_COLUMNS = (
     ("recommendation_delivery", "invalid_recipients"),
     ("recommendation_search_attempt", "llm_retry_count"),
     ("event_log", "attribution_dedupe_key"),
+    ("recommendation_request", "shadow_top_ids"),
+    ("recommendation_request", "shadow_overlap_count"),
+    ("recommendation_request", "shadow_rank_delta"),
+    ("recommendation_request", "shadow_status"),
+    ("recommendation_request", "shadow_queue_wait_ms"),
+    ("recommendation_request", "shadow_latency_ms"),
+    ("recommendation_request", "shadow_input_tokens"),
+    ("recommendation_request", "shadow_output_tokens"),
+    ("recommendation_request", "shadow_fallback"),
 )
 
 REQUIRED_INDEXES = (

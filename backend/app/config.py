@@ -280,6 +280,12 @@ class Settings(BaseSettings):
     recommendation_shadow_daily_token_budget_search_worker: int = 200_000
     """search_worker 方向的 shadow 日 token 预算，语义同上。"""
 
+    recommendation_shadow_max_output_tokens: int = 1_024
+    """shadow 单次调用预占预算时使用的悲观最大输出 token 数。
+
+    provider 返回真实 usage 后会退回 ``reserve - actual``；timeout/unknown 不退款，
+    因为客户端断开后供应商仍可能完成推理并计费。"""
+
     recommendation_strategy_kill_switch: bool = False
     """环境变量 ``RECOMMENDATION_STRATEGY_KILL_SWITCH``：进程启动时的更强 override。
 
@@ -298,6 +304,7 @@ class Settings(BaseSettings):
         "recommendation_shadow_queue_capacity",
         "recommendation_shadow_persistence_threads",
         "recommendation_shadow_persistence_queue_capacity",
+        "recommendation_shadow_max_output_tokens",
         "recommendation_content_key_active_version",
         mode="after",
     )

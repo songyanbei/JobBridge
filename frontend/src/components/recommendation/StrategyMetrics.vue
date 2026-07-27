@@ -65,6 +65,7 @@
         <el-collapse-item name="attempts" title="排序尝试（attempt）">
           <el-descriptions :column="3" border size="small">
             <el-descriptions-item label="尝试总数">{{ num(group('attempts').total) }}</el-descriptions-item>
+            <el-descriptions-item label="服务排序尝试">{{ num(group('attempts').ranking_attempts) }}</el-descriptions-item>
             <el-descriptions-item label="重排回退率">{{ pct(group('attempts').reranker_fallback_rate) }}</el-descriptions-item>
             <el-descriptions-item label="零候选率">{{ pct(group('attempts').zero_candidate_rate) }}</el-descriptions-item>
             <el-descriptions-item label="LLM 重试次数">{{ num(group('attempts').llm_retry_count) }}</el-descriptions-item>
@@ -165,13 +166,13 @@
             <el-descriptions-item label="provider 限流率">{{ pct(group('llm').provider_throttle_rate) }}</el-descriptions-item>
           </el-descriptions>
           <el-alert
-            v-if="!group('shadow').available"
+            v-if="!group('shadow').available || (group('shadow').missing_sources || []).length"
             type="info"
             :closable="false"
             class="inline-note"
-            :title="`shadow 链路数据不可用，下列数值不可解读。缺失来源：${(group('shadow').missing_sources || []).join('、') || '未说明'}`"
+            :title="shadowSourceNote"
           />
-          <el-descriptions v-else :column="3" border size="small">
+          <el-descriptions v-if="group('shadow').available" :column="3" border size="small">
             <el-descriptions-item label="shadow 请求数">{{ num(group('shadow').requests) }}</el-descriptions-item>
             <el-descriptions-item label="Top N 重合率">{{ pct(group('shadow').top_n_overlap_rate) }}</el-descriptions-item>
             <el-descriptions-item label="平均位次差">{{ ratio(group('shadow').average_position_delta) }}</el-descriptions-item>
@@ -227,6 +228,14 @@ const EMPTY_GROUP = {}
 function group(name) {
   return metrics.value?.[name] || EMPTY_GROUP
 }
+
+const shadowSourceNote = computed(() => {
+  const shadow = group('shadow')
+  const missing = (shadow.missing_sources || []).join('、') || '未说明'
+  return shadow.available
+    ? `部分 shadow 指标暂无数据库真源，将显示为“—”：${missing}`
+    : `shadow 链路数据不可用，下列数值不可解读。缺失来源：${missing}`
+})
 
 function num(value) {
   if (value === null || value === undefined) return '—'

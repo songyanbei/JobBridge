@@ -202,6 +202,7 @@ def call_llm_api(
             _record_llm_failure(circuit_key)
             raise
         else:
+            resp.extensions["llm_retry_count"] = attempt
             _record_llm_success(circuit_key)
             return resp
 
@@ -211,6 +212,7 @@ def call_llm_api(
             )
             continue
         _record_llm_failure(circuit_key)
+        setattr(last_error, "llm_retry_count", attempt)
         raise last_error
 
 
@@ -311,6 +313,7 @@ async def call_llm_api_async(
             _record_llm_failure(circuit_key)
             raise
         else:
+            resp.extensions["llm_retry_count"] = attempt
             _record_llm_success(circuit_key)
             return resp
 
@@ -321,6 +324,7 @@ async def call_llm_api_async(
             )
             continue
         _record_llm_failure(circuit_key)
+        setattr(last_error, "llm_retry_count", attempt)
         raise last_error
 
 

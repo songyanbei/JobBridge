@@ -2908,6 +2908,8 @@ def _recommendation_reply_fields(
     attempt_kind: str | None = None,
     request_index: int | None = None,
     total_latency_ms: int | None = None,
+    prior_search_result=None,
+    prior_search_outcome=None,
 ) -> dict:
     """Carry the recommendation contract from search to the durable outbox.
 
@@ -2954,6 +2956,11 @@ def _recommendation_reply_fields(
         # §9.4：查看更多和"用户确认放宽"各自是新的 request，parent 指向原 request。
         request_id = str(uuid.uuid4())
         parent_request_id = parent_request_id or result_request_id
+    elif request_kind == "auto_relaxed":
+        # 自动放宽的最终检索可能重新走了一次 assignment/shadow 提交；使用最终
+        # SearchResult 的 request_id，前一轮查询作为同 request 的 additional attempt。
+        request_id = result_request_id or parent_request_id or str(uuid.uuid4())
+        parent_request_id = None
     else:
         # §9.4 行 1839-1840：初次搜索后自动放宽仍然只有一条 request，沿用初次搜索的
         # request_id（后续放宽只是它的第二个 attempt），因此不能再挂 parent。
@@ -2969,15 +2976,86 @@ def _recommendation_reply_fields(
     candidate_ids = [str(cid) for cid in (
         getattr(search_result, "candidate_ids", None) or []
     )][:50]
-    # legacy 不产生 RecommendationItem，服务数量取 SearchResult.result_count，
-    # 否则 legacy 请求会被恒判为业务零结果。
+    # 兼容旧调用方：新搜索路径会为 legacy 结果生成仅用于事实记录的
+    # RecommendationItem；尚未迁移的调用方仍可用 result_count 表示服务数量。
     result_count = len(items) or int(getattr(search_result, "result_count", 0) or 0)
     exhausted = bool(getattr(search_outcome, "snapshot_exhausted", False))
+    current_probe_records = [
+        dict(probe)
+        for probe in (getattr(search_outcome, "relax_probe_results", None) or [])
+        if isinstance(probe, dict)
+    ]
     probe_steps = [
         str(probe.get("step"))
-        for probe in (getattr(search_outcome, "relax_probe_results", None) or [])
-        if isinstance(probe, dict) and probe.get("step")
+        for probe in current_probe_records
+        if probe.get("step") and probe.get("step") != "initial"
     ]
+
+    def _attempt_from_result(result, *, kind: str) -> dict:
+        ids = [
+            str(value) for value in (
+                getattr(result, "candidate_ids", None) or []
+            )
+        ][:50]
+        return {
+            "step": kind,
+            "attempt_kind": kind,
+            "criteria_digest": str(
+                getattr(result, "query_digest", "") or ""
+            ),
+            "candidate_count": len(ids),
+            "candidate_ids": ids,
+            "precision_pool_ids": [
+                str(value) for value in (
+                    getattr(result, "precision_pool_ids", None) or []
+                )
+            ][:50],
+            "result_count": int(getattr(result, "result_count", 0) or 0),
+            "is_zero_result": not ids,
+            "scoring_time_utc": getattr(result, "scoring_time_utc", None),
+            "llm_status": getattr(result, "llm_status", "skipped"),
+            "llm_input_tokens": getattr(result, "llm_input_tokens", None),
+            "llm_output_tokens": getattr(result, "llm_output_tokens", None),
+            "llm_retry_count": max(
+                0, int(getattr(result, "llm_retry_count", 0) or 0),
+            ),
+            "ranking_fallback": getattr(result, "ranking_fallback", None),
+            "ranking_latency_ms": max(
+                0, int(getattr(result, "ranking_latency_ms", 0) or 0),
+            ),
+        }
+
+    additional_attempts: list[dict] = []
+    if prior_search_result is not None:
+        additional_attempts.append(_attempt_from_result(
+            prior_search_result, kind="initial",
+        ))
+        additional_attempts.extend(
+            dict(probe)
+            for probe in (
+                getattr(prior_search_outcome, "relax_probe_results", None) or []
+            )
+            if isinstance(probe, dict)
+        )
+    additional_attempts.extend(current_probe_records)
+    probe_steps = list(dict.fromkeys(
+        probe_steps + [
+            str(attempt.get("step"))
+            for attempt in additional_attempts
+            if attempt.get("step") and attempt.get("step") != "initial"
+        ],
+    ))
+    if request_kind == "auto_relaxed":
+        for index, attempt in enumerate(additional_attempts):
+            attempt["attempt_no"] = index
+            if attempt.get("step") != "initial":
+                attempt["attempt_kind"] = "relax_probe"
+        served_attempt_no = len(additional_attempts)
+    else:
+        for index, attempt in enumerate(additional_attempts, start=1):
+            attempt["attempt_no"] = index
+            attempt["attempt_kind"] = "relax_probe"
+        served_attempt_no = 0
 
     fact = RecommendationRequestFact(
         request_id=request_id,
@@ -3016,6 +3094,22 @@ def _recommendation_reply_fields(
             or ATTEMPT_KIND_BY_REQUEST_KIND.get(request_kind, "initial")
         ),
         relax_probe_steps=probe_steps,
+        additional_attempts=additional_attempts,
+        attempt_no=served_attempt_no,
+        scoring_time_utc=getattr(search_result, "scoring_time_utc", None),
+        llm_status=getattr(search_result, "llm_status", "skipped"),
+        llm_input_tokens=getattr(search_result, "llm_input_tokens", None),
+        llm_output_tokens=getattr(search_result, "llm_output_tokens", None),
+        llm_retry_count=max(
+            0, int(getattr(search_result, "llm_retry_count", 0) or 0),
+        ),
+        ranking_fallback=getattr(search_result, "ranking_fallback", None),
+        ranking_latency_ms=max(
+            0, int(getattr(search_result, "ranking_latency_ms", 0) or 0),
+        ),
+        attempt_latency_ms=max(
+            0, int(getattr(search_result, "ranking_latency_ms", 0) or 0),
+        ),
         total_latency_ms=(
             _recommendation_elapsed_ms() if total_latency_ms is None
             else max(0, int(total_latency_ms))
@@ -3026,7 +3120,7 @@ def _recommendation_reply_fields(
     if assignment is not None:
         fields["strategy_assignment"] = assignment
     if not items:
-        # 零结果 / legacy：只有请求事实，不建 delivery，也就不会派生虚假曝光。
+        # 零结果：只有请求事实，不建 delivery，也就不会派生虚假曝光。
         return fields
     context = RecommendationDeliveryContext(
         delivery_id=str(uuid.uuid4()),

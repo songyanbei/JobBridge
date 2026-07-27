@@ -103,6 +103,14 @@ jobs:
     env:
       PHASE9_DSN: mysql+pymysql://jobbridge_test:jobbridge_test@127.0.0.1:3306/jobbridge_test
       APP_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_NAME: jobbridge_test
+      DB_USER: jobbridge_test
+      DB_PASSWORD: jobbridge_test
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      RUN_INTEGRATION: "1"
       RECOMMENDATION_CONTENT_KEY: ci-only-recommendation-key
     steps:
       - uses: actions/checkout@v4
@@ -125,4 +133,10 @@ jobs:
           python scripts/apply_phase9_migrations.py --manifest sql/migrations/phase9_manifest.sha256 --dsn-env PHASE9_DSN --verify
       - name: Run recommendation tests
         working-directory: backend
-        run: pytest -p no:cacheprovider tests/unit/test_recommendation_strategy_v1.py -q
+        # The whole recommendation unit surface, not one file. The three
+        # mandated fixed-vector suites, the delivery state machine, the privacy
+        # closure and the metrics all live in sibling files, so gating on a
+        # single file made this job look far broader than it actually was.
+        run: |
+          pytest -p no:cacheprovider -q tests/unit -k "recommendation or click_attribution or delivery_state_machine"
+          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py

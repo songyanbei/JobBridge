@@ -88,8 +88,10 @@ class QwenIntentExtractor(IntentExtractor):
                 # 不传 call_policy / timeout：意图抽取继续用原配置（§11.5），
                 # 由 _base 解析成 legacy 的 llm_timeout_seconds + 一次重试。
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
@@ -146,8 +148,10 @@ class QwenIntentExtractor(IntentExtractor):
                 # 不传 call_policy / timeout：意图抽取继续用原配置（§11.5），
                 # 由 _base 解析成 legacy 的 llm_timeout_seconds + 一次重试。
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
@@ -200,12 +204,16 @@ class QwenReranker(Reranker):
                 payload=payload,
                 call_policy=call_policy,
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
-        return finalize_rerank_response(resp.json())
+        result = finalize_rerank_response(resp.json())
+        result.retry_count = int(resp.extensions.get("llm_retry_count", 0) or 0)
+        return result
 
     async def arerank(
         self,
@@ -235,9 +243,13 @@ class QwenReranker(Reranker):
                 payload=payload,
                 call_policy=call_policy,
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Qwen API HTTP error: {exc.response.status_code}")
 
-        return finalize_rerank_response(resp.json())
+        result = finalize_rerank_response(resp.json())
+        result.retry_count = int(resp.extensions.get("llm_retry_count", 0) or 0)
+        return result

@@ -116,7 +116,7 @@ def _attempt(**kwargs) -> RecommendationSearchAttempt:
         result_count=0,
         is_zero_result=0,
         algorithm_version="recommendation-v1",
-        llm_status="succeeded",
+        llm_status="ok",
         ranking_latency_ms=10,
         total_latency_ms=20,
         created_at=datetime(2026, 3, 9, 1, 0),
@@ -194,18 +194,29 @@ def seeded(db):
                  served_max_owner_items=1, total_latency_ms=200),
         _request(request_id="r3", served_attempt_id="a3", created_at=datetime(2026, 3, 9, 3, 0),
                  viewer_userid="u1", served_top_ids=["1", "2", "4"], result_count=3,
-                 served_max_owner_items=1, total_latency_ms=300),
+                 served_max_owner_items=1, total_latency_ms=300,
+                 shadow_status="skipped_capacity", shadow_fallback="global_capacity",
+                 shadow_queue_wait_ms=15, shadow_latency_ms=0),
         # 业务零结果（legacy 流量）
         _request(request_id="r4", served_attempt_id="a4", created_at=datetime(2026, 3, 9, 3, 30),
                  viewer_userid="u2", query_digest="q2", is_zero_result=1,
-                 served_assignment="legacy", execution_mode="on"),
+                 served_assignment="legacy", execution_mode="on",
+                 shadow_status="timeout", shadow_fallback="deadline",
+                 shadow_queue_wait_ms=5, shadow_latency_ms=3000),
         # show_more 耗尽：复用 r1 的 served attempt，且不计入业务零结果率
         _request(request_id="r5", served_attempt_id="a1", created_at=datetime(2026, 3, 9, 3, 40),
                  viewer_userid="u1", request_kind="show_more", is_zero_result=1,
-                 show_more_exhausted=1),
+                 show_more_exhausted=1, shadow_status="skipped_capacity",
+                 shadow_fallback="local_capacity", shadow_queue_wait_ms=20,
+                 shadow_latency_ms=0),
         # 上游若把 shadow attempt 写成 served_attempt_id，召回池必须仍然排除它
         _request(request_id="r6", served_attempt_id="a6", created_at=datetime(2026, 3, 9, 3, 50),
-                 viewer_userid="u3", query_digest="q3", is_zero_result=1),
+                 viewer_userid="u3", query_digest="q3", is_zero_result=1,
+                 served_top_ids=["777", "778", "779"],
+                 shadow_top_ids=["777", "780", "778"], shadow_overlap_count=2,
+                 shadow_rank_delta={"777": 0, "778": 1}, shadow_status="completed",
+                 shadow_queue_wait_ms=10, shadow_latency_ms=30,
+                 shadow_input_tokens=30, shadow_output_tokens=6),
     ])
     db.add_all([
         _attempt(attempt_id="a1", request_id="r1", candidate_ids=["1", "2", "3", "4", "5"],
@@ -218,7 +229,7 @@ def seeded(db):
         _attempt(attempt_id="a5", request_id="r1", attempt_no=1, attempt_kind="relax_probe",
                  candidate_ids=["900"]),
         _attempt(attempt_id="a6", request_id="r6", attempt_kind="shadow_candidate",
-                 candidate_ids=["777"]),
+                 candidate_ids=["777"], llm_input_tokens=30, llm_output_tokens=6),
     ])
     db.add_all([
         _delivery("d1", sent_at=datetime(2026, 3, 9, 5, 0),
@@ -307,9 +318,10 @@ class TestRequestMetrics:
 
     def test_reranker_fallback_rate(self, seeded):
         result = metrics_service.collect_metrics(seeded, days=7, now=NOW).attempts
-        assert result.total == 6
+        assert result.total == 5
+        assert result.ranking_attempts == 4
         assert result.fallback_by_reason == {"llm_timeout": 1}
-        assert result.reranker_fallback_rate == pytest.approx(1 / 6, abs=1e-6)
+        assert result.reranker_fallback_rate == pytest.approx(1 / 4, abs=1e-6)
 
     def test_requests_outside_window_are_excluded(self, seeded):
         seeded.add(_request(request_id="old", created_at=datetime(2026, 2, 1, 0, 0),
@@ -439,11 +451,28 @@ class TestDeliveryMetrics:
 
 
 class TestShadowMetrics:
-    def test_shadow_section_is_explicitly_unavailable(self, seeded):
+    def test_shadow_section_aggregates_persisted_facts(self, seeded):
         result = metrics_service.collect_metrics(seeded, days=7, now=NOW).shadow
-        assert result.available is False
-        assert result.top_n_overlap_rate is None
-        assert any("shadow_top_ids" in source for source in result.missing_sources)
+        assert result.available is True
+        assert result.requests == 4
+        assert result.top_n_overlap_rate == pytest.approx(2 / 3)
+        assert result.average_position_delta == pytest.approx(0.5)
+        assert result.timeout_count == 1
+        assert result.local_capacity_skip_count == 1
+        assert result.global_capacity_skip_count == 1
+        assert result.persistence_drop_count is None
+        assert result.queue_wait_p95_ms == pytest.approx(19.25)
+        assert result.duration_p95_ms == pytest.approx(2560.25)
+        assert any("shadow_persistence_dropped" in source for source in result.missing_sources)
+
+    def test_llm_cost_separates_serving_and_shadow_tokens(self, seeded):
+        result = metrics_service.collect_metrics(seeded, days=7, now=NOW).llm
+        assert result.legacy_input_tokens == 100
+        assert result.legacy_output_tokens == 20
+        assert result.shadow_input_tokens == 30
+        assert result.shadow_output_tokens == 6
+        assert result.by_direction["search_job"]["legacy_attempts"] == 5
+        assert result.by_direction["search_job"]["shadow_attempts"] == 1
 
 
 class TestDirectionFilter:

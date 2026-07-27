@@ -683,10 +683,28 @@ class TestSimulationEndpoint:
         )
 
     def _patch_search(self, monkeypatch, candidates):
+        from app.llm.base import RerankResult
         from app.services import search_service
 
+        monkeypatch.setattr(
+            search_service,
+            "_get_config_int",
+            lambda key, *_args, **_kwargs: 50 if key == "match.max_candidates" else 3,
+        )
         monkeypatch.setattr(search_service, "_query_jobs", lambda criteria, limit, db: [])
         monkeypatch.setattr(search_service, "_jobs_to_dicts", lambda rows, db: candidates)
+        monkeypatch.setattr(
+            search_service,
+            "_rerank_with_logging",
+            lambda **kwargs: RerankResult(
+                ranked_items=[
+                    {"id": str(candidate["id"])}
+                    for candidate in reversed(candidates)
+                ],
+                input_tokens=12,
+                output_tokens=4,
+            ),
+        )
         monkeypatch.setattr(
             search_service.conversation_service, "compute_query_digest", lambda criteria: "digest-1",
         )
@@ -723,8 +741,11 @@ class TestSimulationEndpoint:
         data = payload["data"]
         assert data["current_basis"] == "legacy"
         assert len(data["current"]) == 3
-        assert data["llm_invoked"] is False
-        assert data["simulation_mode"] == "deterministic"
+        assert data["llm_invoked"] is True
+        assert data["semantic_source"] == "llm"
+        assert data["simulation_mode"] == "llm"
+        assert data["llm_input_tokens"] == 24
+        assert data["llm_output_tokens"] == 8
         assert data["call_site"] == "recommendation_simulation"
         assert data["exposure_available"] is True
         # 真实读取曝光与重复曝光，且用被模拟用户的 ID
@@ -749,6 +770,39 @@ class TestSimulationEndpoint:
         # §8.3：不写快照 / 曝光 / 对话日志 —— 唯一写入是 §7.1 的 last_simulated_digest
         db.add.assert_not_called()
         assert draft.last_simulated_digest == "digest-draft"
+
+    def test_llm_failure_does_not_unlock_publish(self, monkeypatch):
+        from app.api.admin.recommendation_strategies import simulate_strategy_draft
+        from app.llm.base import RerankResult
+        from app.schemas.recommendation import RecommendationSimulationRequest
+        from app.services import search_service
+
+        candidates = [_job_candidate(1, "o1")]
+        self._patch_search(monkeypatch, candidates)
+        self._patch_exposures(monkeypatch, {})
+        monkeypatch.setattr(
+            search_service,
+            "_rerank_with_logging",
+            lambda **kwargs: RerankResult(ranked_items=[]),
+        )
+        draft = self._draft()
+        db = _simulation_db(
+            draft,
+            SimpleNamespace(direction="search_job", stable_version_id=None),
+        )
+        req = RecommendationSimulationRequest(
+            direction="search_job", criteria={}, draft_version_id=11,
+        )
+
+        with pytest.raises(BusinessException) as excinfo:
+            simulate_strategy_draft(
+                11, req, db=db, _=SimpleNamespace(username="admin"),
+            )
+
+        assert excinfo.value.code == 50101
+        assert draft.last_simulated_digest is None
+        db.rollback.assert_called_once()
+        db.commit.assert_not_called()
 
     def test_stable_version_is_used_when_present(self, monkeypatch):
         from app.api.admin.recommendation_strategies import simulate_strategy_draft

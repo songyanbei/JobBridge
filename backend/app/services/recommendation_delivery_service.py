@@ -550,6 +550,77 @@ def _persist_request_facts(
         db.flush()
         served_attempt_id = attempt_id
 
+        # §9.5：一次 request 可能实际执行 initial、多个 relax_probe，最后再
+        # auto_relaxed。served_attempt_id 只指向最终服务用户的 attempt，但每条
+        # 真查询都必须落一行，不能只在 request 上留步骤名。
+        for raw_attempt in fact.get("additional_attempts") or []:
+            if not isinstance(raw_attempt, Mapping):
+                continue
+            extra = dict(raw_attempt)
+            extra_candidate_ids = [
+                str(value) for value in (extra.get("candidate_ids") or [])
+            ][:_MAX_CANDIDATE_IDS]
+            extra_kind = _enum(
+                extra.get("attempt_kind"),
+                _ATTEMPT_KINDS,
+                "relax_probe",
+            )
+            db.add(RecommendationSearchAttempt(
+                attempt_id=str(uuid.uuid4()),
+                request_id=request_id,
+                attempt_no=max(0, int(extra.get("attempt_no", 0) or 0)),
+                attempt_kind=extra_kind,
+                criteria_digest=_criteria_digest(
+                    extra,
+                    direction=direction,
+                    query_digest=query_digest,
+                    algorithm_version=algorithm_version,
+                ),
+                scoring_time_utc=to_naive_utc(
+                    _as_datetime(extra.get("scoring_time_utc")) or now,
+                ),
+                candidate_count=int(
+                    extra.get("candidate_count", len(extra_candidate_ids)) or 0,
+                ),
+                candidate_ids=extra_candidate_ids,
+                precision_pool_ids=[
+                    str(value) for value in (
+                        extra.get("precision_pool_ids") or []
+                    )
+                ][:_MAX_CANDIDATE_IDS],
+                result_count=int(
+                    extra.get("result_count", len(extra_candidate_ids)) or 0,
+                ),
+                is_zero_result=bool(
+                    extra.get("is_zero_result", not extra_candidate_ids),
+                ),
+                strategy_version_id=strategy_version_id,
+                algorithm_version=algorithm_version,
+                llm_status=_enum(
+                    extra.get("llm_status"), _LLM_STATUSES, "skipped",
+                ),
+                llm_input_tokens=_optional_int(extra.get("llm_input_tokens")),
+                llm_output_tokens=_optional_int(extra.get("llm_output_tokens")),
+                llm_timeout_budget_ms=_optional_int(
+                    extra.get("llm_timeout_budget_ms"),
+                ),
+                llm_retry_count=int(extra.get("llm_retry_count", 0) or 0),
+                ranking_fallback=(
+                    str(extra["ranking_fallback"])[:32]
+                    if extra.get("ranking_fallback") else None
+                ),
+                ranking_latency_ms=int(
+                    extra.get("ranking_latency_ms", 0) or 0,
+                ),
+                total_latency_ms=int(
+                    extra.get(
+                        "attempt_latency_ms",
+                        extra.get("ranking_latency_ms", 0),
+                    ) or 0,
+                ),
+            ))
+        db.flush()
+
     request.served_attempt_id = served_attempt_id
     db.flush()
 

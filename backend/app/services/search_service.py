@@ -6,6 +6,7 @@ show_more 复用快照，不重新执行全量检索。
 Phase 7：在 LLM 调用处补 loguru 结构化打点（llm_call 事件）。
 """
 import json
+import hashlib
 import logging
 import math
 import time
@@ -33,7 +34,7 @@ from app.schemas.search import (
     SearchOutcome,
     SearchResult,
 )
-from app.schemas.recommendation import StrategyAssignment
+from app.schemas.recommendation import RecommendationItem, StrategyAssignment
 from app.services import conversation_service, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 from app.services.recommendation_experience_gate import userid_hash
@@ -70,6 +71,47 @@ logger = logging.getLogger(__name__)
 # used since v2.  Re-export the single source of truth instead.
 from app.llm.prompts import RERANK_PROMPT_VERSION  # noqa: E402
 _queue_backlog_hint: ContextVar[int] = ContextVar("queue_backlog_hint", default=0)
+
+
+def _query_attempt_record(
+    *,
+    step: str,
+    criteria: dict,
+    candidates: list,
+    started: float,
+) -> dict:
+    """Build the durable facts for one real SQL candidate query (§9.5)."""
+    criteria_body = json.dumps(
+        criteria or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    candidate_ids = [
+        str(
+            item.get("id") if isinstance(item, dict)
+            else getattr(item, "id", "")
+        )
+        for item in candidates
+    ]
+    candidate_ids = [candidate_id for candidate_id in candidate_ids if candidate_id]
+    return {
+        "step": step,
+        "attempt_kind": "initial" if step == "initial" else "relax_probe",
+        "criteria_digest": hashlib.sha256(
+            criteria_body.encode("utf-8"),
+        ).hexdigest(),
+        "candidate_count": len(candidate_ids),
+        "candidate_ids": candidate_ids[:V1_MAX_CANDIDATES],
+        "precision_pool_ids": [],
+        "result_count": len(candidate_ids),
+        "is_zero_result": not candidate_ids,
+        "scoring_time_utc": utc_now(),
+        "llm_status": "skipped",
+        "llm_retry_count": 0,
+        "ranking_latency_ms": max(0, int((time.perf_counter() - started) * 1000)),
+    }
 
 
 def set_queue_backlog_hint(depth: int):
@@ -415,6 +457,7 @@ def _rerank_with_logging(
             ranked_items=[], reply_text="", raw_response="",
             input_tokens=getattr(exc, "input_tokens", None),
             output_tokens=getattr(exc, "output_tokens", None),
+            retry_count=int(getattr(exc, "llm_retry_count", 0) or 0),
         )
     except LLMParseError as exc:
         # 空结果回落，后续业务按 0 召回处理；不再 raise 以对齐 intent 侧策略。
@@ -427,6 +470,7 @@ def _rerank_with_logging(
             raw_response="",
             input_tokens=getattr(exc, "input_tokens", None),
             output_tokens=getattr(exc, "output_tokens", None),
+            retry_count=int(getattr(exc, "llm_retry_count", 0) or 0),
         )
     except LLMError as exc:
         status = "http_error"
@@ -435,6 +479,7 @@ def _rerank_with_logging(
             ranked_items=[], reply_text="", raw_response="",
             input_tokens=getattr(exc, "input_tokens", None),
             output_tokens=getattr(exc, "output_tokens", None),
+            retry_count=int(getattr(exc, "llm_retry_count", 0) or 0),
         )
     except Exception as exc:
         # 非 LLMError 家族的意外异常（如 provider 实现 bug、类型错误等）。
@@ -447,15 +492,25 @@ def _rerank_with_logging(
             ranked_items=[], reply_text="", raw_response="",
             input_tokens=getattr(exc, "input_tokens", None),
             output_tokens=getattr(exc, "output_tokens", None),
+            retry_count=int(getattr(exc, "llm_retry_count", 0) or 0),
         )
     finally:
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        if result is not None:
+            result.llm_status = (
+                status if status in {"ok", "timeout", "http_error", "parse_failed"}
+                else "skipped" if status == "backlog_degraded"
+                else "http_error"
+            )
+            result.latency_ms = max(0, duration_ms)
+            result.ranking_fallback = None if status == "ok" else status[:32]
         log_event(
             "llm_call",
             call_site=call_site,
             provider=settings.llm_provider,
             model=settings.llm_reranker_model,
             prompt_version=RERANK_PROMPT_VERSION,
-            duration_ms=int((time.perf_counter() - start) * 1000),
+            duration_ms=duration_ms,
             candidate_count=len(candidates),
             top_n=top_n,
             ranked_count=len(result.ranked_items) if result else 0,
@@ -527,6 +582,93 @@ def _build_search_outcome(
     )
 
 
+def _legacy_fallback_assignment(decision) -> StrategyAssignment | None:
+    """The assignment to record when v1 declines or fails.
+
+    Dropping it to ``None`` makes the request fact read `execution_mode=off`,
+    which is indistinguishable from an operator having switched v1 off. During a
+    rollout the legacy share is the only signal that v1 is silently failing, so
+    the release's real execution_mode has to survive the fallback — only the
+    strategy identity degrades to legacy.
+    """
+    assignment = getattr(decision, "assignment", None)
+    if assignment is None:
+        return None
+    return assignment.model_copy(update={
+        "assignment": "legacy",
+        "strategy_version_id": None,
+        "algorithm_version": "legacy",
+    })
+
+
+def _served_recommendation_items(
+    served_candidates: list[dict],
+    direction: str,
+    ranked_items: list[RecommendationItem] | None = None,
+) -> list[RecommendationItem]:
+    """Describe exactly the candidates rendered in the reply.
+
+    Delivery/impression facts are required in off/legacy mode too.  They cannot
+    reuse the pre-permission v1 list because doing so would count candidates
+    that were filtered out and never appeared in the user-visible message.
+    """
+    ranked_by_id = {
+        str(item.target_id): item for item in (ranked_items or [])
+    }
+    result: list[RecommendationItem] = []
+    for position, candidate in enumerate(served_candidates, 1):
+        candidate_id = int(candidate["id"])
+        ranked = ranked_by_id.get(str(candidate_id))
+        if ranked is not None:
+            result.append(ranked.model_copy(update={
+                "position": position,
+                "owner_userid": candidate.get("owner_userid"),
+            }))
+            continue
+        result.append(RecommendationItem(
+            target_type="job" if direction == "search_job" else "resume",
+            target_id=candidate_id,
+            position=position,
+            owner_userid=candidate.get("owner_userid"),
+            final_score=0.0,
+            is_exploration=False,
+            reason_codes=["legacy_baseline"],
+            score_detail=None,
+        ))
+    return result
+
+
+def _search_attempt_fields(
+    v1: dict | None,
+    rerank_result: RerankResult,
+    *,
+    scoring_time_utc: datetime | None = None,
+) -> dict:
+    """Project serving-rank telemetry into the durable request/attempt DTO."""
+    source = v1 or {}
+    return {
+        "scoring_time_utc": (
+            source.get("scoring_time_utc") or scoring_time_utc or utc_now()
+        ),
+        "llm_status": source.get("llm_status", rerank_result.llm_status),
+        "llm_input_tokens": source.get(
+            "llm_input_tokens", rerank_result.input_tokens,
+        ),
+        "llm_output_tokens": source.get(
+            "llm_output_tokens", rerank_result.output_tokens,
+        ),
+        "llm_retry_count": int(source.get(
+            "llm_retry_count", rerank_result.retry_count,
+        ) or 0),
+        "ranking_fallback": source.get(
+            "ranking_fallback", rerank_result.ranking_fallback,
+        ),
+        "ranking_latency_ms": int(source.get(
+            "ranking_latency_ms", rerank_result.latency_ms,
+        ) or 0),
+    }
+
+
 def _snapshot_is_v1(snapshot) -> bool:
     """A snapshot produced by recommendation-v1 rather than the legacy ranker."""
     if snapshot is None:
@@ -557,6 +699,7 @@ def _try_recommendation_v1(
     db: Session,
     raw_query: str,
     assignment_decision=None,
+    request_now_utc: datetime | None = None,
 ):
     """Run v1 only when its DB release is enabled; any control-plane failure
     deliberately falls back to the existing legacy caller."""
@@ -576,11 +719,15 @@ def _try_recommendation_v1(
             userid=userid,
             query_digest=query_digest,
         )
-        precision_set = set(precision_ids)
+        candidates_by_id = {
+            str(item.get("id")): item for item in candidate_dicts
+        }
         precision_candidates = [
-            item for item in candidate_dicts
-            if str(item.get("id")) in precision_set
+            candidates_by_id[candidate_id]
+            for candidate_id in precision_ids
+            if candidate_id in candidates_by_id
         ]
+        request_now_utc = request_now_utc or utc_now()
         semantic_result = _rerank_with_logging(
             query=raw_query,
             candidates=precision_candidates,
@@ -590,7 +737,6 @@ def _try_recommendation_v1(
         )
         candidate_ids = [str(item.get("id")) for item in candidate_dicts[:V1_MAX_CANDIDATES]]
         target_type = "job" if direction == "search_job" else "resume"
-        request_now_utc = utc_now()
         parameters = assignment.version.parameters
         # §10.6: exposure reads are an observability side channel.  A failure
         # degrades the exposure component to the neutral 0.5 for every candidate
@@ -645,6 +791,13 @@ def _try_recommendation_v1(
             "query_digest": query_digest,
             "candidate_ids": candidate_ids,
             "precision_pool_ids": precision_ids,
+            "scoring_time_utc": request_now_utc,
+            "llm_status": semantic_result.llm_status,
+            "llm_input_tokens": semantic_result.input_tokens,
+            "llm_output_tokens": semantic_result.output_tokens,
+            "llm_retry_count": semantic_result.retry_count,
+            "ranking_fallback": semantic_result.ranking_fallback,
+            "ranking_latency_ms": semantic_result.latency_ms,
             "candidate_scores": {
                 item.candidate_id: {
                     "final_score": item.repeat_adjusted_score,
@@ -666,6 +819,165 @@ def _try_recommendation_v1(
     except Exception:
         logger.exception("recommendation-v1 failed closed to legacy")
         return None
+
+
+def _submit_shadow_candidate(
+    *,
+    candidate_dicts: list[dict],
+    direction: str,
+    criteria: dict,
+    userid: str,
+    raw_query: str,
+    assignment_decision,
+    db: Session,
+    request_now_utc: datetime | None = None,
+) -> dict | None:
+    """Submit the candidate strategy without delaying the legacy serving path.
+
+    The returned metadata is also used to give the served request a stable
+    request/snapshot identity.  Persistence remains dormant until Worker commits
+    that request and calls ``activate_persistence``.
+    """
+    shadow_version_id = getattr(assignment_decision, "shadow_version_id", None)
+    if not shadow_version_id:
+        return None
+
+    query_digest = conversation_service.compute_query_digest(criteria)
+    metadata = {
+        "request_id": assignment_decision.request_id,
+        "snapshot_id": assignment_decision.snapshot_id,
+        "query_digest": query_digest,
+        "candidate_ids": [
+            str(item.get("id")) for item in candidate_dicts[:V1_MAX_CANDIDATES]
+        ],
+        "precision_pool_ids": [],
+        "assignment": _legacy_fallback_assignment(assignment_decision),
+    }
+    try:
+        from app.services.recommendation_exposure_service import (
+            batch_candidate_exposures,
+            recent_user_exposures,
+        )
+        from app.services.recommendation_request_service import precision_pool
+        from app.services.recommendation_shadow_service import ShadowJob, shadow_runner
+        from app.services.recommendation_strategy_service import load_published_version
+
+        version = load_published_version(db, int(shadow_version_id))
+        if version is None:
+            logger.warning(
+                "shadow candidate version unavailable direction=%s version=%s",
+                direction,
+                shadow_version_id,
+            )
+            return metadata
+
+        candidates = [dict(item) for item in candidate_dicts[:V1_MAX_CANDIDATES]]
+        precision_ids = precision_pool(
+            candidates,
+            direction=direction,
+            criteria=criteria,
+            userid=userid,
+            query_digest=query_digest,
+        )
+        metadata["precision_pool_ids"] = precision_ids
+        request_now_utc = request_now_utc or utc_now()
+        target_type = "job" if direction == "search_job" else "resume"
+        try:
+            candidate_ids = metadata["candidate_ids"]
+            exposure_counts = batch_candidate_exposures(
+                db,
+                target_type=target_type,
+                candidate_ids=candidate_ids,
+                request_now_utc=request_now_utc,
+            )
+            recent_exposures = recent_user_exposures(
+                db,
+                viewer_userid=userid,
+                target_type=target_type,
+                candidate_ids=candidate_ids,
+                request_now_utc=request_now_utc,
+                cooldown_hours=int(version.parameters.get("repeat_cooldown_hours", 24)),
+            )
+            exposure_available = True
+        except Exception:
+            logger.warning(
+                "shadow exposure read failed; using neutral opportunity",
+                exc_info=True,
+            )
+            exposure_counts, recent_exposures, exposure_available = {}, {}, False
+
+        submitted = time.monotonic()
+        handle = shadow_runner.submit(ShadowJob(
+            request_id=assignment_decision.request_id,
+            direction=direction,
+            userid=userid,
+            raw_query=raw_query,
+            role="worker" if direction == "search_job" else "factory",
+            criteria=dict(criteria),
+            query_digest=query_digest,
+            candidate_dicts=tuple(candidates),
+            precision_pool_ids=tuple(precision_ids),
+            strategy_version=int(version.id),
+            algorithm_version=(
+                getattr(version, "algorithm_version", None) or "recommendation-v1"
+            ),
+            parameters=dict(version.parameters or {}),
+            exposure_counts=dict(exposure_counts),
+            recent_exposures=dict(recent_exposures),
+            exposure_available=exposure_available,
+            rotation_date=rotation_date(request_now_utc),
+            scoring_time_utc=request_now_utc,
+            deadline_monotonic=(
+                submitted + float(settings.recommendation_shadow_timeout_seconds)
+            ),
+            submitted_monotonic=submitted,
+            provider=settings.llm_provider,
+            daily_token_limit=settings.recommendation_shadow_daily_token_budget(direction),
+        ))
+        if handle is None:
+            logger.warning(
+                "shadow runner rejected submission request_id=%s",
+                assignment_decision.request_id,
+            )
+    except Exception:
+        # Shadow is observability-only.  Any submission failure leaves the
+        # already selected legacy path untouched.
+        logger.exception(
+            "shadow submission failed request_id=%s",
+            assignment_decision.request_id,
+        )
+    return metadata
+
+
+def _set_shadow_served_baseline(
+    shadow_metadata: dict | None,
+    served_ids: list[str],
+) -> None:
+    if not shadow_metadata:
+        return
+    try:
+        from app.services.recommendation_shadow_service import set_served_baseline
+
+        set_served_baseline(
+            shadow_metadata["request_id"],
+            served_ids[:V1_DISPLAY_TOP_N],
+        )
+    except Exception:
+        logger.warning("failed to attach shadow served baseline", exc_info=True)
+
+
+def _attach_legacy_decision_metadata(
+    result: SearchResult,
+    assignment_decision,
+    criteria: dict,
+) -> SearchResult:
+    """Keep off/shadow/on-fallback facts visible even when no result was served."""
+    if assignment_decision is None:
+        return result
+    result.strategy_assignment = _legacy_fallback_assignment(assignment_decision)
+    result.request_id = assignment_decision.request_id
+    result.query_digest = conversation_service.compute_query_digest(criteria)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -692,21 +1004,34 @@ def search_jobs(
             db, userid=user_ctx.external_userid, direction="search_job",
         )
         is_v1 = assignment_decision.assignment.assignment != "legacy"
+        shadow_due = getattr(assignment_decision, "shadow_version_id", None) is not None
     except Exception:
         logger.warning("recommendation release lookup failed; serving legacy", exc_info=True)
         assignment_decision = None
         is_v1 = False
+        shadow_due = False
     # §5.4.1: legacy keeps reading the historical generic config; v1 is pinned to
     # the code constants.  Both are resolved up front so a v1 failure can still
     # fall back to genuine legacy behaviour.
     legacy_top_n = _get_config_int("match.top_n", db, 3)
     legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
     top_n = V1_DISPLAY_TOP_N if is_v1 else legacy_top_n
-    max_candidates = V1_MAX_CANDIDATES if is_v1 else legacy_max_candidates
+    max_candidates = (
+        V1_MAX_CANDIDATES if is_v1
+        else max(V1_MAX_CANDIDATES, legacy_max_candidates) if shadow_due
+        else legacy_max_candidates
+    )
     flags = _normalize_experience_flags(experience_flags)
 
     # 硬过滤
+    initial_query_started = time.perf_counter()
     candidates = _query_jobs(criteria, max_candidates, db)
+    initial_query_record = _query_attempt_record(
+        step="initial",
+        criteria=criteria,
+        candidates=candidates,
+        started=initial_query_started,
+    )
     initial_count = len(candidates)
 
     # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
@@ -729,6 +1054,16 @@ def search_jobs(
             criteria, candidates, top_n, max_candidates, db,
         )
         candidates = outcome.candidates
+        probe_results = list(outcome.probe_results)
+        if outcome.applied_step:
+            # The selected relaxed query becomes the served auto_relaxed
+            # attempt. The original strict query and every non-selected query
+            # remain separate facts on the same request.
+            probe_results = [initial_query_record] + [
+                record for record in probe_results
+                if record.get("step") != outcome.applied_step
+            ]
+            criteria = dict(outcome.applied_criteria or criteria)
     else:
         outcome = FallbackOutcome(candidates=candidates)
 
@@ -745,6 +1080,7 @@ def search_jobs(
                 reply_text=NO_JOB_MATCH_REPLY,
                 result_count=0,
             )
+        _attach_legacy_decision_metadata(sr, assignment_decision, criteria)
         so = _build_search_outcome(
             direction="search_job",
             criteria_used=criteria,
@@ -767,6 +1103,17 @@ def search_jobs(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "job_search", flags,
     )
+    request_now_utc = utc_now()
+    shadow = _submit_shadow_candidate(
+        candidate_dicts=candidate_dicts,
+        direction="search_job",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        raw_query=raw_query,
+        assignment_decision=assignment_decision,
+        db=db,
+        request_now_utc=request_now_utc,
+    ) if shadow_due else None
     # v1 runs first because it owns its own precision-pool LLM call.  Only when
     # it declines (legacy assignment) or fails do we fall back to the legacy
     # reranker — skipping both would hand the user raw SQL `created_at DESC`.
@@ -778,6 +1125,7 @@ def search_jobs(
         db=db,
         raw_query=raw_query,
         assignment_decision=assignment_decision,
+        request_now_utc=request_now_utc,
     ) if is_v1 else None
     if v1 is None:
         if is_v1:
@@ -793,6 +1141,8 @@ def search_jobs(
             soft_preferences=soft_prefs,
             ranking_weights=ranking_weights,
         )
+        if is_v1 and rerank_result.ranking_fallback is None:
+            rerank_result.ranking_fallback = "recommendation_v1_failed"
     else:
         rerank_result = RerankResult(ranked_items=[])
 
@@ -822,12 +1172,41 @@ def search_jobs(
                 "candidate_scores": v1.get("candidate_scores", {}),
             },
         }
+    elif shadow:
+        # Shadow only observes the candidate strategy.  The durable snapshot is
+        # the legacy order actually served to the user.
+        snapshot_kwargs = {
+            "request_id": shadow["request_id"],
+            "snapshot_id": shadow["snapshot_id"],
+            "direction": "search_job",
+            "strategy_version_id": None,
+            "algorithm_version": "legacy",
+            "assignment": "legacy",
+        }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
     # 取首批
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(
+            reply_text="暂无匹配结果。",
+            result_count=0,
+            snapshot_id=shadow["snapshot_id"] if shadow else None,
+            strategy_assignment=(
+                shadow["assignment"] if shadow
+                else _legacy_fallback_assignment(assignment_decision)
+            ),
+            request_id=shadow["request_id"] if shadow else (
+                assignment_decision.request_id if assignment_decision else None
+            ),
+            query_digest=shadow["query_digest"] if shadow else digest,
+            candidate_ids=shadow["candidate_ids"] if shadow else [],
+            precision_pool_ids=shadow["precision_pool_ids"] if shadow else [],
+            **_search_attempt_fields(
+                v1, rerank_result, scoring_time_utc=request_now_utc,
+            ),
+        )
+        _set_shadow_served_baseline(shadow, [])
         so = _build_search_outcome(
             direction="search_job",
             criteria_used=criteria,
@@ -847,6 +1226,10 @@ def search_jobs(
 
     # 权限过滤
     filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+    _set_shadow_served_baseline(
+        shadow,
+        [str(item.get("id")) for item in filtered],
+    )
 
     # 记录已展示
     shown_ids = [str(j["id"]) for j in batch]
@@ -867,13 +1250,29 @@ def search_jobs(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
-        recommendation_items=(v1["items"] if v1 else []),
-        snapshot_id=(v1["snapshot_id"] if v1 else None),
-        strategy_assignment=(v1["assignment"] if v1 else None),
-        request_id=(v1["request_id"] if v1 else None),
-        query_digest=(v1["query_digest"] if v1 else ""),
-        candidate_ids=(v1["candidate_ids"] if v1 else []),
-        precision_pool_ids=(v1["precision_pool_ids"] if v1 else []),
+        recommendation_items=_served_recommendation_items(
+            filtered, "search_job", v1["items"] if v1 else None,
+        ),
+        snapshot_id=(v1["snapshot_id"] if v1 else shadow["snapshot_id"] if shadow else None),
+        strategy_assignment=(
+            v1["assignment"] if v1 else
+            shadow["assignment"] if shadow else
+            _legacy_fallback_assignment(assignment_decision)
+        ),
+        request_id=(v1["request_id"] if v1 else shadow["request_id"] if shadow else None),
+        query_digest=(v1["query_digest"] if v1 else shadow["query_digest"] if shadow else digest),
+        candidate_ids=(
+            v1["candidate_ids"] if v1 else
+            shadow["candidate_ids"] if shadow else
+            [str(item.get("id")) for item in candidate_dicts[:max_candidates]]
+        ),
+        precision_pool_ids=(
+            v1["precision_pool_ids"] if v1 else
+            shadow["precision_pool_ids"] if shadow else []
+        ),
+        **_search_attempt_fields(
+            v1, rerank_result, scoring_time_utc=request_now_utc,
+        ),
     )
     # Phase 5 §5.4：统计 ranked_items（即 batch）中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
@@ -916,19 +1315,32 @@ def search_workers(
             db, userid=user_ctx.external_userid, direction="search_worker",
         )
         is_v1 = assignment_decision.assignment.assignment != "legacy"
+        shadow_due = getattr(assignment_decision, "shadow_version_id", None) is not None
     except Exception:
         logger.warning("recommendation release lookup failed; serving legacy", exc_info=True)
         assignment_decision = None
         is_v1 = False
+        shadow_due = False
     # §5.4.1: legacy keeps reading the historical generic config; v1 is pinned to
     # the code constants.
     legacy_top_n = _get_config_int("match.top_n", db, 3)
     legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
     top_n = V1_DISPLAY_TOP_N if is_v1 else legacy_top_n
-    max_candidates = V1_MAX_CANDIDATES if is_v1 else legacy_max_candidates
+    max_candidates = (
+        V1_MAX_CANDIDATES if is_v1
+        else max(V1_MAX_CANDIDATES, legacy_max_candidates) if shadow_due
+        else legacy_max_candidates
+    )
     flags = _normalize_experience_flags(experience_flags)
 
+    initial_query_started = time.perf_counter()
     candidates = _query_resumes(criteria, max_candidates, db)
+    initial_query_record = _query_attempt_record(
+        step="initial",
+        criteria=criteria,
+        candidates=candidates,
+        started=initial_query_started,
+    )
     initial_count = len(candidates)
 
     # Phase 5 §5.2.1 / §5.4：仅 mode=on 且用户命中 rollout 桶时，
@@ -950,6 +1362,13 @@ def search_workers(
             criteria, candidates, top_n, max_candidates, db,
         )
         candidates = outcome.candidates
+        probe_results = list(outcome.probe_results)
+        if outcome.applied_step:
+            probe_results = [initial_query_record] + [
+                record for record in probe_results
+                if record.get("step") != outcome.applied_step
+            ]
+            criteria = dict(outcome.applied_criteria or criteria)
     else:
         outcome = FallbackOutcome(candidates=candidates)
 
@@ -966,6 +1385,7 @@ def search_workers(
                 reply_text=NO_WORKER_MATCH_REPLY,
                 result_count=0,
             )
+        _attach_legacy_decision_metadata(sr, assignment_decision, criteria)
         so = _build_search_outcome(
             direction="search_worker",
             criteria_used=criteria,
@@ -984,6 +1404,17 @@ def search_workers(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "candidate_search", flags,
     )
+    request_now_utc = utc_now()
+    shadow = _submit_shadow_candidate(
+        candidate_dicts=candidate_dicts,
+        direction="search_worker",
+        criteria=criteria,
+        userid=user_ctx.external_userid,
+        raw_query=raw_query,
+        assignment_decision=assignment_decision,
+        db=db,
+        request_now_utc=request_now_utc,
+    ) if shadow_due else None
     # See search_jobs: v1 first, legacy rerank only as the declined/failed path.
     v1 = _try_recommendation_v1(
         candidate_dicts=candidate_dicts,
@@ -993,6 +1424,7 @@ def search_workers(
         db=db,
         raw_query=raw_query,
         assignment_decision=assignment_decision,
+        request_now_utc=request_now_utc,
     ) if is_v1 else None
     if v1 is None:
         if is_v1:
@@ -1008,6 +1440,8 @@ def search_workers(
             soft_preferences=soft_prefs,
             ranking_weights=ranking_weights,
         )
+        if is_v1 and rerank_result.ranking_fallback is None:
+            rerank_result.ranking_fallback = "recommendation_v1_failed"
     else:
         rerank_result = RerankResult(ranked_items=[])
 
@@ -1034,11 +1468,38 @@ def search_workers(
                 "candidate_scores": v1.get("candidate_scores", {}),
             },
         }
+    elif shadow:
+        snapshot_kwargs = {
+            "request_id": shadow["request_id"],
+            "snapshot_id": shadow["snapshot_id"],
+            "direction": "search_worker",
+            "strategy_version_id": None,
+            "algorithm_version": "legacy",
+            "assignment": "legacy",
+        }
     conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(
+            reply_text="暂无匹配结果。",
+            result_count=0,
+            snapshot_id=shadow["snapshot_id"] if shadow else None,
+            strategy_assignment=(
+                shadow["assignment"] if shadow
+                else _legacy_fallback_assignment(assignment_decision)
+            ),
+            request_id=shadow["request_id"] if shadow else (
+                assignment_decision.request_id if assignment_decision else None
+            ),
+            query_digest=shadow["query_digest"] if shadow else digest,
+            candidate_ids=shadow["candidate_ids"] if shadow else [],
+            precision_pool_ids=shadow["precision_pool_ids"] if shadow else [],
+            **_search_attempt_fields(
+                v1, rerank_result, scoring_time_utc=request_now_utc,
+            ),
+        )
+        _set_shadow_served_baseline(shadow, [])
         so = _build_search_outcome(
             direction="search_worker",
             criteria_used=criteria,
@@ -1059,6 +1520,10 @@ def search_workers(
     owner_ids = list({r.get("owner_userid", "") for r in batch})
     users_map = _build_users_map(owner_ids, db)
     filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+    _set_shadow_served_baseline(
+        shadow,
+        [str(item.get("id")) for item in filtered],
+    )
 
     shown_ids = [str(r["id"]) for r in batch]
     conversation_service.record_shown(session, shown_ids)
@@ -1077,13 +1542,29 @@ def search_workers(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
-        recommendation_items=(v1["items"] if v1 else []),
-        snapshot_id=(v1["snapshot_id"] if v1 else None),
-        strategy_assignment=(v1["assignment"] if v1 else None),
-        request_id=(v1["request_id"] if v1 else None),
-        query_digest=(v1["query_digest"] if v1 else ""),
-        candidate_ids=(v1["candidate_ids"] if v1 else []),
-        precision_pool_ids=(v1["precision_pool_ids"] if v1 else []),
+        recommendation_items=_served_recommendation_items(
+            filtered, "search_worker", v1["items"] if v1 else None,
+        ),
+        snapshot_id=(v1["snapshot_id"] if v1 else shadow["snapshot_id"] if shadow else None),
+        strategy_assignment=(
+            v1["assignment"] if v1 else
+            shadow["assignment"] if shadow else
+            _legacy_fallback_assignment(assignment_decision)
+        ),
+        request_id=(v1["request_id"] if v1 else shadow["request_id"] if shadow else None),
+        query_digest=(v1["query_digest"] if v1 else shadow["query_digest"] if shadow else digest),
+        candidate_ids=(
+            v1["candidate_ids"] if v1 else
+            shadow["candidate_ids"] if shadow else
+            [str(item.get("id")) for item in candidate_dicts[:max_candidates]]
+        ),
+        precision_pool_ids=(
+            v1["precision_pool_ids"] if v1 else
+            shadow["precision_pool_ids"] if shadow else []
+        ),
+        **_search_attempt_fields(
+            v1, rerank_result, scoring_time_utc=request_now_utc,
+        ),
     )
     # Phase 5 §5.4：统计 ranked_items 中各软偏好字段命中数。
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
@@ -1479,6 +1960,8 @@ def _run_job_fallback_steps(
     """
     best = initial
     applied_step: str | None = None
+    applied_criteria: dict | None = None
+    probe_results: list[dict] = []
     steps: list[tuple[str, dict]] = []
 
     salary = criteria.get("salary_floor_monthly")
@@ -1502,7 +1985,14 @@ def _run_job_fallback_steps(
         steps.append(("drop_optional_filters", drop_optional))
 
     for step_name, step_criteria in steps:
+        started = time.perf_counter()
         candidates = _query_jobs(step_criteria, limit, db)
+        probe_results.append(_query_attempt_record(
+            step=step_name,
+            criteria=step_criteria,
+            candidates=candidates,
+            started=started,
+        ))
         log_event(
             "search_fallback_applied",
             direction="search_job",
@@ -1514,16 +2004,21 @@ def _run_job_fallback_steps(
         if len(candidates) > len(best):
             best = candidates
             applied_step = step_name
+            applied_criteria = dict(step_criteria)
             if len(best) >= top_n:
                 break
 
     suggestions: list[FallbackSuggestion] = []
     if not best:
-        suggestions = _probe_job_suggestions(criteria, limit, db)
+        suggestions = _probe_job_suggestions(
+            criteria, limit, db, attempt_records=probe_results,
+        )
 
     return FallbackOutcome(
         candidates=best,
         applied_step=applied_step,
+        applied_criteria=applied_criteria,
+        probe_results=probe_results,
         suggestions=suggestions,
     )
 
@@ -1543,6 +2038,8 @@ def _run_resume_fallback_steps(
     """
     best = initial
     applied_step: str | None = None
+    applied_criteria: dict | None = None
+    probe_results: list[dict] = []
     steps: list[tuple[str, dict]] = []
 
     salary = criteria.get("salary_ceiling_monthly")
@@ -1565,7 +2062,14 @@ def _run_resume_fallback_steps(
         steps.append(("drop_optional_filters", drop_optional))
 
     for step_name, step_criteria in steps:
+        started = time.perf_counter()
         candidates = _query_resumes(step_criteria, limit, db)
+        probe_results.append(_query_attempt_record(
+            step=step_name,
+            criteria=step_criteria,
+            candidates=candidates,
+            started=started,
+        ))
         log_event(
             "search_fallback_applied",
             direction="search_worker",
@@ -1577,16 +2081,21 @@ def _run_resume_fallback_steps(
         if len(candidates) > len(best):
             best = candidates
             applied_step = step_name
+            applied_criteria = dict(step_criteria)
             if len(best) >= top_n:
                 break
 
     suggestions: list[FallbackSuggestion] = []
     if not best:
-        suggestions = _probe_resume_suggestions(criteria, limit, db)
+        suggestions = _probe_resume_suggestions(
+            criteria, limit, db, attempt_records=probe_results,
+        )
 
     return FallbackOutcome(
         candidates=best,
         applied_step=applied_step,
+        applied_criteria=applied_criteria,
+        probe_results=probe_results,
         suggestions=suggestions,
     )
 
@@ -1684,9 +2193,19 @@ def _probe_relax_steps(
         if relaxed == criteria:
             # 该 step 不会改变 criteria（如薪资字段缺失 → relax_salary_10pct 无效）
             continue
+        started = time.perf_counter()
         candidates = query_fn(relaxed, limit, db)
         available.append(step)
-        probes.append({"step": step, "count": len(candidates)})
+        record = _query_attempt_record(
+            step=step,
+            criteria=relaxed,
+            candidates=candidates,
+            started=started,
+        )
+        # Reducer compatibility: it consumes ``count`` while persistence uses
+        # the explicit candidate_count/result_count fields.
+        record["count"] = len(candidates)
+        probes.append(record)
     return available, probes
 
 
@@ -1731,10 +2250,18 @@ def execute_relaxed_search(
         and relaxed_decision.version
         and relaxed_decision.assignment.assignment != "legacy"
     )
+    shadow_due = bool(
+        relaxed_decision
+        and getattr(relaxed_decision, "shadow_version_id", None) is not None
+    )
     legacy_top_n = _get_config_int("match.top_n", db, 3)
     legacy_max_candidates = _get_config_int("match.max_candidates", db, 50)
     top_n = V1_DISPLAY_TOP_N if relaxed_is_v1 else legacy_top_n
-    max_candidates = V1_MAX_CANDIDATES if relaxed_is_v1 else legacy_max_candidates
+    max_candidates = (
+        V1_MAX_CANDIDATES if relaxed_is_v1
+        else max(V1_MAX_CANDIDATES, legacy_max_candidates) if shadow_due
+        else legacy_max_candidates
+    )
     flags = _normalize_experience_flags(experience_flags)
 
     if direction == "search_job":
@@ -1770,6 +2297,7 @@ def execute_relaxed_search(
             applied=True,
         )
         sr = SearchResult(reply_text=reply, result_count=0)
+        _attach_legacy_decision_metadata(sr, relaxed_decision, relaxed)
         so = _build_search_outcome(
             direction=direction,
             criteria_used=relaxed,
@@ -1789,6 +2317,17 @@ def execute_relaxed_search(
     frame = "candidate_search" if direction == "search_worker" else "job_search"
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame, flags)
     digest = conversation_service.compute_query_digest(relaxed)
+    request_now_utc = utc_now()
+    shadow = _submit_shadow_candidate(
+        candidate_dicts=candidate_dicts,
+        direction=direction,
+        criteria=relaxed,
+        userid=user_ctx.external_userid,
+        raw_query=raw_query,
+        assignment_decision=relaxed_decision,
+        db=db,
+        request_now_utc=request_now_utc,
+    ) if shadow_due else None
 
     # The relaxed path shares the exact v1 entry point used by the initial
     # search, so it inherits the §6.2 "LLM input = precision Top 20" contract and
@@ -1803,6 +2342,7 @@ def execute_relaxed_search(
         db=db,
         raw_query=raw_query,
         assignment_decision=relaxed_decision,
+        request_now_utc=request_now_utc,
     ) if relaxed_is_v1 else None
 
     if v1_meta is None:
@@ -1822,6 +2362,8 @@ def execute_relaxed_search(
             soft_preferences=soft_prefs,
             ranking_weights=ranking_weights,
         )
+        if relaxed_is_v1 and rerank_result.ranking_fallback is None:
+            rerank_result.ranking_fallback = "recommendation_v1_failed"
         ranked_ids = [str(item["id"]) for item in rerank_result.ranked_items]
     else:
         rerank_result = RerankResult(ranked_items=[])
@@ -1834,9 +2376,15 @@ def execute_relaxed_search(
 
     conversation_service.save_snapshot(
         session, ranked_ids, digest, relaxed,
-        request_id=v1_meta["request_id"] if v1_meta else None,
-        snapshot_id=v1_meta["snapshot_id"] if v1_meta else None,
-        direction=direction if v1_meta else None,
+        request_id=(
+            v1_meta["request_id"] if v1_meta else
+            shadow["request_id"] if shadow else None
+        ),
+        snapshot_id=(
+            v1_meta["snapshot_id"] if v1_meta else
+            shadow["snapshot_id"] if shadow else None
+        ),
+        direction=direction if (v1_meta or shadow) else None,
         strategy_version_id=(
             v1_meta["assignment"].strategy_version_id if v1_meta else None
         ),
@@ -1854,7 +2402,22 @@ def execute_relaxed_search(
 
     first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
     if not first_batch_ids:
-        sr = SearchResult(reply_text="暂无匹配结果。", result_count=0)
+        sr = SearchResult(
+            reply_text="暂无匹配结果。",
+            result_count=0,
+            snapshot_id=shadow["snapshot_id"] if shadow else None,
+            strategy_assignment=(
+                shadow["assignment"] if shadow
+                else _legacy_fallback_assignment(relaxed_decision)
+            ),
+            request_id=shadow["request_id"] if shadow else (
+                relaxed_decision.request_id if relaxed_decision else None
+            ),
+            query_digest=shadow["query_digest"] if shadow else digest,
+            candidate_ids=shadow["candidate_ids"] if shadow else [],
+            precision_pool_ids=shadow["precision_pool_ids"] if shadow else [],
+        )
+        _set_shadow_served_baseline(shadow, [])
         so = _build_search_outcome(
             direction=direction,
             criteria_used=relaxed,
@@ -1874,6 +2437,10 @@ def execute_relaxed_search(
         owner_ids = list({r.get("owner_userid", "") for r in batch})
         users_map = _build_users_map(owner_ids, db)
         filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+    _set_shadow_served_baseline(
+        shadow,
+        [str(item.get("id")) for item in filtered],
+    )
 
     shown_ids = [str(r["id"]) for r in batch]
     conversation_service.record_shown(session, shown_ids)
@@ -1914,13 +2481,35 @@ def execute_relaxed_search(
         reply_text=reply,
         has_more=remaining > 0,
         result_count=len(filtered),
-        recommendation_items=v1_meta["items"] if v1_meta else [],
-        snapshot_id=v1_meta["snapshot_id"] if v1_meta else None,
-        strategy_assignment=v1_meta["assignment"] if v1_meta else None,
-        request_id=v1_meta["request_id"] if v1_meta else None,
-        query_digest=digest if v1_meta else "",
-        candidate_ids=v1_meta["candidate_ids"] if v1_meta else [],
-        precision_pool_ids=v1_meta["precision_pool_ids"] if v1_meta else [],
+        recommendation_items=_served_recommendation_items(
+            filtered, direction, v1_meta["items"] if v1_meta else None,
+        ),
+        snapshot_id=(
+            v1_meta["snapshot_id"] if v1_meta else
+            shadow["snapshot_id"] if shadow else None
+        ),
+        strategy_assignment=(
+            v1_meta["assignment"] if v1_meta else
+            shadow["assignment"] if shadow else
+            _legacy_fallback_assignment(relaxed_decision)
+        ),
+        request_id=(
+            v1_meta["request_id"] if v1_meta else
+            shadow["request_id"] if shadow else None
+        ),
+        query_digest=digest,
+        candidate_ids=(
+            v1_meta["candidate_ids"] if v1_meta else
+            shadow["candidate_ids"] if shadow else
+            [str(item.get("id")) for item in candidate_dicts[:max_candidates]]
+        ),
+        precision_pool_ids=(
+            v1_meta["precision_pool_ids"] if v1_meta else
+            shadow["precision_pool_ids"] if shadow else []
+        ),
+        **_search_attempt_fields(
+            v1_meta, rerank_result, scoring_time_utc=request_now_utc,
+        ),
     )
     # Phase 5 §5.4：execute_relaxed_search 也统计 soft_pref_hits
     soft_pref_hits = _count_soft_pref_hits(batch, soft_prefs)
@@ -1946,6 +2535,8 @@ def _probe_job_suggestions(
     criteria: dict,
     limit: int,
     db: Session,
+    *,
+    attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     """温和放宽全 0 后，探查激进方向给用户做选择（Bug 3）。
 
@@ -1972,13 +2563,18 @@ def _probe_job_suggestions(
         if c != criteria and all(c != prev_c for _, prev_c in probes):
             probes.append(("keep_city_only", c))
 
-    return _collect_suggestions(probes, limit, db, _query_jobs, "search_job")
+    return _collect_suggestions(
+        probes, limit, db, _query_jobs, "search_job",
+        attempt_records=attempt_records,
+    )
 
 
 def _probe_resume_suggestions(
     criteria: dict,
     limit: int,
     db: Session,
+    *,
+    attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     probes: list[tuple[str, dict]] = []
 
@@ -1998,7 +2594,10 @@ def _probe_resume_suggestions(
         if c != criteria and all(c != prev_c for _, prev_c in probes):
             probes.append(("keep_city_only", c))
 
-    return _collect_suggestions(probes, limit, db, _query_resumes, "search_worker")
+    return _collect_suggestions(
+        probes, limit, db, _query_resumes, "search_worker",
+        attempt_records=attempt_records,
+    )
 
 
 def _collect_suggestions(
@@ -2007,6 +2606,8 @@ def _collect_suggestions(
     db: Session,
     query_fn,
     direction: str,
+    *,
+    attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     """跑探查并打日志，返回命中数 ≥1 的方向，按命中数降序，截到 _MAX_SUGGESTIONS。"""
     suggestions: list[FallbackSuggestion] = []
@@ -2014,7 +2615,15 @@ def _collect_suggestions(
         # 安全护栏：city / job_category 至少一个非空才允许查询
         if not has_effective_search_criteria(c):
             continue
+        started = time.perf_counter()
         cands = query_fn(c, limit, db)
+        if attempt_records is not None:
+            attempt_records.append(_query_attempt_record(
+                step=name,
+                criteria=c,
+                candidates=cands,
+                started=started,
+            ))
         log_event(
             "search_suggestion_probed",
             direction=direction,

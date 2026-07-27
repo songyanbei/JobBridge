@@ -570,10 +570,16 @@ class TestSearchJobsFallbackPrefix:
         criteria = {
             "city": ["北京"], "job_category": ["餐饮"], "salary_floor_monthly": 2200,
         }
-        result, _outcome = search_jobs(criteria, "北京餐饮", _make_session(), _make_user_ctx(), MagicMock())
+        result, _outcome = search_jobs(
+            criteria, "北京餐饮", _make_session(), _make_user_ctx(), MagicMock(),
+        )
 
         assert result.result_count == 3
         assert result.reply_text.startswith(_FALLBACK_NOTICE_JOB["relax_salary_10pct"])
+        assert _outcome.criteria_used["salary_floor_monthly"] == 1980
+        assert len(_outcome.relax_probe_results) == 1
+        assert _outcome.relax_probe_results[0]["attempt_kind"] == "initial"
+        assert _outcome.relax_probe_results[0]["candidate_count"] == 0
         assert "为您找到" in result.reply_text
 
 

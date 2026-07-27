@@ -456,6 +456,9 @@ class RecommendationRequestFact(BaseModel):
     attempt_kind: AttemptKind = "initial"
     #: §9.5：本次请求跑过的放宽探查步；probe attempt 不得被 served_attempt_id 引用。
     relax_probe_steps: list[str] = Field(default_factory=list)
+    #: 同一 request 内、served attempt 之外真实执行过的 initial/relax_probe
+    #: 查询。持久化层逐条写 recommendation_search_attempt，禁止只留步骤名。
+    additional_attempts: list[dict[str, Any]] = Field(default_factory=list)
     #: §9.5 attempt 事实。``criteria_digest`` 是 CHAR(64) 的**有效条件**规范化摘要，
     #: 不是 16 位 ``query_digest``；留空时持久化层按固定域分隔重新算一个 64 位摘要。
     criteria_digest: str = ""
@@ -489,10 +492,17 @@ class RecommendationSimulationResponse(BaseModel):
     #: "stable" 或 "legacy"；stable_version_id=NULL 是合法的 legacy 对照（§7.2），
     #: 对照侧必须给出 legacy 排序而不是空列表。
     current_basis: Literal["stable", "legacy"] = "legacy"
-    #: 模拟走确定性流水线，不调用 LLM；语义分统一取中性值，据实声明避免误读。
-    simulation_mode: Literal["deterministic"] = "deterministic"
+    #: 正常为真实 LLM；调用失败时明确标记 deterministic_fallback。
+    simulation_mode: Literal[
+        "llm", "deterministic_fallback", "no_candidates"
+    ] = "llm"
     llm_invoked: bool = False
     call_site: str = "recommendation_simulation"
+    semantic_source: Literal[
+        "llm", "llm_fallback_neutral", "no_candidates"
+    ] = "no_candidates"
+    llm_input_tokens: int | None = Field(default=None, ge=0)
+    llm_output_tokens: int | None = Field(default=None, ge=0)
     exposure_available: bool = True
     rank_changes: list[dict[str, Any]] = Field(default_factory=list)
     candidate_summaries: dict[str, Any] = Field(default_factory=dict)

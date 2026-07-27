@@ -195,6 +195,13 @@ class RerankResult(BaseModel):
     # Phase 7：同 IntentResult。
     input_tokens: int | None = Field(default=None, description="prompt_tokens")
     output_tokens: int | None = Field(default=None, description="completion_tokens")
+    # Serving-attempt telemetry. Providers may populate retry_count; the
+    # search wrapper always normalizes status/latency/fallback before the result
+    # is attached to recommendation_request/recommendation_search_attempt.
+    llm_status: str = Field(default="ok")
+    retry_count: int = Field(default=0, ge=0)
+    latency_ms: int = Field(default=0, ge=0)
+    ranking_fallback: str | None = Field(default=None)
 
 
 # ---------------------------------------------------------------------------

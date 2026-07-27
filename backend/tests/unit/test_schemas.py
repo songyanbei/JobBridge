@@ -238,6 +238,13 @@ class TestAdminSchemas:
             created_at=datetime(2026, 1, 1),
         )
         assert a.enabled is True
+        assert a.role == "viewer"
+
+        operator = AdminUserRead(
+            id=2, username="operator", role="operator",
+            created_at=datetime(2026, 1, 1),
+        )
+        assert operator.model_dump()["role"] == "operator"
 
     def test_system_config_read(self):
         c = SystemConfigRead(

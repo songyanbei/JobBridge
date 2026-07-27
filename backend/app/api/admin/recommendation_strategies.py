@@ -358,27 +358,11 @@ def rank_change_reasons(current_items: list, draft_items: list) -> list[dict[str
     return changes
 
 
-def _legacy_baseline_items(candidates: list[dict], direction: str, top_n: int) -> list:
-    """stable_version_id=NULL 时的 legacy 对照（§7.2 明确 NULL 就是 legacy）。
+def _legacy_baseline_items(candidates: list[dict], direction: str, top_n: int):
+    """Compatibility wrapper for callers/tests that used the former API helper."""
+    from app.services.recommendation_simulation_service import _legacy_baseline
 
-    Legacy 没有 v1 打分，只有硬过滤后的原始顺序，所以对照侧如实呈现它，而不是
-    返回空列表让管理员误以为"线上没有结果"。
-    """
-    from app.schemas.recommendation import RecommendationItem
-
-    items = []
-    for index, candidate in enumerate(candidates[:top_n], start=1):
-        items.append(RecommendationItem(
-            target_type="job" if direction == "search_job" else "resume",
-            target_id=int(candidate.get("id")),
-            position=index,
-            owner_userid=candidate.get("owner_userid"),
-            final_score=0.0,
-            is_exploration=False,
-            reason_codes=["legacy_baseline"],
-            score_detail=None,
-        ))
-    return items
+    return _legacy_baseline(candidates, direction, top_n)
 
 
 @strategy_router.post("/drafts/{version_id}/simulate")
@@ -388,7 +372,7 @@ def simulate_strategy_draft(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin_role(*_VIEWER)),
 ):
-    """确定性模拟：与线上共享同一排序流水线和同一曝光数据，但不调用 LLM。
+    """真实模拟：与线上共享精排 LLM、曝光数据和确定性排序流水线。
 
     §8.3 无副作用：本端点只读事实表（曝光/重复曝光），不写快照、不改
     ``shown_items``、不写曝光、不改分桶、不写对话日志、不发企微。唯一写入是
@@ -401,105 +385,56 @@ def simulate_strategy_draft(
     if row.direction != req.direction:
         raise BusinessException(40905, "strategy direction mismatch")
 
-    from app.services import search_service
-    from app.services.recommendation_exposure_service import (
-        batch_candidate_exposures,
-        recent_user_exposures,
+    from app.services.recommendation_simulation_service import simulate_strategy
+
+    simulation = simulate_strategy(
+        db,
+        draft=row,
+        direction=req.direction,
+        user_id=req.user_id,
+        raw_query=req.raw_query,
+        criteria=req.criteria,
     )
-    from app.services.recommendation_request_service import rank_candidate_dicts
-    from app.services.recommendation_scoring_service import V1_DISPLAY_TOP_N, V1_MAX_CANDIDATES
-    from app.core.time_utils import rotation_date, utc_now
-
-    if req.direction == "search_job":
-        candidates = search_service._jobs_to_dicts(
-            search_service._query_jobs(req.criteria, V1_MAX_CANDIDATES, db), db,
+    if simulation.llm_invoked and simulation.semantic_source != "llm":
+        db.rollback()
+        raise BusinessException(
+            50101,
+            "LLM recommendation simulation failed; the draft was not marked as simulated",
         )
-        target_type = "job"
-    else:
-        candidates = search_service._resumes_to_dicts(
-            search_service._query_resumes(req.criteria, V1_MAX_CANDIDATES, db),
-        )
-        target_type = "resume"
-
-    simulated_user = req.user_id or "simulation"
-    query_digest = search_service.conversation_service.compute_query_digest(req.criteria)
-    now = utc_now()
-    candidate_ids = [str(item.get("id")) for item in candidates[:V1_MAX_CANDIDATES]]
-
-    # §8: 模拟必须读真实曝光/重复曝光，否则曝光机会分与重复系数恒为中位，
-    # 模拟结果与线上系统性偏离。两次查询都是只读的。
-    draft_params = row.parameters or {}
-    try:
-        exposure_counts = batch_candidate_exposures(
-            db, target_type=target_type, candidate_ids=candidate_ids, request_now_utc=now,
-        )
-        recent_exposures = recent_user_exposures(
-            db, viewer_userid=simulated_user, target_type=target_type,
-            candidate_ids=candidate_ids, request_now_utc=now,
-            cooldown_hours=int(draft_params.get("repeat_cooldown_hours", 24) or 0),
-        )
-        exposure_available = True
-    except Exception:
-        exposure_counts, recent_exposures, exposure_available = {}, {}, False
-
-    rotation = rotation_date(now)
-    common = {
-        "direction": req.direction,
-        "criteria": req.criteria,
-        "userid": simulated_user,
-        "query_digest": query_digest,
-        # None（而不是 []）表示"本次没有语义结果"，流水线按中性 0.5 处理；传 []
-        # 会被当成"LLM 返回空"，把精排池全部压到 0 分，凭空制造偏差。
-        "semantic_ranked_items": None,
-        "exposure_counts": exposure_counts,
-        "recent_exposures": recent_exposures,
-        "exposure_available": exposure_available,
-        "rotation_date": rotation,
-        "now": now,
-    }
-
-    _draft_ranked, draft_items = rank_candidate_dicts(
-        candidates, strategy_version=row.id, parameters=draft_params, **common,
-    )
-
-    release = db.get(RecommendationStrategyRelease, req.direction)
-    stable_version = (
-        db.get(RecommendationStrategyVersion, release.stable_version_id)
-        if release and release.stable_version_id else None
-    )
-    if stable_version is not None:
-        _current_ranked, current_items = rank_candidate_dicts(
-            candidates, strategy_version=stable_version.id,
-            parameters=stable_version.parameters, **common,
-        )
-        current_basis = "stable"
-    else:
-        current_items = _legacy_baseline_items(candidates, req.direction, V1_DISPLAY_TOP_N)
-        current_basis = "legacy"
 
     mark_simulated(db, version_id)
     db.commit()
 
-    summaries = {str(item.get("id")): _candidate_summary(item, req.direction) for item in candidates}
+    summaries = {
+        str(item.get("id")): _candidate_summary(item, req.direction)
+        for item in simulation.candidates
+    }
     return ok({
         "version_id": version_id,
         "direction": req.direction,
         "parameters_digest": row.parameters_digest,
         "side_effects_written": False,
         "call_site": "recommendation_simulation",
-        # 明确标注模拟是确定性的：不调用 LLM，语义分统一取中性 0.5，因此两侧
-        # 差异只来自参数本身。前端必须原样展示这段说明，避免把模拟当成线上复现。
-        "llm_invoked": False,
-        "semantic_source": "deterministic_neutral",
-        "simulation_mode": "deterministic",
-        "current_basis": current_basis,
-        "exposure_available": exposure_available,
-        "rotation_date": rotation,
-        "current": [item.model_dump(mode="json") for item in current_items],
-        "draft": [item.model_dump(mode="json") for item in draft_items],
-        "rank_changes": rank_change_reasons(current_items, draft_items),
+        "llm_invoked": simulation.llm_invoked,
+        "semantic_source": simulation.semantic_source,
+        "simulation_mode": simulation.simulation_mode,
+        "llm_input_tokens": simulation.llm_input_tokens,
+        "llm_output_tokens": simulation.llm_output_tokens,
+        "current_basis": simulation.current_basis,
+        "exposure_available": simulation.exposure_available,
+        "rotation_date": simulation.rotation_date,
+        "current": [
+            item.model_dump(mode="json") for item in simulation.current_items
+        ],
+        "draft": [
+            item.model_dump(mode="json") for item in simulation.draft_items
+        ],
+        "rank_changes": rank_change_reasons(
+            simulation.current_items,
+            simulation.draft_items,
+        ),
         "candidate_summaries": summaries,
-        "candidate_count": len(candidates),
+        "candidate_count": len(simulation.candidates),
     })
 
 

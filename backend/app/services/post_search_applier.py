@@ -284,6 +284,15 @@ def _handle_auto_relax_and_retry(
         _attach_recommendation_fields,
         _recommendation_reply_fields,
     )
+    previous_request_id = getattr(ctx.search_result, "request_id", None)
+    final_request_id = getattr(new_result, "request_id", None)
+    if previous_request_id and previous_request_id != final_request_id:
+        # The preliminary search may already have submitted a detached shadow
+        # observation. It will never be activated because only the final
+        # auto-relaxed reply is committed; discard it to avoid a stranded state.
+        from app.services.recommendation_shadow_service import discard
+
+        discard(previous_request_id)
     fields = _recommendation_reply_fields(
         new_result,
         ctx.user_ctx.external_userid,
@@ -291,6 +300,8 @@ def _handle_auto_relax_and_retry(
         request_kind="auto_relaxed",
         parent_request_id=getattr(ctx.search_result, "request_id", None),
         search_outcome=new_outcome,
+        prior_search_result=ctx.search_result,
+        prior_search_outcome=ctx.search_outcome,
     )
     return _attach_recommendation_fields(replies, fields, new_result)
 

@@ -75,6 +75,7 @@ class RequestMetrics(BaseModel):
 
 class AttemptMetrics(BaseModel):
     total: int = 0
+    ranking_attempts: int = 0
     reranker_fallback: int = 0
     reranker_fallback_rate: float = 0.0
     fallback_by_reason: dict[str, int] = {}
@@ -157,7 +158,12 @@ class LlmCostMetrics(BaseModel):
 
 
 class ShadowMetrics(BaseModel):
-    """shadow 执行链路未实现前的空壳，``available=False`` 时全部值不可解读。"""
+    """Shadow 聚合指标。
+
+    ``available`` 表示 request/attempt 上的核心 shadow 事实可查询；
+    ``missing_sources`` 单独列出仍只存在于日志等外部系统、无法由本接口可靠聚合的
+    指标。缺少单个外部来源不应让其余已落库指标全部消失。
+    """
 
     available: bool = False
     missing_sources: list[str] = []
@@ -167,7 +173,7 @@ class ShadowMetrics(BaseModel):
     timeout_count: int = 0
     local_capacity_skip_count: int = 0
     global_capacity_skip_count: int = 0
-    persistence_drop_count: int = 0
+    persistence_drop_count: int | None = None
     queue_wait_p95_ms: float | None = None
     duration_p95_ms: float | None = None
 

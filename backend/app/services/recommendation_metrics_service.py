@@ -83,18 +83,10 @@ IMPRESSION_BACKLOG_STATES = ("pending", "processing", "retry", "deriving")
 # probe / shadow attempt 不进入召回池分母（§11.9、§14.5）。
 NON_SERVING_ATTEMPT_KINDS = ("relax_probe", "shadow_candidate")
 
-# shadow 执行链路（§7.5）尚未实现，这些字段在 ``recommendation_request`` 上都不
-# 存在。指标先按"数据源存在但恒为空"返回，接上以后只需改 ``_shadow_section``。
+# persistence executor 队列满时不能再同步写数据库，否则会把本应非阻塞的 shadow
+# 反压到服务链路；该事件目前只存在于结构化日志，需由日志指标系统聚合。
 SHADOW_MISSING_SOURCES = (
-    "recommendation_request.shadow_status",
-    "recommendation_request.shadow_top_ids",
-    "recommendation_request.shadow_position_delta",
-    "recommendation_request.shadow_queue_wait_ms",
-    "recommendation_request.shadow_duration_ms",
-    "recommendation_request.shadow_skip_reason",
-    "recommendation_request.shadow_input_tokens",
-    "recommendation_request.shadow_output_tokens",
-    "recommendation_search_attempt.attempt_kind='shadow_candidate'",
+    "structured_log.event='shadow_persistence_dropped'",
 )
 
 
@@ -309,8 +301,18 @@ def _attempt_base(db: Session, direction: str | None, start: datetime, end: date
 def _attempt_section(
     db: Session, direction: str | None, start: datetime, end: datetime,
 ) -> AttemptMetrics:
-    base = _attempt_base(db, direction, start, end)
-    totals = base.with_entities(
+    # shadow 有独立的差异、容量与成本分区；混进服务 attempt 会让候选策略超时
+    # 污染用户实际经历的 reranker 回退率和延迟。
+    base = _attempt_base(db, direction, start, end).filter(
+        RecommendationSearchAttempt.attempt_kind != "shadow_candidate",
+    )
+    total = int(base.with_entities(
+        func.count(RecommendationSearchAttempt.attempt_id),
+    ).scalar() or 0)
+    ranking_base = base.filter(
+        RecommendationSearchAttempt.attempt_kind != "relax_probe",
+    )
+    totals = ranking_base.with_entities(
         func.count(RecommendationSearchAttempt.attempt_id),
         func.coalesce(func.sum(
             case((RecommendationSearchAttempt.ranking_fallback.isnot(None), 1), else_=0),
@@ -320,11 +322,18 @@ def _attempt_section(
         ), 0),
         func.coalesce(func.sum(RecommendationSearchAttempt.llm_retry_count), 0),
     ).one()
-    total, fallback, zero_candidate, retries = (int(value) for value in totals)
+    ranking_attempts, fallback, _rank_zero_candidate, retries = (
+        int(value) for value in totals
+    )
+    zero_candidate = int(base.with_entities(
+        func.coalesce(func.sum(
+            case((RecommendationSearchAttempt.is_zero_result == 1, 1), else_=0),
+        ), 0),
+    ).scalar() or 0)
 
     fallback_reasons = {
         str(reason): int(count)
-        for reason, count in base.with_entities(
+        for reason, count in ranking_base.with_entities(
             RecommendationSearchAttempt.ranking_fallback,
             func.count(RecommendationSearchAttempt.attempt_id),
         ).filter(
@@ -333,7 +342,7 @@ def _attempt_section(
     }
     llm_status_counts = {
         str(status): int(count)
-        for status, count in base.with_entities(
+        for status, count in ranking_base.with_entities(
             RecommendationSearchAttempt.llm_status,
             func.count(RecommendationSearchAttempt.attempt_id),
         ).group_by(RecommendationSearchAttempt.llm_status).all()
@@ -341,15 +350,16 @@ def _attempt_section(
 
     latencies = [
         float(value or 0)
-        for (value,) in base.with_entities(
+        for (value,) in ranking_base.with_entities(
             RecommendationSearchAttempt.ranking_latency_ms,
         ).order_by(RecommendationSearchAttempt.created_at.desc()).limit(SCAN_LIMIT).all()
     ]
 
     return AttemptMetrics(
         total=total,
+        ranking_attempts=ranking_attempts,
         reranker_fallback=fallback,
-        reranker_fallback_rate=_ratio(fallback, total),
+        reranker_fallback_rate=_ratio(fallback, ranking_attempts),
         fallback_by_reason=fallback_reasons,
         llm_status_counts=llm_status_counts,
         llm_status_share=_shares(llm_status_counts),
@@ -680,6 +690,7 @@ def _llm_section(
 ) -> LlmCostMetrics:
     rows = db.query(
         RecommendationRequest.direction,
+        RecommendationSearchAttempt.attempt_kind,
         func.coalesce(func.sum(RecommendationSearchAttempt.llm_input_tokens), 0),
         func.coalesce(func.sum(RecommendationSearchAttempt.llm_output_tokens), 0),
         func.count(RecommendationSearchAttempt.attempt_id),
@@ -692,39 +703,154 @@ def _llm_section(
     )
     if direction:
         rows = rows.filter(RecommendationRequest.direction == direction)
-    by_direction = {
-        str(row[0]): {
-            "input_tokens": int(row[1]),
-            "output_tokens": int(row[2]),
-            "attempts": int(row[3]),
-        }
-        for row in rows.group_by(RecommendationRequest.direction).all()
-    }
+    grouped_rows = rows.group_by(
+        RecommendationRequest.direction,
+        RecommendationSearchAttempt.attempt_kind,
+    ).all()
+    by_direction: dict[str, dict[str, int]] = {}
+    legacy_input_tokens = 0
+    legacy_output_tokens = 0
+    shadow_input_tokens = 0
+    shadow_output_tokens = 0
+    for row_direction, attempt_kind, input_tokens, output_tokens, attempts in grouped_rows:
+        key = str(row_direction)
+        bucket = by_direction.setdefault(key, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "attempts": 0,
+            "legacy_input_tokens": 0,
+            "legacy_output_tokens": 0,
+            "legacy_attempts": 0,
+            "shadow_input_tokens": 0,
+            "shadow_output_tokens": 0,
+            "shadow_attempts": 0,
+        })
+        input_count = int(input_tokens)
+        output_count = int(output_tokens)
+        attempt_count = int(attempts)
+        bucket["input_tokens"] += input_count
+        bucket["output_tokens"] += output_count
+        bucket["attempts"] += attempt_count
+        if str(attempt_kind) == "shadow_candidate":
+            bucket["shadow_input_tokens"] += input_count
+            bucket["shadow_output_tokens"] += output_count
+            bucket["shadow_attempts"] += attempt_count
+            shadow_input_tokens += input_count
+            shadow_output_tokens += output_count
+        else:
+            bucket["legacy_input_tokens"] += input_count
+            bucket["legacy_output_tokens"] += output_count
+            bucket["legacy_attempts"] += attempt_count
+            legacy_input_tokens += input_count
+            legacy_output_tokens += output_count
     return LlmCostMetrics(
-        legacy_input_tokens=sum(item["input_tokens"] for item in by_direction.values()),
-        legacy_output_tokens=sum(item["output_tokens"] for item in by_direction.values()),
+        legacy_input_tokens=legacy_input_tokens,
+        legacy_output_tokens=legacy_output_tokens,
         by_direction=by_direction,
-        shadow_input_tokens=0,
-        shadow_output_tokens=0,
+        shadow_input_tokens=shadow_input_tokens,
+        shadow_output_tokens=shadow_output_tokens,
         # 单价表与 provider 限流事实都还没有落库，返回 None 表示"无数据源"。
         daily_cost_by_direction=None,
         provider_throttle_rate=None,
     )
 
 
-def _shadow_section() -> ShadowMetrics:
+def _shadow_section(
+    db: Session, direction: str | None, start: datetime, end: datetime,
+) -> ShadowMetrics:
+    rows = _request_base(db, direction, start, end).filter(
+        RecommendationRequest.shadow_status.isnot(None),
+    ).with_entities(
+        RecommendationRequest.shadow_status,
+        RecommendationRequest.shadow_fallback,
+        RecommendationRequest.served_top_ids,
+        RecommendationRequest.shadow_top_ids,
+        RecommendationRequest.shadow_overlap_count,
+        RecommendationRequest.shadow_rank_delta,
+        RecommendationRequest.shadow_queue_wait_ms,
+        RecommendationRequest.shadow_latency_ms,
+    ).order_by(
+        RecommendationRequest.created_at.desc(),
+    ).limit(SCAN_LIMIT).all()
+
+    overlap_count = 0
+    overlap_denominator = 0
+    position_deltas: list[float] = []
+    queue_waits: list[float] = []
+    durations: list[float] = []
+    timeout_count = 0
+    local_capacity_skip_count = 0
+    global_capacity_skip_count = 0
+
+    for (
+        status,
+        fallback,
+        served_top_ids,
+        shadow_top_ids,
+        stored_overlap,
+        rank_delta,
+        queue_wait_ms,
+        latency_ms,
+    ) in rows:
+        status_text = str(status)
+        fallback_text = str(fallback or "")
+        if status_text in ("timeout", "timeout_in_queue"):
+            timeout_count += 1
+        if status_text == "skipped_capacity" and fallback_text == "local_capacity":
+            local_capacity_skip_count += 1
+        if status_text == "skipped_capacity" and fallback_text == "global_capacity":
+            global_capacity_skip_count += 1
+
+        served_ids = [str(item) for item in (served_top_ids or [])]
+        shadow_ids = [str(item) for item in (shadow_top_ids or [])]
+        if status_text == "completed" and (served_ids or shadow_ids):
+            # Top-N overlap 的分母取双侧实际 Top 列表较长者；候选策略少返回条目时
+            # 不能因为缩小分母而虚高。stored_overlap 是写入时计算的集合交集。
+            overlap_denominator += max(len(served_ids), len(shadow_ids))
+            overlap_count += int(
+                stored_overlap
+                if stored_overlap is not None
+                else len(set(served_ids) & set(shadow_ids))
+            )
+
+        if isinstance(rank_delta, dict):
+            for value in rank_delta.values():
+                try:
+                    position_deltas.append(abs(float(value)))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(rank_delta, list):
+            for item in rank_delta:
+                value = item.get("delta") if isinstance(item, dict) else item
+                try:
+                    position_deltas.append(abs(float(value)))
+                except (TypeError, ValueError):
+                    continue
+
+        queue_wait = float(queue_wait_ms or 0)
+        latency = float(latency_ms or 0)
+        queue_waits.append(queue_wait)
+        # “完成耗时”从提交到结束，包含排队和实际计算时间。
+        durations.append(queue_wait + latency)
+
     return ShadowMetrics(
-        available=False,
+        available=True,
         missing_sources=list(SHADOW_MISSING_SOURCES),
-        requests=0,
-        top_n_overlap_rate=None,
-        average_position_delta=None,
-        timeout_count=0,
-        local_capacity_skip_count=0,
-        global_capacity_skip_count=0,
-        persistence_drop_count=0,
-        queue_wait_p95_ms=None,
-        duration_p95_ms=None,
+        requests=len(rows),
+        top_n_overlap_rate=(
+            _ratio(overlap_count, overlap_denominator)
+            if overlap_denominator else None
+        ),
+        average_position_delta=(
+            round(sum(position_deltas) / len(position_deltas), 6)
+            if position_deltas else None
+        ),
+        timeout_count=timeout_count,
+        local_capacity_skip_count=local_capacity_skip_count,
+        global_capacity_skip_count=global_capacity_skip_count,
+        persistence_drop_count=None,
+        queue_wait_p95_ms=percentile(queue_waits, 0.95),
+        duration_p95_ms=percentile(durations, 0.95),
     )
 
 
@@ -758,7 +884,7 @@ def collect_metrics(
         clicks=_click_section(db, direction, start, end, exposure.impressions),
         delivery=_delivery_section(db, direction, start, end, end),
         llm=_llm_section(db, direction, start, end),
-        shadow=_shadow_section(),
+        shadow=_shadow_section(db, direction, start, end),
     )
 
 

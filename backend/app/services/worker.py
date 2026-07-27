@@ -144,6 +144,14 @@ class Worker:
 
     def start(self) -> None:
         logger.info("worker: starting pid=%d", self._pid)
+        from app.services.recommendation_shadow_service import start_shadow_runner
+        from app.services.recommendation_strategy_service import (
+            start_runtime_control_watcher,
+            stop_runtime_control_watcher,
+        )
+
+        start_shadow_runner()
+        start_runtime_control_watcher()
         self._setup_signal_handlers()
         self._start_heartbeat()
         self._startup_recovery()
@@ -152,6 +160,10 @@ class Worker:
             self._main_loop()
         finally:
             self._stop_aux_loops()
+            from app.services.recommendation_shadow_service import shutdown_shadow_runner
+
+            stop_runtime_control_watcher()
+            shutdown_shadow_runner()
         logger.info("worker: stopped pid=%d", self._pid)
 
     def _setup_signal_handlers(self) -> None:
@@ -510,6 +522,7 @@ class Worker:
     ) -> str:
         db: Session = SessionLocal()
         business_committed = False
+        shadow_request_ids: set[str] = set()
         try:
             # Redis is an at-least-once queue. A crash between enqueue and the DB
             # claim can leave a duplicate payload behind. The per-user lease
@@ -563,6 +576,15 @@ class Worker:
                     stage_token,
                 )
                 search_service.reset_queue_backlog_hint(backlog_token)
+            shadow_request_ids = {
+                reply.recommendation_request.request_id
+                for reply in replies
+                if (
+                    reply.recommendation_request is not None
+                    and reply.recommendation_request.execution_mode == "shadow"
+                    and reply.recommendation_request.request_id
+                )
+            }
 
             # Router 只暂存了 session 意图；DB 提交前再次验证租约。续租线程一旦
             # 发现 extend 失败会置 lost_event，使旧 Worker 走 rollback + 可恢复重试。
@@ -583,6 +605,17 @@ class Worker:
                 self._mark_event_done(db, inbound_event_id)
             db.commit()
             business_committed = True
+            # A shadow callback may persist only after the served request/outbox
+            # transaction exists.  Direct/no-event calls do not stage those
+            # facts, so their detached observations are discarded.
+            from app.services import recommendation_shadow_service
+            for shadow_request_id in shadow_request_ids:
+                if inbound_event_id:
+                    recommendation_shadow_service.activate_persistence(
+                        shadow_request_id,
+                    )
+                else:
+                    recommendation_shadow_service.discard(shadow_request_id)
 
             # Session 必须先落 Redis 并把 durable event 标 done，outbox 才可见。
             # Redis 短断时业务事务已经安全提交，后续 turn 被 session_pending 顺序
@@ -610,6 +643,10 @@ class Worker:
             return "processed" if session_ready else "session_commit_pending"
         except Exception as exc:
             db.rollback()
+            if not business_committed and shadow_request_ids:
+                from app.services import recommendation_shadow_service
+                for shadow_request_id in shadow_request_ids:
+                    recommendation_shadow_service.discard(shadow_request_id)
             if business_committed:
                 # Never send an already-committed publish/search turn through the
                 # generic retry path. Its durable session/outbox state is the sole

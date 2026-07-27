@@ -1,0 +1,1 @@
+"""Recommendation integration acceptance package."""

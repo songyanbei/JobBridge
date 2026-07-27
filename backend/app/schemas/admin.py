@@ -1,5 +1,6 @@
 """运营后台相关 DTO。"""
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +37,11 @@ class AdminUserRead(BaseModel):
     id: int = Field(..., description="管理员数值 ID")
     username: str = Field(..., description="登录用户名")
     display_name: str | None = Field(default=None, description="显示名")
+    # §9.10：前端要按角色收敛按钮。缺这个字段时每个管理端页面都得单独再请求一次
+    # 角色接口，或者干脆展示一堆点下去就 403 的按钮。
+    role: Literal["viewer", "operator", "super_admin"] = Field(
+        default="viewer", description="管理员角色（viewer/operator/super_admin）",
+    )
     password_changed: bool = Field(default=False, description="是否已修改初始密码")
     enabled: bool = Field(default=True, description="账号是否启用")
     last_login_at: datetime | None = Field(default=None, description="最近登录时间")

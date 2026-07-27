@@ -2,6 +2,8 @@
 
 只覆盖 message_router 的纯函数部分，不需要 DB / Redis。
 """
+from datetime import datetime, timezone
+
 from app.schemas.conversation import ReplyMessage
 from app.schemas.recommendation import RecommendationItem, StrategyAssignment
 from app.schemas.search import SearchOutcome, SearchResult
@@ -9,6 +11,7 @@ from app.services.message_router import (
     _attach_recommendation_fields,
     _recommendation_reply_fields,
 )
+from app.services.search_service import _legacy_fallback_assignment
 
 
 def _outcome(**overrides) -> SearchOutcome:
@@ -111,6 +114,29 @@ def test_shadow_serves_legacy_but_keeps_candidate_version():
     assert fact.candidate_strategy_version_id == 9
 
 
+def test_v1_failure_keeps_real_execution_mode_in_legacy_fact():
+    """v1 回退不是运维关闭，事实表必须保留当时的 on/shadow 模式。"""
+    decision = type("Decision", (), {
+        "assignment": StrategyAssignment(
+            direction="search_job",
+            execution_mode="on",
+            assignment="candidate",
+            strategy_version_id=9,
+            candidate_version_id=9,
+            algorithm_version="recommendation-v1",
+        ),
+    })()
+
+    fallback = _legacy_fallback_assignment(decision)
+
+    assert fallback is not None
+    assert fallback.execution_mode == "on"
+    assert fallback.assignment == "legacy"
+    assert fallback.strategy_version_id is None
+    assert fallback.candidate_version_id == 9
+    assert fallback.algorithm_version == "legacy"
+
+
 def test_reply_without_real_query_does_not_fabricate_a_request():
     """快照过期这类回复根本没查过库，不能污染零结果率。"""
     result = SearchResult(reply_text="搜索结果已过期，请重新搜索。")
@@ -185,10 +211,62 @@ def test_relax_probe_steps_are_carried():
     fact = _recommendation_reply_fields(
         result, "u1", "msg-1",
         search_outcome=_outcome(
-            relax_probe_results=[{"step": "relax_salary_10pct", "count": 4}],
+            relax_probe_results=[{
+                "step": "relax_salary_10pct",
+                "count": 4,
+                "candidate_count": 4,
+                "candidate_ids": ["1", "2", "3", "4"],
+            }],
         ),
     )["recommendation_request"]
     assert fact.relax_probe_steps == ["relax_salary_10pct"]
+    assert len(fact.additional_attempts) == 1
+    assert fact.additional_attempts[0]["attempt_kind"] == "relax_probe"
+    assert fact.additional_attempts[0]["attempt_no"] == 1
+
+
+def test_auto_relaxed_keeps_initial_and_probe_attempts_on_final_request():
+    prior = SearchResult(
+        reply_text="暂无结果",
+        result_count=0,
+        request_id="req-preliminary",
+        query_digest="strict-digest",
+        candidate_ids=[],
+        llm_status="ok",
+        ranking_latency_ms=12,
+    )
+    final = SearchResult(
+        reply_text="放宽后结果",
+        result_count=1,
+        request_id="req-final",
+        query_digest="relaxed-digest",
+        candidate_ids=["7"],
+    )
+    fact = _recommendation_reply_fields(
+        final,
+        "u1",
+        "msg-1",
+        request_kind="auto_relaxed",
+        parent_request_id="req-preliminary",
+        search_outcome=_outcome(final_count=1),
+        prior_search_result=prior,
+        prior_search_outcome=_outcome(
+            relax_probe_results=[{
+                "step": "relax_salary_10pct",
+                "candidate_count": 1,
+                "candidate_ids": ["7"],
+            }],
+        ),
+    )["recommendation_request"]
+
+    assert fact.request_id == "req-final"
+    assert fact.parent_request_id is None
+    assert fact.attempt_kind == "auto_relaxed"
+    assert fact.attempt_no == 2
+    assert [
+        (item["attempt_no"], item["attempt_kind"])
+        for item in fact.additional_attempts
+    ] == [(0, "initial"), (1, "relax_probe")]
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +306,72 @@ def test_only_the_reply_that_renders_candidates_gets_the_delivery():
     assert replies[1].recommendation_context is not None
     assert replies[1].delivery_id == replies[1].recommendation_context.delivery_id
     assert len(replies[1].recommendation_context.items) == 3
+
+
+def test_legacy_results_create_delivery_items_for_actual_visible_candidates():
+    from app.services.search_service import _served_recommendation_items
+
+    visible = [
+        {"id": 8, "owner_userid": "owner-8"},
+        {"id": 3, "owner_userid": "owner-3"},
+    ]
+    items = _served_recommendation_items(visible, "search_job")
+    result = SearchResult(
+        reply_text="岗位 8\n岗位 3",
+        result_count=2,
+        recommendation_items=items,
+    )
+    fields = _recommendation_reply_fields(
+        result,
+        "u1",
+        "msg-legacy",
+        search_outcome=_outcome(final_count=2),
+    )
+
+    assert fields["recommendation_request"].served_assignment == "legacy"
+    assert fields["recommendation_request"].served_top_ids == ["8", "3"]
+    assert [item.target_id for item in fields["recommendation_context"].items] == [8, 3]
+    assert all(item.reason_codes == ["legacy_baseline"] for item in items)
+
+
+def test_served_items_drop_v1_candidates_removed_by_permission_filter():
+    from app.services.search_service import _served_recommendation_items
+
+    ranked = _v1_result().recommendation_items
+    items = _served_recommendation_items(
+        [{"id": 2, "owner_userid": "visible-owner"}],
+        "search_job",
+        ranked,
+    )
+
+    assert [item.target_id for item in items] == [2]
+    assert items[0].position == 1
+    assert items[0].owner_userid == "visible-owner"
+
+
+def test_served_attempt_carries_real_llm_telemetry():
+    scoring_time = datetime(2026, 7, 27, 2, 3, 4, tzinfo=timezone.utc)
+    result = _v1_result()
+    result.scoring_time_utc = scoring_time
+    result.llm_status = "timeout"
+    result.llm_input_tokens = 31
+    result.llm_output_tokens = 7
+    result.llm_retry_count = 1
+    result.ranking_fallback = "provider_timeout"
+    result.ranking_latency_ms = 432
+
+    fact = _recommendation_reply_fields(
+        result, "u1", "msg-telemetry", search_outcome=_outcome(final_count=3),
+    )["recommendation_request"]
+
+    assert fact.scoring_time_utc == scoring_time
+    assert fact.llm_status == "timeout"
+    assert fact.llm_input_tokens == 31
+    assert fact.llm_output_tokens == 7
+    assert fact.llm_retry_count == 1
+    assert fact.ranking_fallback == "provider_timeout"
+    assert fact.ranking_latency_ms == 432
+    assert fact.attempt_latency_ms == 432
 
 
 def test_applier_attached_fields_are_not_overwritten():

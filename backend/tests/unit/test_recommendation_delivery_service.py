@@ -324,6 +324,44 @@ def test_attempt_uses_legal_enums_and_a_real_64_char_digest(content_keys):
     assert attempt.precision_pool_ids == ["11"]
 
 
+def test_every_real_relax_query_is_persisted_as_an_attempt(content_keys):
+    db = _FakeSession()
+    _prepare(db, content_keys, fact=_fact(
+        request_kind="auto_relaxed",
+        attempt_kind="auto_relaxed",
+        attempt_no=2,
+        additional_attempts=[
+            {
+                "attempt_no": 0,
+                "attempt_kind": "initial",
+                "candidate_ids": [],
+                "candidate_count": 0,
+                "result_count": 0,
+                "is_zero_result": True,
+            },
+            {
+                "attempt_no": 1,
+                "attempt_kind": "relax_probe",
+                "candidate_ids": ["99"],
+                "candidate_count": 1,
+                "result_count": 1,
+                "is_zero_result": False,
+            },
+        ],
+    ))
+
+    attempts = [
+        row for row in db.added if type(row).__name__ == "RecommendationSearchAttempt"
+    ]
+    assert [(row.attempt_no, row.attempt_kind) for row in attempts] == [
+        (2, "auto_relaxed"),
+        (0, "initial"),
+        (1, "relax_probe"),
+    ]
+    request = db.added[0]
+    assert request.served_attempt_id == attempts[0].attempt_id
+
+
 def test_illegal_enum_values_fall_back_instead_of_being_written(content_keys):
     db = _FakeSession()
     _prepare(db, content_keys, fact=_fact(llm_status="completed", attempt_kind="show_more"))

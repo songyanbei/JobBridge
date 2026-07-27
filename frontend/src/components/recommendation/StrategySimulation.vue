@@ -1,10 +1,10 @@
 <template>
   <div class="strategy-simulation">
     <el-alert type="info" :closable="false" show-icon class="sim-alert">
-      <template #title>模拟是确定性计算，不调用 LLM，也不产生任何线上副作用</template>
+      <template #title>模拟复用线上精排 LLM 与确定性排序流水线，但不产生线上服务副作用</template>
       <template #default>
         <div>
-          语义分统一取中性值（0.5），因此左右两侧差异只来自策略参数本身；模拟结果不能等同于线上复现。
+          同一次 LLM 语义排序结果会同时用于稳定版本和草稿版本，避免模型采样差异干扰参数对比；LLM 调用失败时本次模拟不会解锁发布。
         </div>
         <div>
           模拟不写搜索快照、不修改 shown_items、不写曝光、不改灰度分桶、不写对话日志、不发企微消息；唯一写入是发布前置校验需要的「最后模拟指纹」。
@@ -114,6 +114,12 @@
         <el-tag size="small" type="info">轮换日 {{ result.rotation_date || '—' }}</el-tag>
         <el-tag size="small" type="info">写入副作用：{{ result.side_effects_written ? '有' : '无' }}</el-tag>
         <el-tag size="small" type="info">LLM 调用：{{ result.llm_invoked ? '有' : '无' }}</el-tag>
+        <el-tag size="small" :type="result.simulation_mode === 'llm' ? 'success' : 'warning'">
+          模拟模式：{{ result.simulation_mode || '—' }}
+        </el-tag>
+        <el-tag v-if="result.llm_invoked" size="small" type="info">
+          Token：{{ result.llm_input_tokens ?? '—' }} / {{ result.llm_output_tokens ?? '—' }}
+        </el-tag>
       </div>
 
       <el-row :gutter="16" class="compare-row">
@@ -121,7 +127,7 @@
           <div class="compare-head">
             当前线上策略
             <span class="jb-muted">
-              （{{ result.current_basis === 'stable' ? '稳定版本' : 'legacy 原始顺序' }}）
+              （{{ result.current_basis === 'stable' ? '稳定版本' : 'legacy 线上重排' }}）
             </span>
           </div>
           <el-empty v-if="!currentItems.length" description="无结果" :image-size="60" />

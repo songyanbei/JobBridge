@@ -36,10 +36,22 @@ async def lifespan(app: FastAPI):
     - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
     """
     configure_loguru(settings.app_env)
+    from app.services.recommendation_shadow_service import start_shadow_runner
+    from app.services.recommendation_strategy_service import (
+        start_runtime_control_watcher,
+        stop_runtime_control_watcher,
+    )
+
+    start_shadow_runner()
+    start_runtime_control_watcher()
     task_scheduler.start()
     try:
         yield
     finally:
+        from app.services.recommendation_shadow_service import shutdown_shadow_runner
+
+        stop_runtime_control_watcher()
+        shutdown_shadow_runner()
         task_scheduler.shutdown()
 
 OPENAPI_TAGS = [

@@ -679,6 +679,15 @@ class RecommendationRequest(Base):
     served_owner_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     served_max_owner_items = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     served_exploration_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    shadow_top_ids = sa.Column(sa.JSON, nullable=True)
+    shadow_overlap_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    shadow_rank_delta = sa.Column(sa.JSON, nullable=True)
+    shadow_status = sa.Column(sa.String(32), nullable=True)
+    shadow_queue_wait_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    shadow_latency_ms = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    shadow_input_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    shadow_output_tokens = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    shadow_fallback = sa.Column(sa.String(32), nullable=True)
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
 
     __table_args__ = (
