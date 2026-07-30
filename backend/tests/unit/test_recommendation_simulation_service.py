@@ -58,7 +58,13 @@ def _patch_inputs(monkeypatch, rerank_result: RerankResult):
         "_get_config_int",
         lambda key, *_args, **_kwargs: 50 if key == "match.max_candidates" else 3,
     )
-    monkeypatch.setattr(search_service, "_query_jobs", lambda *_args, **_kwargs: [object()])
+    query_criteria = []
+
+    def _query_jobs(criteria, *_args, **_kwargs):
+        query_criteria.append(criteria)
+        return [object()]
+
+    monkeypatch.setattr(search_service, "_query_jobs", _query_jobs)
     monkeypatch.setattr(
         search_service,
         "_jobs_to_dicts",
@@ -86,11 +92,11 @@ def _patch_inputs(monkeypatch, rerank_result: RerankResult):
         return rerank_result
 
     monkeypatch.setattr(search_service, "_rerank_with_logging", _rerank)
-    return candidates, calls
+    return candidates, calls, query_criteria
 
 
 def test_simulation_invokes_v1_and_real_legacy_reranking(monkeypatch):
-    candidates, calls = _patch_inputs(
+    candidates, calls, query_criteria = _patch_inputs(
         monkeypatch,
         RerankResult(
             ranked_items=[{"id": "2"}, {"id": "1"}, {"id": "3"}],
@@ -106,8 +112,12 @@ def test_simulation_invokes_v1_and_real_legacy_reranking(monkeypatch):
         draft=_draft(),
         direction="search_job",
         user_id="viewer-1",
-        raw_query="北京普工，月薪六千",
-        criteria={"city": ["北京市"], "salary_floor_monthly": 6000},
+        raw_query="找苏州电子厂，工资下限5500",
+        criteria={
+            "city": ["苏州"],
+            "job_category": ["电子厂"],
+            "salary_floor_monthly": 5500,
+        },
     )
 
     assert result.llm_invoked is True
@@ -116,6 +126,11 @@ def test_simulation_invokes_v1_and_real_legacy_reranking(monkeypatch):
     assert result.llm_input_tokens == 44
     assert result.llm_output_tokens == 16
     assert result.current_basis == "legacy"
+    assert query_criteria == [{
+        "city": ["苏州市"],
+        "job_category": ["电子厂"],
+        "salary_floor_monthly": 5500,
+    }]
     assert [item.target_id for item in result.current_items] == [2, 1, 3]
     assert len(calls) == 2
     assert calls[0]["call_site"] == "recommendation_simulation"
@@ -132,7 +147,7 @@ def test_simulation_invokes_v1_and_real_legacy_reranking(monkeypatch):
 
 
 def test_simulation_labels_llm_failure_as_neutral_fallback(monkeypatch):
-    _candidates_value, calls = _patch_inputs(
+    _candidates_value, calls, _query_criteria = _patch_inputs(
         monkeypatch,
         RerankResult(ranked_items=[]),
     )

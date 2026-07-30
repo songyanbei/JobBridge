@@ -96,6 +96,28 @@ def simulate_strategy(
         V1_DISPLAY_TOP_N,
         V1_MAX_CANDIDATES,
     )
+    from app.services.intent_service import (
+        _normalize_city_value,
+        _normalize_job_category_value,
+    )
+
+    # Admin simulation bypasses the dialogue intent layer, so normalize the
+    # form values here exactly as a production search would.  The UI commonly
+    # submits short city names such as "苏州" while jobs store "苏州市".
+    criteria = dict(criteria or {})
+    if criteria.get("city"):
+        cities = criteria["city"]
+        cities = cities if isinstance(cities, list) else [cities]
+        criteria["city"] = [
+            _normalize_city_value(value) or value for value in cities
+        ]
+    if criteria.get("job_category"):
+        categories = criteria["job_category"]
+        categories = categories if isinstance(categories, list) else [categories]
+        criteria["job_category"] = [
+            _normalize_job_category_value(value) or value
+            for value in categories
+        ]
 
     release = db.get(RecommendationStrategyRelease, direction)
     stable = (
