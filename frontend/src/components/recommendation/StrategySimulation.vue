@@ -240,7 +240,11 @@ const draftItems = computed(() => result.value?.draft || [])
 
 // 换方向或换草稿时旧结果不再可解读，直接丢弃避免误读。
 watch(
-  () => [props.direction, props.draft?.id, props.draft?.parameters_digest],
+  [
+    () => props.direction,
+    () => props.draft?.id,
+    () => props.draft?.parameters_digest,
+  ],
   () => {
     result.value = null
   },
