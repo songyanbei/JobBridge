@@ -54,6 +54,11 @@ from app.services.recommendation_scoring_service import (
     V1_PRECISION_POOL_SIZE,
 )
 from app.services.user_service import UserContext
+from app.services.search_permission import (
+    PermissionDecision,
+    denied_search_response,
+    ensure_search_permission,
+)
 from app.tasks.common import log_event
 
 # 显式 re-export，让 mypy / IDE / runtime 都识别本模块仍提供这些名字。
@@ -1049,12 +1054,20 @@ def search_jobs(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """工人/中介找岗位。
 
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`，
     本子阶段产出 SearchOutcome 但调用方解构后丢弃；5.1 起 message_router 才开始消费。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, "search_job", permission_decision,
+        entrypoint="search_service.search_jobs", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+
     from app.services.recommendation_assignment_service import choose_assignment
     try:
         assignment_decision = choose_assignment(
@@ -1368,11 +1381,19 @@ def search_workers(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """厂家/中介找工人。
 
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, "search_worker", permission_decision,
+        entrypoint="search_service.search_workers", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+
     from app.services.recommendation_assignment_service import choose_assignment
     try:
         assignment_decision = choose_assignment(
@@ -1664,6 +1685,7 @@ def show_more(
     user_ctx: UserContext,
     db: Session,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """show_more：从快照取下一批，跳过失效条目。
 
@@ -1674,6 +1696,12 @@ def show_more(
     """
     is_job_search = _is_job_search(session, user_ctx)
     direction = "search_job" if is_job_search else "search_worker"
+    permission_decision = ensure_search_permission(
+        user_ctx, direction, permission_decision,
+        entrypoint="search_service.show_more",
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
     # §5.4.1: a v1 snapshot is pinned to the fixed page size of 3.  Reading the
     # legacy `match.top_n` here made paging drift off the v1 contract whenever
     # the historical production value was not 3.
@@ -2300,6 +2328,7 @@ def execute_relaxed_search(
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
     original_visible_count: int = 0,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
 
@@ -2311,6 +2340,13 @@ def execute_relaxed_search(
     权限过滤 → 文案渲染。**不再走** ``_run_*_fallback_steps`` 级联（reducer
     第二轮已由 recursion_depth=1 守护，不允许再次输出 auto_relax_and_retry）。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, direction, permission_decision,
+        entrypoint="search_service.execute_relaxed_search", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+
     if direction == "search_job":
         relaxed = _compute_relaxed_criteria_job(original_criteria, step)
     else:
@@ -3082,12 +3118,27 @@ def _format_no_match_with_suggestions_resume(
 
 def _is_job_search(session: SessionState, user_ctx: UserContext) -> bool:
     """判断当前搜索方向。"""
+    return resolve_show_more_direction(session, user_ctx) == "search_job"
+
+
+def resolve_show_more_direction(
+    session: SessionState,
+    user_ctx: UserContext,
+) -> Literal["search_job", "search_worker"]:
+    """Resolve paging direction from the snapshot before mutable session hints."""
+
+    snapshot_direction = getattr(session.candidate_snapshot, "direction", None)
+    if snapshot_direction in ("search_job", "search_worker"):
+        return snapshot_direction
     if user_ctx.role == "worker":
-        return True
+        return "search_job"
     if user_ctx.role == "broker" and session.broker_direction:
-        return session.broker_direction == "search_job"
+        return (
+            "search_job" if session.broker_direction == "search_job"
+            else "search_worker"
+        )
     # factory 默认找工人
-    return False
+    return "search_worker"
 
 
 def _get_config_int(key: str, db: Session, default: int) -> int:

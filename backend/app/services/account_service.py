@@ -127,8 +127,10 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
     # - 厂家默认 can_search_workers=1 / can_search_jobs=0（只能检索工人）
     # - 中介默认双向（两个开关默认 True，可由 payload 覆盖）
     if role == "factory":
+        if payload.get("can_search_jobs"):
+            raise BusinessException(40101, "厂家账号不能开通岗位搜索权限")
         can_search_workers = True if payload.get("can_search_workers") is None else bool(payload.get("can_search_workers"))
-        can_search_jobs = bool(payload.get("can_search_jobs"))
+        can_search_jobs = False
     else:  # broker
         can_search_workers = True if payload.get("can_search_workers") is None else bool(payload.get("can_search_workers"))
         can_search_jobs = True if payload.get("can_search_jobs") is None else bool(payload.get("can_search_jobs"))
@@ -164,6 +166,8 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
 
 def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
     user = get_user(db, userid)
+    if user.role == "factory" and payload.get("can_search_jobs"):
+        raise BusinessException(40101, "厂家账号不能开通岗位搜索权限")
     before = {
         "display_name": user.display_name,
         "company": user.company,
@@ -182,7 +186,10 @@ def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
     for k in ("display_name", "company", "contact_person", "phone"):
         if k in payload and payload[k] is not None:
             setattr(user, k, payload[k])
-    if "can_search_jobs" in payload and payload["can_search_jobs"] is not None:
+    if user.role == "factory":
+        # Also repairs legacy rows that were manually set to true.
+        user.can_search_jobs = 0
+    elif "can_search_jobs" in payload and payload["can_search_jobs"] is not None:
         user.can_search_jobs = 1 if payload["can_search_jobs"] else 0
     if "can_search_workers" in payload and payload["can_search_workers"] is not None:
         user.can_search_workers = 1 if payload["can_search_workers"] else 0
