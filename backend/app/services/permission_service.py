@@ -1,108 +1,178 @@
-"""字段级权限过滤服务（Phase 3）。
+"""Final structured-candidate field filtering for recommendation visibility."""
+from __future__ import annotations
 
-按角色对岗位/简历结果做字段脱敏，返回结构化数据供最终文本拼装。
-过滤在 service 层执行，不依赖前端。
-"""
+from typing import Mapping
 
-# ---------------------------------------------------------------------------
-# 工人侧需要隐藏的岗位字段
-# ---------------------------------------------------------------------------
+from app.services.visibility_contract import (
+    ViewerRole,
+    VisibilityScene,
+    hard_visibility_limit,
+    registry_for,
+)
+from app.services.visibility_policy import EffectivePolicySnapshot
 
-_WORKER_HIDDEN_JOB_FIELDS = frozenset({
-    # 电话 / 联系方式
-    "phone", "contact_person",
-    # 歧视性展示字段
-    "gender_required", "age_min", "age_max", "accept_minority",
+# Transitional compatibility is used only until P5 wires a request snapshot into
+# every recommendation path.  Unknown roles already fail closed here.
+_LEGACY_WORKER_HIDDEN_JOB_FIELDS = frozenset({
+    "phone", "contact_person", "gender_required", "age_min", "age_max",
+    "accept_minority",
 })
 
-# 岗位字段中属于关联用户的字段（需要从 user 数据中补充）
-_JOB_USER_FIELDS = frozenset({
-    "company", "contact_person", "phone",
-})
+_JOB_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
+    "hiring_company": ("hiring_company", "hiring_company_source"),
+    "job_category": ("job_category",),
+    "salary": ("salary_floor_monthly", "salary_ceiling_monthly", "pay_type"),
+    "city": ("city",),
+    "district": ("district",),
+    "address": ("address", "address_source"),
+    "benefits": ("provide_meal", "provide_housing"),
+    "shift": ("shift_pattern", "work_hours"),
+    "contact_person": ("contact_person", "contact_source"),
+    "phone": ("phone", "phone_source", "phone_placeholder"),
+    "publisher_company": ("publisher_company",),
+}
+
+_RESUME_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
+    "display_name": ("display_name",),
+    "gender_age": ("gender", "age"),
+    "expected_job_categories": ("expected_job_categories",),
+    "salary_expectation": ("salary_expect_floor_monthly",),
+    "expected_cities": ("expected_cities",),
+    "phone": ("phone", "phone_placeholder"),
+}
 
 
-# ---------------------------------------------------------------------------
-# 公开 API
-# ---------------------------------------------------------------------------
+def _snapshot_matches(
+    snapshot: EffectivePolicySnapshot,
+    scene: VisibilityScene,
+    role: str,
+) -> bool:
+    return snapshot.scene is scene and snapshot.role == role
 
-def filter_job_for_role(job_data: dict, viewer_role: str) -> dict:
-    """过滤单条岗位结果。
 
-    Args:
-        job_data: 岗位字段字典（已包含关联用户数据）
-        viewer_role: 查看者角色 (worker/factory/broker)
+def _project_visible_candidate(
+    candidate: Mapping,
+    visible_fields: tuple[str, ...],
+    key_map: Mapping[str, tuple[str, ...]],
+) -> dict:
+    result = {"id": candidate.get("id")}
+    for field in visible_fields:
+        for key in key_map.get(field, ()):
+            if key in candidate:
+                result[key] = candidate[key]
+    return result
 
-    Returns:
-        过滤后的结构化字典
-    """
-    if viewer_role == "worker":
-        return {
-            k: v for k, v in job_data.items()
-            if k not in _WORKER_HIDDEN_JOB_FIELDS
-        }
-    # factory / broker 看全量
-    return dict(job_data)
+
+def _effective_visible_fields(
+    snapshot: EffectivePolicySnapshot,
+    scene: VisibilityScene,
+    role: ViewerRole,
+) -> tuple[str, ...]:
+    hard_limit = set(hard_visibility_limit(scene, role))
+    return tuple(
+        field for field in registry_for(scene)
+        if field in snapshot.visible_fields and field in hard_limit
+    )
+
+
+def filter_job_for_role(
+    job_data: dict,
+    viewer_role: str,
+    effective_policy: EffectivePolicySnapshot | None = None,
+) -> dict:
+    """Filter a normalized job using policy whitelist ∩ backend hard limit."""
+
+    try:
+        role = ViewerRole(viewer_role)
+    except ValueError:
+        return {"id": job_data.get("id")}
+
+    if effective_policy is None:
+        # Removed when P5 has made snapshot propagation mandatory.
+        if role is ViewerRole.WORKER:
+            return {
+                key: value for key, value in job_data.items()
+                if key not in _LEGACY_WORKER_HIDDEN_JOB_FIELDS
+            }
+        return dict(job_data)
+    if not _snapshot_matches(effective_policy, VisibilityScene.JOB_SEARCH, viewer_role):
+        return {"id": job_data.get("id")}
+    return _project_visible_candidate(
+        job_data,
+        _effective_visible_fields(
+            effective_policy, VisibilityScene.JOB_SEARCH, role,
+        ),
+        _JOB_CANDIDATE_KEYS,
+    )
 
 
 def filter_resume_for_role(
     resume_data: dict,
     owner_user: dict | None,
     viewer_role: str,
+    effective_policy: EffectivePolicySnapshot | None = None,
 ) -> dict:
-    """过滤单条简历结果。
+    """Filter a normalized resume and its owner data through one policy snapshot."""
 
-    Args:
-        resume_data: 简历字段字典
-        owner_user: 简历所有者的用户数据 (display_name, phone 等)
-        viewer_role: 查看者角色
+    try:
+        role = ViewerRole(viewer_role)
+    except ValueError:
+        return {"id": resume_data.get("id")}
 
-    Returns:
-        过滤后的结构化字典
-    """
-    result = dict(resume_data)
+    candidate = dict(resume_data)
+    if owner_user:
+        candidate["display_name"] = owner_user.get("display_name") or "求职者"
+        candidate["phone"] = owner_user.get("phone") or None
+    else:
+        candidate["display_name"] = "求职者"
+        candidate["phone"] = None
 
-    if viewer_role in ("factory", "broker"):
-        # 补充用户信息
-        if owner_user:
-            result["display_name"] = owner_user.get("display_name", "")
-            phone = owner_user.get("phone")
-            result["phone"] = phone if phone else None
-            result["phone_placeholder"] = "联系方式待补充" if not phone else None
-        else:
-            result["phone"] = None
-            result["phone_placeholder"] = "联系方式待补充"
-
-    # worker 一般不会搜简历，但安全起见也做处理
-    if viewer_role == "worker":
-        result.pop("phone", None)
-        result.pop("display_name", None)
-
-    return result
+    if effective_policy is None:
+        # Removed when P5 has made snapshot propagation mandatory.
+        if role in (ViewerRole.FACTORY, ViewerRole.BROKER):
+            candidate["phone_placeholder"] = (
+                "联系方式待补充" if not candidate.get("phone") else None
+            )
+            return candidate
+        candidate.pop("phone", None)
+        candidate.pop("display_name", None)
+        return candidate
+    if not _snapshot_matches(
+        effective_policy, VisibilityScene.CANDIDATE_SEARCH, viewer_role,
+    ):
+        return {"id": resume_data.get("id")}
+    visible_fields = _effective_visible_fields(
+        effective_policy, VisibilityScene.CANDIDATE_SEARCH, role,
+    )
+    if "phone" in visible_fields and not candidate.get("phone"):
+        candidate["phone_placeholder"] = "联系方式待补充"
+    return _project_visible_candidate(
+        candidate, visible_fields, _RESUME_CANDIDATE_KEYS,
+    )
 
 
 def filter_jobs_batch(
     jobs: list[dict],
     viewer_role: str,
+    effective_policy: EffectivePolicySnapshot | None = None,
 ) -> list[dict]:
-    """批量过滤岗位结果。"""
-    return [filter_job_for_role(j, viewer_role) for j in jobs]
+    return [
+        filter_job_for_role(job, viewer_role, effective_policy) for job in jobs
+    ]
 
 
 def filter_resumes_batch(
     resumes: list[dict],
     users_map: dict[str, dict],
     viewer_role: str,
+    effective_policy: EffectivePolicySnapshot | None = None,
 ) -> list[dict]:
-    """批量过滤简历结果。
-
-    Args:
-        resumes: 简历字典列表
-        users_map: {owner_userid: user_data} 映射
-        viewer_role: 查看者角色
-    """
-    result = []
-    for r in resumes:
-        owner_userid = r.get("owner_userid", "")
-        owner_user = users_map.get(owner_userid)
-        result.append(filter_resume_for_role(r, owner_user, viewer_role))
-    return result
+    return [
+        filter_resume_for_role(
+            resume,
+            users_map.get(resume.get("owner_userid", "")),
+            viewer_role,
+            effective_policy,
+        )
+        for resume in resumes
+    ]
