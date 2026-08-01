@@ -34,7 +34,11 @@ from app.schemas.search import (
     SearchOutcome,
     SearchResult,
 )
-from app.schemas.recommendation import RecommendationItem, StrategyAssignment
+from app.schemas.recommendation import (
+    RecommendationItem,
+    RecommendationScoreDetail,
+    StrategyAssignment,
+)
 from app.services import conversation_service, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 from app.services.recommendation_experience_gate import userid_hash
@@ -679,6 +683,71 @@ def _snapshot_is_v1(snapshot) -> bool:
     )
 
 
+def _score_detail_from_snapshot(
+    score: dict,
+) -> tuple[RecommendationScoreDetail | None, bool]:
+    """Read current and pre-fix v1 score metadata through one strict DTO.
+
+    Snapshots live for 30 minutes, so a deploy can legitimately page a payload
+    written by the previous process version.  Compatibility is deliberately
+    narrow: unknown keys are dropped and only the formerly omitted
+    ``repeat_adjusted_score`` is reconstructed.  Other malformed/missing
+    required components still fail closed.
+    """
+    raw_detail = score.get("score_detail")
+    if not isinstance(raw_detail, dict):
+        return None, False
+
+    allowed = set(RecommendationScoreDetail.model_fields)
+    payload = {
+        key: value for key, value in raw_detail.items()
+        if key in allowed
+    }
+    repaired = len(payload) != len(raw_detail)
+    if "repeat_adjusted_score" not in payload:
+        fallback = score.get("final_score")
+        if fallback is None:
+            try:
+                fallback = (
+                    float(payload["base_score"])
+                    * float(payload["repeat_factor"])
+                )
+            except (KeyError, TypeError, ValueError):
+                fallback = None
+        if fallback is not None:
+            payload["repeat_adjusted_score"] = max(
+                0.0, min(1.0, float(fallback)),
+            )
+            repaired = True
+
+    payload.setdefault(
+        "is_exploration",
+        bool(score.get("is_exploration", False)),
+    )
+    payload.setdefault(
+        "reason_codes",
+        list(score.get("reason_codes") or []),
+    )
+    return RecommendationScoreDetail.model_validate(payload), repaired
+
+
+def _snapshot_working_copy(session: SessionState) -> SessionState:
+    """Isolate snapshot/shown mutations until the reply is fully constructed."""
+    return session.model_copy(deep=True)
+
+
+def _commit_snapshot_state(
+    session: SessionState,
+    working_session: SessionState,
+) -> None:
+    session.candidate_snapshot = (
+        working_session.candidate_snapshot.model_copy(deep=True)
+        if working_session.candidate_snapshot is not None
+        else None
+    )
+    session.shown_items = list(working_session.shown_items)
+
+
 def _recommendation_kill_switch(db: Session) -> bool:
     """§7.5 fail-safe: an unreadable control plane counts as killed."""
     try:
@@ -705,7 +774,11 @@ def _try_recommendation_v1(
     deliberately falls back to the existing legacy caller."""
     try:
         from app.services.recommendation_assignment_service import choose_assignment
-        from app.services.recommendation_request_service import precision_pool, rank_candidate_dicts
+        from app.services.recommendation_request_service import (
+            precision_pool,
+            rank_candidate_dicts,
+            snapshot_candidate_scores,
+        )
         assignment = assignment_decision or choose_assignment(
             db, userid=userid, direction=direction,
         )
@@ -798,23 +871,7 @@ def _try_recommendation_v1(
             "llm_retry_count": semantic_result.retry_count,
             "ranking_fallback": semantic_result.ranking_fallback,
             "ranking_latency_ms": semantic_result.latency_ms,
-            "candidate_scores": {
-                item.candidate_id: {
-                    "final_score": item.repeat_adjusted_score,
-                    "is_exploration": item.is_exploration,
-                    "reason_codes": list(item.reason_codes),
-                    "score_detail": {
-                        "match_score": item.match_score,
-                        "quality_score": item.quality_score,
-                        "freshness_score": item.freshness_score,
-                        "exposure_opportunity": item.exposure_opportunity,
-                        "base_score": item.base_score,
-                        "repeat_factor": item.repeat_factor,
-                        "diversity_penalty": item.diversity_penalty,
-                    },
-                }
-                for item in ordered
-            },
+            "candidate_scores": snapshot_candidate_scores(ordered),
         }
     except Exception:
         logger.exception("recommendation-v1 failed closed to legacy")
@@ -1157,7 +1214,7 @@ def search_jobs(
 
     # 保存快照
     digest = conversation_service.compute_query_digest(criteria)
-    snapshot_kwargs = {}
+    snapshot_kwargs = {"direction": "search_job"}
     if v1:
         snapshot_kwargs = {
             "request_id": v1.get("request_id"),
@@ -1183,10 +1240,15 @@ def search_jobs(
             "algorithm_version": "legacy",
             "assignment": "legacy",
         }
-    conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
+    working_session = _snapshot_working_copy(session)
+    conversation_service.save_snapshot(
+        working_session, ranked_ids, digest, criteria, **snapshot_kwargs,
+    )
 
     # 取首批
-    first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
+    first_batch_ids = conversation_service.get_next_candidate_ids(
+        working_session, top_n,
+    )
     if not first_batch_ids:
         sr = SearchResult(
             reply_text="暂无匹配结果。",
@@ -1218,6 +1280,7 @@ def search_jobs(
             available_relax_steps=available_steps,
             relax_probe_results=probe_results,
         )
+        _commit_snapshot_state(session, working_session)
         return sr, so
 
     # 从候选中找到对应记录
@@ -1231,12 +1294,12 @@ def search_jobs(
         [str(item.get("id")) for item in filtered],
     )
 
-    # 记录已展示
+    # 先在隔离副本记录；回复/DTO 构造全部成功后再提交到真实 session。
     shown_ids = [str(j["id"]) for j in batch]
-    conversation_service.record_shown(session, shown_ids)
+    conversation_service.record_shown(working_session, shown_ids)
 
     # 格式化
-    remaining = conversation_service.get_remaining_count(session)
+    remaining = conversation_service.get_remaining_count(working_session)
     reason_lines = _build_job_reason_lines_by_id(
         filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
     )
@@ -1293,6 +1356,7 @@ def search_jobs(
         shown_count=len(filtered),
         remaining_count_capped=remaining,
     )
+    _commit_snapshot_state(session, working_session)
     return sr, so
 
 
@@ -1453,7 +1517,7 @@ def search_workers(
             ranked_ids.append(cid)
 
     digest = conversation_service.compute_query_digest(criteria)
-    snapshot_kwargs = {}
+    snapshot_kwargs = {"direction": "search_worker"}
     if v1:
         snapshot_kwargs = {
             "request_id": v1.get("request_id"),
@@ -1477,9 +1541,14 @@ def search_workers(
             "algorithm_version": "legacy",
             "assignment": "legacy",
         }
-    conversation_service.save_snapshot(session, ranked_ids, digest, criteria, **snapshot_kwargs)
+    working_session = _snapshot_working_copy(session)
+    conversation_service.save_snapshot(
+        working_session, ranked_ids, digest, criteria, **snapshot_kwargs,
+    )
 
-    first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
+    first_batch_ids = conversation_service.get_next_candidate_ids(
+        working_session, top_n,
+    )
     if not first_batch_ids:
         sr = SearchResult(
             reply_text="暂无匹配结果。",
@@ -1511,6 +1580,7 @@ def search_workers(
             available_relax_steps=available_steps,
             relax_probe_results=probe_results,
         )
+        _commit_snapshot_state(session, working_session)
         return sr, so
 
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
@@ -1526,9 +1596,9 @@ def search_workers(
     )
 
     shown_ids = [str(r["id"]) for r in batch]
-    conversation_service.record_shown(session, shown_ids)
+    conversation_service.record_shown(working_session, shown_ids)
 
-    remaining = conversation_service.get_remaining_count(session)
+    remaining = conversation_service.get_remaining_count(working_session)
     reason_lines = _build_resume_reason_lines_by_id(
         filtered, criteria, flags, soft_prefs, userid_hash(user_ctx.external_userid),
     )
@@ -1585,6 +1655,7 @@ def search_workers(
         shown_count=len(filtered),
         remaining_count_capped=remaining,
     )
+    _commit_snapshot_state(session, working_session)
     return sr, so
 
 
@@ -1654,6 +1725,7 @@ def show_more(
         session.candidate_snapshot, "effective_criteria", None,
     )
     effective_criteria = dict(snapshot_effective_criteria or {})
+    working_session = _snapshot_working_copy(session)
 
     collected = []
     attempts = 0
@@ -1662,13 +1734,13 @@ def show_more(
     while len(collected) < top_n and attempts < max_attempts:
         attempts += 1
         batch_ids = conversation_service.get_next_candidate_ids(
-            session, top_n - len(collected),
+            working_session, top_n - len(collected),
         )
         if not batch_ids:
             break
 
         # 标记为已展示（即使失效也要标记，避免重复取）
-        conversation_service.record_shown(session, batch_ids)
+        conversation_service.record_shown(working_session, batch_ids)
 
         if is_job_search:
             # 重新查询验证有效性
@@ -1710,11 +1782,12 @@ def show_more(
             shown_count=0,
             remaining_count_capped=0,
         )
+        _commit_snapshot_state(session, working_session)
         return sr, so
 
     # 截断到 top_n
     collected = collected[:top_n]
-    remaining = conversation_service.get_remaining_count(session)
+    remaining = conversation_service.get_remaining_count(working_session)
     has_more = remaining > 0
 
     if is_job_search:
@@ -1747,11 +1820,10 @@ def show_more(
         has_more=has_more,
         result_count=len(collected),
     )
-    snapshot = session.candidate_snapshot
+    snapshot = working_session.candidate_snapshot
     if snapshot and snapshot.algorithm_version != "legacy" and snapshot.assignment != "legacy":
         from app.schemas.recommendation import (
             RecommendationItem,
-            RecommendationScoreDetail,
             StrategyAssignment,
         )
         assignment = StrategyAssignment(
@@ -1763,9 +1835,11 @@ def show_more(
         )
         score_map = snapshot.ranking_metadata.get("candidate_scores", {})
         recommendation_items = []
+        compat_repaired = 0
         for index, item in enumerate(collected, 1):
             score = dict(score_map.get(str(item["id"])) or {})
-            detail = score.get("score_detail")
+            detail, repaired = _score_detail_from_snapshot(score)
+            compat_repaired += int(repaired)
             recommendation_items.append(RecommendationItem(
                 target_type="job" if direction == "search_job" else "resume",
                 target_id=int(item["id"]),
@@ -1773,11 +1847,15 @@ def show_more(
                 final_score=float(score.get("final_score", 0.0)),
                 is_exploration=bool(score.get("is_exploration", False)),
                 reason_codes=list(score.get("reason_codes") or []),
-                score_detail=(
-                    RecommendationScoreDetail.model_validate(detail)
-                    if detail else None
-                ),
+                score_detail=detail,
             ))
+        if compat_repaired:
+            log_event(
+                "recommendation_snapshot_score_compat_repaired",
+                direction=direction,
+                algorithm_version=snapshot.algorithm_version,
+                repaired_count=compat_repaired,
+            )
         sr.recommendation_items = recommendation_items
         sr.snapshot_id = snapshot.snapshot_id
         sr.request_id = snapshot.request_id
@@ -1796,6 +1874,7 @@ def show_more(
         shown_count=len(collected),
         remaining_count_capped=remaining,
     )
+    _commit_snapshot_state(session, working_session)
     return sr, so
 
 
@@ -2374,8 +2453,9 @@ def execute_relaxed_search(
         if cid not in ranked_id_set:
             ranked_ids.append(cid)
 
+    working_session = _snapshot_working_copy(session)
     conversation_service.save_snapshot(
-        session, ranked_ids, digest, relaxed,
+        working_session, ranked_ids, digest, relaxed,
         request_id=(
             v1_meta["request_id"] if v1_meta else
             shadow["request_id"] if shadow else None
@@ -2384,7 +2464,7 @@ def execute_relaxed_search(
             v1_meta["snapshot_id"] if v1_meta else
             shadow["snapshot_id"] if shadow else None
         ),
-        direction=direction if (v1_meta or shadow) else None,
+        direction=direction,
         strategy_version_id=(
             v1_meta["assignment"].strategy_version_id if v1_meta else None
         ),
@@ -2400,7 +2480,9 @@ def execute_relaxed_search(
         } if v1_meta else {},
     )
 
-    first_batch_ids = conversation_service.get_next_candidate_ids(session, top_n)
+    first_batch_ids = conversation_service.get_next_candidate_ids(
+        working_session, top_n,
+    )
     if not first_batch_ids:
         sr = SearchResult(
             reply_text="暂无匹配结果。",
@@ -2426,6 +2508,7 @@ def execute_relaxed_search(
             desired_count=top_n,
             applied_relax_step=step,
         )
+        _commit_snapshot_state(session, working_session)
         return sr, so
 
     id_to_dict = {str(c["id"]): c for c in candidate_dicts}
@@ -2443,9 +2526,9 @@ def execute_relaxed_search(
     )
 
     shown_ids = [str(r["id"]) for r in batch]
-    conversation_service.record_shown(session, shown_ids)
+    conversation_service.record_shown(working_session, shown_ids)
 
-    remaining = conversation_service.get_remaining_count(session)
+    remaining = conversation_service.get_remaining_count(working_session)
     if direction == "search_job":
         reason_lines = _build_job_reason_lines_by_id(
             filtered, relaxed, flags, soft_prefs, userid_hash(user_ctx.external_userid),
@@ -2528,6 +2611,7 @@ def execute_relaxed_search(
         remaining_count_capped=remaining,
         relaxation_summary=relaxation_summary,
     )
+    _commit_snapshot_state(session, working_session)
     return sr, so
 
 

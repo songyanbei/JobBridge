@@ -209,6 +209,44 @@ class TestProcessMessageHappyPath:
 class TestDurableSessionCommit:
     @patch("app.services.worker.SessionLocal")
     @patch("app.services.worker.message_router")
+    def test_unattached_shadow_handle_is_discarded_after_busy_reply(
+        self, mock_router, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        mock_session_factory.return_value = db
+        mock_router.process.return_value = [
+            ReplyMessage(userid="u1", content="系统繁忙，请稍后再试。"),
+        ]
+
+        with patch(
+            "app.services.worker.conversation_service.begin_session_staging",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.conversation_service.end_session_staging",
+            return_value=None,
+        ), patch(
+            "app.services.worker.recommendation_shadow_service.begin_turn_tracking",
+            return_value=MagicMock(),
+        ), patch(
+            "app.services.worker.recommendation_shadow_service.end_turn_tracking",
+            return_value={"orphan-shadow-request"},
+        ), patch(
+            "app.services.worker.recommendation_shadow_service.discard",
+        ) as discard, patch(
+            "app.services.worker.recommendation_shadow_service.activate_persistence",
+        ) as activate, patch.object(
+            worker, "_deliver_outbox_for_event", return_value=True,
+        ):
+            outcome = worker._process_locked(
+                _basic_msg_data(), 42, 0, "u1", MagicMock(),
+            )
+
+        assert outcome == "processed"
+        discard.assert_called_once_with("orphan-shadow-request")
+        activate.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.message_router")
     def test_business_commit_failure_never_applies_staged_redis_session(
         self, mock_router, mock_session_factory, worker,
     ):

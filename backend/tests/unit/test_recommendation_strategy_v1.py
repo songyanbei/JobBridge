@@ -87,8 +87,12 @@ def test_search_request_identity_is_preserved_into_delivery_contract():
 
 
 def test_recommendation_history_is_always_redacted():
+    from app.schemas.conversation import SessionState
     from app.schemas.conversation import ReplyMessage
-    from app.services.message_router import _history_reply_content
+    from app.services.message_router import (
+        _history_reply_content,
+        _record_reply_history,
+    )
     reply = ReplyMessage(
         userid="u1",
         content="sensitive recommendation body",
@@ -104,3 +108,11 @@ def test_recommendation_history_is_always_redacted():
         },
     )
     assert _history_reply_content(reply) == "[recommendation_delivery]"
+    session = SessionState(role="worker")
+    _record_reply_history(session, reply)
+    assert session.history == [{
+        "role": "assistant",
+        "content": "[recommendation_delivery]",
+        "delivery_id": "d1",
+    }]
+    assert "sensitive recommendation body" not in str(session.history)

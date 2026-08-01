@@ -50,6 +50,48 @@ def get_redis() -> redis.Redis:
 
 SESSION_PREFIX = "session:"
 SESSION_TTL = 30 * 60  # 30 分钟
+RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX = (
+    "recommendation:session:delivery:"
+)
+RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX = "recommendation:session:target:"
+RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX = (
+    "recommendation:session:indexes:"
+)
+
+
+def recommendation_session_index_keys(session: dict) -> list[str]:
+    """Derive bounded reverse-index keys from a redacted session payload."""
+    keys: set[str] = set()
+    history = session.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            delivery_id = entry.get("delivery_id")
+            if delivery_id:
+                keys.add(
+                    f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}"
+                    f"{delivery_id}"
+                )
+
+    snapshot = session.get("candidate_snapshot")
+    if isinstance(snapshot, dict):
+        direction = snapshot.get("direction")
+        target_type = (
+            "job" if direction == "search_job"
+            else "resume" if direction == "search_worker"
+            else None
+        )
+        candidate_ids = snapshot.get("candidate_ids")
+        if target_type and isinstance(candidate_ids, list):
+            for candidate_id in candidate_ids:
+                if candidate_id in (None, ""):
+                    continue
+                keys.add(
+                    f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}"
+                    f"{target_type}:{candidate_id}"
+                )
+    return sorted(keys)
 
 
 def get_session(userid: str) -> dict | None:
@@ -64,7 +106,57 @@ def get_session(userid: str) -> dict | None:
 def save_session(userid: str, session: dict) -> None:
     """保存用户会话状态（自动续 TTL）。"""
     r = get_redis()
-    r.setex(f"{SESSION_PREFIX}{userid}", SESSION_TTL, json.dumps(session, ensure_ascii=False))
+    r.eval(
+        _SAVE_SESSION_WITH_INDEXES_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        SESSION_TTL,
+        json.dumps(session, ensure_ascii=False),
+        userid,
+        json.dumps(recommendation_session_index_keys(session)),
+    )
+
+
+_SAVE_SESSION_WITH_INDEXES_SCRIPT = """
+redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
+local registry = KEYS[2]
+local userid = ARGV[3]
+local ttl = tonumber(ARGV[1])
+local new_indexes = cjson.decode(ARGV[4])
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+for _, index_key in ipairs(new_indexes) do
+    redis.call('SADD', index_key, userid)
+    redis.call('EXPIRE', index_key, ttl)
+    redis.call('SADD', registry, index_key)
+end
+if #new_indexes > 0 then
+    redis.call('EXPIRE', registry, ttl)
+end
+return 1
+"""
+
+_DELETE_SESSION_WITH_INDEXES_SCRIPT = """
+redis.call('DEL', KEYS[1])
+local registry = KEYS[2]
+local userid = ARGV[1]
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+return 1
+"""
 
 
 _SAVE_SESSION_CAS_SCRIPT = """
@@ -83,6 +175,25 @@ elseif expected ~= 0 and ARGV[5] ~= '1' then
     return 0
 end
 redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
+local registry = KEYS[3]
+local userid = ARGV[6]
+local new_indexes = cjson.decode(ARGV[7])
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+for _, index_key in ipairs(new_indexes) do
+    redis.call('SADD', index_key, userid)
+    redis.call('EXPIRE', index_key, ARGV[2])
+    redis.call('SADD', registry, index_key)
+end
+if #new_indexes > 0 then
+    redis.call('EXPIRE', registry, ARGV[2])
+end
 return 1
 """
 
@@ -93,14 +204,27 @@ end
 local current = redis.call('GET', KEYS[1])
 local expected = tonumber(ARGV[1])
 if not current then
-    return expected == 0 and 1 or 0
-end
-local decoded = cjson.decode(current)
-local version = tonumber(decoded['session_version'] or 0)
-if version ~= expected then
-    return 0
+    if expected ~= 0 then
+        return 0
+    end
+else
+    local decoded = cjson.decode(current)
+    local version = tonumber(decoded['session_version'] or 0)
+    if version ~= expected then
+        return 0
+    end
 end
 redis.call('DEL', KEYS[1])
+local registry = KEYS[3]
+local userid = ARGV[3]
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
 return 1
 """
 
@@ -123,14 +247,17 @@ def save_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _SAVE_SESSION_CAS_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
         int(expected_version),
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),
         lock_token,
         "1" if allow_missing else "0",
+        userid,
+        json.dumps(recommendation_session_index_keys(session)),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session commit")
@@ -140,7 +267,13 @@ def save_session_if_version(
 def delete_session(userid: str) -> None:
     """清除用户会话状态。"""
     r = get_redis()
-    r.delete(f"{SESSION_PREFIX}{userid}")
+    r.eval(
+        _DELETE_SESSION_WITH_INDEXES_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        userid,
+    )
 
 
 def delete_session_if_version(
@@ -153,11 +286,13 @@ def delete_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _DELETE_SESSION_CAS_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
         int(expected_version),
         lock_token,
+        userid,
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session delete")

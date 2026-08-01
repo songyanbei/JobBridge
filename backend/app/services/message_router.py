@@ -563,11 +563,7 @@ def _handle_text(
         )
         replies = _finalize_action_plan_replies(replies)
         if replies:
-            conversation_service.record_history(
-                session,
-                "assistant",
-                _history_reply_content(replies[0]),
-            )
+            _record_reply_history(session, replies[0])
         conversation_service.save_session(userid, session)
         return replies
 
@@ -653,9 +649,7 @@ def _handle_text(
                 replies = _finalize_action_plan_replies(
                     [_reply(userid, reply_text)],
                 )
-                conversation_service.record_history(
-                    session, "assistant", _history_reply_content(replies[0]),
-                )
+                _record_reply_history(session, replies[0])
                 conversation_service.save_session(userid, session)
                 return replies
             # enter_upload_conflict：直接调现成的 _enter_upload_conflict
@@ -664,9 +658,7 @@ def _handle_text(
                 replies = _enter_upload_conflict(intent_result, msg, session)
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
-                    conversation_service.record_history(
-                        session, "assistant", _history_reply_content(replies[0]),
-                    )
+                    _record_reply_history(session, replies[0])
                 conversation_service.save_session(userid, session)
                 return replies
             # resolve_conflict（dialogue-intent-extraction-phased-plan §2.1.8）：
@@ -688,9 +680,7 @@ def _handle_text(
                 )
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
-                    conversation_service.record_history(
-                        session, "assistant", _history_reply_content(replies[0]),
-                    )
+                    _record_reply_history(session, replies[0])
                 conversation_service.save_session(userid, session)
                 return replies
             # Phase 5 §5.2.1.5 执行归属表 / §5.2.3 message_router 行：
@@ -707,9 +697,7 @@ def _handle_text(
                 )
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
-                    conversation_service.record_history(
-                        session, "assistant", _history_reply_content(replies[0]),
-                    )
+                    _record_reply_history(session, replies[0])
                 conversation_service.save_session(userid, session)
                 return replies
             # codex review 修订（PR4 P1-1）：cancel / reset 走专用 handler，**不再
@@ -732,9 +720,7 @@ def _handle_text(
                 replies = _route_v2_cancel_reset(decision, pre_state, msg, session)
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
-                    conversation_service.record_history(
-                        session, "assistant", _history_reply_content(replies[0]),
-                    )
+                    _record_reply_history(session, replies[0])
                 conversation_service.save_session(userid, session)
                 return replies
             # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
@@ -821,8 +807,7 @@ def _handle_text(
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
     replies = _finalize_action_plan_replies(replies)
     if replies:
-        history_content = _history_reply_content(replies[0])
-        conversation_service.record_history(session, "assistant", history_content)
+        _record_reply_history(session, replies[0])
 
     conversation_service.save_session(userid, session)
     return replies
@@ -2843,6 +2828,22 @@ def _history_reply_content(reply: ReplyMessage) -> str:
         "[recommendation_delivery]"
         if reply.recommendation_context
         else reply.content
+    )
+
+
+def _record_reply_history(
+    session: SessionState,
+    reply: ReplyMessage,
+) -> None:
+    """Persist a redacted reply plus the non-secret delivery lookup marker."""
+    delivery_id = reply.delivery_id
+    if delivery_id is None and reply.recommendation_context is not None:
+        delivery_id = reply.recommendation_context.delivery_id
+    conversation_service.record_history(
+        session,
+        "assistant",
+        _history_reply_content(reply),
+        delivery_id=delivery_id if reply.recommendation_context else None,
     )
 
 

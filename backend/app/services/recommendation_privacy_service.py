@@ -32,6 +32,10 @@ from typing import Any, Iterable, Sequence
 
 from sqlalchemy.orm import Session
 
+from app.core.redis_client import (
+    RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX as SESSION_DELIVERY_INDEX_PREFIX,
+    RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX as SESSION_TARGET_INDEX_PREFIX,
+)
 from app.core.time_utils import to_naive_utc, utc_now
 from app.models import (
     ConversationLog,
@@ -56,9 +60,6 @@ BATCH_SIZE = 500
 # Redis session 反查索引（§10.1.1 行 2228-2229）。这两个 key 由 session mutation
 # 的写入侧维护；本模块只读取并在清理后删除索引本身。方案明令**禁止**用全库
 # ``KEYS`` 扫描兜底，所以索引缺失时就只清理能定位到的会话。
-SESSION_DELIVERY_INDEX_PREFIX = "recommendation:session:delivery:"
-SESSION_TARGET_INDEX_PREFIX = "recommendation:session:target:"
-
 # 可观测重试队列（§10.1.1 行 2240）。
 PRIVACY_RETRY_QUEUE = "queue:recommendation_privacy_retry"
 PRIVACY_RETRY_DEAD_QUEUE = "queue:recommendation_privacy_retry:dead"
@@ -743,6 +744,18 @@ def _scrub_session_payload(
     """就地擦掉一个 session 副本中的推荐痕迹，返回是否有变化。"""
     changed = False
     removable = _removable_ids(grouped, None)
+    snapshot = session.get("candidate_snapshot")
+    if isinstance(snapshot, dict):
+        direction = snapshot.get("direction")
+        snapshot_removable = (
+            set(grouped.get("job", set()))
+            if direction == "search_job"
+            else set(grouped.get("resume", set()))
+            if direction == "search_worker"
+            else removable
+        )
+    else:
+        snapshot_removable = removable
 
     history = session.get("history")
     if isinstance(history, list):
@@ -771,16 +784,21 @@ def _scrub_session_payload(
 
     shown = session.get("shown_items")
     if isinstance(shown, list):
-        kept = [item for item in shown if str(item) not in removable]
+        kept = [
+            item for item in shown
+            if str(item) not in snapshot_removable
+        ]
         if len(kept) != len(shown):
             session["shown_items"] = kept
             changed = True
 
-    snapshot = session.get("candidate_snapshot")
     if isinstance(snapshot, dict):
         candidate_ids = snapshot.get("candidate_ids")
         if isinstance(candidate_ids, list):
-            kept = [i for i in candidate_ids if str(i) not in removable]
+            kept = [
+                item for item in candidate_ids
+                if str(item) not in snapshot_removable
+            ]
             if len(kept) != len(candidate_ids):
                 changed = True
                 if kept:
@@ -788,6 +806,41 @@ def _scrub_session_payload(
                 else:
                     # 快照被清空后继续留着只会让 show_more 读到空壳。
                     session["candidate_snapshot"] = None
+        if session.get("candidate_snapshot") is not None:
+            metadata = snapshot.get("ranking_metadata")
+            if isinstance(metadata, dict):
+                score_map = metadata.get("candidate_scores")
+                if isinstance(score_map, dict):
+                    kept_scores = {
+                        key: value for key, value in score_map.items()
+                        if str(key) not in snapshot_removable
+                    }
+                    if len(kept_scores) != len(score_map):
+                        metadata["candidate_scores"] = kept_scores
+                        changed = True
+                for list_key in (
+                    "precision_pool_ids",
+                    "shadow_top_ids",
+                    "served_top_ids",
+                ):
+                    values = metadata.get(list_key)
+                    if not isinstance(values, list):
+                        continue
+                    kept_values = [
+                        value for value in values
+                        if str(value) not in snapshot_removable
+                    ]
+                    if len(kept_values) != len(values):
+                        metadata[list_key] = kept_values
+                        changed = True
+                if "shadow_rank_delta" in metadata:
+                    scrubbed, hit = _strip_rank_delta(
+                        metadata["shadow_rank_delta"],
+                        snapshot_removable,
+                    )
+                    if hit:
+                        metadata["shadow_rank_delta"] = scrubbed
+                        changed = True
     return changed
 
 

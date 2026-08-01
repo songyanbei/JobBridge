@@ -23,6 +23,48 @@ from app.services.recommendation_scoring_service import (
 )
 
 
+def recommendation_score_detail(
+    candidate: ScoredCandidate,
+) -> RecommendationScoreDetail:
+    """Project one scored candidate through the public score-detail contract.
+
+    Snapshot persistence and the served ``RecommendationItem`` must use the
+    same projection.  Keeping a hand-written snapshot field list beside the
+    DTO previously let ``repeat_adjusted_score`` disappear while an internal
+    ``diversity_penalty`` field leaked into Redis.
+    """
+    return RecommendationScoreDetail(
+        match_score=candidate.match_score,
+        quality_score=candidate.quality_score,
+        freshness_score=candidate.freshness_score,
+        exposure_opportunity=candidate.exposure_opportunity,
+        base_score=candidate.base_score,
+        repeat_factor=candidate.repeat_factor,
+        repeat_adjusted_score=candidate.repeat_adjusted_score,
+        is_exploration=candidate.is_exploration,
+        reason_codes=list(candidate.reason_codes),
+    )
+
+
+def snapshot_candidate_scores(
+    candidates: list[ScoredCandidate],
+) -> dict[str, dict[str, Any]]:
+    """Build the complete, Redis-safe score map for a ranked snapshot."""
+    return {
+        candidate.candidate_id: {
+            "final_score": max(
+                0.0, min(1.0, candidate.repeat_adjusted_score),
+            ),
+            "is_exploration": candidate.is_exploration,
+            "reason_codes": list(candidate.reason_codes),
+            "score_detail": recommendation_score_detail(candidate).model_dump(
+                mode="json",
+            ),
+        }
+        for candidate in candidates
+    }
+
+
 def precision_pool(
     candidate_dicts: list[Mapping[str, Any]],
     *,
@@ -156,17 +198,7 @@ def rank_candidate_dicts(
             final_score=max(0.0, min(1.0, item.repeat_adjusted_score)),
             is_exploration=item.is_exploration,
             reason_codes=item.reason_codes,
-            score_detail=RecommendationScoreDetail(
-                match_score=item.match_score,
-                quality_score=item.quality_score,
-                freshness_score=item.freshness_score,
-                exposure_opportunity=item.exposure_opportunity,
-                base_score=item.base_score,
-                repeat_factor=item.repeat_factor,
-                repeat_adjusted_score=item.repeat_adjusted_score,
-                is_exploration=item.is_exploration,
-                reason_codes=item.reason_codes,
-            ),
+            score_detail=recommendation_score_detail(item),
         )
         for index, item in enumerate(top, start=1)
     ]

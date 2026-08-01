@@ -117,3 +117,129 @@ def test_snapshot_v1_detection(algorithm_version, assignment, expected):
     )
     assert _snapshot_is_v1(snapshot) is expected
     assert _snapshot_is_v1(None) is False
+
+
+def test_snapshot_scores_use_the_public_score_detail_contract():
+    from app.services.recommendation_request_service import (
+        snapshot_candidate_scores,
+    )
+    from app.services.recommendation_scoring_service import ScoredCandidate
+
+    scores = snapshot_candidate_scores([
+        ScoredCandidate(
+            candidate_id="4",
+            owner_userid="owner-4",
+            match_score=0.7,
+            quality_score=0.8,
+            freshness_score=0.6,
+            exposure_opportunity=0.5,
+            base_score=0.68,
+            repeat_factor=0.9,
+            repeat_adjusted_score=0.612,
+            diversity_penalty=0.03,
+            is_exploration=True,
+            reason_codes=["exploration"],
+        ),
+    ])
+
+    detail = scores["4"]["score_detail"]
+    assert detail["repeat_adjusted_score"] == 0.612
+    assert detail["is_exploration"] is True
+    assert "diversity_penalty" not in detail
+
+
+@patch("app.services.search_service._recommendation_kill_switch", return_value=False)
+@patch("app.services.search_service._get_config_int", return_value=3)
+@patch("app.services.search_service._validate_job_ids")
+@patch("app.services.search_service._jobs_to_dicts")
+@patch("app.services.search_service.permission_service.filter_jobs_batch")
+@patch("app.services.search_service._build_job_reason_lines_by_id", return_value={})
+@patch("app.services.search_service._format_job_results", return_value="ok")
+def test_v1_show_more_repairs_previous_score_contract(
+    mock_format,
+    _reasons,
+    mock_filter,
+    mock_dicts,
+    mock_validate,
+    _config,
+    _kill,
+):
+    """A 30-minute old snapshot must survive the score DTO deploy boundary."""
+    candidate = {
+        "id": 4,
+        "owner_userid": "owner-4",
+        "city": "苏州",
+        "job_category": "电子厂",
+        "salary_floor_monthly": 5000,
+    }
+    mock_validate.return_value = [MagicMock(id=4, owner_userid="owner-4")]
+    mock_dicts.return_value = [candidate]
+    mock_filter.return_value = [candidate]
+    session = _session(algorithm_version="recommendation-v1", assignment="candidate")
+    session.candidate_snapshot.candidate_ids = ["1", "2", "3", "4"]
+    session.candidate_snapshot.ranking_metadata = {
+        "candidate_scores": {
+            "4": {
+                "final_score": 0.72,
+                "is_exploration": True,
+                "reason_codes": ["exploration"],
+                "score_detail": {
+                    "match_score": 0.7,
+                    "quality_score": 0.8,
+                    "freshness_score": 0.6,
+                    "exposure_opportunity": 0.5,
+                    "base_score": 0.68,
+                    "repeat_factor": 1.0,
+                    # Old producer omitted this and leaked this internal key.
+                    "diversity_penalty": 0.01,
+                },
+            },
+        },
+    }
+    session.shown_items = ["1", "2", "3"]
+
+    result, _outcome = show_more(session, _user_ctx(), MagicMock())
+
+    assert result.result_count == 1
+    assert result.recommendation_items[0].score_detail.repeat_adjusted_score == 0.72
+    assert result.recommendation_items[0].score_detail.is_exploration is True
+    assert session.shown_items == ["1", "2", "3", "4"]
+    mock_format.assert_called_once()
+
+
+@patch("app.services.search_service._recommendation_kill_switch", return_value=False)
+@patch("app.services.search_service._get_config_int", return_value=3)
+@patch("app.services.search_service._validate_job_ids", return_value=[MagicMock(id=4)])
+@patch(
+    "app.services.search_service._jobs_to_dicts",
+    return_value=[{"id": 4, "owner_userid": "owner-4"}],
+)
+@patch(
+    "app.services.search_service.permission_service.filter_jobs_batch",
+    return_value=[{"id": 4, "owner_userid": "owner-4"}],
+)
+@patch(
+    "app.services.search_service._build_job_reason_lines_by_id",
+    return_value={},
+)
+@patch(
+    "app.services.search_service._format_job_results",
+    side_effect=RuntimeError("format failed"),
+)
+def test_show_more_failure_does_not_advance_session(
+    _format,
+    _reasons,
+    _filter,
+    _dicts,
+    _validate,
+    _config,
+    _kill,
+):
+    session = _session()
+    session.candidate_snapshot.candidate_ids = ["1", "2", "3", "4"]
+    session.shown_items = ["1", "2", "3"]
+
+    with pytest.raises(RuntimeError, match="format failed"):
+        show_more(session, _user_ctx(), MagicMock())
+
+    assert session.shown_items == ["1", "2", "3"]

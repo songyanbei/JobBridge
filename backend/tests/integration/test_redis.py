@@ -18,6 +18,8 @@ from app.core.redis_client import (
     current_user_lock_fence,
     UserLockLost,
     QUEUE_INCOMING,
+    RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX,
+    RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
 )
 
 
@@ -101,6 +103,52 @@ class TestSessionOperations:
             assert get_session(userid)["session_version"] == 1
         finally:
             delete_session(userid)
+
+    def test_recommendation_reverse_indexes_follow_session_lifecycle(self):
+        userid = "integration-recommendation-index"
+        delivery_key = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}delivery-1"
+        )
+        target_7 = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:7"
+        )
+        target_9 = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:9"
+        )
+        r = get_redis()
+        delete_session(userid)
+        r.delete(delivery_key, target_7, target_9)
+        try:
+            save_session(userid, {
+                "role": "factory",
+                "history": [{
+                    "role": "assistant",
+                    "content": "[recommendation_delivery]",
+                    "delivery_id": "delivery-1",
+                }],
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["7", "9"],
+                },
+            })
+            assert r.smembers(delivery_key) == {userid}
+            assert r.smembers(target_7) == {userid}
+            assert r.smembers(target_9) == {userid}
+
+            save_session(userid, {
+                "role": "factory",
+                "history": [],
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["9"],
+                },
+            })
+            assert r.exists(delivery_key) == 0
+            assert r.exists(target_7) == 0
+            assert r.smembers(target_9) == {userid}
+        finally:
+            delete_session(userid)
+            assert userid not in r.smembers(target_9)
 
 
 class TestDedup:

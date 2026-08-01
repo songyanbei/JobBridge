@@ -15,6 +15,8 @@ from app.services.recommendation_shadow_service import (
     ShadowJob,
     ShadowPolicy,
     ShadowRunner,
+    begin_turn_tracking,
+    end_turn_tracking,
 )
 from app.services.search_service import _submit_shadow_candidate
 
@@ -285,6 +287,37 @@ def test_persistence_waits_for_served_transaction_activation():
         runner.shutdown()
 
     assert persisted == [("req-shadow-1", "completed", ("1", "2", "3"))]
+
+
+def test_shadow_handles_are_tracked_and_unactivated_states_are_reaped():
+    runner = ShadowRunner(
+        ShadowPolicy(
+            queue_capacity=1,
+            local_concurrency=1,
+            global_concurrency=1,
+            unactivated_state_ttl_seconds=0.05,
+        ),
+        reranker_factory=_FakeReranker,
+        redis_factory=lambda: _FakeRedis(),
+    )
+    token = begin_turn_tracking()
+    try:
+        assert runner.submit(_job()) is not None
+    finally:
+        submitted = end_turn_tracking(token)
+
+    try:
+        assert submitted == {"req-shadow-1"}
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            with runner._state_lock:
+                if "req-shadow-1" not in runner._states:
+                    break
+            time.sleep(0.01)
+        with runner._state_lock:
+            assert "req-shadow-1" not in runner._states
+    finally:
+        runner.shutdown()
 
 
 def test_search_submission_carries_full_production_ranking_inputs(monkeypatch):

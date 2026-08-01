@@ -83,6 +83,29 @@ PHASE9_TABLES = (
     "recommendation_exposure_daily",
 )
 
+PHASE9_MANIFEST = (
+    Path(__file__).resolve().parents[1]
+    / "sql"
+    / "migrations"
+    / "phase9_manifest.sha256"
+)
+
+PHASE9_REQUIRED_COLUMNS = (
+    ("recommendation_delivery", "content_expires_at"),
+    ("event_log", "client_event_id"),
+    ("event_log", "attribution_dedupe_key"),
+    ("recommendation_request", "parent_request_id"),
+    ("recommendation_request", "shadow_status"),
+)
+
+PHASE9_REQUIRED_INDEXES = (
+    ("event_log", "uk_event_client_idempotency"),
+    (
+        "recommendation_delivery",
+        "idx_recommendation_delivery_impression_lease",
+    ),
+)
+
 LEDGER_DDL = """
 CREATE TABLE IF NOT EXISTS recommendation_preflight_ledger (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -401,6 +424,98 @@ def existing_tables(conn) -> set[str]:
     }
 
 
+def _phase9_manifest_entries() -> tuple[dict[str, str], list[str]]:
+    expected: dict[str, str] = {}
+    file_mismatches: list[str] = []
+    root = PHASE9_MANIFEST.parent
+    for raw_line in PHASE9_MANIFEST.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, filename = line.split(None, 1)
+        filename = filename.strip()
+        expected[filename] = digest
+        path = root / filename
+        actual = (
+            hashlib.sha256(path.read_bytes()).hexdigest()
+            if path.exists() else "missing"
+        )
+        if actual != digest:
+            file_mismatches.append(filename)
+    return expected, file_mismatches
+
+
+def _check_phase9_structure(conn, findings: list[Finding]) -> None:
+    columns = {
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(text(
+            "SELECT TABLE_NAME, COLUMN_NAME "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE()"
+        ))
+    }
+    indexes = {
+        (str(row[0]), str(row[1]))
+        for row in conn.execute(text(
+            "SELECT TABLE_NAME, INDEX_NAME "
+            "FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE()"
+        ))
+    }
+    parent_indexed = bool(conn.execute(text(
+        "SELECT 1 FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'recommendation_request' "
+        "AND COLUMN_NAME = 'parent_request_id' "
+        "AND SEQ_IN_INDEX = 1 LIMIT 1"
+    )).first())
+    missing_columns = [
+        f"{table}.{column}"
+        for table, column in PHASE9_REQUIRED_COLUMNS
+        if (table, column) not in columns
+    ]
+    missing_indexes = [
+        f"{table}.{index}"
+        for table, index in PHASE9_REQUIRED_INDEXES
+        if (table, index) not in indexes
+    ]
+    if not parent_indexed:
+        missing_indexes.append(
+            "recommendation_request(parent_request_id)",
+        )
+    if missing_columns or missing_indexes:
+        findings.append(Finding(
+            ERROR,
+            "phase9_structure_incomplete",
+            "critical Phase 9 columns/indexes are missing",
+            {
+                "missing_columns": missing_columns,
+                "missing_indexes": missing_indexes,
+            },
+        ))
+        return
+
+    ttl_missing = int(conn.execute(text(
+        "SELECT COUNT(*) FROM recommendation_delivery "
+        "WHERE content_expires_at IS NULL "
+        "AND (content_ciphertext IS NOT NULL "
+        "OR session_patch_ciphertext IS NOT NULL)"
+    )).scalar() or 0)
+    if ttl_missing:
+        findings.append(Finding(
+            ERROR,
+            "recommendation_content_ttl_missing",
+            f"{ttl_missing} encrypted delivery rows have no content expiry",
+            {"rows": ttl_missing},
+        ))
+    else:
+        findings.append(Finding(
+            INFO,
+            "phase9_structure_ok",
+            "critical Phase 9 columns, indexes and encrypted-content TTLs are present",
+        ))
+
+
 def check_phase9_applied(conn, tables: set[str], stage: str, findings: list[Finding]) -> None:
     missing = [name for name in PHASE9_TABLES if name not in tables]
     if stage == "pre-migration":
@@ -421,11 +536,32 @@ def check_phase9_applied(conn, tables: set[str], stage: str, findings: list[Find
     if "schema_migration_history" not in tables:
         findings.append(Finding(ERROR, "migration_ledger_missing", "schema_migration_history does not exist"))
         return
+    expected, file_mismatches = _phase9_manifest_entries()
+    if file_mismatches:
+        findings.append(Finding(
+            ERROR,
+            "phase9_manifest_checksum_invalid",
+            f"local Phase 9 migration files do not match manifest: {file_mismatches}",
+            {"migrations": file_mismatches},
+        ))
+        return
     rows = list(conn.execute(text(
-        "SELECT migration_name, success FROM schema_migration_history "
+        "SELECT migration_name, sha256, success FROM schema_migration_history "
         "WHERE migration_name LIKE 'phase9%'"
     )))
-    failed = sorted(str(row[0]) for row in rows if int(row[1]) != 1)
+    recorded = {
+        str(row[0]): (str(row[1]), int(row[2]))
+        for row in rows
+    }
+    failed = sorted(
+        name for name, (_digest, success) in recorded.items()
+        if success != 1
+    )
+    missing = sorted(set(expected) - set(recorded))
+    stale = sorted(
+        name for name, digest in expected.items()
+        if name in recorded and recorded[name][0] != digest
+    )
     if not rows:
         findings.append(Finding(ERROR, "migration_ledger_empty", "no phase9 rows in schema_migration_history"))
     elif failed:
@@ -434,11 +570,22 @@ def check_phase9_applied(conn, tables: set[str], stage: str, findings: list[Find
             f"phase9 migrations recorded success=0: {failed}",
             {"migrations": failed},
         ))
+    elif missing or stale:
+        findings.append(Finding(
+            ERROR,
+            "migration_ledger_incomplete",
+            "Phase 9 ledger is missing manifest entries or has stale checksums",
+            {
+                "missing": missing,
+                "stale_checksum": stale,
+            },
+        ))
     else:
         findings.append(Finding(
             INFO, "phase9_applied",
-            f"{len(rows)} phase9 migrations applied, all v1 tables present",
+            f"{len(expected)} manifest migrations applied with matching checksums",
         ))
+        _check_phase9_structure(conn, findings)
 
 
 def read_release_state(conn, tables: set[str], stage: str, findings: list[Finding]) -> dict[str, dict[str, Any]]:

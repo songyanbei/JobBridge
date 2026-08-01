@@ -60,8 +60,11 @@ REQUIRED_COLUMNS = (
     ("admin_user", "role"),
     ("recommendation_delivery", "impression_lease_owner"),
     ("recommendation_delivery", "invalid_recipients"),
+    ("recommendation_delivery", "content_expires_at"),
     ("recommendation_search_attempt", "llm_retry_count"),
+    ("event_log", "client_event_id"),
     ("event_log", "attribution_dedupe_key"),
+    ("recommendation_request", "parent_request_id"),
     ("recommendation_request", "shadow_top_ids"),
     ("recommendation_request", "shadow_overlap_count"),
     ("recommendation_request", "shadow_rank_delta"),
@@ -76,6 +79,11 @@ REQUIRED_COLUMNS = (
 REQUIRED_INDEXES = (
     ("recommendation_impression", "uk_recommendation_impression_delivery_target"),
     ("recommendation_delivery", "idx_recommendation_delivery_impression_lease"),
+    ("event_log", "uk_event_client_idempotency"),
+)
+
+REQUIRED_INDEX_COLUMNS = (
+    ("recommendation_request", ("parent_request_id",)),
 )
 
 
@@ -341,6 +349,32 @@ def verify_structure(engine) -> list[str]:
                 "WHERE TABLE_SCHEMA = DATABASE()"
             ))
         }
+        index_rows = list(conn.execute(text(
+            "SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX "
+            "FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE()"
+        )))
+        index_columns: dict[tuple[str, str], list[tuple[int, str]]] = {}
+        for table, index, column, sequence in index_rows:
+            index_columns.setdefault(
+                (str(table), str(index)), [],
+            ).append((int(sequence), str(column)))
+        normalized_index_columns = {
+            table: {
+                tuple(
+                    column for _sequence, column in sorted(columns)
+                )
+                for (index_table, _index), columns in index_columns.items()
+                if index_table == table
+            }
+            for table, _columns in REQUIRED_INDEX_COLUMNS
+        }
+        ttl_missing = int(conn.execute(text(
+            "SELECT COUNT(*) FROM recommendation_delivery "
+            "WHERE content_expires_at IS NULL "
+            "AND (content_ciphertext IS NOT NULL "
+            "OR session_patch_ciphertext IS NOT NULL)"
+        )).scalar() or 0) if "recommendation_delivery" in tables else 0
     problems = []
     for table in REQUIRED_TABLES:
         if table not in tables:
@@ -351,6 +385,16 @@ def verify_structure(engine) -> list[str]:
     for table, index in REQUIRED_INDEXES:
         if (table, index) not in indexes:
             problems.append(f"missing index: {table}.{index}")
+    for table, expected_columns in REQUIRED_INDEX_COLUMNS:
+        if expected_columns not in normalized_index_columns.get(table, set()):
+            problems.append(
+                f"missing index columns: {table}{expected_columns}",
+            )
+    if ttl_missing:
+        problems.append(
+            "recommendation_delivery rows retain encrypted content without "
+            f"content_expires_at: {ttl_missing}",
+        )
     return problems
 
 

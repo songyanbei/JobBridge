@@ -561,7 +561,17 @@ class TestSessionScrub:
                     {"role": "assistant", "content": PHONE_IN_BODY, "delivery_id": "d-other"},
                 ],
                 "shown_items": ["7", "9"],
-                "candidate_snapshot": {"candidate_ids": ["7"]},
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["7", "9"],
+                    "ranking_metadata": {
+                        "candidate_scores": {
+                            "7": {"final_score": 0.8},
+                            "9": {"final_score": 0.7},
+                        },
+                        "precision_pool_ids": ["7", "9"],
+                    },
+                },
             },
         }
         saved: dict = {}
@@ -586,7 +596,11 @@ class TestSessionScrub:
         }
         assert PHONE_IN_BODY not in str(session)
         assert session["shown_items"] == ["9"]
-        assert session["candidate_snapshot"] is None
+        assert session["candidate_snapshot"]["candidate_ids"] == ["9"]
+        assert session["candidate_snapshot"]["ranking_metadata"] == {
+            "candidate_scores": {"9": {"final_score": 0.7}},
+            "precision_pool_ids": ["9"],
+        }
         # 版本 +1，让按旧版本算好的 staged mutation CAS 失败，不会把正文写回来。
         assert session["session_version"] == 5
         # 索引用完即删，且全程没有 KEYS 扫描。

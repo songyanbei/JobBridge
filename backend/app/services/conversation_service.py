@@ -375,9 +375,20 @@ def reset_search(session: SessionState) -> None:
 # 对话历史
 # ---------------------------------------------------------------------------
 
-def record_history(session: SessionState, role: str, content: str) -> None:
+def record_history(
+    session: SessionState,
+    role: str,
+    content: str,
+    *,
+    delivery_id: str | None = None,
+) -> None:
     """追加一条对话记录，截断到 MAX_HISTORY_MESSAGES 条。"""
-    session.history.append({"role": role, "content": content})
+    entry = {"role": role, "content": content}
+    if delivery_id:
+        # Non-secret lookup marker used by target/user deletion. Recommendation
+        # plaintext remains replaced by the fixed history placeholder.
+        entry["delivery_id"] = str(delivery_id)
+    session.history.append(entry)
     if len(session.history) > MAX_HISTORY_MESSAGES:
         session.history = session.history[-MAX_HISTORY_MESSAGES:]
 

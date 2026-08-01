@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import uuid
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping
@@ -32,6 +33,11 @@ from app.services.recommendation_request_service import rank_candidate_dicts
 from app.tasks.common import log_event
 
 logger = logging.getLogger(__name__)
+
+_turn_shadow_request_ids: ContextVar[set[str] | None] = ContextVar(
+    "recommendation_shadow_turn_request_ids",
+    default=None,
+)
 
 _PERMIT_ACQUIRE_LUA = """
 local key = KEYS[1]
@@ -87,6 +93,7 @@ class ShadowPolicy:
         settings.recommendation_shadow_persistence_queue_capacity
     )
     max_output_tokens: int = settings.recommendation_shadow_max_output_tokens
+    unactivated_state_ttl_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,18 @@ class _ShadowState:
 @dataclass(frozen=True)
 class ShadowHandle:
     request_id: str
+
+
+def begin_turn_tracking() -> Token:
+    """Track every handle submitted while one serving turn is being built."""
+    return _turn_shadow_request_ids.set(set())
+
+
+def end_turn_tracking(token: Token) -> set[str]:
+    """Return submitted handles and restore the caller's previous context."""
+    request_ids = set(_turn_shadow_request_ids.get() or set())
+    _turn_shadow_request_ids.reset(token)
+    return request_ids
 
 
 def _criteria_digest(criteria: Mapping[str, Any]) -> str:
@@ -321,8 +340,46 @@ class ShadowRunner:
             asyncio.create_task(self._worker(), name=f"shadow-worker-{index}")
             for index in range(self.policy.local_concurrency)
         ]
+        reaper = asyncio.create_task(
+            self._reap_unactivated_states(),
+            name="shadow-state-reaper",
+        )
         self._ready.set()
-        await asyncio.gather(*workers)
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            reaper.cancel()
+            try:
+                await reaper
+            except asyncio.CancelledError:
+                pass
+
+    async def _reap_unactivated_states(self) -> None:
+        ttl = max(0.05, float(self.policy.unactivated_state_ttl_seconds))
+        interval = max(0.05, min(5.0, ttl / 2))
+        while True:
+            await asyncio.sleep(interval)
+            cutoff = time.monotonic() - ttl
+            reaped = 0
+            with self._state_lock:
+                stale_ids = [
+                    request_id
+                    for request_id, state in self._states.items()
+                    if (
+                        not state.active
+                        and state.job.submitted_monotonic <= cutoff
+                    )
+                ]
+                for request_id in stale_ids:
+                    state = self._states.pop(request_id, None)
+                    if state is not None:
+                        state.discarded = True
+                        reaped += 1
+            if reaped:
+                log_event(
+                    "recommendation_shadow_unactivated_reaped",
+                    reaped_count=reaped,
+                )
 
     async def _close_async_resources(self) -> None:
         if self._redis is not None:
@@ -627,6 +684,9 @@ class ShadowRunner:
                 return None
             state = _ShadowState(job=job)
             self._states[job.request_id] = state
+            tracked = _turn_shadow_request_ids.get()
+            if tracked is not None:
+                tracked.add(job.request_id)
             if self._queued_count >= self.policy.queue_capacity:
                 state.result = ShadowResult(
                     status="skipped_capacity",
@@ -777,7 +837,9 @@ __all__ = [
     "ShadowResult",
     "ShadowRunner",
     "activate_persistence",
+    "begin_turn_tracking",
     "discard",
+    "end_turn_tracking",
     "set_served_baseline",
     "shadow_runner",
     "start_shadow_runner",

@@ -50,7 +50,12 @@ from app.models import (
     RecommendationDelivery,
 )
 from app.schemas.conversation import ReplyMessage
-from app.services import conversation_service, message_router, search_service
+from app.services import (
+    conversation_service,
+    message_router,
+    recommendation_shadow_service,
+    search_service,
+)
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 from app.wecom.client import (
@@ -522,7 +527,8 @@ class Worker:
     ) -> str:
         db: Session = SessionLocal()
         business_committed = False
-        shadow_request_ids: set[str] = set()
+        submitted_shadow_request_ids: set[str] = set()
+        committed_shadow_request_ids: set[str] = set()
         try:
             # Redis is an at-least-once queue. A crash between enqueue and the DB
             # claim can leave a duplicate payload behind. The per-user lease
@@ -568,15 +574,23 @@ class Worker:
                 backlog_depth = 0
             backlog_token = search_service.set_queue_backlog_hint(backlog_depth)
             stage_token = conversation_service.begin_session_staging(userid)
+            shadow_tracking_token = (
+                recommendation_shadow_service.begin_turn_tracking()
+            )
             staged_session = None
             try:
                 replies = message_router.process(msg, db)
             finally:
+                submitted_shadow_request_ids.update(
+                    recommendation_shadow_service.end_turn_tracking(
+                        shadow_tracking_token,
+                    ),
+                )
                 staged_session = conversation_service.end_session_staging(
                     stage_token,
                 )
                 search_service.reset_queue_backlog_hint(backlog_token)
-            shadow_request_ids = {
+            committed_shadow_request_ids = {
                 reply.recommendation_request.request_id
                 for reply in replies
                 if (
@@ -608,9 +622,13 @@ class Worker:
             # A shadow callback may persist only after the served request/outbox
             # transaction exists.  Direct/no-event calls do not stage those
             # facts, so their detached observations are discarded.
-            from app.services import recommendation_shadow_service
-            for shadow_request_id in shadow_request_ids:
-                if inbound_event_id:
+            for shadow_request_id in (
+                submitted_shadow_request_ids | committed_shadow_request_ids
+            ):
+                if (
+                    inbound_event_id
+                    and shadow_request_id in committed_shadow_request_ids
+                ):
                     recommendation_shadow_service.activate_persistence(
                         shadow_request_id,
                     )
@@ -643,9 +661,11 @@ class Worker:
             return "processed" if session_ready else "session_commit_pending"
         except Exception as exc:
             db.rollback()
-            if not business_committed and shadow_request_ids:
-                from app.services import recommendation_shadow_service
-                for shadow_request_id in shadow_request_ids:
+            if not business_committed:
+                for shadow_request_id in (
+                    submitted_shadow_request_ids
+                    | committed_shadow_request_ids
+                ):
                     recommendation_shadow_service.discard(shadow_request_id)
             if business_committed:
                 # Never send an already-committed publish/search turn through the
