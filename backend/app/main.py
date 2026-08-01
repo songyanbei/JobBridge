@@ -182,19 +182,35 @@ def health_check():
     """健康检查，检测应用与数据库状态。"""
     db_ok = False
     db_error: str | None = None
+    visibility_policy_ok = False
+    visibility_policy_error: str | None = None
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
+            value = conn.execute(text(
+                "SELECT config_value FROM system_config "
+                "WHERE config_key = 'visibility.recommendation_fields'"
+            )).scalar_one_or_none()
+            if value is None:
+                visibility_policy_error = "visibility_policy_missing"
+            else:
+                from app.services.visibility_policy import normalize_policy
+                normalize_policy(value)
+                visibility_policy_ok = True
         db_ok = True
     except Exception as exc:
         db_error = str(exc)
 
     return {
-        "status": "ok" if db_ok else "degraded",
+        "status": "ok" if db_ok and visibility_policy_ok else "degraded",
         "env": settings.app_env,
         "version": app.version,
         "db": {
             "ok": db_ok,
             "error": db_error,
+        },
+        "visibility_policy": {
+            "ok": visibility_policy_ok,
+            "error": visibility_policy_error,
         },
     }
