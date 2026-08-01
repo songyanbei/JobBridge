@@ -1,0 +1,6 @@
+# The phase9 manifest hashes migration files byte-for-byte and the digests are
+# recorded in the production `schema_migration_history` ledger.  With
+# core.autocrlf=true a Windows checkout would materialize these files as CRLF,
+# changing every digest and failing `apply_phase9_migrations.py --check`.
+# Pin them to LF so the checksum is platform-independent.
+backend/sql/migrations/** text eol=lf

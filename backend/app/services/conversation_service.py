@@ -375,9 +375,20 @@ def reset_search(session: SessionState) -> None:
 # 对话历史
 # ---------------------------------------------------------------------------
 
-def record_history(session: SessionState, role: str, content: str) -> None:
+def record_history(
+    session: SessionState,
+    role: str,
+    content: str,
+    *,
+    delivery_id: str | None = None,
+) -> None:
     """追加一条对话记录，截断到 MAX_HISTORY_MESSAGES 条。"""
-    session.history.append({"role": role, "content": content})
+    entry = {"role": role, "content": content}
+    if delivery_id:
+        # Non-secret lookup marker used by target/user deletion. Recommendation
+        # plaintext remains replaced by the fixed history placeholder.
+        entry["delivery_id"] = str(delivery_id)
+    session.history.append(entry)
     if len(session.history) > MAX_HISTORY_MESSAGES:
         session.history = session.history[-MAX_HISTORY_MESSAGES:]
 
@@ -391,6 +402,14 @@ def save_snapshot(
     candidate_ids: list[str],
     query_digest: str,
     effective_criteria: dict | None = None,
+    *,
+    request_id: str | None = None,
+    snapshot_id: str | None = None,
+    direction: str | None = None,
+    strategy_version_id: str | None = None,
+    algorithm_version: str = "legacy",
+    assignment: str = "legacy",
+    ranking_metadata: dict | None = None,
 ) -> None:
     """保存候选 ID 快照（由 search_service 在 rerank 后调用）。"""
     now = datetime.now(timezone.utc)
@@ -406,6 +425,13 @@ def save_snapshot(
         created_at=now.isoformat(),
         expires_at=expires.isoformat(),
         effective_criteria=dict(effective_criteria or session.search_criteria or {}),
+        request_id=request_id,
+        snapshot_id=snapshot_id,
+        direction=direction,
+        strategy_version_id=strategy_version_id,
+        algorithm_version=algorithm_version,
+        assignment=assignment,
+        ranking_metadata=dict(ranking_metadata or {}),
     )
     session.shown_items = []
 

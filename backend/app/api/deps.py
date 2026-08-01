@@ -17,6 +17,7 @@ from app.core.redis_client import get_redis
 from app.core.security import decode_admin_token
 from app.db import SessionLocal
 from app.models import AdminUser
+from app.services import admin_user_service
 
 # OAuth2 Bearer，auto_error=False 让我们自己抛统一错误码
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/admin/login", auto_error=False)
@@ -82,6 +83,41 @@ def require_admin_password_changed(
     if settings.admin_force_password_change and not bool(current.password_changed):
         raise BusinessException(40301, "请先修改默认密码")
     return current
+
+
+def require_admin_role(*roles: str):
+    """Return a dependency enforcing recommendation-console RBAC (§9.10/§14.8).
+
+    Fail-closed: the effective role comes from ``admin_user_service.resolve_role``
+    which normalises anything unrecognised down to ``viewer``. The previous
+    ``getattr(current, "role", "super_admin")`` default made **every** account
+    behave like a super admin, so all ``require_admin_role`` declarations on the
+    strategy/metrics routers were decorative.
+    """
+    unknown = [role for role in roles if role not in admin_user_service.ADMIN_ROLES]
+    if unknown or not roles:
+        # A typo'd role name must fail at import time, not silently normalise to
+        # `viewer` and widen the route to every logged-in admin.
+        raise ValueError(f"unknown admin role(s) in route declaration: {unknown or roles}")
+    allowed = set(roles)
+
+    def dependency(current: AdminUser = Depends(require_admin_password_changed)) -> AdminUser:
+        if admin_user_service.resolve_role(current) not in allowed:
+            raise BusinessException(40301, "权限不足")
+        return current
+
+    return dependency
+
+
+def require_admin_permission(permission: str):
+    """Same gate expressed against the §9.10 capability matrix."""
+
+    def dependency(current: AdminUser = Depends(require_admin_password_changed)) -> AdminUser:
+        if not admin_user_service.has_permission(current, permission):
+            raise BusinessException(40301, "权限不足")
+        return current
+
+    return dependency
 
 
 def require_event_api_key(

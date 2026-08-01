@@ -9,6 +9,7 @@
 --   - 城市字典：仅示例几条，完整 340 城导入另行用脚本批量插入
 --   - 敏感词字典：仅示例，完整词表由运营后台逐步维护
 --   - 管理员账号：开发环境默认账号，生产部署前必须修改
+--   - 推荐控制面初始行：与 phase9_001 的 INSERT IGNORE 完全一致
 -- ============================================================================
 
 SET NAMES utf8mb4;
@@ -56,6 +57,7 @@ INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `descri
 ('ttl.audit_log.days',             '180','int',  '审核日志 TTL（天）— Phase 7 新增'),
 ('ttl.wecom_inbound_event.days',   '30', 'int',  '入站事件表 TTL（天）— Phase 7 新增'),
 ('ttl.hard_delete.delay_days',     '7',  'int',  '软删到硬删延迟（天）— Phase 7 新增'),
+('ttl.recommendation_detail.days', '90', 'int',  '推荐明细 TTL（天）— Phase 9 新增（§9.11）'),
 
 -- 匹配引擎参数
 ('match.top_n',                    '3',  'int',  '首轮推荐条数（§10.3）'),
@@ -123,5 +125,29 @@ INSERT INTO `dict_sensitive_word` (`word`, `level`, `category`, `enabled`) VALUE
 -- ⚠️ 生产部署前必须执行：
 --      UPDATE admin_user SET password_hash = '<新哈希>' WHERE username = 'admin';
 -- ============================================================================
-INSERT INTO `admin_user` (`username`, `password_hash`, `display_name`, `password_changed`, `enabled`) VALUES
-('admin', '$2b$10$eSJKksBigl05aIBiYNR/MuHvR0GCahspw0YnVo3EL8UlYanuXBNDy', '系统管理员', 0, 1);
+-- role 必须显式写死：admin_user.role 的列默认值是最小权限 viewer（§9.10），
+-- 引导管理员如果不指定角色就会建成 viewer，直接失去全部运营后台权限。
+INSERT INTO `admin_user` (`username`, `password_hash`, `display_name`, `role`, `password_changed`, `enabled`) VALUES
+('admin', '$2b$10$eSJKksBigl05aIBiYNR/MuHvR0GCahspw0YnVo3EL8UlYanuXBNDy', '系统管理员', 'super_admin', 0, 1);
+
+
+-- ============================================================================
+-- 推荐策略控制面初始行（§9.2，与 phase9_001 迁移的 INSERT IGNORE 保持一致）
+-- ============================================================================
+-- 两个方向默认 execution_mode='off'、rollout_percentage=0、stable/candidate 为
+-- NULL，即完全回落 legacy；kill_switch 默认关闭。revision=1 与 release_history
+-- 的初始行一一对应。
+-- ============================================================================
+INSERT IGNORE INTO `recommendation_strategy_release`
+    (`direction`, `execution_mode`, `rollout_percentage`, `revision`, `lock_version`, `updated_by`) VALUES
+('search_job',    'off', 0, 1, 1, 'system'),
+('search_worker', 'off', 0, 1, 1, 'system');
+
+INSERT IGNORE INTO `recommendation_runtime_control`
+    (`scope`, `kill_switch`, `revision`, `lock_version`, `change_reason`, `updated_by`) VALUES
+('global', 0, 1, 1, 'initial', 'system');
+
+INSERT IGNORE INTO `recommendation_release_history`
+    (`direction`, `revision`, `operation`, `execution_mode`, `rollout_percentage`, `change_reason`, `created_by`) VALUES
+('search_job',    1, 'init', 'off', 0, 'initial legacy baseline', 'system'),
+('search_worker', 1, 'init', 'off', 0, 'initial legacy baseline', 'system');

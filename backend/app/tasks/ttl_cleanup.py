@@ -1,6 +1,7 @@
 """每日 03:00 TTL 清理与硬删除任务（Phase 7 §3.1 模块 B）。
 
 处理顺序（按 phase7-dev-implementation.md §5.4）：
+0. 推荐正文/session patch 到期清理与推荐明细 90 天硬删（§9.11；删除顺序被外键强制）
 1. 岗位过期软删：expires_at < NOW() 且 delist_reason IS NULL → delist_reason='expired' + deleted_at=NOW()
 2. 简历过期软删：expires_at < NOW() 且 deleted_at IS NULL → deleted_at=NOW()
 3. 岗位软删后 ``ttl.hard_delete.delay_days`` 天硬删（分批）
@@ -32,6 +33,148 @@ from app.storage import get_storage
 from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 
 BATCH_SIZE = 500
+
+
+def _redact_expired_recommendation_content(db) -> int:
+    """清理到期的推荐正文与 prepared session patch（§9.11 行 2108-2110）。
+
+    状态机口径严格对齐 §9.6 行 1921 的
+    ``prepared/pending/sending/retry_wait/sent/permanent_failed/unknown``：
+
+    - ``sent`` 是终态，TTL 只清空 ``content_ciphertext``，**不得改写 status**
+      （旧实现写成 ``redacted``，会让曝光派生和指标口径全部错位）；
+    - 还没发出去就失去正文的 prepared/pending/retry_wait 转 ``permanent_failed``
+      （旧实现写的 ``expired`` 不在枚举内）；
+    - sending 且租约已过期转 ``unknown``，不自动重发（§10.3）。
+    """
+    unknown = db.execute(text(
+        "UPDATE recommendation_delivery d "
+        "JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
+        "SET d.status='unknown', d.last_error='sending lease expired after content TTL', "
+        "d.last_error_code='sending_lease_expired', "
+        "o.status='dead_letter', o.locked_at=NULL, o.next_attempt_at=NULL, "
+        "o.last_error='ambiguous provider outcome; automatic resend disabled' "
+        "WHERE d.status='sending' AND d.lease_expires_at IS NOT NULL "
+        "AND d.lease_expires_at <= NOW(6) "
+        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
+    ))
+    expired = db.execute(text(
+        "UPDATE recommendation_delivery d "
+        "LEFT JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
+        "SET d.content_ciphertext=NULL, d.session_patch_ciphertext=NULL, "
+        # MySQL 的多列 UPDATE 是左到右求值，后面的 CASE 会读到已经被改写的列值，
+        # 因此所有依赖旧 status 的赋值必须排在 status 之前。
+        "d.last_error=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
+        "             THEN 'recommendation content expired before send' ELSE d.last_error END, "
+        # P2-12：retry_wait 同样是“还没发出去”的可恢复状态，必须纳入。
+        "d.status=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
+        "             THEN 'permanent_failed' ELSE d.status END, "
+        "o.last_error=CASE WHEN o.status='pending' "
+        "                 THEN 'recommendation delivery expired before send' ELSE o.last_error END, "
+        "o.status=CASE WHEN o.status='pending' THEN 'dead_letter' ELSE o.status END, "
+        "o.locked_at=NULL, o.next_attempt_at=NULL "
+        "WHERE d.status IN ('prepared','pending','retry_wait','sent','permanent_failed','unknown') "
+        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
+    ))
+    # §9.11 行 2109：prepared 超过 24 小时仍无法提交 session 时转 permanent_failed
+    # 并同时清空正文，避免可解密的推荐正文无限期停留。
+    stale_prepared = db.execute(text(
+        "UPDATE recommendation_delivery "
+        "SET status='permanent_failed', content_ciphertext=NULL, "
+        "session_patch_ciphertext=NULL, "
+        "last_error='prepared session never committed within 24h', "
+        "last_error_code='session_commit_timeout' "
+        "WHERE status='prepared' AND created_at < NOW(6) - INTERVAL 24 HOUR"
+    ))
+    # unknown 最多保留 7 天正文，供人工按 msgid 核对后再清理。
+    stale_unknown = db.execute(text(
+        "UPDATE recommendation_delivery "
+        "SET content_ciphertext=NULL, session_patch_ciphertext=NULL "
+        "WHERE status='unknown' AND content_ciphertext IS NOT NULL "
+        "AND updated_at < NOW(6) - INTERVAL 7 DAY"
+    ))
+    db.commit()
+    return (
+        int(unknown.rowcount or 0)
+        + int(expired.rowcount or 0)
+        + int(stale_prepared.rowcount or 0)
+        + int(stale_unknown.rowcount or 0)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 推荐明细 90 天 TTL（§9.11 行 2106-2107 / 2133-2143）
+# ---------------------------------------------------------------------------
+
+RECOMMENDATION_DETAIL_RETENTION_DAYS = 90
+
+
+def _purge_expired_recommendation_details(db, retention_days: int) -> int:
+    """按 §9.11 行 2133-2143 的固定顺序分批删除过期推荐明细。
+
+    顺序是被真实外键强制的（RESTRICT/CASCADE/SET NULL 已按 §9.11 建好），错一步
+    直接被数据库挡住：
+
+    ``归因 event 脱钩 → impression → delivery → request.served_attempt_id 置 NULL
+    → attempt → request``
+
+    每批 ``BATCH_SIZE`` 条 request 独立 commit，避免长事务锁住在线推荐写入
+    （§9.11 行 2117）。
+    """
+    days = int(retention_days)
+    total = 0
+    while True:
+        request_rows = db.execute(
+            text(
+                "SELECT request_id FROM recommendation_request "
+                f"WHERE created_at < NOW(6) - INTERVAL {days} DAY "
+                f"LIMIT {BATCH_SIZE}"
+            )
+        ).fetchall()
+        request_ids = [row[0] for row in request_rows]
+        if not request_ids:
+            break
+
+        id_list = ",".join(_escape_literal(rid) for rid in request_ids)
+        # 1) 归因 event 脱钩：event_log.delivery_id 虽然是 ON DELETE SET NULL，
+        #    但 request_id/snapshot_id 没有外键，必须显式清掉，否则留下悬空引用。
+        db.execute(text(
+            "UPDATE `event_log` SET delivery_id=NULL, request_id=NULL, snapshot_id=NULL "
+            "WHERE request_id IN (" + id_list + ") "
+            "OR delivery_id IN (SELECT delivery_id FROM recommendation_delivery "
+            "WHERE request_id IN (" + id_list + "))"
+        ))
+        # 2) impression（impression.request_id 是 RESTRICT）
+        deleted = db.execute(text(
+            "DELETE FROM recommendation_impression WHERE request_id IN (" + id_list + ")"
+        ))
+        total += int(deleted.rowcount or 0)
+        # 3) delivery（delivery.request_id 是 RESTRICT）
+        deleted = db.execute(text(
+            "DELETE FROM recommendation_delivery WHERE request_id IN (" + id_list + ")"
+        ))
+        total += int(deleted.rowcount or 0)
+        # 4) request.served_attempt_id 置 NULL，才能删 attempt
+        db.execute(text(
+            "UPDATE recommendation_request SET served_attempt_id=NULL "
+            "WHERE served_attempt_id IN (SELECT attempt_id FROM recommendation_search_attempt "
+            "WHERE request_id IN (" + id_list + "))"
+        ))
+        # 5) attempt（attempt.request_id 是 RESTRICT）
+        deleted = db.execute(text(
+            "DELETE FROM recommendation_search_attempt WHERE request_id IN (" + id_list + ")"
+        ))
+        total += int(deleted.rowcount or 0)
+        # 6) request（parent_request_id 自引用是 SET NULL，子请求不会被挡住）
+        deleted = db.execute(text(
+            "DELETE FROM recommendation_request WHERE request_id IN (" + id_list + ")"
+        ))
+        total += int(deleted.rowcount or 0)
+        db.commit()
+
+        if len(request_ids) < BATCH_SIZE:
+            break
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +520,26 @@ def run() -> None:
             inbound_days = cfg["wecom_inbound_event_days"]
             audit_days = cfg["audit_log_days"]
 
+            # 90 天明细留存独立读取，不并入 _load_ttl_config 的 4 个通用 key。
+            recommendation_days = _read_int_config(
+                db,
+                "ttl.recommendation_detail.days",
+                RECOMMENDATION_DETAIL_RETENTION_DAYS,
+            )
+
             _safe_step("soft_delete_jobs", stats, lambda: _soft_delete_expired_jobs(db))
+            _safe_step(
+                "redact_recommendation_content",
+                stats,
+                lambda: _redact_expired_recommendation_content(db),
+            )
+            _safe_step(
+                "purge_recommendation_details",
+                stats,
+                lambda: _purge_expired_recommendation_details(
+                    db, recommendation_days,
+                ),
+            )
             _safe_step("soft_delete_resumes", stats, lambda: _soft_delete_expired_resumes(db))
             _safe_step("hard_delete_jobs", stats, lambda: _hard_delete_expired_jobs(db, delay))
             _safe_step(

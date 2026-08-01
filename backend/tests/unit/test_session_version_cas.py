@@ -6,6 +6,7 @@ import pytest
 from app.core.redis_client import (
     UserLockLost,
     delete_session_if_version,
+    recommendation_session_index_keys,
     save_session_if_version,
 )
 from app.schemas.conversation import SessionState
@@ -22,8 +23,16 @@ def test_redis_session_cas_passes_expected_version_and_payload():
         ) is True
 
     args = redis.eval.call_args.args
-    assert args[1:6] == (2, "session:u-1", "__no_user_lock_fence__", 3, 1800)
-    assert '"session_version": 4' in args[6]
+    assert args[1:7] == (
+        3,
+        "session:u-1",
+        "__no_user_lock_fence__",
+        "recommendation:session:indexes:u-1",
+        3,
+        1800,
+    )
+    assert '"session_version": 4' in args[7]
+    assert args[9:] == ("0", "u-1", "[]")
 
 
 def test_redis_session_cas_rejects_lost_lock_fence():
@@ -55,7 +64,7 @@ def test_redis_session_cas_can_restore_missing_durable_state():
             allow_missing=True,
         ) is True
 
-    assert redis.eval.call_args.args[-1] == "1"
+    assert redis.eval.call_args.args[9] == "1"
 
 
 def test_redis_session_delete_cas_passes_version_and_fence():
@@ -68,8 +77,40 @@ def test_redis_session_delete_cas_passes_version_and_fence():
 
     args = redis.eval.call_args.args
     assert args[1:] == (
-        2, "session:u-1", "lock:u-1", 7, "owner-token",
+        3,
+        "session:u-1",
+        "lock:u-1",
+        "recommendation:session:indexes:u-1",
+        7,
+        "owner-token",
+        "u-1",
     )
+
+
+def test_recommendation_session_indexes_are_derived_without_plaintext():
+    keys = recommendation_session_index_keys({
+        "history": [
+            {
+                "role": "assistant",
+                "content": "[recommendation_delivery]",
+                "delivery_id": "delivery-1",
+            },
+        ],
+        "candidate_snapshot": {
+            "direction": "search_worker",
+            "candidate_ids": ["7", "9"],
+            "ranking_metadata": {
+                "candidate_scores": {"7": {"final_score": 0.8}},
+            },
+        },
+    })
+
+    assert keys == [
+        "recommendation:session:delivery:delivery-1",
+        "recommendation:session:target:resume:7",
+        "recommendation:session:target:resume:9",
+    ]
+    assert "final_score" not in str(keys)
 
 
 def test_conversation_save_increments_version_only_after_success():

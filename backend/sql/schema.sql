@@ -8,7 +8,7 @@
 -- 字符集：     utf8mb4 / utf8mb4_0900_ai_ci
 -- 引擎：       InnoDB
 -- ============================================================================
--- 表清单（共 11 张）：
+-- 表清单（共 22 张）：
 --   user                   用户表（工人/厂家/中介）
 --   job                    岗位信息表
 --   resume                 简历信息表
@@ -20,6 +20,18 @@
 --   system_config          系统配置
 --   admin_user             运营管理员账号
 --   wecom_inbound_event    企微入站事件表（审计追溯 + 幂等 L2 防线）
+--   wecom_outbound_outbox  企微回复事务出站箱
+--   event_log              外部事件回传日志
+--   -- 推荐策略与曝光多样性 v1（phase9_001..007，方案 §9）--
+--   recommendation_strategy_version   策略版本（草稿/发布/归档）
+--   recommendation_strategy_release   方向级发布状态（灰度/主备版本）
+--   recommendation_release_history    发布操作台账
+--   recommendation_runtime_control    运行时总闸（kill switch）
+--   recommendation_request            推荐请求事实表
+--   recommendation_search_attempt     单次检索尝试事实表
+--   recommendation_delivery           推荐投递出站箱（密文正文 + 曝光派生）
+--   recommendation_impression         曝光事实表
+--   recommendation_exposure_daily     曝光日聚合
 -- ============================================================================
 -- 设计说明：
 -- 1. 会话状态（conversation_session）存 Redis，不在 MySQL，见方案 §14
@@ -219,12 +231,15 @@ CREATE TABLE `conversation_log` (
     `wecom_msg_id`      VARCHAR(64)     DEFAULT NULL                 COMMENT '企微消息 ID（幂等 L3 防线）',
     `intent`            VARCHAR(32)     DEFAULT NULL                 COMMENT '识别意图（search_job/search_worker/upload_job/upload_resume...）',
     `criteria_snapshot` JSON            DEFAULT NULL                 COMMENT '本轮 criteria 快照（调试与复现用）',
+    `recommendation_delivery_id` CHAR(36) DEFAULT NULL               COMMENT '推荐投递 ID（仅 v1 推荐日志赋值，旧非推荐日志为 NULL）',
+    `redaction_state`   VARCHAR(24)     DEFAULT NULL                 COMMENT '脱敏状态（推荐日志一律占位符，不回填历史明文）',
     `created_at`        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `expires_at`        DATETIME        NOT NULL                     COMMENT '默认 created_at + 30 天',
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_msg_id` (`wecom_msg_id`),
     KEY `idx_user_time` (`userid`, `created_at`),
-    KEY `idx_expires`   (`expires_at`)
+    KEY `idx_expires`   (`expires_at`),
+    KEY `idx_conversation_recommendation_delivery` (`recommendation_delivery_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='对话历史日志';
 
 
@@ -234,9 +249,9 @@ CREATE TABLE `conversation_log` (
 DROP TABLE IF EXISTS `audit_log`;
 CREATE TABLE `audit_log` (
     `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    `target_type`  ENUM('job','resume','user','system') NOT NULL   COMMENT '审核对象类型（system=系统配置变更）',
-    `target_id`    VARCHAR(64)     NOT NULL                         COMMENT 'job.id / resume.id / user.external_userid',
-    `action`       ENUM('auto_pass','auto_reject','manual_pass','manual_reject','manual_edit','undo','appeal','reinstate') NOT NULL,
+    `target_type`  ENUM('job','resume','user','system','recommendation_strategy') NOT NULL   COMMENT '审核对象类型（system=系统配置变更 / recommendation_strategy=推荐策略变更）',
+    `target_id`    VARCHAR(64)     NOT NULL                         COMMENT 'job.id / resume.id / user.external_userid / 推荐策略方向',
+    `action`       ENUM('auto_pass','auto_reject','manual_pass','manual_reject','manual_edit','undo','appeal','reinstate','strategy_publish','strategy_rollout','strategy_promote','strategy_rollback','strategy_kill_switch') NOT NULL,
     `reason`       VARCHAR(255)    DEFAULT NULL                     COMMENT '动作原因',
     `operator`     VARCHAR(64)     DEFAULT NULL                     COMMENT 'system / admin 用户名',
     `snapshot`     JSON            DEFAULT NULL                     COMMENT '动作发生时的对象快照（可选）',
@@ -326,6 +341,10 @@ CREATE TABLE `admin_user` (
     `username`       VARCHAR(32)  NOT NULL                     COMMENT '登录用户名',
     `password_hash`  VARCHAR(128) NOT NULL                     COMMENT 'bcrypt 哈希',
     `display_name`   VARCHAR(64)  DEFAULT NULL                 COMMENT '显示名',
+    -- §9.10：默认取最小权限。phase9_004 只把"迁移前既有"的账号提升为 super_admin，
+    -- 新建账号必须显式指定角色，不能静默继承全部控制权。
+    -- 建库脚本的引导管理员由 seed.sql 显式写入 role='super_admin'。
+    `role`           ENUM('viewer','operator','super_admin') NOT NULL DEFAULT 'viewer' COMMENT '管理员角色',
     `password_changed` TINYINT(1) NOT NULL DEFAULT 0             COMMENT '是否已修改初始密码（0=未改，首次登录强制改密码）',
     `enabled`        TINYINT(1)   NOT NULL DEFAULT 1,
     `last_login_at`  DATETIME     DEFAULT NULL,
@@ -382,7 +401,8 @@ CREATE TABLE `wecom_outbound_outbox` (
     `reply_index`       SMALLINT UNSIGNED NOT NULL COMMENT '同一入站事件内回复顺序',
     `userid`            VARCHAR(64) NOT NULL COMMENT '接收者 external_userid',
     `msg_type`          VARCHAR(16) NOT NULL DEFAULT 'text',
-    `content`           MEDIUMTEXT NOT NULL,
+    -- 推荐回复只把正文留在加密的 recommendation_delivery 信封里，出站箱不再持有明文
+    `content`           MEDIUMTEXT DEFAULT NULL,
     `intent`            VARCHAR(32) DEFAULT NULL,
     `criteria_snapshot` JSON DEFAULT NULL,
     `status`            ENUM('pending','sending','sent','dead_letter') NOT NULL DEFAULT 'pending',
@@ -391,14 +411,17 @@ CREATE TABLE `wecom_outbound_outbox` (
     `locked_at`         DATETIME(6) DEFAULT NULL,
     `provider_msg_id`   VARCHAR(128) DEFAULT NULL,
     `last_error`        TEXT DEFAULT NULL,
+    `recommendation_delivery_id` CHAR(36) DEFAULT NULL COMMENT '关联的推荐投递（非推荐回复为 NULL）',
     `created_at`        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     `sent_at`           DATETIME(6) DEFAULT NULL,
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_outbox_event_reply` (`inbound_event_id`, `reply_index`),
+    UNIQUE KEY `uk_outbox_recommendation_delivery` (`recommendation_delivery_id`),
     KEY `idx_outbox_status_due` (`status`, `next_attempt_at`, `id`),
     KEY `idx_outbox_status_locked` (`status`, `locked_at`),
     KEY `idx_outbox_event` (`inbound_event_id`, `id`),
     KEY `idx_outbox_user_status_id` (`userid`, `status`, `id`)
+    -- fk_outbox_recommendation_delivery 在 recommendation_delivery 建表后统一补
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='企微回复事务出站箱';
 
 
@@ -416,11 +439,346 @@ CREATE TABLE `event_log` (
     `target_id`   BIGINT UNSIGNED NOT NULL COMMENT '目标主键',
     `occurred_at` DATETIME NOT NULL COMMENT '客户端上报的发生时间',
     `extra`       JSON DEFAULT NULL COMMENT '扩展字段',
+
+    -- ---- 推荐归因字段（§9.9，phase9_003 / phase9_006）----
+    `delivery_id`                    CHAR(36) DEFAULT NULL     COMMENT '归因到的推荐投递',
+    `request_id`                     CHAR(36) DEFAULT NULL     COMMENT '归因到的推荐请求',
+    `snapshot_id`                    CHAR(36) DEFAULT NULL     COMMENT '归因到的候选快照',
+    `position`                       SMALLINT UNSIGNED DEFAULT NULL COMMENT '点击项在推荐列表中的位次',
+    `attribution_status`             VARCHAR(24) NOT NULL DEFAULT 'legacy_unattributed' COMMENT 'attributed / legacy_unattributed / rejected',
+    `attributed_strategy_version_id` BIGINT UNSIGNED DEFAULT NULL COMMENT '归因命中的策略版本',
+    `attributed_algorithm_version`   VARCHAR(32) DEFAULT NULL  COMMENT '归因命中的算法版本',
+    `attributed_is_exploration`      TINYINT(1) DEFAULT NULL   COMMENT '被点击项是否为探索位',
+    `client_event_id`                VARCHAR(64) DEFAULT NULL  COMMENT '客户端幂等键',
+    `attribution_dedupe_key`         CHAR(64) DEFAULT NULL     COMMENT '服务端归因去重键',
+
     `created_at`  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_event_attribution_dedupe` (`attribution_dedupe_key`),
+    UNIQUE KEY `uk_event_client_idempotency` (`userid`, `event_type`, `client_event_id`),
     KEY `idx_target` (`target_type`, `target_id`, `occurred_at`),
-    KEY `idx_user_time` (`userid`, `occurred_at`)
+    KEY `idx_user_time` (`userid`, `occurred_at`),
+    KEY `idx_event_delivery_target` (`delivery_id`, `target_type`, `target_id`),
+    KEY `idx_event_attributed_version` (`attributed_strategy_version_id`, `event_type`, `occurred_at`),
+    KEY `idx_event_attribution_status` (`attribution_status`, `occurred_at`)
+    -- fk_event_recommendation_delivery 在 recommendation_delivery 建表后统一补
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='外部事件回传日志';
+
+
+-- ============================================================================
+-- 14. recommendation_strategy_version 推荐策略版本（§9.1）
+-- ============================================================================
+-- 以下 9 张表对应 phase9_001..007 迁移的最终形态。schema.sql 是全新建库脚本，
+-- 直接写目标结构，不需要迁移里的 information_schema 守卫。
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_strategy_version`;
+CREATE TABLE `recommendation_strategy_version` (
+    `id`                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `direction`             VARCHAR(32)  NOT NULL                  COMMENT 'search_job / search_worker',
+    `version_no`            INT UNSIGNED NOT NULL                  COMMENT '方向内自增版本号',
+    `template_key`          VARCHAR(32)  NOT NULL                  COMMENT '参数模板标识',
+    `status`                ENUM('draft','published','archived') NOT NULL DEFAULT 'draft',
+    `parameters`            JSON         NOT NULL                  COMMENT '策略参数全量快照',
+    `parameters_digest`     CHAR(64)     NOT NULL                  COMMENT 'parameters 的 SHA256',
+    `last_simulated_digest` CHAR(64)     DEFAULT NULL              COMMENT '最近一次仿真所用参数摘要',
+    `last_simulated_at`     DATETIME(6)  DEFAULT NULL,
+    `algorithm_version`     VARCHAR(32)  NOT NULL DEFAULT 'recommendation-v1',
+    `base_version_id`       BIGINT UNSIGNED DEFAULT NULL           COMMENT '派生自哪个版本',
+    `lock_version`          INT UNSIGNED NOT NULL DEFAULT 1        COMMENT '乐观锁版本号',
+    `change_reason`         VARCHAR(255) NOT NULL                  COMMENT '变更原因（必填）',
+    `created_by`            VARCHAR(64)  NOT NULL,
+    `created_at`            DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `published_by`          VARCHAR(64)  DEFAULT NULL,
+    `published_at`          DATETIME(6)  DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_recommendation_version_direction_no` (`direction`, `version_no`),
+    KEY `idx_recommendation_version_status` (`direction`, `status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐策略版本';
+
+
+-- ============================================================================
+-- 15. recommendation_strategy_release 方向级发布状态（§9.2）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_strategy_release`;
+CREATE TABLE `recommendation_strategy_release` (
+    `direction`             VARCHAR(32)  NOT NULL                  COMMENT 'search_job / search_worker',
+    `execution_mode`        ENUM('off','shadow','on') NOT NULL DEFAULT 'off',
+    `stable_version_id`     BIGINT UNSIGNED DEFAULT NULL           COMMENT '稳定版本（NULL=legacy 基线）',
+    `candidate_version_id`  BIGINT UNSIGNED DEFAULT NULL           COMMENT '灰度候选版本',
+    `rollout_percentage`    INT UNSIGNED NOT NULL DEFAULT 0        COMMENT '候选版本灰度比例 0-100',
+    `revision`              BIGINT UNSIGNED NOT NULL DEFAULT 1     COMMENT '发布修订号，与 history 对齐',
+    `lock_version`          INT UNSIGNED NOT NULL DEFAULT 1        COMMENT '乐观锁版本号',
+    `updated_by`            VARCHAR(64)  NOT NULL DEFAULT 'system',
+    `updated_at`            DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`direction`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐策略方向级发布状态';
+
+
+-- ============================================================================
+-- 16. recommendation_release_history 发布操作台账（§9.2）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_release_history`;
+CREATE TABLE `recommendation_release_history` (
+    `direction`             VARCHAR(32)  NOT NULL,
+    `revision`              BIGINT UNSIGNED NOT NULL               COMMENT '与 release.revision 一一对应',
+    `operation`             VARCHAR(32)  NOT NULL                  COMMENT 'init/publish/rollout/promote/rollback/kill_switch',
+    `execution_mode`        VARCHAR(16)  NOT NULL                  COMMENT '本次操作后的执行模式',
+    `stable_version_id`     BIGINT UNSIGNED DEFAULT NULL,
+    `candidate_version_id`  BIGINT UNSIGNED DEFAULT NULL,
+    `rollout_percentage`    INT UNSIGNED NOT NULL,
+    `target_revision`       BIGINT UNSIGNED DEFAULT NULL           COMMENT '回滚目标 revision',
+    `change_reason`         VARCHAR(255) NOT NULL,
+    `created_by`            VARCHAR(64)  NOT NULL,
+    `created_at`            DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`direction`, `revision`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐策略发布操作台账';
+
+
+-- ============================================================================
+-- 17. recommendation_runtime_control 运行时总闸（§9.2）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_runtime_control`;
+CREATE TABLE `recommendation_runtime_control` (
+    `scope`          VARCHAR(16)  NOT NULL                         COMMENT '一期固定 global',
+    `kill_switch`    TINYINT(1)   NOT NULL DEFAULT 0               COMMENT '1=全局熔断回落 legacy',
+    `revision`       BIGINT UNSIGNED NOT NULL DEFAULT 1,
+    `lock_version`   INT UNSIGNED NOT NULL DEFAULT 1               COMMENT '乐观锁版本号',
+    `change_reason`  VARCHAR(255) NOT NULL DEFAULT 'initial',
+    `updated_by`     VARCHAR(64)  NOT NULL DEFAULT 'system',
+    `updated_at`     DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`scope`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐运行时总闸';
+
+
+-- ============================================================================
+-- 18. recommendation_request 推荐请求事实表（§9.3）
+-- ============================================================================
+-- 注：parent_request_id 不额外建 idx_recommendation_request_parent，
+--     InnoDB 会用与约束同名的索引回填 fk_recommendation_request_parent，
+--     phase9_007 在这种情况下同样是空操作，避免重复索引。
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_request`;
+CREATE TABLE `recommendation_request` (
+    `request_id`                    CHAR(36)     NOT NULL,
+    `source_inbound_msg_id`         VARCHAR(64)  NOT NULL          COMMENT '来源企微消息 ID',
+    `request_index`                 SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '同一入站消息内的请求序号',
+    `request_kind`                  VARCHAR(32)  NOT NULL          COMMENT 'initial / auto_relax / show_more',
+    `parent_request_id`             CHAR(36)     DEFAULT NULL      COMMENT '放宽/翻页的父请求',
+    `served_attempt_id`             CHAR(36)     DEFAULT NULL      COMMENT '最终采纳的检索尝试',
+    `snapshot_id`                   CHAR(36)     DEFAULT NULL      COMMENT '候选快照 ID',
+    `viewer_userid`                 VARCHAR(64)  NOT NULL,
+    `direction`                     VARCHAR(32)  NOT NULL,
+    `query_digest`                  VARCHAR(16)  NOT NULL          COMMENT '查询条件短摘要',
+    `execution_mode`                VARCHAR(16)  NOT NULL          COMMENT '本次请求生效的执行模式',
+    `served_assignment`             VARCHAR(16)  NOT NULL          COMMENT 'legacy / stable / candidate',
+    `served_strategy_version_id`    BIGINT UNSIGNED DEFAULT NULL,
+    `candidate_strategy_version_id` BIGINT UNSIGNED DEFAULT NULL,
+    `algorithm_version`             VARCHAR(32)  NOT NULL,
+    `final_candidate_count`         INT UNSIGNED NOT NULL DEFAULT 0,
+    `result_count`                  INT UNSIGNED NOT NULL DEFAULT 0,
+    `is_zero_result`                TINYINT(1)   NOT NULL DEFAULT 0,
+    `show_more_exhausted`           TINYINT(1)   NOT NULL DEFAULT 0,
+    `total_latency_ms`              INT UNSIGNED NOT NULL DEFAULT 0,
+    `served_top_ids`                JSON         NOT NULL          COMMENT '最终返回的目标 ID 序列',
+    `served_owner_count`            INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '返回结果覆盖的发布者数',
+    `served_max_owner_items`        INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '单一发布者最多占几条',
+    `served_exploration_count`      INT UNSIGNED NOT NULL DEFAULT 0 COMMENT '返回结果中的探索位数量',
+    `shadow_top_ids`                JSON NULL COMMENT 'shadow 候选 Top N',
+    `shadow_overlap_count`          INT UNSIGNED NULL COMMENT '与 legacy Top N 重合数',
+    `shadow_rank_delta`             JSON NULL COMMENT '共同候选位次差',
+    `shadow_status`                 VARCHAR(32) NULL COMMENT 'completed/timeout/timeout_in_queue/skipped_capacity/failed',
+    `shadow_queue_wait_ms`          INT UNSIGNED NULL COMMENT 'shadow runner 排队时间',
+    `shadow_latency_ms`             INT UNSIGNED NULL COMMENT 'shadow 增量计算耗时',
+    `shadow_input_tokens`           INT UNSIGNED NULL COMMENT 'shadow 输入 token',
+    `shadow_output_tokens`          INT UNSIGNED NULL COMMENT 'shadow 输出 token',
+    `shadow_fallback`               VARCHAR(32) NULL COMMENT 'shadow 回退类型',
+    `created_at`                    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`request_id`),
+    UNIQUE KEY `uk_recommendation_request_inbound_index` (`source_inbound_msg_id`, `request_index`),
+    KEY `idx_recommendation_request_viewer_time` (`viewer_userid`, `direction`, `created_at`),
+    KEY `idx_recommendation_request_attempt` (`served_attempt_id`),
+    KEY `idx_recommendation_request_mode_time` (`created_at`, `direction`, `execution_mode`),
+    KEY `idx_recommendation_request_kind_zero` (`request_kind`, `is_zero_result`, `created_at`),
+    KEY `idx_recommendation_request_version_time` (`served_strategy_version_id`, `created_at`),
+    CONSTRAINT `fk_recommendation_request_parent`
+        FOREIGN KEY (`parent_request_id`) REFERENCES `recommendation_request`(`request_id`) ON DELETE SET NULL
+    -- fk_recommendation_request_served_attempt 是循环引用，见文件末尾的 ALTER
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐请求事实表';
+
+
+-- ============================================================================
+-- 19. recommendation_search_attempt 检索尝试事实表（§9.4）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_search_attempt`;
+CREATE TABLE `recommendation_search_attempt` (
+    `attempt_id`             CHAR(36)     NOT NULL,
+    `request_id`             CHAR(36)     NOT NULL,
+    `attempt_no`             SMALLINT UNSIGNED NOT NULL            COMMENT '请求内尝试序号，从 0 递增',
+    `attempt_kind`           VARCHAR(32)  NOT NULL                 COMMENT 'initial / relax_probe / auto_relaxed / confirmed_relaxed / shadow_candidate',
+    `criteria_digest`        CHAR(64)     NOT NULL                 COMMENT '本次检索条件的 SHA256',
+    `scoring_time_utc`       DATETIME(6)  NOT NULL                 COMMENT '打分基准时间（复现用）',
+    `candidate_count`        INT UNSIGNED NOT NULL DEFAULT 0,
+    `candidate_ids`          JSON         NOT NULL                 COMMENT '硬过滤后的候选 ID',
+    `precision_pool_ids`     JSON         NOT NULL                 COMMENT '精排池 ID',
+    `result_count`           INT UNSIGNED NOT NULL DEFAULT 0,
+    `is_zero_result`         TINYINT(1)   NOT NULL DEFAULT 0,
+    `strategy_version_id`    BIGINT UNSIGNED DEFAULT NULL,
+    `algorithm_version`      VARCHAR(32)  NOT NULL,
+    `llm_status`             VARCHAR(32)  NOT NULL DEFAULT 'skipped' COMMENT 'skipped/ok/timeout/error/fallback',
+    `llm_input_tokens`       INT UNSIGNED DEFAULT NULL,
+    `llm_output_tokens`      INT UNSIGNED DEFAULT NULL,
+    `llm_timeout_budget_ms`  INT UNSIGNED DEFAULT NULL             COMMENT '本次尝试分配的 LLM 超时预算',
+    `llm_retry_count`        SMALLINT UNSIGNED NOT NULL DEFAULT 0  COMMENT 'LLM 重试次数',
+    `ranking_fallback`       VARCHAR(32)  DEFAULT NULL             COMMENT '回落到的排序方式',
+    `ranking_latency_ms`     INT UNSIGNED NOT NULL DEFAULT 0,
+    `total_latency_ms`       INT UNSIGNED NOT NULL DEFAULT 0,
+    `created_at`             DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`attempt_id`),
+    UNIQUE KEY `uk_recommendation_attempt_request_no` (`request_id`, `attempt_no`),
+    KEY `idx_recommendation_attempt_kind_time` (`created_at`, `attempt_kind`),
+    KEY `idx_recommendation_attempt_version_time` (`strategy_version_id`, `created_at`),
+    KEY `idx_recommendation_attempt_llm_status` (`llm_status`, `created_at`),
+    CONSTRAINT `fk_recommendation_attempt_request`
+        FOREIGN KEY (`request_id`) REFERENCES `recommendation_request`(`request_id`) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐检索尝试事实表';
+
+
+-- ============================================================================
+-- 20. recommendation_delivery 推荐投递出站箱（§9.5 / §9.6）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_delivery`;
+CREATE TABLE `recommendation_delivery` (
+    `delivery_id`                  CHAR(36)     NOT NULL,
+    `delivery_order`               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE COMMENT '全局单调序号，供 show_more 定位',
+    `source_inbound_msg_id`        VARCHAR(64)  NOT NULL,
+    `reply_index`                  SMALLINT UNSIGNED NOT NULL,
+    `request_id`                   CHAR(36)     NOT NULL,
+    `snapshot_id`                  CHAR(36)     DEFAULT NULL,
+    `userid`                       VARCHAR(64)  NOT NULL           COMMENT '接收者 external_userid',
+
+    -- ---- 加密正文信封 ----
+    `content_ciphertext`           MEDIUMBLOB   DEFAULT NULL       COMMENT '回复正文密文',
+    `content_key_version`          SMALLINT UNSIGNED NOT NULL DEFAULT 1,
+    `content_hash`                 CHAR(64)     DEFAULT NULL,
+    `content_expires_at`           DATETIME(6)  DEFAULT NULL       COMMENT '正文 TTL（phase9_005）',
+    `recommendation_context`       JSON         NOT NULL           COMMENT '归因所需的上下文（不含明文正文）',
+    `status`                       VARCHAR(24)  NOT NULL DEFAULT 'prepared',
+
+    -- ---- 会话补偿提交 ----
+    `session_expected_version`     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    `session_commit_token`         CHAR(36)     NOT NULL,
+    `session_patch_ciphertext`     MEDIUMBLOB   DEFAULT NULL,
+    `session_commit_state`         VARCHAR(16)  NOT NULL DEFAULT 'not_applied',
+    `session_committed_at`         DATETIME(6)  DEFAULT NULL,
+
+    -- ---- 发送重试与租约 ----
+    `attempt_count`                INT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at`              DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `lease_owner`                  VARCHAR(64)  DEFAULT NULL,
+    `lease_expires_at`             DATETIME(6)  DEFAULT NULL,
+    `wecom_msgid`                  VARCHAR(128) DEFAULT NULL,
+    `wecom_response`               JSON         DEFAULT NULL,
+    `invalid_recipients`           JSON         DEFAULT NULL       COMMENT '企微返回的无效接收人',
+    `last_error_code`              VARCHAR(32)  DEFAULT NULL,
+    `last_error`                   VARCHAR(500) DEFAULT NULL,
+    `sent_at`                      DATETIME(6)  DEFAULT NULL,
+
+    -- ---- 曝光派生 ----
+    `impression_state`             VARCHAR(24)  NOT NULL DEFAULT 'pending',
+    `impression_expected_count`    SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    `impression_actual_count`      SMALLINT UNSIGNED NOT NULL DEFAULT 0,
+    `impression_attempt_count`     INT UNSIGNED NOT NULL DEFAULT 0,
+    `impression_next_attempt_at`   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `impression_lease_owner`       VARCHAR(64)  DEFAULT NULL,
+    `impression_lease_expires_at`  DATETIME(6)  DEFAULT NULL,
+    `impression_derived_at`        DATETIME(6)  DEFAULT NULL,
+    `impression_last_error`        VARCHAR(500) DEFAULT NULL,
+
+    `created_at`                   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `updated_at`                   DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`delivery_id`),
+    UNIQUE KEY `uk_recommendation_delivery_inbound_index` (`source_inbound_msg_id`, `reply_index`),
+    KEY `idx_recommendation_delivery_user_order` (`userid`, `delivery_order`),
+    KEY `idx_recommendation_delivery_status_due` (`status`, `next_attempt_at`),
+    KEY `idx_recommendation_delivery_session_recovery` (`status`, `session_commit_state`, `updated_at`),
+    KEY `idx_recommendation_delivery_user_status_order` (`userid`, `status`, `delivery_order`),
+    KEY `idx_recommendation_delivery_lease` (`lease_expires_at`, `status`),
+    KEY `idx_recommendation_delivery_impression_due` (`status`, `impression_state`, `impression_next_attempt_at`),
+    KEY `idx_recommendation_delivery_impression_lease` (`impression_lease_expires_at`, `impression_state`),
+    KEY `idx_recommendation_delivery_request` (`request_id`),
+    KEY `idx_recommendation_delivery_msgid` (`wecom_msgid`),
+    CONSTRAINT `fk_recommendation_delivery_request`
+        FOREIGN KEY (`request_id`) REFERENCES `recommendation_request`(`request_id`) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐投递出站箱';
+
+
+-- ============================================================================
+-- 21. recommendation_impression 曝光事实表（§9.7）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_impression`;
+CREATE TABLE `recommendation_impression` (
+    `id`                    BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `delivery_id`           CHAR(36)     NOT NULL,
+    `request_id`            CHAR(36)     NOT NULL,
+    `snapshot_id`           CHAR(36)     NOT NULL,
+    `viewer_userid`         VARCHAR(64)  NOT NULL,
+    `direction`             VARCHAR(32)  NOT NULL,
+    `target_type`           VARCHAR(16)  NOT NULL                  COMMENT 'job / resume',
+    `target_id`             BIGINT UNSIGNED NOT NULL,
+    `position`              SMALLINT UNSIGNED NOT NULL             COMMENT '曝光位次，从 1 起',
+    `strategy_version_id`   BIGINT UNSIGNED DEFAULT NULL,
+    `algorithm_version`     VARCHAR(32)  NOT NULL,
+    `assignment`            VARCHAR(16)  NOT NULL                  COMMENT 'legacy / stable / candidate',
+    `is_exploration`        TINYINT(1)   NOT NULL DEFAULT 0,
+    `query_digest`          VARCHAR(16)  NOT NULL,
+    `score_detail`          JSON         DEFAULT NULL              COMMENT '分项打分明细',
+    `exposed_at`            DATETIME(6)  NOT NULL,
+    `created_at`            DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_recommendation_impression_delivery_target` (`delivery_id`, `target_type`, `target_id`),
+    KEY `idx_recommendation_impression_viewer_time` (`viewer_userid`, `target_type`, `exposed_at`),
+    KEY `idx_recommendation_impression_target_time` (`target_type`, `target_id`, `exposed_at`),
+    KEY `idx_recommendation_impression_version_time` (`strategy_version_id`, `exposed_at`),
+    KEY `idx_recommendation_impression_snapshot_position` (`snapshot_id`, `position`),
+    -- §9.11：曝光随投递级联删除，但钉住 request
+    CONSTRAINT `fk_recommendation_impression_delivery`
+        FOREIGN KEY (`delivery_id`) REFERENCES `recommendation_delivery`(`delivery_id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_recommendation_impression_request`
+        FOREIGN KEY (`request_id`) REFERENCES `recommendation_request`(`request_id`) ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐曝光事实表';
+
+
+-- ============================================================================
+-- 22. recommendation_exposure_daily 曝光日聚合（§9.8）
+-- ============================================================================
+DROP TABLE IF EXISTS `recommendation_exposure_daily`;
+CREATE TABLE `recommendation_exposure_daily` (
+    `stat_date`        DATE         NOT NULL,
+    `target_type`      VARCHAR(16)  NOT NULL,
+    `target_id`        BIGINT UNSIGNED NOT NULL,
+    `impression_count` INT UNSIGNED NOT NULL DEFAULT 0,
+    `updated_at`       DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`stat_date`, `target_type`, `target_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='推荐曝光日聚合';
+
+
+-- ============================================================================
+-- 推荐相关的延后外键（引用的表在上面才建出来）
+-- ============================================================================
+ALTER TABLE `recommendation_request`
+    ADD CONSTRAINT `fk_recommendation_request_served_attempt`
+    FOREIGN KEY (`served_attempt_id`) REFERENCES `recommendation_search_attempt`(`attempt_id`)
+    ON DELETE SET NULL;
+
+ALTER TABLE `wecom_outbound_outbox`
+    ADD CONSTRAINT `fk_outbox_recommendation_delivery`
+    FOREIGN KEY (`recommendation_delivery_id`) REFERENCES `recommendation_delivery`(`delivery_id`)
+    ON DELETE SET NULL;
+
+ALTER TABLE `event_log`
+    ADD CONSTRAINT `fk_event_recommendation_delivery`
+    FOREIGN KEY (`delivery_id`) REFERENCES `recommendation_delivery`(`delivery_id`)
+    ON DELETE SET NULL;
 
 
 SET FOREIGN_KEY_CHECKS = 1;
@@ -436,6 +794,22 @@ SET FOREIGN_KEY_CHECKS = 1;
 --   ALTER TABLE audit_log MODIFY COLUMN target_type
 --     ENUM('job','resume','user','system') NOT NULL;
 -- event_log 新表：见上
+-- ============================================================================
+
+-- ============================================================================
+-- 推荐策略与曝光多样性 v1 DDL（已存在库不要跑本文件）
+-- ============================================================================
+-- 本文件是"全新建库"脚本，第 14~22 张表已经是 phase9_001..007 的最终形态。
+-- 已有生产库必须走带台账的迁移脚本，禁止手工 ALTER：
+--   cd backend
+--   python scripts/apply_phase9_migrations.py --dsn-env DB_URL \
+--     --manifest sql/migrations/phase9_manifest.sha256 --check
+--   python scripts/apply_phase9_migrations.py --dsn-env DB_URL \
+--     --manifest sql/migrations/phase9_manifest.sha256 --apply
+--   python scripts/apply_phase9_migrations.py --dsn-env DB_URL \
+--     --manifest sql/migrations/phase9_manifest.sha256 --verify
+-- 回滚（仅限新表为空且功能未启用时）按 phase9_down_007 → phase9_down_001 逆序
+-- 手工执行，down 文件不在 manifest 里。
 -- ============================================================================
 
 -- ============================================================================

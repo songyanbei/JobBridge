@@ -7,6 +7,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.schemas.recommendation import (
+    RecommendationDeliveryContext,
+    RecommendationRequestFact,
+    StrategyAssignment,
+)
+
 
 # ---------------------------------------------------------------------------
 # Redis 会话状态 DTO
@@ -23,6 +29,13 @@ class CandidateSnapshot(BaseModel):
         default_factory=dict,
         description="生成当前候选快照实际使用的检索条件；自动放宽后为放宽后的条件",
     )
+    request_id: str | None = None
+    snapshot_id: str | None = None
+    direction: str | None = None
+    strategy_version_id: int | None = None
+    algorithm_version: str = "legacy"
+    assignment: str = "legacy"
+    ranking_metadata: dict = Field(default_factory=dict)
 
 
 class SessionState(BaseModel):
@@ -147,6 +160,11 @@ class ReplyMessage(BaseModel):
         default=None,
         description="本轮 criteria 快照 + prompt_version；落 conversation_log.criteria_snapshot",
     )
+    delivery_id: str | None = Field(default=None)
+    recommendation_context: RecommendationDeliveryContext | None = Field(default=None)
+    session_mutation: dict | None = Field(default=None)
+    recommendation_request: RecommendationRequestFact | None = Field(default=None)
+    strategy_assignment: StrategyAssignment | None = Field(default=None)
 
 
 # ---------------------------------------------------------------------------

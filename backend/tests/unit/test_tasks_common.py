@@ -40,7 +40,7 @@ def _mock_db_with_existing_keys(existing: set[str]) -> MagicMock:
 
 class TestEnsureTtlConfigDefaults:
     def test_defaults_tuple_contents(self):
-        """Phase 7 §4.1 定义的 6 个 key 必须齐全。"""
+        """Phase 7 §4.1 与 Phase 9 §9.11 定义的 key 必须齐全。"""
         keys = {k for k, *_ in _TTL_CONFIG_DEFAULTS}
         assert keys == {
             "ttl.job.days",
@@ -49,18 +49,23 @@ class TestEnsureTtlConfigDefaults:
             "ttl.audit_log.days",
             "ttl.wecom_inbound_event.days",
             "ttl.hard_delete.delay_days",
+            "ttl.recommendation_detail.days",
         }
 
     def test_empty_db_inserts_all(self):
-        """数据库中完全没有 ttl.* key 时，补齐 6 行。"""
+        """数据库中完全没有 ttl.* key 时，补齐全部默认行。
+
+        计数从 ``_TTL_CONFIG_DEFAULTS`` 推导：新增一个 TTL key 不该让这些
+        「补齐机制是否工作」的用例失败，只有上面那条显式清单该失败。
+        """
         db = _mock_db_with_existing_keys(existing=set())
         added = ensure_ttl_config_defaults(db)
-        assert added == 6
-        assert db.add.call_count == 6
+        assert added == len(_TTL_CONFIG_DEFAULTS)
+        assert db.add.call_count == len(_TTL_CONFIG_DEFAULTS)
         db.commit.assert_called_once()
 
     def test_full_db_inserts_zero(self):
-        """全部 6 个 key 已存在时，不插入、不 commit。"""
+        """全部 key 已存在时，不插入、不 commit。"""
         full = {k for k, *_ in _TTL_CONFIG_DEFAULTS}
         db = _mock_db_with_existing_keys(existing=full)
         added = ensure_ttl_config_defaults(db)
@@ -70,27 +75,24 @@ class TestEnsureTtlConfigDefaults:
 
     def test_partial_db_inserts_missing_only(self):
         """部分 key 存在时，只补齐缺失的，不覆盖已有的。"""
-        # 模拟：首次部署跑过旧 seed.sql，只有 3 个 key；Phase 7 新增 3 个缺失
+        # 模拟：首次部署跑过旧 seed.sql，只有 3 个 key；Phase 7/9 新增的都缺失
         existing = {
             "ttl.job.days",
             "ttl.resume.days",
             "ttl.conversation_log.days",
         }
+        expected_missing = {k for k, *_ in _TTL_CONFIG_DEFAULTS} - existing
         db = _mock_db_with_existing_keys(existing=existing)
         added = ensure_ttl_config_defaults(db)
-        assert added == 3
-        assert db.add.call_count == 3
+        assert added == len(expected_missing)
+        assert db.add.call_count == len(expected_missing)
         db.commit.assert_called_once()
 
-        # 确认被 add 的都是 Phase 7 新增 key，不重复添加已有
+        # 确认被 add 的都是缺失 key，不重复添加已有
         inserted_keys = {
             call.args[0].config_key for call in db.add.call_args_list
         }
-        assert inserted_keys == {
-            "ttl.audit_log.days",
-            "ttl.wecom_inbound_event.days",
-            "ttl.hard_delete.delay_days",
-        }
+        assert inserted_keys == expected_missing
 
     def test_warning_logged_for_each_missing_key(self, caplog):
         """每条缺失 key 都应产生 warn 日志，提示"未跑 phase7_001 迁移"。
@@ -100,7 +102,7 @@ class TestEnsureTtlConfigDefaults:
         """
         db = _mock_db_with_existing_keys(existing=set())
         added = ensure_ttl_config_defaults(db)
-        assert added == 6
+        assert added == len(_TTL_CONFIG_DEFAULTS)
 
     def test_insert_values_match_defaults(self):
         """插入的 value / value_type / description 必须与 _TTL_CONFIG_DEFAULTS 严格一致。"""

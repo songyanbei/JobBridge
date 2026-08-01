@@ -230,6 +230,200 @@ class Settings(BaseSettings):
     llm_circuit_recovery_seconds: int = 30
     reranker_queue_degrade_threshold: int = 10
 
+    # ---- 推荐策略 v1：shadow 双算 + LLM 调用预算（方案 §7.5 / §11.5）----
+    # 这些都属于**运维配置**，不在推荐策略后台开放给运营编辑。
+
+    recommendation_shadow_timeout_seconds: float = 3.0
+    """shadow 双算的绝对超时预算（秒）。
+
+    在**提交 runner 之前**换算成 ``deadline_monotonic``，因此这几秒里包含 runner
+    排队、prompt 构造、建连、写入、服务端响应和读取；runner 真正开始执行时只剩
+    remaining，不会重新拿到完整预算（§7.5）。"""
+
+    recommendation_shadow_max_concurrency: int = 4
+    """同一 provider 在**整个部署环境的全局并发上限**，不是每进程上限。
+
+    进程内 semaphore 只是本地防护；真正的闸门是 Redis Lua 对
+    ``recommendation:shadow:permits:{provider}`` 带过期 token ZSET 的原子
+    prune/acquire（lease 5 秒，进程崩溃自动过期）。Redis 不可用时 shadow
+    fail-closed 直接跳过，**绝不允许退化成"每进程各自并发 4"**——否则
+    ``worker=N`` 横向扩容会线性放大供应商并发（§7.5）。"""
+
+    recommendation_shadow_queue_capacity: int = 100
+    """每进程 shadow runner 待执行队列容量。
+
+    队列满时立即记 ``shadow_skipped_capacity`` 并放弃该候选，不得挤占前台 legacy
+    的线程池或连接池。"""
+
+    recommendation_shadow_persistence_threads: int = 2
+    """每进程 shadow persistence executor 的线程数（§7.5）。
+
+    event loop 回调只做 O(1) 非阻塞投递；真正写库在这些线程里，每个任务自建并
+    关闭独立 ``SessionLocal``。禁止在 event loop 或 activate 调用线程里使用同步
+    SQLAlchemy。"""
+
+    recommendation_shadow_persistence_queue_capacity: int = 100
+    """shadow persistence executor 队列容量；满时记 ``shadow_persistence_dropped``，
+    只影响观测，不影响实际回复。"""
+
+    recommendation_shadow_daily_token_budget_search_job: int = 200_000
+    """search_job 方向的 shadow 日 token 预算（Asia/Shanghai 业务日）。
+
+    按 §7.5 用 Redis Lua 原子预占
+    ``recommendation:shadow:token_budget:{direction}:{business_date}``：
+    reserve = 悲观 input tokens + 配置的 max output tokens，超预算直接跳过 shadow；
+    拿到真实 usage 后可原子退回差额，**timeout/unknown 不退款**（provider 断连后
+    仍可能完成推理并计费）。预算 Redis 不可用时同样跳过 shadow。
+
+    这里的默认值只是"未经审批前的保守占位"，扩量前必须替换为审批后的方向级预算。"""
+
+    recommendation_shadow_daily_token_budget_search_worker: int = 200_000
+    """search_worker 方向的 shadow 日 token 预算，语义同上。"""
+
+    recommendation_shadow_max_output_tokens: int = 1_024
+    """shadow 单次调用预占预算时使用的悲观最大输出 token 数。
+
+    provider 返回真实 usage 后会退回 ``reserve - actual``；timeout/unknown 不退款，
+    因为客户端断开后供应商仍可能完成推理并计费。"""
+
+    recommendation_strategy_kill_switch: bool = False
+    """环境变量 ``RECOMMENDATION_STRATEGY_KILL_SWITCH``：进程启动时的更强 override。
+
+    语义严格按 §7.5：
+
+    - 日常事故处置的**真源是动态控制面** ``recommendation_runtime_control``
+      （DB revision + Redis write-through + Pub/Sub，最大生效时间 5 秒）；
+    - 本变量为 ``true`` 时在本进程内强制 off/legacy，压过 DB 里的任何取值；
+    - 本变量为 ``false`` **永远不能覆盖 DB 里的 true**——它只是"不额外强制关闭"，
+      不是"强制打开"；
+    - 改 ``.env`` 需要滚动重启全部 App/Worker 才生效，**不是在线秒级开关**，
+      不要在事故中把它当 kill switch 用。"""
+
+    @field_validator(
+        "recommendation_shadow_max_concurrency",
+        "recommendation_shadow_queue_capacity",
+        "recommendation_shadow_persistence_threads",
+        "recommendation_shadow_persistence_queue_capacity",
+        "recommendation_shadow_max_output_tokens",
+        "recommendation_content_key_active_version",
+        mode="after",
+    )
+    @classmethod
+    def _at_least_one(cls, v: int) -> int:
+        """0 / 负数会让 semaphore、队列和密钥版本静默失效，一律夹到 1。"""
+        return max(1, int(v))
+
+    @field_validator("recommendation_shadow_timeout_seconds", mode="after")
+    @classmethod
+    def _positive_shadow_timeout(cls, v: float) -> float:
+        """非正超时等于"每次都 deadline 已耗尽"，夹到一个仍会真实发起请求的下限。"""
+        return max(0.1, float(v))
+
+    @field_validator(
+        "recommendation_shadow_daily_token_budget_search_job",
+        "recommendation_shadow_daily_token_budget_search_worker",
+        mode="after",
+    )
+    @classmethod
+    def _non_negative_budget(cls, v: int) -> int:
+        """0 是合法配置，含义是"该方向不跑 shadow"。"""
+        return max(0, int(v))
+
+    @property
+    def recommendation_shadow_daily_token_budgets(self) -> dict[str, int]:
+        """方向 → 日 token 预算。未知方向不在表里 = 没有预算 = 跳过 shadow。"""
+        return {
+            "search_job": max(0, int(self.recommendation_shadow_daily_token_budget_search_job)),
+            "search_worker": max(
+                0, int(self.recommendation_shadow_daily_token_budget_search_worker),
+            ),
+        }
+
+    def recommendation_shadow_daily_token_budget(self, direction: str) -> int:
+        """取某个推荐方向的日 token 预算；未知方向返回 0（fail-closed，不跑 shadow）。"""
+        return self.recommendation_shadow_daily_token_budgets.get(direction, 0)
+
+    # ---- 推荐正文加密密钥环（方案 §9.11）----
+    # 密钥只来自 secrets/KMS；日志、审计和数据库不得保存明文密钥。
+    # 轮换流程：先加新 key（写进 key ring）→ 切 active version → 等旧密文过期
+    # → 再从 ring 里退役旧 key。旧 key 必须至少保留到对应 ciphertext 全部过期。
+
+    recommendation_content_key: str = ""
+    """当前 active version 对应的密钥材料（``RECOMMENDATION_CONTENT_KEY``）。
+
+    生产/预发必须配置：缺失时投递侧无法加密正文。单 key 场景只配这一项即可，
+    它会被登记为 ``recommendation_content_key_active_version`` 那一版。"""
+
+    recommendation_content_key_ring: str = ""
+    """只读 key ring，格式 ``version:material`` 的逗号分隔列表。
+
+    例：``RECOMMENDATION_CONTENT_KEY_RING=1:old-secret,2:new-secret``。
+    轮换期间必须同时含新旧两版，否则旧 ciphertext 解不开。密钥材料本身不能含
+    英文逗号和冒号以外的分隔歧义（冒号只按**第一个**切分，材料里可以有冒号）。"""
+
+    recommendation_content_key_active_version: int = 1
+    """``RECOMMENDATION_CONTENT_KEY_ACTIVE_VERSION``：新写入 ciphertext 使用的版本号，
+    会落到 ``content_key_version`` 列。解密一律按行上记录的版本回查 key ring。"""
+
+    @property
+    def recommendation_content_keys(self) -> dict[int, str]:
+        """只读 key ring：``{version: 密钥材料}``。
+
+        返回的是每次重新构建的副本，调用方改它不会影响进程配置。
+        ``recommendation_content_key`` 作为 active version 的条目补进来，且
+        **不覆盖** key ring 里已显式声明的同版本值（ring 是更明确的声明）。
+        """
+        ring: dict[int, str] = {}
+        for entry in (self.recommendation_content_key_ring or "").split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            raw_version, material = entry.split(":", 1)
+            try:
+                version = int(raw_version.strip())
+            except (TypeError, ValueError):
+                continue
+            material = material.strip()
+            if material:
+                ring[version] = material
+        active = int(self.recommendation_content_key_active_version)
+        if self.recommendation_content_key and active not in ring:
+            ring[active] = self.recommendation_content_key
+        return ring
+
+    @property
+    def recommendation_content_key_configured(self) -> bool:
+        """active version 是否有可用密钥材料。
+
+        投递侧应在生产/预发环境用它做启动自检，把"首次投递才 RuntimeError"
+        提前成部署期可见的失败。
+        """
+        return bool(
+            self.recommendation_content_keys.get(
+                int(self.recommendation_content_key_active_version),
+            )
+        )
+
+    def recommendation_content_key_material(self, version: int | None = None) -> str:
+        """取指定版本（默认 active）的密钥材料。
+
+        Raises:
+            RuntimeError: 该版本不在 key ring 中。加密侧说明未配置密钥；
+                解密侧说明旧 key 被过早退役，此时**必须**报错而不是回退到任何
+                硬编码常量——回退等于用固定密钥保护用户正文。
+        """
+        target = (
+            int(self.recommendation_content_key_active_version)
+            if version is None else int(version)
+        )
+        material = self.recommendation_content_keys.get(target)
+        if not material:
+            raise RuntimeError(
+                f"recommendation content key version {target} is not configured; "
+                "set RECOMMENDATION_CONTENT_KEY / RECOMMENDATION_CONTENT_KEY_RING"
+            )
+        return material
+
     # ---- 对象存储 ----
     oss_provider: str = "local"
     oss_endpoint: str = ""

@@ -58,6 +58,11 @@ def _delete_test_rows(db, prefix: str) -> None:
     db.commit()
 
 
+def _owned_rows(rows, prefix: str):
+    """Ignore unrelated fixtures that may coexist in the shared integration DB."""
+    return [row for row in rows if row.owner_userid.startswith(prefix)]
+
+
 def _user(prefix: str, suffix: str, *, status: str = "active", role: str = "factory") -> User:
     return User(
         external_userid=f"{prefix}-{suffix}",
@@ -140,7 +145,7 @@ def test_query_jobs_runs_against_mysql_and_filters_lifecycle(db_session):
 
     rows = _query_jobs({"city": ["苏州市"], "job_category": ["电子厂"]}, 20, db)
 
-    assert [row.id for row in rows] == [wanted.id]
+    assert [row.id for row in _owned_rows(rows, prefix)] == [wanted.id]
 
 
 def test_query_jobs_salary_floor_uses_range_ceiling_semantics(db_session):
@@ -207,7 +212,7 @@ def test_query_jobs_salary_floor_uses_range_ceiling_semantics(db_session):
         db,
     )
 
-    assert {row.id for row in rows} == {
+    assert {row.id for row in _owned_rows(rows, prefix)} == {
         covers_by_ceiling.id,
         exact_range.id,
         open_high_floor.id,
@@ -258,10 +263,10 @@ def test_query_resumes_json_contains_city_category_and_lifecycle(db_session):
     )
     by_mismatch = _query_resumes({"city": ["北京市"], "job_category": ["餐饮"]}, 20, db)
 
-    assert {row.id for row in by_city} == {wanted.id}
-    assert {row.id for row in by_city_list} == {wanted.id}
-    assert {row.id for row in by_multi_city} == {wanted.id}
-    assert {row.id for row in by_category} == {wanted.id}
-    assert {row.id for row in by_both} == {wanted.id}
-    assert {row.id for row in by_special} == {special.id}
-    assert by_mismatch == []
+    assert {row.id for row in _owned_rows(by_city, prefix)} == {wanted.id}
+    assert {row.id for row in _owned_rows(by_city_list, prefix)} == {wanted.id}
+    assert {row.id for row in _owned_rows(by_multi_city, prefix)} == {wanted.id}
+    assert {row.id for row in _owned_rows(by_category, prefix)} == {wanted.id}
+    assert {row.id for row in _owned_rows(by_both, prefix)} == {wanted.id}
+    assert {row.id for row in _owned_rows(by_special, prefix)} == {special.id}
+    assert _owned_rows(by_mismatch, prefix) == []

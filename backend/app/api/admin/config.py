@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db, require_admin_password_changed as require_admin
 from app.core.responses import ok
+from app.core.exceptions import BusinessException
 from app.models import AdminUser
 from app.schemas.admin import SystemConfigUpdate
 from app.services import system_config_service
@@ -28,7 +29,12 @@ def update_config(
     db: Session = Depends(get_db),
     current: AdminUser = Depends(require_admin),
 ):
-    result = system_config_service.update(
-        db, key, req.config_value, req.value_type, current.username,
-    )
+    try:
+        result = system_config_service.update(
+            db, key, req.config_value, req.value_type, current.username,
+        )
+    except ValueError as exc:
+        if str(exc) == "config_locked_by_recommendation_v1":
+            raise BusinessException(40905, str(exc)) from exc
+        raise
     return ok(result)

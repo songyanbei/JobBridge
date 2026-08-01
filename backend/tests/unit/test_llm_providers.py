@@ -222,6 +222,7 @@ class TestCallLlmApi:
         resp = call_llm_api(url="https://example.com", headers={}, payload={}, timeout=10)
         assert resp.status_code == 200
         assert mock_post.call_count == 1
+        assert resp.extensions["llm_retry_count"] == 0
 
     @patch("app.llm.providers._base.httpx.post")
     def test_retry_once_on_timeout(self, mock_post):
@@ -235,6 +236,7 @@ class TestCallLlmApi:
         resp = call_llm_api(url="https://example.com", headers={}, payload={}, timeout=10)
         assert resp.status_code == 200
         assert mock_post.call_count == 2
+        assert resp.extensions["llm_retry_count"] == 1
 
     @patch("app.llm.providers._base.httpx.post")
     def test_raises_after_two_timeouts(self, mock_post):
@@ -396,6 +398,7 @@ class TestQwenReranker:
 
         assert len(result.ranked_items) == 1
         assert result.reply_text == "推荐岗位"
+        assert result.retry_count == 0
 
     @patch("app.llm.providers.qwen.call_llm_api")
     def test_timeout_raises(self, mock_call):

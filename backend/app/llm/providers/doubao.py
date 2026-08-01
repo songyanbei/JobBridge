@@ -1,6 +1,7 @@
 """豆包 (Doubao) LLM Provider。
 
-豆包 API 同样兼容 OpenAI chat/completions 格式，通过 httpx 同步调用。
+豆包 API 同样兼容 OpenAI chat/completions 格式。legacy 路径走 httpx 同步调用；
+shadow 双算走 ``arerank()`` 的真异步路径（共享 AsyncClient + 绝对 deadline，§11.5）。
 Phase 2 以结构骨架 + mock 测试可过为交付标准，不以真实 API 联调成功作为阻塞条件。
 """
 import logging
@@ -13,6 +14,7 @@ from app.llm.base import (
     DialogueParseResult,
     IntentExtractor,
     IntentResult,
+    LLMCallPolicy,
     Reranker,
     RerankResult,
 )
@@ -21,18 +23,19 @@ from app.llm.prompts import (
     DIALOGUE_USER_TEMPLATE,
     INTENT_SYSTEM_PROMPT,
     INTENT_USER_TEMPLATE,
-    RERANK_SYSTEM_PROMPT,
-    RERANK_USER_TEMPLATE,
 )
 from app.llm.providers._base import (
+    build_rerank_payload,
     call_llm_api,
-    format_candidates,
+    call_llm_api_async,
+    extract_chat_content as _extract_content,
+    extract_chat_usage as _extract_usage,
+    finalize_rerank_response,
     format_criteria,
     format_history,
     format_session_hint,
     parse_dialogue_response,
     parse_intent_response,
-    parse_rerank_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,30 +51,6 @@ def _build_headers() -> dict:
 def _chat_url() -> str:
     base = settings.llm_api_base.rstrip("/")
     return f"{base}/chat/completions"
-
-
-def _extract_content(resp_json: dict) -> str:
-    """从 OpenAI 兼容响应中提取 assistant content。"""
-    try:
-        return resp_json["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        return ""
-
-
-def _extract_usage(resp_json: dict) -> tuple[int | None, int | None]:
-    """从 OpenAI 兼容响应中提取 token 用量（Phase 7 llm_call 日志字段）。"""
-    usage = resp_json.get("usage") or {}
-    in_tok = usage.get("prompt_tokens")
-    out_tok = usage.get("completion_tokens")
-    try:
-        in_tok = int(in_tok) if in_tok is not None else None
-    except (TypeError, ValueError):
-        in_tok = None
-    try:
-        out_tok = int(out_tok) if out_tok is not None else None
-    except (TypeError, ValueError):
-        out_tok = None
-    return in_tok, out_tok
 
 
 class DoubaoIntentExtractor(IntentExtractor):
@@ -107,10 +86,13 @@ class DoubaoIntentExtractor(IntentExtractor):
                 url=_chat_url(),
                 headers=_build_headers(),
                 payload=payload,
-                timeout=settings.llm_timeout_seconds,
+                # 不传 call_policy / timeout：意图抽取继续用原配置（§11.5），
+                # 由 _base 解析成 legacy 的 llm_timeout_seconds + 一次重试。
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Doubao API HTTP error: {exc.response.status_code}")
 
@@ -160,10 +142,13 @@ class DoubaoIntentExtractor(IntentExtractor):
                 url=_chat_url(),
                 headers=_build_headers(),
                 payload=payload,
-                timeout=settings.llm_timeout_seconds,
+                # 不传 call_policy / timeout：意图抽取继续用原配置（§11.5），
+                # 由 _base 解析成 legacy 的 llm_timeout_seconds + 一次重试。
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Doubao API HTTP error: {exc.response.status_code}")
 
@@ -182,7 +167,11 @@ class DoubaoIntentExtractor(IntentExtractor):
 
 
 class DoubaoReranker(Reranker):
-    """基于豆包的重排实现。"""
+    """基于豆包的重排实现。
+
+    与 QwenReranker 共享同一份 payload 构造与响应解析（``_base``），
+    ``call_policy`` 原样透传，provider 内不重新覆盖成全局 30 秒（§11.5）。
+    """
 
     def rerank(
         self,
@@ -193,62 +182,70 @@ class DoubaoReranker(Reranker):
         *,
         soft_preferences: dict | None = None,
         ranking_weights: dict[str, float] | None = None,
+        call_policy: LLMCallPolicy | None = None,
     ) -> RerankResult:
-        system_prompt = RERANK_SYSTEM_PROMPT.format(
+        payload = build_rerank_payload(
+            query=query,
+            candidates=candidates,
             role=role,
             top_n=top_n,
+            soft_preferences=soft_preferences,
+            ranking_weights=ranking_weights,
         )
-        # Phase 5 §5.3：soft_preferences 非空时走 v2.1 prompt（带软偏好块）；
-        # 为空时严格走 v2.0 等价路径（向后兼容验收）。
-        if soft_preferences:
-            from app.llm.prompts import (
-                RERANK_USER_TEMPLATE_WITH_SOFT_PREF,
-                format_soft_preferences_block,
-            )
-            user_prompt = RERANK_USER_TEMPLATE_WITH_SOFT_PREF.format(
-                query=query,
-                candidates=format_candidates(candidates),
-                soft_preferences_block=format_soft_preferences_block(
-                    soft_preferences, ranking_weights,
-                ),
-            )
-        else:
-            user_prompt = RERANK_USER_TEMPLATE.format(
-                query=query,
-                candidates=format_candidates(candidates),
-            )
-
-        payload = {
-            "model": settings.llm_reranker_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.1,
-        }
 
         try:
             resp = call_llm_api(
                 url=_chat_url(),
                 headers=_build_headers(),
                 payload=payload,
-                timeout=settings.llm_timeout_seconds,
+                call_policy=call_policy,
             )
-        except (httpx.TimeoutException, httpx.ConnectError):
-            raise LLMTimeout()
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
         except httpx.HTTPStatusError as exc:
             raise LLMError(f"Doubao API HTTP error: {exc.response.status_code}")
 
-        resp_json = resp.json()
-        raw = _extract_content(resp_json)
-        # 同 intent 路径：usage 先提再 parse，parse 失败时把 token 挂到异常
-        in_tok, out_tok = _extract_usage(resp_json)
+        result = finalize_rerank_response(resp.json())
+        result.retry_count = int(resp.extensions.get("llm_retry_count", 0) or 0)
+        return result
+
+    async def arerank(
+        self,
+        query: str,
+        candidates: list[dict],
+        role: str,
+        top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
+        call_policy: LLMCallPolicy,
+    ) -> RerankResult:
+        """真异步重排：``LLMDeadlineExceeded`` 直接上抛，由 shadow 侧记 timeout。"""
+        payload = build_rerank_payload(
+            query=query,
+            candidates=candidates,
+            role=role,
+            top_n=top_n,
+            soft_preferences=soft_preferences,
+            ranking_weights=ranking_weights,
+        )
+
         try:
-            result = parse_rerank_response(raw)
-        except LLMParseError as exc:
-            exc.input_tokens = in_tok
-            exc.output_tokens = out_tok
-            raise
-        result.input_tokens = in_tok
-        result.output_tokens = out_tok
+            resp = await call_llm_api_async(
+                url=_chat_url(),
+                headers=_build_headers(),
+                payload=payload,
+                call_policy=call_policy,
+            )
+        except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            error = LLMTimeout()
+            error.llm_retry_count = int(getattr(exc, "llm_retry_count", 0) or 0)
+            raise error from exc
+        except httpx.HTTPStatusError as exc:
+            raise LLMError(f"Doubao API HTTP error: {exc.response.status_code}")
+
+        result = finalize_rerank_response(resp.json())
+        result.retry_count = int(resp.extensions.get("llm_retry_count", 0) or 0)
         return result

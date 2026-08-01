@@ -11,6 +11,8 @@ from . import (
     logs,
     reports,
     resumes,
+    recommendation_strategies,
+    recommendation_metrics,
 )
 
 router = APIRouter()
@@ -23,3 +25,5 @@ router.include_router(dicts.router)
 router.include_router(config.router)
 router.include_router(reports.router)
 router.include_router(logs.router)
+router.include_router(recommendation_strategies.router)
+router.include_router(recommendation_metrics.router)

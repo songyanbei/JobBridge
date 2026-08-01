@@ -76,3 +76,67 @@ jobs:
       - name: Run MySQL search integration tests
         working-directory: backend
         run: pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
+
+  backend-recommendation-mysql:
+    name: backend-recommendation-mysql
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: jobbridge_test
+          MYSQL_USER: jobbridge_test
+          MYSQL_PASSWORD: jobbridge_test
+          MYSQL_ROOT_PASSWORD: root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ujobbridge_test -pjobbridge_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+    env:
+      PHASE9_DSN: mysql+pymysql://jobbridge_test:jobbridge_test@127.0.0.1:3306/jobbridge_test
+      APP_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_NAME: jobbridge_test
+      DB_USER: jobbridge_test
+      DB_PASSWORD: jobbridge_test
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      RUN_INTEGRATION: "1"
+      RECOMMENDATION_CONTENT_KEY: ci-only-recommendation-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt
+      - name: Load base schema and conversation migrations
+        working-directory: backend
+        run: |
+          mysql -h127.0.0.1 -ujobbridge_test -pjobbridge_test jobbridge_test < sql/schema.sql
+          for f in sql/migrations/phase8_*.sql; do mysql -h127.0.0.1 -ujobbridge_test -pjobbridge_test jobbridge_test < "$f"; done
+      - name: Apply and verify Phase 9
+        working-directory: backend
+        run: |
+          python scripts/apply_phase9_migrations.py --manifest sql/migrations/phase9_manifest.sha256 --dsn-env PHASE9_DSN --check
+          python scripts/apply_phase9_migrations.py --manifest sql/migrations/phase9_manifest.sha256 --dsn-env PHASE9_DSN --apply
+          python scripts/apply_phase9_migrations.py --manifest sql/migrations/phase9_manifest.sha256 --dsn-env PHASE9_DSN --verify
+      - name: Run recommendation tests
+        working-directory: backend
+        # The whole recommendation unit surface, not one file. The three
+        # mandated fixed-vector suites, the delivery state machine, the privacy
+        # closure and the metrics all live in sibling files, so gating on a
+        # single file made this job look far broader than it actually was.
+        run: |
+          pytest -p no:cacheprovider -q tests/unit -k "recommendation or click_attribution or delivery_state_machine"
+          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py

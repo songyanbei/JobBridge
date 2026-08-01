@@ -23,8 +23,10 @@ import os
 import signal
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import and_, exists, func, null, or_, text
 from sqlalchemy.orm import Session, aliased
@@ -45,12 +47,24 @@ from app.models import (
     ConversationLog,
     WecomInboundEvent,
     WecomOutboundOutbox,
+    RecommendationDelivery,
 )
 from app.schemas.conversation import ReplyMessage
-from app.services import conversation_service, message_router, search_service
+from app.services import (
+    conversation_service,
+    message_router,
+    recommendation_shadow_service,
+    search_service,
+)
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
-from app.wecom.client import WeComClient, WeComError
+from app.wecom.client import (
+    WeComClient,
+    WeComError,
+    parse_invalid_recipients,
+    recipient_rejected,
+    whitelist_send_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +90,35 @@ OUTBOX_RETRY_BACKOFFS = [30, 60, 120, 300, 600]
 SESSION_COMMIT_STALE_SECONDS = 180
 SESSION_COMMIT_RETRY_BACKOFFS = [5, 15, 30, 60, 300]
 
+# §9.6 行 1921 的 recommendation_delivery.status 合法枚举。这里是唯一的写入口径，
+# 历史实现里的 dead_letter/expired/redacted 一律不再写入。
+DELIVERY_PREPARED = "prepared"
+DELIVERY_PENDING = "pending"
+DELIVERY_SENDING = "sending"
+DELIVERY_RETRY_WAIT = "retry_wait"
+DELIVERY_SENT = "sent"
+DELIVERY_PERMANENT_FAILED = "permanent_failed"
+DELIVERY_UNKNOWN = "unknown"
+# §10.4.1：顺序门禁上的“未完成”集合；sent/permanent_failed/unknown 是 terminal。
+DELIVERY_ACTIVE_STATUSES = (
+    DELIVERY_PREPARED, DELIVERY_PENDING, DELIVERY_SENDING, DELIVERY_RETRY_WAIT,
+)
+# §10.4 的 claim 条件：只有 pending/retry_wait 允许被 dispatcher 领走发送。
+DELIVERY_SENDABLE_STATUSES = (DELIVERY_PENDING, DELIVERY_RETRY_WAIT)
+
+# §10.4.1：dispatcher / prepared session reconciler 各自独立 250ms 扫描，
+# 每批最多 100 条；§10.5 的 impression deriver 同样 250ms。
+AUX_LOOP_INTERVAL_SECONDS = 0.25
+AUX_LOOP_BATCH_SIZE = 100
+# §10.5：sent 提交后立即投递到有界 executor，用户锁释放前最多等待 200ms。
+IMPRESSION_IMMEDIATE_WAIT_SECONDS = 0.2
+IMPRESSION_IMMEDIATE_BATCH_SIZE = 20
+IMPRESSION_EXECUTOR_WORKERS = 2
+# §10.3：拿到成功响应后必须优先、带有限重试地提交 sent；数据库暂时不可用时
+# 只在进程内重试并告警，绝不重新调用企微。
+SEND_COMMIT_MAX_ATTEMPTS = 5
+SEND_COMMIT_BACKOFFS = [0.2, 0.5, 1.0, 2.0]
+
 DEAD_LETTER_REPLY = "系统繁忙，请稍后再试。"
 
 
@@ -93,6 +136,12 @@ class Worker:
         self._redis = get_redis()
         self._wecom_client = WeComClient()
         self._last_recovery_scan = 0.0
+        # 每个进程一个稳定且全局唯一的 lease owner。所有 delivery 状态转移都带
+        # `lease_owner=?` 条件，租约过期后被别人接管的旧 Worker 无法再覆盖新状态
+        # （§10.4「状态转移使用条件 UPDATE，防止旧 Worker 覆盖新状态」）。
+        self._lease_owner = f"worker-{self._pid}-{uuid.uuid4().hex[:8]}"[:64]
+        self._aux_threads: list[threading.Thread] = []
+        self._impression_executor: ThreadPoolExecutor | None = None
 
     # -----------------------------------------------------------------------
     # 启停
@@ -100,10 +149,26 @@ class Worker:
 
     def start(self) -> None:
         logger.info("worker: starting pid=%d", self._pid)
+        from app.services.recommendation_shadow_service import start_shadow_runner
+        from app.services.recommendation_strategy_service import (
+            start_runtime_control_watcher,
+            stop_runtime_control_watcher,
+        )
+
+        start_shadow_runner()
+        start_runtime_control_watcher()
         self._setup_signal_handlers()
         self._start_heartbeat()
         self._startup_recovery()
-        self._main_loop()
+        self._start_aux_loops()
+        try:
+            self._main_loop()
+        finally:
+            self._stop_aux_loops()
+            from app.services.recommendation_shadow_service import shutdown_shadow_runner
+
+            stop_runtime_control_watcher()
+            shutdown_shadow_runner()
         logger.info("worker: stopped pid=%d", self._pid)
 
     def _setup_signal_handlers(self) -> None:
@@ -137,6 +202,70 @@ class Worker:
             target=_hb, daemon=True, name="worker-heartbeat",
         )
         self._heartbeat_thread.start()
+
+    # -----------------------------------------------------------------------
+    # 独立恢复线程（§10.4.1 / §10.5）
+    # -----------------------------------------------------------------------
+
+    def _start_interval_thread(
+        self, name: str, fn: Callable[[], Any], interval: float,
+    ) -> threading.Thread:
+        """固定间隔循环线程；单次迭代异常不会杀死线程。"""
+        def _loop() -> None:
+            while self._running:
+                started = time.monotonic()
+                try:
+                    fn()
+                except Exception:
+                    logger.exception("worker: %s iteration failed", name)
+                time.sleep(max(0.0, interval - (time.monotonic() - started)))
+
+        thread = threading.Thread(target=_loop, daemon=True, name=name)
+        thread.start()
+        return thread
+
+    def _start_aux_loops(self) -> None:
+        """启动 dispatcher / session reconciler / impression deriver 三条独立线程。
+
+        §10.4.1 明确要求它们不读取 incoming 队列：恢复扫描一旦挂在主循环上，
+        一条慢 LLM 消息就能让整个 delivery 恢复停摆。有界 impression executor
+        用于 §10.5 的 sent 后即时派生，同样只走 claim 流程。
+        """
+        from app.tasks import (
+            recommendation_delivery_dispatcher,
+            recommendation_impression_deriver,
+            recommendation_session_reconciler,
+        )
+
+        self._impression_executor = ThreadPoolExecutor(
+            max_workers=IMPRESSION_EXECUTOR_WORKERS,
+            thread_name_prefix="impression-executor",
+        )
+        self._aux_threads = [
+            self._start_interval_thread(
+                "delivery-dispatcher",
+                lambda: recommendation_delivery_dispatcher.run_once(self),
+                recommendation_delivery_dispatcher.SCAN_INTERVAL_SECONDS,
+            ),
+            self._start_interval_thread(
+                "session-reconciler",
+                lambda: recommendation_session_reconciler.run_once(self),
+                recommendation_session_reconciler.SCAN_INTERVAL_SECONDS,
+            ),
+            self._start_interval_thread(
+                "impression-deriver",
+                lambda: recommendation_impression_deriver.run_once(self),
+                recommendation_impression_deriver.SCAN_INTERVAL_SECONDS,
+            ),
+        ]
+
+    def _stop_aux_loops(self) -> None:
+        executor, self._impression_executor = self._impression_executor, None
+        if executor is not None:
+            executor.shutdown(wait=False)
+        for thread in self._aux_threads:
+            thread.join(timeout=AUX_LOOP_INTERVAL_SECONDS * 4)
+        self._aux_threads = []
 
     # -----------------------------------------------------------------------
     # 启动自检
@@ -268,9 +397,10 @@ class Worker:
                 processed_since_aux = 0
 
     def _service_aux_queues(self) -> None:
+        # delivery dispatcher / session reconciler / impression deriver 已经是独立
+        # 线程（§10.4.1），主循环只保留纯 Redis 队列的即发即弃任务，否则慢消息期间
+        # 恢复扫描仍然会被 incoming 队列拖住。
         self._process_rate_limit_notify_once()
-        self._process_session_commit_once()
-        self._process_outbox_once()
         self._process_send_retry_once()
 
     # -----------------------------------------------------------------------
@@ -397,6 +527,8 @@ class Worker:
     ) -> str:
         db: Session = SessionLocal()
         business_committed = False
+        submitted_shadow_request_ids: set[str] = set()
+        committed_shadow_request_ids: set[str] = set()
         try:
             # Redis is an at-least-once queue. A crash between enqueue and the DB
             # claim can leave a duplicate payload behind. The per-user lease
@@ -442,14 +574,31 @@ class Worker:
                 backlog_depth = 0
             backlog_token = search_service.set_queue_backlog_hint(backlog_depth)
             stage_token = conversation_service.begin_session_staging(userid)
+            shadow_tracking_token = (
+                recommendation_shadow_service.begin_turn_tracking()
+            )
             staged_session = None
             try:
                 replies = message_router.process(msg, db)
             finally:
+                submitted_shadow_request_ids.update(
+                    recommendation_shadow_service.end_turn_tracking(
+                        shadow_tracking_token,
+                    ),
+                )
                 staged_session = conversation_service.end_session_staging(
                     stage_token,
                 )
                 search_service.reset_queue_backlog_hint(backlog_token)
+            committed_shadow_request_ids = {
+                reply.recommendation_request.request_id
+                for reply in replies
+                if (
+                    reply.recommendation_request is not None
+                    and reply.recommendation_request.execution_mode == "shadow"
+                    and reply.recommendation_request.request_id
+                )
+            }
 
             # Router 只暂存了 session 意图；DB 提交前再次验证租约。续租线程一旦
             # 发现 extend 失败会置 lost_event，使旧 Worker 走 rollback + 可恢复重试。
@@ -470,6 +619,21 @@ class Worker:
                 self._mark_event_done(db, inbound_event_id)
             db.commit()
             business_committed = True
+            # A shadow callback may persist only after the served request/outbox
+            # transaction exists.  Direct/no-event calls do not stage those
+            # facts, so their detached observations are discarded.
+            for shadow_request_id in (
+                submitted_shadow_request_ids | committed_shadow_request_ids
+            ):
+                if (
+                    inbound_event_id
+                    and shadow_request_id in committed_shadow_request_ids
+                ):
+                    recommendation_shadow_service.activate_persistence(
+                        shadow_request_id,
+                    )
+                else:
+                    recommendation_shadow_service.discard(shadow_request_id)
 
             # Session 必须先落 Redis 并把 durable event 标 done，outbox 才可见。
             # Redis 短断时业务事务已经安全提交，后续 turn 被 session_pending 顺序
@@ -497,6 +661,12 @@ class Worker:
             return "processed" if session_ready else "session_commit_pending"
         except Exception as exc:
             db.rollback()
+            if not business_committed:
+                for shadow_request_id in (
+                    submitted_shadow_request_ids
+                    | committed_shadow_request_ids
+                ):
+                    recommendation_shadow_service.discard(shadow_request_id)
             if business_committed:
                 # Never send an already-committed publish/search turn through the
                 # generic retry path. Its durable session/outbox state is the sole
@@ -548,13 +718,17 @@ class Worker:
         inbound_event_id: Any,
         commit: conversation_service.StagedSessionCommit,
     ) -> None:
+        # P1-14/§10.1.1：staged payload 含搜索条件、候选快照和 history，绝不能以明文
+        # JSON 落 wecom_inbound_event。本轮存在推荐 delivery 时改写加密的
+        # session_patch_ciphertext，inbound 事件只保留 operation/expected_version。
+        patched = self._stage_session_patch(db, inbound_event_id, commit)
         updated = db.query(WecomInboundEvent).filter(
             WecomInboundEvent.id == inbound_event_id,
         ).update({
             "status": "session_pending",
             "session_operation": commit.operation,
             "session_expected_version": commit.expected_version,
-            "session_payload": commit.payload,
+            "session_payload": null() if patched else commit.payload,
             "session_apply_attempts": 0,
             "session_apply_locked_at": None,
             "session_next_attempt_at": None,
@@ -565,6 +739,50 @@ class Worker:
             raise RuntimeError(
                 f"unable to stage session commit for event {inbound_event_id}",
             )
+
+    def _stage_session_patch(
+        self,
+        db: Session,
+        inbound_event_id: Any,
+        commit: conversation_service.StagedSessionCommit,
+    ) -> bool:
+        """把 session patch 加密写入本轮 delivery（§9.6 / §10.1.1）。
+
+        返回是否已经落到密文列。非推荐回合没有 delivery 行可承载 patch，保持既有
+        非推荐合同（§10.1 行 2210）不变。
+        """
+        if commit.payload is None:
+            return False
+        deliveries = self._deliveries_for_event(db, inbound_event_id)
+        if not deliveries:
+            return False
+        from app.services.recommendation_delivery_service import store_session_patch
+
+        payload = json.dumps(commit.payload, ensure_ascii=False)
+        for delivery in deliveries:
+            store_session_patch(delivery, payload)
+            delivery.session_expected_version = int(commit.expected_version or 0)
+            delivery.session_commit_state = "not_applied"
+        return True
+
+    @staticmethod
+    def _deliveries_for_event(
+        db: Session, inbound_event_id: Any,
+    ) -> list[RecommendationDelivery]:
+        """本轮 inbound 事件关联的推荐 delivery，按回复顺序返回。"""
+        if not inbound_event_id:
+            return []
+        return (
+            db.query(RecommendationDelivery)
+            .join(
+                WecomOutboundOutbox,
+                WecomOutboundOutbox.recommendation_delivery_id
+                == RecommendationDelivery.delivery_id,
+            )
+            .filter(WecomOutboundOutbox.inbound_event_id == int(inbound_event_id))
+            .order_by(WecomOutboundOutbox.reply_index)
+            .all()
+        )
 
     def _claim_session_commits(
         self,
@@ -601,6 +819,12 @@ class Worker:
             )
             claimed: list[dict] = []
             for row in rows:
+                try:
+                    payload = self._load_session_patch(db, row)
+                except Exception as exc:
+                    # §10.6：解密失败 fail-closed，保持 prepared 并告警，绝不走明文旁路。
+                    self._backoff_session_commit(row, exc)
+                    continue
                 row.session_apply_locked_at = now
                 row.session_apply_attempts = int(
                     row.session_apply_attempts or 0,
@@ -615,11 +839,7 @@ class Worker:
                         expected_version=int(
                             row.session_expected_version or 0,
                         ),
-                        payload=(
-                            dict(row.session_payload)
-                            if row.session_payload is not None
-                            else None
-                        ),
+                        payload=payload,
                     ),
                 })
             db.commit()
@@ -630,6 +850,44 @@ class Worker:
             return []
         finally:
             db.close()
+
+    def _load_session_patch(
+        self, db: Session, row: WecomInboundEvent,
+    ) -> dict | None:
+        """还原 staged session payload。
+
+        推荐回合的 patch 只存在于 delivery 的 `session_patch_ciphertext`（P1-14），
+        非推荐回合继续读 inbound 事件上的 payload。
+        """
+        if row.session_payload is not None:
+            return dict(row.session_payload)
+        for delivery in self._deliveries_for_event(db, row.id):
+            if not delivery.session_patch_ciphertext:
+                continue
+            return _decrypt_session_patch(delivery)
+        return None
+
+    def _backoff_session_commit(
+        self, row: WecomInboundEvent, error: Exception,
+    ) -> None:
+        """在 claim 事务内推迟一条 session_pending 事件，不改变其 prepared 语义。"""
+        attempts = int(row.session_apply_attempts or 0) + 1
+        backoff = SESSION_COMMIT_RETRY_BACKOFFS[
+            min(attempts - 1, len(SESSION_COMMIT_RETRY_BACKOFFS) - 1)
+        ]
+        row.session_apply_attempts = attempts
+        row.session_apply_locked_at = None
+        row.session_next_attempt_at = func.timestampadd(
+            text("SECOND"), backoff, func.now(6),
+        )
+        row.error_message = f"{type(error).__name__}: {error}"[:1000]
+        log_event(
+            "recommendation_session_patch_unreadable",
+            inbound_event_id=int(row.id),
+            attempts=attempts,
+            error_type=type(error).__name__,
+            severity="alert",
+        )
 
     def _mark_session_commit_applied(self, event_id: int) -> bool:
         db = SessionLocal()
@@ -651,6 +909,8 @@ class Worker:
                 "worker_finished_at": func.now(6),
                 "error_message": None,
             })
+            if updated == 1:
+                _promote_prepared_deliveries(db, event_id)
             db.commit()
             return updated == 1
         except Exception:
@@ -733,8 +993,10 @@ class Worker:
             return False
         return self._apply_session_commit_item(item)
 
-    def _process_session_commit_once(self) -> None:
-        for item in self._claim_session_commits():
+    def reconcile_sessions_once(self, *, limit: int = AUX_LOOP_BATCH_SIZE) -> int:
+        """§10.4.1 的 prepared session reconciler：先完成 Redis CAS 再转 pending。"""
+        items = self._claim_session_commits(limit=limit)
+        for item in items:
             try:
                 with user_lock(item["userid"], timeout=5) as lease:
                     if not lease:
@@ -746,6 +1008,7 @@ class Worker:
                     self._apply_session_commit_item(item)
             except Exception as exc:
                 self._mark_session_commit_retry(item, exc)
+        return len(items)
 
     def _stage_outbox(
         self,
@@ -755,6 +1018,45 @@ class Worker:
     ) -> None:
         """在 router 业务事务中持久化有序回复意图。"""
         for index, reply in enumerate(replies):
+            if reply.recommendation_context:
+                from app.services.recommendation_delivery_service import prepare_delivery
+                ctx = reply.recommendation_context
+                prepare_delivery(
+                    db,
+                    inbound_event_id=int(inbound_event_id),
+                    reply_index=index,
+                    userid=reply.userid,
+                    body=reply.content,
+                    request_id=ctx.request_id,
+                    snapshot_id=ctx.snapshot_id,
+                    position_count=len(ctx.items),
+                    delivery_id=ctx.delivery_id,
+                    recommendation_context=ctx.model_dump(mode="json"),
+                    source_inbound_msg_id=(
+                        reply.recommendation_request.source_inbound_msg_id
+                        if reply.recommendation_request else str(inbound_event_id)
+                    ),
+                    request_fact=(
+                        reply.recommendation_request.model_dump(mode="json")
+                        if reply.recommendation_request else None
+                    ),
+                )
+                continue
+            if reply.recommendation_request:
+                # §7.5: zero-result, legacy and off-mode searches still produce a
+                # request fact even though no candidate was written into the
+                # reply, so they get the facts without a delivery/outbox row.
+                from app.services.recommendation_delivery_service import (
+                    persist_request_fact_only,
+                )
+                persist_request_fact_only(
+                    db,
+                    inbound_event_id=int(inbound_event_id),
+                    reply_index=index,
+                    userid=reply.userid,
+                    request_fact=reply.recommendation_request.model_dump(mode="json"),
+                    source_inbound_msg_id=reply.recommendation_request.source_inbound_msg_id,
+                )
             db.add(WecomOutboundOutbox(
                 inbound_event_id=int(inbound_event_id),
                 reply_index=index,
@@ -779,6 +1081,35 @@ class Worker:
             stale_before = func.timestampadd(
                 text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
             )
+            ambiguous = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+            ).with_for_update(skip_locked=True).all()
+            for stale in ambiguous:
+                # outbox 自己的枚举里 dead_letter 是合法终态（phase8 DDL），保持不变。
+                stale.status = "dead_letter"
+                stale.locked_at = None
+                stale.last_error = "ambiguous provider outcome; automatic resend disabled"
+                delivery = db.get(
+                    RecommendationDelivery, stale.recommendation_delivery_id,
+                )
+                if delivery and delivery.status == DELIVERY_SENDING:
+                    # §10.4：sending lease 过期写 unknown，且不自动重发推荐。
+                    delivery.status = DELIVERY_UNKNOWN
+                    delivery.last_error = stale.last_error
+                    delivery.last_error_code = "sending_lease_expired"
+            # outbox 行可能因为历史 SET NULL 或人工干预而丢失，仍然要保证 sending
+            # 租约过期的 delivery 收敛到 unknown，而不是永远挂在 sending。
+            db.query(RecommendationDelivery).filter(
+                RecommendationDelivery.status == DELIVERY_SENDING,
+                RecommendationDelivery.lease_expires_at.isnot(None),
+                RecommendationDelivery.lease_expires_at <= now,
+            ).update({
+                "status": DELIVERY_UNKNOWN,
+                "last_error": "sending lease expired; automatic resend disabled",
+                "last_error_code": "sending_lease_expired",
+            }, synchronize_session=False)
             due = or_(
                 and_(
                     WecomOutboundOutbox.status == "pending",
@@ -790,6 +1121,7 @@ class Worker:
                 and_(
                     WecomOutboundOutbox.status == "sending",
                     WecomOutboundOutbox.locked_at <= stale_before,
+                    WecomOutboundOutbox.recommendation_delivery_id.is_(None),
                 ),
             )
             earlier = aliased(WecomOutboundOutbox)
@@ -798,12 +1130,29 @@ class Worker:
                 earlier.id < WecomOutboundOutbox.id,
                 earlier.status.in_(("pending", "sending")),
             ))
+            # §10.4.1：claim 某用户 delivery 前必须确认不存在该用户更小
+            # delivery_order 的 prepared/pending/sending/retry_wait。outbox 的 id 序
+            # 只覆盖有 outbox 行的回复，delivery_order 才是跨进程恢复的稳定序。
+            current_delivery = aliased(RecommendationDelivery)
+            earlier_delivery = aliased(RecommendationDelivery)
+            no_earlier_active_delivery = ~exists().where(and_(
+                earlier_delivery.userid == current_delivery.userid,
+                earlier_delivery.delivery_order < current_delivery.delivery_order,
+                earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
+            ))
             query = db.query(WecomOutboundOutbox).join(
                 WecomInboundEvent,
                 WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
+            ).outerjoin(
+                current_delivery,
+                current_delivery.delivery_id
+                == WecomOutboundOutbox.recommendation_delivery_id,
             ).filter(
                 due,
                 no_earlier_unsent_for_user,
+                # 非推荐回复没有 delivery 行，outer join 后 delivery_order 为 NULL，
+                # 子查询恒不命中，等价于不受该门禁影响。
+                no_earlier_active_delivery,
                 WecomInboundEvent.status == "done",
             )
             if inbound_event_id:
@@ -815,19 +1164,26 @@ class Worker:
                     WecomOutboundOutbox.inbound_event_id,
                     WecomOutboundOutbox.reply_index,
                 )
-                .with_for_update(skip_locked=True)
+                .with_for_update(skip_locked=True, of=WecomOutboundOutbox)
                 .limit(limit)
                 .all()
             )
             claimed: list[dict] = []
             for row in rows:
-                row.status = "sending"
-                row.locked_at = now
-                row.attempt_count = int(row.attempt_count or 0) + 1
+                content = row.content
+                if row.recommendation_delivery_id:
+                    content = self._claim_recommendation_body(db, row, now)
+                    if content is None:
+                        continue
+                else:
+                    row.status = "sending"
+                    row.locked_at = now
+                    row.attempt_count = int(row.attempt_count or 0) + 1
                 claimed.append({
                     "id": int(row.id),
                     "userid": row.userid,
-                    "content": row.content,
+                    "content": content or "",
+                    "recommendation_delivery_id": row.recommendation_delivery_id,
                     "attempt_count": int(row.attempt_count),
                 })
             db.commit()
@@ -839,9 +1195,152 @@ class Worker:
         finally:
             db.close()
 
-    def _mark_outbox_sent(self, outbox_id: int, provider_msg_id: str | None) -> bool:
-        db = SessionLocal()
+    def _claim_recommendation_body(
+        self, db: Session, row: WecomOutboundOutbox, now: Any,
+    ) -> str | None:
+        """把一条推荐 outbox 行连同它的 delivery 一起 claim 成 sending。
+
+        返回待发送正文；返回 None 表示本轮不发送（已在函数内落好状态）。
+        状态转移全部收敛到 §9.6 行 1921 的枚举，并用条件 UPDATE 防止旧 Worker
+        覆盖新状态（§10.4）。
+        """
+        delivery = db.get(RecommendationDelivery, row.recommendation_delivery_id)
+        if delivery is None:
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "recommendation delivery row missing"
+            return None
+
+        if delivery.status == DELIVERY_PREPARED:
+            # session CAS 还没完成，由独立 reconciler 负责推进；这里只推迟重扫，
+            # 不能把还能恢复的投递意图打成终态。
+            self._defer_outbox_row(row, "recommendation delivery still prepared")
+            return None
+
+        if delivery.status not in DELIVERY_SENDABLE_STATUSES:
+            # sent/unknown/permanent_failed 都是 terminal，不再重发（§10.2/§10.3）。
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = (
+                f"recommendation delivery not sendable: {delivery.status}"
+            )
+            return None
+
+        if not delivery.content_ciphertext:
+            # 正文已被 TTL 清理，永远无法再发送。
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "recommendation delivery body unavailable"
+            delivery.status = DELIVERY_PERMANENT_FAILED
+            delivery.last_error = row.last_error
+            delivery.last_error_code = "content_unavailable"
+            return None
+
         try:
+            from app.services.recommendation_delivery_service import (
+                decrypt_delivery_body,
+            )
+            content = decrypt_delivery_body(delivery)
+        except Exception as exc:
+            # P2-8/§10.6：解密失败 fail-closed，保持可恢复状态并告警，
+            # 既不终态化也不允许明文旁路。
+            attempts = int(delivery.attempt_count or 0) + 1
+            delivery.attempt_count = attempts
+            delivery.status = DELIVERY_RETRY_WAIT
+            delivery.last_error = f"recommendation decrypt failed: {type(exc).__name__}"
+            delivery.last_error_code = "content_decrypt_failed"
+            delivery.next_attempt_at = func.timestampadd(
+                text("SECOND"), _delivery_backoff_seconds(attempts), func.now(6),
+            )
+            self._defer_outbox_row(
+                row, delivery.last_error, attempts=attempts,
+            )
+            log_event(
+                "recommendation_delivery_decrypt_failed",
+                delivery_id=delivery.delivery_id,
+                attempts=attempts,
+                error_type=type(exc).__name__,
+                severity="alert",
+            )
+            return None
+
+        attempts = int(delivery.attempt_count or 0) + 1
+        # §10.4 的条件 UPDATE：只有把 pending/retry_wait 改成 sending 成功的
+        # Worker 才可以调用企微。
+        updated = db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.delivery_id == delivery.delivery_id,
+            RecommendationDelivery.status.in_(DELIVERY_SENDABLE_STATUSES),
+            RecommendationDelivery.next_attempt_at <= func.now(6),
+        ).update({
+            "status": DELIVERY_SENDING,
+            "attempt_count": attempts,
+            "lease_owner": self._lease_owner,
+            "lease_expires_at": func.timestampadd(
+                text("SECOND"), OUTBOX_SENDING_STALE_SECONDS, func.now(6),
+            ),
+        }, synchronize_session=False)
+        if updated != 1:
+            self._defer_outbox_row(row, "recommendation delivery claimed elsewhere")
+            return None
+
+        row.status = "sending"
+        row.locked_at = now
+        row.attempt_count = int(row.attempt_count or 0) + 1
+        return content
+
+    @staticmethod
+    def _defer_outbox_row(
+        row: WecomOutboundOutbox, reason: str, *, attempts: int | None = None,
+    ) -> None:
+        """让一条仍可恢复的 outbox 行退避后重扫，不改变它的 pending 语义。"""
+        backoff = _delivery_backoff_seconds(
+            attempts if attempts is not None else int(row.attempt_count or 0) + 1,
+        )
+        row.status = "pending"
+        row.locked_at = None
+        row.next_attempt_at = func.timestampadd(
+            text("SECOND"), backoff, func.now(6),
+        )
+        row.last_error = reason[:1000]
+
+    def _persist_after_send(self, label: str, fn: Callable[[Session], bool]) -> bool:
+        """企微已接受消息后的落库，带进程内有限重试（P2-9 / §10.3 行 2339）。
+
+        数据库暂时不可用时只在进程内退避重试并告警，绝不重新调用企微；重试耗尽
+        后保留 sending，由 lease 过期收敛到 unknown，人工按 msgid 核对。
+        """
+        for attempt in range(1, SEND_COMMIT_MAX_ATTEMPTS + 1):
+            db = SessionLocal()
+            try:
+                result = fn(db)
+                db.commit()
+                return result
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "worker: %s persist attempt %d failed", label, attempt,
+                )
+            finally:
+                db.close()
+            if attempt < SEND_COMMIT_MAX_ATTEMPTS:
+                time.sleep(
+                    SEND_COMMIT_BACKOFFS[
+                        min(attempt - 1, len(SEND_COMMIT_BACKOFFS) - 1)
+                    ],
+                )
+        log_event(
+            "wecom_send_commit_failed",
+            label=label,
+            attempts=SEND_COMMIT_MAX_ATTEMPTS,
+            severity="alert",
+        )
+        return False
+
+    def _mark_outbox_sent(self, outbox_id: int, provider_msg_id: str | None) -> bool:
+        def _persist(db: Session) -> bool:
             updated = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.id == outbox_id,
                 WecomOutboundOutbox.status == "sending",
@@ -853,19 +1352,96 @@ class Worker:
                 "next_attempt_at": None,
                 "last_error": None,
             })
-            db.commit()
             return updated == 1
-        except Exception:
-            db.rollback()
-            # Provider may already have accepted the message. Leaving the row in
-            # sending makes it recoverable but can duplicate after the stale TTL.
-            logger.exception(
-                "worker: mark outbox sent failed id=%s; duplicate risk on recovery",
-                outbox_id,
-            )
-            return False
-        finally:
-            db.close()
+
+        return self._persist_after_send(f"outbox:{outbox_id}", _persist)
+
+    def _mark_delivery_sent(self, item: dict, response: Any) -> bool:
+        """持久化推荐投递的 sent 事实（§10.2 行 2306-2312）。
+
+        白名单响应、msgid 和 invalid/unlicensed 名单在同一个事务里写入；sent 是
+        曝光的唯一真源，因此提交成功后才通过正规 claim 流程触发派生（§10.5）。
+        """
+        from app.core.time_utils import to_naive_utc, utc_now
+        from app.services.recommendation_delivery_service import (
+            content_expires_at_for_status,
+        )
+
+        delivery_id = item["recommendation_delivery_id"]
+        msgid = response.get("msgid") if isinstance(response, dict) else None
+        whitelisted = whitelist_send_response(response)
+        rejected = parse_invalid_recipients(response)
+        sent_at = utc_now()
+        # §9.11：sent 之后正文最多再留 24 小时；口径统一走 delivery service，
+        # 不在 Worker 里另写一份分钟数。
+        content_expires_at = to_naive_utc(
+            content_expires_at_for_status(
+                DELIVERY_SENT, created_at=sent_at, terminal_at=sent_at,
+            ),
+        )
+
+        def _persist(db: Session) -> bool:
+            updated = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.id == item["id"],
+                WecomOutboundOutbox.status == "sending",
+            ).update({
+                "status": "sent",
+                "provider_msg_id": (str(msgid or ""))[:128] or None,
+                "sent_at": func.now(6),
+                "locked_at": None,
+                "next_attempt_at": None,
+                "last_error": None,
+            })
+            # 条件 UPDATE + lease owner：租约过期后被别人接管的旧 Worker
+            # 不能把新状态覆盖回 sent（§10.4）。
+            delivery_updated = db.query(RecommendationDelivery).filter(
+                RecommendationDelivery.delivery_id == delivery_id,
+                RecommendationDelivery.status == DELIVERY_SENDING,
+                RecommendationDelivery.lease_owner == self._lease_owner,
+            ).update({
+                "status": DELIVERY_SENT,
+                "wecom_msgid": (str(msgid or ""))[:128] or None,
+                "wecom_response": whitelisted or None,
+                "invalid_recipients": rejected or None,
+                "last_error": None,
+                "last_error_code": None,
+                "sent_at": to_naive_utc(sent_at),
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "next_attempt_at": func.now(6),
+                "content_expires_at": content_expires_at,
+                # §9.11 行 2110：session patch 不进入留存。
+                "session_patch_ciphertext": null(),
+            }, synchronize_session=False)
+            return updated == 1 and delivery_updated == 1
+
+        ok = self._persist_after_send(f"delivery:{delivery_id}", _persist)
+        if ok:
+            self._submit_immediate_impressions()
+        return ok
+
+    def _record_delivery_response(
+        self,
+        db: Session,
+        delivery_id: str,
+        response: Any,
+        values: dict,
+    ) -> None:
+        """把白名单响应和部分失败名单并入一次 delivery 状态转移。"""
+        whitelisted = whitelist_send_response(response)
+        rejected = parse_invalid_recipients(response)
+        if whitelisted:
+            values["wecom_response"] = whitelisted
+        if rejected:
+            values["invalid_recipients"] = rejected
+        msgid = response.get("msgid") if isinstance(response, dict) else None
+        if msgid:
+            values["wecom_msgid"] = str(msgid)[:128]
+        db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.delivery_id == delivery_id,
+            RecommendationDelivery.status == DELIVERY_SENDING,
+            RecommendationDelivery.lease_owner == self._lease_owner,
+        ).update(values, synchronize_session=False)
 
     def _mark_outbox_failed(
         self,
@@ -873,6 +1449,8 @@ class Worker:
         error: Exception,
         *,
         terminal: bool = False,
+        response: Any = None,
+        error_code: str | None = None,
     ) -> None:
         db = SessionLocal()
         try:
@@ -886,9 +1464,7 @@ class Worker:
             if dead:
                 values["next_attempt_at"] = None
             else:
-                backoff = OUTBOX_RETRY_BACKOFFS[
-                    min(attempts - 1, len(OUTBOX_RETRY_BACKOFFS) - 1)
-                ]
+                backoff = _delivery_backoff_seconds(attempts)
                 values["next_attempt_at"] = func.timestampadd(
                     text("SECOND"), backoff, func.now(6),
                 )
@@ -896,6 +1472,43 @@ class Worker:
                 WecomOutboundOutbox.id == item["id"],
                 WecomOutboundOutbox.status == "sending",
             ).update(values)
+            delivery_id = item.get("recommendation_delivery_id")
+            if delivery_id:
+                # §10.4：可重试错误写 retry_wait/next_attempt_at/attempt_count；
+                # 永久错误或用户无效写 permanent_failed。attempt_count 已在 claim
+                # 时递增，这里不再重复累加。
+                delivery_values: dict = {
+                    "status": (
+                        DELIVERY_PERMANENT_FAILED if dead else DELIVERY_RETRY_WAIT
+                    ),
+                    "last_error": values["last_error"],
+                    "last_error_code": error_code or _error_code(error),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+                if dead:
+                    # §9.11：permanent_failed 之后正文最多再留 24 小时。
+                    from app.core.time_utils import to_naive_utc, utc_now
+                    from app.services.recommendation_delivery_service import (
+                        content_expires_at_for_status,
+                    )
+                    failed_at = utc_now()
+                    delivery_values["content_expires_at"] = to_naive_utc(
+                        content_expires_at_for_status(
+                            DELIVERY_PERMANENT_FAILED,
+                            created_at=failed_at,
+                            terminal_at=failed_at,
+                        ),
+                    )
+                else:
+                    delivery_values["next_attempt_at"] = func.timestampadd(
+                        text("SECOND"),
+                        _delivery_backoff_seconds(attempts),
+                        func.now(6),
+                    )
+                self._record_delivery_response(
+                    db, delivery_id, response, delivery_values,
+                )
             db.commit()
             if dead:
                 self._write_send_failed_audit(
@@ -936,6 +1549,32 @@ class Worker:
             self._mark_outbox_failed(item, exc)
             return False
 
+        # P1-12/§10.2：企微对部分失败仍然返回 errcode=0。单用户发送时接收者出现在
+        # invaliduser/unlicenseduser 里就说明消息没有下发，不能标 sent，
+        # 否则会派生出一批假曝光。
+        rejected_by = recipient_rejected(response, item["userid"])
+        if rejected_by:
+            self._mark_user_inactive(item["userid"])
+            self._mark_outbox_failed(
+                item,
+                WeComError(
+                    f"recipient rejected by wecom: {rejected_by}", errcode=0,
+                ),
+                terminal=True,
+                response=response,
+                error_code=rejected_by,
+            )
+            log_event(
+                "wecom_send_recipient_rejected",
+                user_hash=identifier_hash(item["userid"]),
+                reject_field=rejected_by,
+                delivery_id=item.get("recommendation_delivery_id"),
+                severity="alert",
+            )
+            return False
+
+        if item.get("recommendation_delivery_id"):
+            return self._mark_delivery_sent(item, response)
         return self._mark_outbox_sent(
             item["id"],
             response.get("msgid") if isinstance(response, dict) else None,
@@ -958,9 +1597,72 @@ class Worker:
                 break
         return all(results)
 
-    def _process_outbox_once(self) -> None:
-        for item in self._claim_outbox():
+    def dispatch_deliveries_once(self, *, limit: int = AUX_LOOP_BATCH_SIZE) -> int:
+        """§10.4.1 的 delivery dispatcher 单次扫描，只碰 DB，不读 incoming 队列。"""
+        claimed = self._claim_outbox(limit=limit)
+        for item in claimed:
             self._deliver_outbox_item(item)
+        return len(claimed)
+
+    def _submit_immediate_impressions(self) -> None:
+        """§10.5：sent 提交后立即投递到有界 executor，用户锁释放前最多等 200ms。
+
+        executor 每项独立 Session，并且必须经过 `claim_impression_deliveries`，
+        否则会和后台 deriver 对同一条 delivery 并发派生。
+        """
+        executor = self._impression_executor
+        if executor is None:
+            # 独立 deriver 线程未启动（例如单测直接构造 Worker）；后台扫描仍然是
+            # 兜底真源，这里不做内联派生以免绕过 claim 的并发保护。
+            return
+        try:
+            future = executor.submit(
+                self.derive_impressions_once,
+                limit=IMPRESSION_IMMEDIATE_BATCH_SIZE,
+            )
+        except RuntimeError:
+            # executor 已在关停中，交给下次 deriver 扫描。
+            return
+        try:
+            future.result(timeout=IMPRESSION_IMMEDIATE_WAIT_SECONDS)
+        except Exception:
+            # 超时或失败都不影响 sent 事实，deriver 每 250ms 继续恢复。
+            pass
+
+    def derive_impressions_once(self, *, limit: int = AUX_LOOP_BATCH_SIZE) -> int:
+        """§10.5 的曝光派生：claim → 短事务派生 → 释放派生租约。"""
+        from app.services.recommendation_exposure_service import (
+            claim_impression_deliveries,
+            derive_impressions,
+            mark_impression_retry,
+        )
+        claim_db = SessionLocal()
+        try:
+            delivery_ids = claim_impression_deliveries(claim_db, limit=limit)
+            claim_db.commit()
+        except Exception:
+            claim_db.rollback()
+            logger.exception("worker: claim impression deliveries failed")
+            delivery_ids = []
+        finally:
+            claim_db.close()
+        for delivery_id in delivery_ids:
+            db = SessionLocal()
+            try:
+                delivery = db.get(RecommendationDelivery, delivery_id)
+                if delivery:
+                    # 只释放 impression_lease_*（在 derive_impressions 内完成）；
+                    # 发送租约 lease_owner/lease_expires_at 属于 dispatcher，
+                    # 派生侧既不读也不写。
+                    derive_impressions(db, delivery)
+                    db.commit()
+            except Exception as exc:
+                db.rollback()
+                mark_impression_retry(db, delivery_id, exc)
+                db.commit()
+            finally:
+                db.close()
+        return len(delivery_ids)
 
     def _send_replies(self, replies: list[ReplyMessage]) -> bool:
         all_ok = True
@@ -972,7 +1674,17 @@ class Worker:
 
     def _send_one(self, reply: ReplyMessage) -> bool:
         try:
-            self._wecom_client.send_text(reply.userid, reply.content)
+            response = self._wecom_client.send_text(reply.userid, reply.content)
+            # 非推荐回复同样不能把部分失败当成功：errcode=0 时接收者仍可能落在
+            # invaliduser/unlicenseduser 里（§10.2）。
+            rejected_by = recipient_rejected(response, reply.userid)
+            if rejected_by:
+                logger.warning(
+                    "worker: recipient rejected user_hash=%s field=%s",
+                    identifier_hash(reply.userid), rejected_by,
+                )
+                self._mark_user_inactive(reply.userid)
+                return False
             return True
         except WeComError as exc:
             return self._handle_send_error(reply, exc)
@@ -1208,6 +1920,7 @@ class Worker:
                 "status": "done",
                 "worker_finished_at": func.now(6),
             })
+            _promote_prepared_deliveries(db, event_id)
         except Exception:
             logger.exception("worker: mark_event_done failed id=%s", event_id)
 
@@ -1362,10 +2075,20 @@ class Worker:
                         userid=reply.userid,
                         direction="out",
                         msg_type="text",
-                        content=reply.content,
+                        content=(
+                            "[recommendation_delivery]"
+                            if reply.recommendation_context
+                            else reply.content
+                        ),
                         wecom_msg_id=None,
                         intent=reply.intent,
                         criteria_snapshot=reply.criteria_snapshot,
+                        recommendation_delivery_id=reply.delivery_id,
+                        redaction_state=(
+                            "encrypted_delivery"
+                            if reply.recommendation_context
+                            else None
+                        ),
                         expires_at=expires,
                     ))
             except Exception:
@@ -1429,6 +2152,70 @@ class Worker:
 # ===========================================================================
 # 工具
 # ===========================================================================
+
+def _delivery_backoff_seconds(attempt_count: int) -> int:
+    """§10.4 的 retry_wait 退避；与 outbox 复用同一张退避表。"""
+    index = min(max(int(attempt_count or 1), 1) - 1, len(OUTBOX_RETRY_BACKOFFS) - 1)
+    return OUTBOX_RETRY_BACKOFFS[index]
+
+
+def _error_code(error: Exception) -> str:
+    """`last_error_code` 只保存错误码或异常类型，不写脱敏前的错误正文。"""
+    errcode = getattr(error, "errcode", None)
+    if errcode:
+        return str(errcode)[:32]
+    return type(error).__name__[:32]
+
+
+def _promote_prepared_deliveries(db: Session, event_id: Any) -> None:
+    """Redis session CAS 落地后把本轮 delivery 从 prepared 推进到 pending。
+
+    §9.11 行 2110：`session_patch_ciphertext` 在 prepared→pending 时立即清空，
+    不进入 90 天留存。两条 UPDATE 都是条件更新且幂等，重复恢复不会回退状态。
+    """
+    if not event_id:
+        return
+    delivery_ids = db.query(
+        WecomOutboundOutbox.recommendation_delivery_id,
+    ).filter(
+        WecomOutboundOutbox.inbound_event_id == event_id,
+        WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+    )
+    db.query(RecommendationDelivery).filter(
+        RecommendationDelivery.delivery_id.in_(delivery_ids),
+        RecommendationDelivery.status == DELIVERY_PREPARED,
+    ).update({
+        "status": DELIVERY_PENDING,
+        "next_attempt_at": func.now(6),
+    }, synchronize_session=False)
+    db.query(RecommendationDelivery).filter(
+        RecommendationDelivery.delivery_id.in_(delivery_ids),
+        RecommendationDelivery.session_commit_state != "applied",
+    ).update({
+        "session_commit_state": "applied",
+        "session_committed_at": func.now(6),
+        "session_patch_ciphertext": null(),
+    }, synchronize_session=False)
+
+
+def _decrypt_session_patch(delivery: RecommendationDelivery) -> dict | None:
+    """解密 staged session patch；失败必须冒泡，由调用方 fail-closed（§10.6）。
+
+    envelope/AAD/key ring 全部由 `recommendation_delivery_service` 负责，Worker 侧
+    不复制一份密钥逻辑。
+    """
+    from app.services.recommendation_delivery_service import (
+        decrypt_delivery_session_patch,
+    )
+
+    raw = decrypt_delivery_session_patch(delivery)
+    if raw is None:
+        return None
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("session patch payload is not a JSON object")
+    return payload
+
 
 def _build_wecom_message(msg_data: dict) -> WeComMessage:
     return WeComMessage(

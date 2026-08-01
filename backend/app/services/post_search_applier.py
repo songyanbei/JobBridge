@@ -90,9 +90,10 @@ def apply_post_search_decision(
         )
 
     if action == "no_action":
-        return [_reply(msg_userid, ctx.search_result.reply_text)]
+        return [_reply(msg_userid, ctx.search_result.reply_text, ctx.search_result)]
 
     if action == "paginate_no_more":
+        # §10.1：本分支只输出降级文案，正文里没有任何候选，不得携带推荐上下文。
         return [_reply(msg_userid, _render_paginate_no_more(ctx))]
 
     if action == "ask_clarification":
@@ -102,10 +103,11 @@ def apply_post_search_decision(
         return _handle_auto_relax_and_retry(ctx)
 
     if action == "suggest_relaxation":
+        # §10.1：只给放宽方向、不返回候选，同样不得携带推荐上下文。
         return [_reply(msg_userid, _render_suggest_relaxation(ctx))]
 
     if action == "show_results_with_soft_pref_notice":
-        return [_reply(msg_userid, _render_soft_pref_notice(ctx))]
+        return [_reply(msg_userid, _render_soft_pref_notice(ctx), ctx.search_result)]
 
     # 5.4 后续可能扩 show_results；当前仍走未实现 fallback。
     # 本子阶段未实现的 action：fallback no_action + 告警日志（phased-plan
@@ -115,7 +117,7 @@ def apply_post_search_decision(
         "fallback no_action 直出 search_result.reply_text",
         action,
     )
-    return [_reply(msg_userid, ctx.search_result.reply_text)]
+    return [_reply(msg_userid, ctx.search_result.reply_text, ctx.search_result)]
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +195,10 @@ def _handle_ask_clarification(ctx: PostSearchContext) -> list[ReplyMessage]:
         # 二次 _rerank_with_logging 做归因（与主搜索一致）。
         "raw_query": ctx.raw_query,
         "user_msg_id": ctx.msg.msg_id,
+        "parent_request_id": (
+            getattr(ctx.search_result, "request_id", None)
+            or getattr(ctx.session.candidate_snapshot, "request_id", None)
+        ),
         "expires_at": expires_at,
     }
 
@@ -270,7 +276,34 @@ def _handle_auto_relax_and_retry(
         experience_flags=ctx.experience_flags,
         recursion_depth=ctx.recursion_depth + 1,  # 0 → 1
     )
-    return apply_post_search_decision(new_ctx)
+    replies = apply_post_search_decision(new_ctx)
+    # §9.4：自动放宽仍然只有一条 request（kind=auto_relaxed），attempt 0 是
+    # initial、后续才是 auto_relaxed；请求事实即使二次检索仍然零结果也要写。
+    # §10.1：delivery 只挂给正文里真的渲染了候选的那条回复，否则会凭空派生曝光。
+    from app.services.message_router import (
+        _attach_recommendation_fields,
+        _recommendation_reply_fields,
+    )
+    previous_request_id = getattr(ctx.search_result, "request_id", None)
+    final_request_id = getattr(new_result, "request_id", None)
+    if previous_request_id and previous_request_id != final_request_id:
+        # The preliminary search may already have submitted a detached shadow
+        # observation. It will never be activated because only the final
+        # auto-relaxed reply is committed; discard it to avoid a stranded state.
+        from app.services.recommendation_shadow_service import discard
+
+        discard(previous_request_id)
+    fields = _recommendation_reply_fields(
+        new_result,
+        ctx.user_ctx.external_userid,
+        ctx.msg.msg_id,
+        request_kind="auto_relaxed",
+        parent_request_id=getattr(ctx.search_result, "request_id", None),
+        search_outcome=new_outcome,
+        prior_search_result=ctx.search_result,
+        prior_search_outcome=ctx.search_outcome,
+    )
+    return _attach_recommendation_fields(replies, fields, new_result)
 
 
 def _render_suggest_relaxation(ctx: PostSearchContext) -> str:
@@ -313,6 +346,19 @@ def _visible_or_final_count(search_outcome) -> int:
     return int(getattr(search_outcome, "final_count", 0) or 0)
 
 
-def _reply(userid: str, content: str) -> ReplyMessage:
-    """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。"""
-    return ReplyMessage(userid=userid, content=content)
+def _reply(userid: str, content: str, search_result=None) -> ReplyMessage:
+    """构造 ReplyMessage（与 message_router._reply 同结构，避免引入循环依赖）。
+
+    ``search_result`` 只在本条回复的正文真的渲染了候选时才传；此时把排序契约
+    （strategy_assignment）带上，delivery/request 标识由 message_router 在
+    applier 返回后统一挂（§10.1：不含候选的回复不创建 delivery）。
+    """
+    reply = ReplyMessage(userid=userid, content=content)
+    if search_result is None or not getattr(
+        search_result, "recommendation_items", None,
+    ):
+        return reply
+    assignment = getattr(search_result, "strategy_assignment", None)
+    if assignment is None:
+        return reply
+    return reply.model_copy(update={"strategy_assignment": assignment})

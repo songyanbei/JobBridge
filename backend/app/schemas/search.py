@@ -15,7 +15,10 @@ phased-plan §5.0.1 第 4 项给出的规则：
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal
+
+from app.schemas.recommendation import RecommendationItem, StrategyAssignment
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +35,20 @@ class SearchResult:
     reply_text: str
     has_more: bool = False
     result_count: int = 0
+    recommendation_items: list[RecommendationItem] = field(default_factory=list)
+    snapshot_id: str | None = None
+    strategy_assignment: StrategyAssignment | None = None
+    request_id: str | None = None
+    query_digest: str = ""
+    candidate_ids: list[str] = field(default_factory=list)
+    precision_pool_ids: list[str] = field(default_factory=list)
+    scoring_time_utc: datetime | None = None
+    llm_status: str = "skipped"
+    llm_input_tokens: int | None = None
+    llm_output_tokens: int | None = None
+    llm_retry_count: int = 0
+    ranking_fallback: str | None = None
+    ranking_latency_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,8 @@ class FallbackOutcome:
     """
     candidates: list
     applied_step: str | None = None
+    applied_criteria: dict | None = None
+    probe_results: list[dict] = field(default_factory=list)
     suggestions: list[FallbackSuggestion] = field(default_factory=list)
 
 

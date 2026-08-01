@@ -22,9 +22,26 @@ _scheduler: BackgroundScheduler | None = None
 def build_scheduler() -> BackgroundScheduler:
     """构造 BackgroundScheduler 并注册所有任务。"""
     # 延迟 import，避免 app 启动时的循环依赖
-    from app.tasks import daily_report, send_retry_drain, ttl_cleanup, worker_monitor
+    from app.tasks import (
+        daily_report,
+        recommendation_privacy_cleanup,
+        send_retry_drain,
+        ttl_cleanup,
+        worker_monitor,
+    )
 
     sched = BackgroundScheduler(timezone=settings.scheduler_timezone)
+
+    # ---- 每日 02:30 推荐域延迟硬删（§9.11.1） ----
+    # 必须排在 ttl_cleanup 之前：闭环第 1 步要从 resume/job 读该用户的候选 target ID，
+    # 而 ttl_cleanup 会把这些行硬删掉，顺序反了就再也反查不到相关 impression。
+    sched.add_job(
+        recommendation_privacy_cleanup.run,
+        CronTrigger.from_crontab("30 2 * * *"),
+        id="recommendation_privacy_cleanup",
+        max_instances=1,
+        coalesce=True,
+    )
 
     # ---- 每日 03:00 TTL 清理与硬删除 ----
     sched.add_job(
@@ -84,6 +101,27 @@ def build_scheduler() -> BackgroundScheduler:
         worker_monitor.check_session_commits,
         IntervalTrigger(seconds=60),
         id="session_commit_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # ---- 推荐曝光日聚合校验/重算（§11.8） ----
+    # 每天 00:15 全量对账昨日；再叠一个小时级增量，避免整整一天的偏差要等到次日才
+    # 被发现。两个 job 共用任务内部的 task_lock，重叠时后者直接跳过。
+    from app.tasks import recommendation_exposure_reconcile
+
+    sched.add_job(
+        recommendation_exposure_reconcile.run,
+        CronTrigger.from_crontab("15 0 * * *"),
+        id="recommendation_exposure_reconcile",
+        max_instances=1,
+        coalesce=True,
+    )
+    sched.add_job(
+        recommendation_exposure_reconcile.run,
+        IntervalTrigger(hours=1),
+        args=[1],
+        id="recommendation_exposure_reconcile_intraday",
         max_instances=1,
         coalesce=True,
     )

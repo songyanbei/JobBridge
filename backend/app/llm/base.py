@@ -3,10 +3,59 @@
 业务代码只依赖本文件中的 ABC 和数据结构，不依赖具体 provider。
 切换供应商只需在 llm/__init__.py 的工厂函数里改注册。
 """
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+
+@dataclass(frozen=True)
+class LLMCallPolicy:
+    """调用级 LLM 策略（方案 §11.5）。
+
+    ``deadline_monotonic`` 是 ``time.monotonic()`` 坐标系下的**绝对时刻**，不是
+    相对时长：§7.5 要求 shadow 在**提交 runner 之前**就把预算固定下来，排队等待
+    必须一起消耗，用相对时长会让 worker 启动时重新拿到完整的 3 秒。
+    一律用 monotonic 而不是 UTC wall clock，避免对时 / 闰秒把 deadline 抖成负数。
+
+    ``deadline_monotonic=None``（也就是 ``call_policy=None`` 的默认值）表示
+    **legacy 语义**：单次 HTTP timeout 用 ``settings.llm_timeout_seconds``（30 秒），
+    网络错误最多重试一次（``max_retries=1``）。本次推荐改造不得改变这条基线。
+    shadow 必须显式传 ``max_retries=0``。
+    """
+
+    deadline_monotonic: float | None = None
+    max_retries: int = 1
+
+    def remaining_seconds(self) -> float | None:
+        """距离 deadline 还剩多少秒；无 deadline 时返回 None（不设总时限）。"""
+        if self.deadline_monotonic is None:
+            return None
+        return self.deadline_monotonic - time.monotonic()
+
+    @classmethod
+    def with_deadline_in(
+        cls, seconds: float, *, max_retries: int = 0,
+    ) -> "LLMCallPolicy":
+        """以"从现在起 N 秒"构造绝对 deadline。
+
+        提供这个入口是为了让调用方（shadow runner）不必自己碰时钟，杜绝
+        ``datetime.now()`` / wall clock 混入 deadline 计算。
+        """
+        return cls(
+            deadline_monotonic=time.monotonic() + float(seconds),
+            max_retries=max_retries,
+        )
+
+
+class LLMDeadlineExceeded(TimeoutError):
+    """调用超出 ``LLMCallPolicy.deadline_monotonic`` 约定的绝对时限。
+
+    继承 ``TimeoutError`` 而不是 ``LLMError``：它描述的是调用方给出的预算耗尽，
+    不代表上游一定不可用（provider 很可能仍在推理并计费，见 §7.5 的预算口径）。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +195,13 @@ class RerankResult(BaseModel):
     # Phase 7：同 IntentResult。
     input_tokens: int | None = Field(default=None, description="prompt_tokens")
     output_tokens: int | None = Field(default=None, description="completion_tokens")
+    # Serving-attempt telemetry. Providers may populate retry_count; the
+    # search wrapper always normalizes status/latency/fallback before the result
+    # is attached to recommendation_request/recommendation_search_attempt.
+    llm_status: str = Field(default="ok")
+    retry_count: int = Field(default=0, ge=0)
+    latency_ms: int = Field(default=0, ge=0)
+    ranking_fallback: str | None = Field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +277,7 @@ class Reranker(ABC):
         *,
         soft_preferences: dict | None = None,
         ranking_weights: dict[str, float] | None = None,
+        call_policy: LLMCallPolicy | None = None,
     ) -> RerankResult:
         """对候选集重排并生成回复。
 
@@ -234,8 +291,38 @@ class Reranker(ABC):
                 所有 provider 实现接收形参但忽略，确保后续接通时不破坏现有调用。
             ranking_weights: Phase 5 §5.0 预声明位（5.3 才会消费）。例如
                 ``{"provide_meal": 0.3, "shift_pattern": 0.2}``。
+            call_policy: 调用级 timeout / 重试配置，``None`` = legacy
+                （30 秒单次 timeout + 一次网络重试）。**同步路径只用它统一接口和
+                调用级重试次数**：httpx 的同步 timeout 是分阶段的（connect/read/
+                write/pool 各自计时），不能兑现严格的总 deadline。需要硬 deadline
+                的 shadow 必须调 :meth:`arerank`（方案 §11.5）。
 
         Returns:
             RerankResult
         """
         ...
+
+    async def arerank(
+        self,
+        query: str,
+        candidates: list[dict],
+        role: str,
+        top_n: int = 3,
+        *,
+        soft_preferences: dict | None = None,
+        ranking_weights: dict[str, float] | None = None,
+        call_policy: LLMCallPolicy,
+    ) -> RerankResult:
+        """真异步重排：唯一能兑现 ``call_policy`` 绝对 deadline 的入口。
+
+        默认实现直接 raise：方案 §7.5 明文**禁止**用 ThreadPoolExecutor /
+        ``asyncio.to_thread`` 包同步 :meth:`rerank` 来实现 shadow 硬超时——
+        deadline 到期后那条同步 socket 仍在后台线程上跑满 30 秒 × 2，既不释放
+        并发槽也继续消耗供应商配额。provider 必须基于共享 ``httpx.AsyncClient``
+        自己实现真异步路径。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement arerank; a shadow-capable "
+            "provider must issue a real async HTTP call (wrapping the synchronous "
+            "rerank in a thread is forbidden by the hard-deadline contract)."
+        )

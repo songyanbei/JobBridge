@@ -50,6 +50,48 @@ def get_redis() -> redis.Redis:
 
 SESSION_PREFIX = "session:"
 SESSION_TTL = 30 * 60  # 30 分钟
+RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX = (
+    "recommendation:session:delivery:"
+)
+RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX = "recommendation:session:target:"
+RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX = (
+    "recommendation:session:indexes:"
+)
+
+
+def recommendation_session_index_keys(session: dict) -> list[str]:
+    """Derive bounded reverse-index keys from a redacted session payload."""
+    keys: set[str] = set()
+    history = session.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            delivery_id = entry.get("delivery_id")
+            if delivery_id:
+                keys.add(
+                    f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}"
+                    f"{delivery_id}"
+                )
+
+    snapshot = session.get("candidate_snapshot")
+    if isinstance(snapshot, dict):
+        direction = snapshot.get("direction")
+        target_type = (
+            "job" if direction == "search_job"
+            else "resume" if direction == "search_worker"
+            else None
+        )
+        candidate_ids = snapshot.get("candidate_ids")
+        if target_type and isinstance(candidate_ids, list):
+            for candidate_id in candidate_ids:
+                if candidate_id in (None, ""):
+                    continue
+                keys.add(
+                    f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}"
+                    f"{target_type}:{candidate_id}"
+                )
+    return sorted(keys)
 
 
 def get_session(userid: str) -> dict | None:
@@ -64,7 +106,57 @@ def get_session(userid: str) -> dict | None:
 def save_session(userid: str, session: dict) -> None:
     """保存用户会话状态（自动续 TTL）。"""
     r = get_redis()
-    r.setex(f"{SESSION_PREFIX}{userid}", SESSION_TTL, json.dumps(session, ensure_ascii=False))
+    r.eval(
+        _SAVE_SESSION_WITH_INDEXES_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        SESSION_TTL,
+        json.dumps(session, ensure_ascii=False),
+        userid,
+        json.dumps(recommendation_session_index_keys(session)),
+    )
+
+
+_SAVE_SESSION_WITH_INDEXES_SCRIPT = """
+redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
+local registry = KEYS[2]
+local userid = ARGV[3]
+local ttl = tonumber(ARGV[1])
+local new_indexes = cjson.decode(ARGV[4])
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+for _, index_key in ipairs(new_indexes) do
+    redis.call('SADD', index_key, userid)
+    redis.call('EXPIRE', index_key, ttl)
+    redis.call('SADD', registry, index_key)
+end
+if #new_indexes > 0 then
+    redis.call('EXPIRE', registry, ttl)
+end
+return 1
+"""
+
+_DELETE_SESSION_WITH_INDEXES_SCRIPT = """
+redis.call('DEL', KEYS[1])
+local registry = KEYS[2]
+local userid = ARGV[1]
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+return 1
+"""
 
 
 _SAVE_SESSION_CAS_SCRIPT = """
@@ -83,6 +175,25 @@ elseif expected ~= 0 and ARGV[5] ~= '1' then
     return 0
 end
 redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
+local registry = KEYS[3]
+local userid = ARGV[6]
+local new_indexes = cjson.decode(ARGV[7])
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
+for _, index_key in ipairs(new_indexes) do
+    redis.call('SADD', index_key, userid)
+    redis.call('EXPIRE', index_key, ARGV[2])
+    redis.call('SADD', registry, index_key)
+end
+if #new_indexes > 0 then
+    redis.call('EXPIRE', registry, ARGV[2])
+end
 return 1
 """
 
@@ -93,14 +204,27 @@ end
 local current = redis.call('GET', KEYS[1])
 local expected = tonumber(ARGV[1])
 if not current then
-    return expected == 0 and 1 or 0
-end
-local decoded = cjson.decode(current)
-local version = tonumber(decoded['session_version'] or 0)
-if version ~= expected then
-    return 0
+    if expected ~= 0 then
+        return 0
+    end
+else
+    local decoded = cjson.decode(current)
+    local version = tonumber(decoded['session_version'] or 0)
+    if version ~= expected then
+        return 0
+    end
 end
 redis.call('DEL', KEYS[1])
+local registry = KEYS[3]
+local userid = ARGV[3]
+local old_indexes = redis.call('SMEMBERS', registry)
+for _, index_key in ipairs(old_indexes) do
+    redis.call('SREM', index_key, userid)
+    if redis.call('SCARD', index_key) == 0 then
+        redis.call('DEL', index_key)
+    end
+end
+redis.call('DEL', registry)
 return 1
 """
 
@@ -123,14 +247,17 @@ def save_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _SAVE_SESSION_CAS_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
         int(expected_version),
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),
         lock_token,
         "1" if allow_missing else "0",
+        userid,
+        json.dumps(recommendation_session_index_keys(session)),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session commit")
@@ -140,7 +267,13 @@ def save_session_if_version(
 def delete_session(userid: str) -> None:
     """清除用户会话状态。"""
     r = get_redis()
-    r.delete(f"{SESSION_PREFIX}{userid}")
+    r.eval(
+        _DELETE_SESSION_WITH_INDEXES_SCRIPT,
+        2,
+        f"{SESSION_PREFIX}{userid}",
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        userid,
+    )
 
 
 def delete_session_if_version(
@@ -153,11 +286,13 @@ def delete_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _DELETE_SESSION_CAS_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
         int(expected_version),
         lock_token,
+        userid,
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session delete")
@@ -527,5 +662,100 @@ def set_cached_config(key: str, value: str, ttl: int = CONFIG_CACHE_TTL) -> None
     try:
         r = get_redis()
         r.setex(f"{CONFIG_CACHE_PREFIX}{key}", ttl, value)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 推荐 v1：动态总开关分发通道（方案 §7.5 / §11.8）
+# ---------------------------------------------------------------------------
+
+# DB 才是真源；Redis 只是提交之后的加速通道，因此 key 带 30 秒 TTL：Pub/Sub 丢包
+# 由订阅方的 5 秒 DB 轮询收敛，key 过期后读取方自然回源，不会长期钉住旧值。
+RUNTIME_CONTROL_KEY = "recommendation:runtime_control"
+RUNTIME_CONTROL_CHANNEL = "recommendation:runtime_control"
+RUNTIME_CONTROL_TTL_SECONDS = 30
+
+
+def publish_runtime_control(payload: dict) -> bool:
+    """write-through 写 key 并广播 Pub/Sub；失败返回 False 交给调用方降级。
+
+    payload 必须携带 ``revision``，订阅方只接受不小于本地 revision 的更新。
+    """
+    body = json.dumps(payload, ensure_ascii=False, default=str)
+    try:
+        r = get_redis()
+        pipe = r.pipeline()
+        pipe.setex(RUNTIME_CONTROL_KEY, RUNTIME_CONTROL_TTL_SECONDS, body)
+        pipe.publish(RUNTIME_CONTROL_CHANNEL, body)
+        pipe.execute()
+        return True
+    except Exception:
+        logger.warning("runtime control write-through failed", exc_info=True)
+        return False
+
+
+def read_runtime_control() -> dict | None:
+    """读取 Redis 侧总开关快照；key 缺失或 Redis 故障统一返回 None。"""
+    try:
+        raw = get_redis().get(RUNTIME_CONTROL_KEY)
+    except Exception:
+        logger.warning("runtime control read failed", exc_info=True)
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def runtime_control_pubsub():
+    """返回已订阅总开关频道的 pubsub 对象；Redis 不可用时返回 None。"""
+    try:
+        pubsub = get_redis().pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(RUNTIME_CONTROL_CHANNEL)
+        return pubsub
+    except Exception:
+        logger.warning("runtime control subscribe failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 推荐 v1：不可变策略版本缓存（方案 §11.8）
+# ---------------------------------------------------------------------------
+
+# 只缓存"已发布/已归档"这类禁止再修改的 version 行，key 带 version ID，因此缓存
+# 回填永远不会把新指针覆盖成旧指针。可变的 release 指针明确不缓存。
+STRATEGY_VERSION_CACHE_PREFIX = "recommendation:strategy:"
+STRATEGY_VERSION_CACHE_TTL = 600
+
+
+def get_cached_strategy_version(version_id: int | str) -> dict | None:
+    try:
+        raw = get_redis().get(f"{STRATEGY_VERSION_CACHE_PREFIX}{version_id}")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def set_cached_strategy_version(
+    version_id: int | str,
+    payload: dict,
+    ttl: int = STRATEGY_VERSION_CACHE_TTL,
+) -> None:
+    try:
+        get_redis().setex(
+            f"{STRATEGY_VERSION_CACHE_PREFIX}{version_id}",
+            ttl,
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
     except Exception:
         pass
