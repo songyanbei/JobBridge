@@ -2807,6 +2807,13 @@ def _broaden_job_categories(criteria: dict) -> dict | None:
 # ORM → dict 转换
 # ---------------------------------------------------------------------------
 
+def _normalized_optional_text(value) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
     """将 Job ORM 对象转为字典列表，补充关联用户信息。"""
     if not jobs:
@@ -2843,9 +2850,67 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             "accept_minority": j.accept_minority,
         }
         user_data = users_map.get(j.owner_userid, {})
-        d["company"] = user_data.get("company", "")
-        d["contact_person"] = user_data.get("contact_person", "")
-        d["phone"] = user_data.get("phone", "")
+        publisher_company = _normalized_optional_text(user_data.get("company"))
+        job_company = _normalized_optional_text(getattr(j, "hiring_company", None))
+        if job_company:
+            hiring_company = job_company
+            hiring_company_source = "job.hiring_company"
+        elif publisher_company:
+            hiring_company = publisher_company
+            hiring_company_source = "publisher_company_fallback"
+        else:
+            hiring_company = None
+            hiring_company_source = "none"
+
+        publisher_address = _normalized_optional_text(user_data.get("address"))
+        job_address = _normalized_optional_text(getattr(j, "address", None))
+        if job_address:
+            address = job_address
+            address_source = "job.address"
+        elif publisher_address:
+            address = publisher_address
+            address_source = "publisher_address_fallback"
+        else:
+            address = None
+            address_source = "none"
+
+        publisher_contact = _normalized_optional_text(user_data.get("contact_person"))
+        job_contact = _normalized_optional_text(getattr(j, "contact_person", None))
+        if job_contact:
+            contact_person = job_contact
+            contact_source = "job_override"
+        elif publisher_contact:
+            contact_person = publisher_contact
+            contact_source = "publisher_fallback"
+        else:
+            contact_person = None
+            contact_source = "none"
+
+        publisher_phone = _normalized_optional_text(user_data.get("phone"))
+        job_phone = _normalized_optional_text(getattr(j, "phone", None))
+        if job_phone:
+            phone = job_phone
+            phone_source = "job_override"
+        elif publisher_phone:
+            phone = publisher_phone
+            phone_source = "publisher_fallback"
+        else:
+            phone = None
+            phone_source = "none"
+
+        d.update({
+            "hiring_company": hiring_company,
+            "hiring_company_source": hiring_company_source,
+            "publisher_company": publisher_company,
+            "company": hiring_company,
+            "address": address,
+            "address_source": address_source,
+            "contact_person": contact_person,
+            "contact_source": contact_source,
+            "phone": phone,
+            "phone_source": phone_source,
+            "phone_placeholder": "联系方式待补充" if phone is None else None,
+        })
         result.append(d)
     return result
 
@@ -2888,6 +2953,7 @@ def _build_users_map(user_ids: list[str], db: Session) -> dict[str, dict]:
         u.external_userid: {
             "display_name": u.display_name,
             "company": u.company,
+            "address": u.address,
             "contact_person": u.contact_person,
             "phone": u.phone,
         }
@@ -2962,9 +3028,15 @@ def _format_job_results(
 
     for i, j in enumerate(jobs):
         marker = markers[i] if i < len(markers) else f"({i+1})"
-        company = j.get("company", "")
+        company = j.get("hiring_company") or j.get("company", "")
+        company_source = j.get("hiring_company_source")
         category = j.get("job_category", "")
-        title = f"{company} | {category}" if company else category
+        if company and company_source == "job.hiring_company":
+            title = f"招聘工厂：{company} | {category}"
+        elif company and company_source == "publisher_company_fallback":
+            title = f"发布主体：{company}（历史回退） | {category}"
+        else:
+            title = f"{company} | {category}" if company else category
 
         salary_floor = j.get("salary_floor_monthly", 0)
         salary_ceil = j.get("salary_ceiling_monthly")
@@ -2988,6 +3060,29 @@ def _format_job_results(
         lines.append(f"{marker} {title}")
         lines.append(f"   💰 {salary_str}{benefit_str}")
         lines.append(f"   📍 {location}")
+        address = j.get("address")
+        address_source = j.get("address_source")
+        if address and address_source == "job.address":
+            lines.append(f"   🏭 工作地址：{address}")
+        elif address and address_source == "publisher_address_fallback":
+            lines.append(f"   🏢 发布方经营地址：{address}（岗位地址缺失）")
+
+        publisher_company = j.get("publisher_company")
+        if (
+            publisher_company
+            and company_source == "job.hiring_company"
+            and publisher_company != company
+        ):
+            lines.append(f"   🏢 发布主体：{publisher_company}")
+
+        contact_person = j.get("contact_person")
+        if contact_person:
+            lines.append(f"   👤 联系人：{contact_person}")
+        phone = j.get("phone")
+        if phone:
+            lines.append(f"   📞 联系电话：{phone}")
+        elif j.get("phone_placeholder"):
+            lines.append(f"   📞 {j['phone_placeholder']}")
         for reason_line in (reason_lines_by_id or {}).get(str(j.get("id", "")), []):
             lines.append(reason_line)
 

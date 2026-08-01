@@ -13,6 +13,9 @@
       <el-form-item label="公司 / 机构" prop="company">
         <el-input v-model="form.company" />
       </el-form-item>
+      <el-form-item label="公司 / 经营地址">
+        <el-input v-model="form.address" placeholder="仅表示发布方经营地址，不是岗位工作地址" />
+      </el-form-item>
       <el-form-item label="联系人" prop="contact_person">
         <el-input v-model="form.contact_person" />
       </el-form-item>
@@ -51,6 +54,7 @@ const formRef = ref(null)
 const form = reactive({
   display_name: '',
   company: '',
+  address: '',
   contact_person: '',
   phone: '',
   external_userid: '',
@@ -80,6 +84,7 @@ watch(
     if (!v) {
       form.display_name = ''
       form.company = ''
+      form.address = ''
       form.contact_person = ''
       form.phone = ''
       form.external_userid = ''

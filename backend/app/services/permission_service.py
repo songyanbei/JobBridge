@@ -14,7 +14,8 @@ from app.services.visibility_policy import EffectivePolicySnapshot
 # Transitional compatibility is used only until P5 wires a request snapshot into
 # every recommendation path.  Unknown roles already fail closed here.
 _LEGACY_WORKER_HIDDEN_JOB_FIELDS = frozenset({
-    "phone", "contact_person", "gender_required", "age_min", "age_max",
+    "phone", "phone_source", "phone_placeholder", "contact_person", "contact_source",
+    "address", "address_source", "gender_required", "age_min", "age_max",
     "accept_minority",
 })
 

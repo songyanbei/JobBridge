@@ -55,6 +55,7 @@ class Job(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     owner_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid", ondelete="RESTRICT"), nullable=False, comment="发布者")
+    hiring_company = sa.Column(sa.String(128), nullable=True, comment="实际招聘工厂名（岗位级）")
 
     # ---- 硬过滤字段（§7.1）----
     city = sa.Column(sa.String(32), nullable=False, comment="城市")
@@ -76,6 +77,8 @@ class Job(Base):
     # ---- 软匹配字段（§7.1）----
     district = sa.Column(sa.String(32), nullable=True, comment="区县（细粒度）")
     address = sa.Column(sa.String(255), nullable=True, comment="岗位详细工作地址（街道+门牌）")
+    contact_person = sa.Column(sa.String(64), nullable=True, comment="岗位级联系人（覆盖发布账号）")
+    phone = sa.Column(sa.String(32), nullable=True, comment="岗位级联系电话（覆盖发布账号）")
     salary_ceiling_monthly = sa.Column(sa.Integer, nullable=True, comment="月综合收入上限")
     provide_meal = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包吃")
     provide_housing = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包住")

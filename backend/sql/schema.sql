@@ -77,6 +77,7 @@ DROP TABLE IF EXISTS `job`;
 CREATE TABLE `job` (
     `id`                       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     `owner_userid`             VARCHAR(64)     NOT NULL                     COMMENT '发布者 external_userid（厂家/中介）',
+    `hiring_company`           VARCHAR(128)    DEFAULT NULL                  COMMENT '实际招聘工厂名（岗位级）',
 
     -- ---- 硬过滤字段（§7.1）----
     `city`                     VARCHAR(32)     NOT NULL                     COMMENT '城市（强制归一到 dict_city）',
@@ -92,6 +93,8 @@ CREATE TABLE `job` (
     -- ---- 软匹配字段（§7.1）----
     `district`                 VARCHAR(32)     DEFAULT NULL                  COMMENT '区县（细粒度）',
     `address`                  VARCHAR(255)    DEFAULT NULL                  COMMENT '岗位详细工作地址（街道+门牌，区县另见 district）',
+    `contact_person`            VARCHAR(64)     DEFAULT NULL                  COMMENT '岗位级联系人（覆盖发布账号）',
+    `phone`                     VARCHAR(32)     DEFAULT NULL                  COMMENT '岗位级联系电话（覆盖发布账号）',
     `salary_ceiling_monthly`   INT             DEFAULT NULL                  COMMENT '月综合收入上限',
     `provide_meal`             TINYINT(1)      DEFAULT NULL                  COMMENT '包吃',
     `provide_housing`          TINYINT(1)      DEFAULT NULL                  COMMENT '包住',

@@ -80,6 +80,10 @@ INTENT_SYSTEM_PROMPT = """\
 - gender_required (str)：性别要求（男/女/不限）
 - is_long_term (bool)：长期工=true，短期工=false
 - district (str)：区县
+- address (str)：岗位详细工作地址（街道+门牌）
+- hiring_company (str)：实际招聘工厂名；中介代发时不能用中介公司名代替
+- contact_person (str)：岗位联系人（岗位级覆盖）
+- phone (str)：岗位联系电话（岗位级覆盖）
 - salary_ceiling_monthly (int)：月综合收入上限
 - provide_meal (bool)：包吃
 - provide_housing (bool)：包住
@@ -164,8 +168,8 @@ structured_data**表达本轮抽取到的字段，**不要再用 op 语义**。
 {{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000, "provide_meal": true, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.92}}
 
 示例2 - 厂家发布岗位:
-用户消息: "我们苏州吴中区电子厂招普工30人，月薪5500-6500，包吃住，两班倒"
-{{"intent": "upload_job", "structured_data": {{"city": "苏州市", "district": "吴中区", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
+用户消息: "华星电子苏州吴中区木渎镇金山路88号招普工30人，月薪5500-6500，联系人张经理13800138000，包吃住，两班倒"
+{{"intent": "upload_job", "structured_data": {{"hiring_company": "华星电子", "city": "苏州市", "district": "吴中区", "address": "木渎镇金山路88号", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "contact_person": "张经理", "phone": "13800138000", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
 
 示例3 - 厂家发布岗位并顺便找工人:
 用户消息: "我们苏州工业园区招电子厂普工20人，5500-6500包吃住，顺便帮我找几个合适的工人"
