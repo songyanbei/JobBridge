@@ -59,6 +59,11 @@ from app.services.search_permission import (
     denied_search_response,
     ensure_search_permission,
 )
+from app.services.visibility_contract import VisibilityScene
+from app.services.visibility_policy import (
+    EffectivePolicySnapshot, load as load_visibility_policy,
+    project_for_reranker, project_soft_preferences,
+)
 from app.tasks.common import log_event
 
 # 显式 re-export，让 mypy / IDE / runtime 都识别本模块仍提供这些名字。
@@ -74,6 +79,20 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _visibility_snapshot(db: Session, direction: str, role: str) -> EffectivePolicySnapshot:
+    scene = VisibilityScene.JOB_SEARCH if direction == "search_job" else VisibilityScene.CANDIDATE_SEARCH
+    snapshot = load_visibility_policy(db, scene, role)
+    log_event(
+        "recommendation_visibility_applied",
+        scene=scene.value, role=role,
+        policy_source=snapshot.policy_source,
+        policy_revision=snapshot.policy_revision,
+        fallback_policy_id=snapshot.fallback_policy_id,
+        visible_fields=list(snapshot.visible_fields),
+    )
+    return snapshot
 
 # §11.5: this used to be a local "v1" literal that shadowed the real prompt
 # version, so every llm_call log event reported a version the prompt had not
@@ -1067,6 +1086,7 @@ def search_jobs(
     )
     if not permission_decision.allowed:
         return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, "search_job", user_ctx.role)
 
     from app.services.recommendation_assignment_service import choose_assignment
     try:
@@ -1166,6 +1186,10 @@ def search_jobs(
 
     # 转为 dict 列表用于 rerank
     candidate_dicts = _jobs_to_dicts(candidates, db)
+    model_candidate_dicts = [
+        project_for_reranker("job_search", user_ctx.role, visibility, candidate)
+        for candidate in candidate_dicts
+    ]
 
     # Reranker（含结构化打点）
     # Phase 5 §5.3：soft_preference_ranking_enabled=True 时把 criteria 中的
@@ -1173,9 +1197,11 @@ def search_jobs(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "job_search", flags,
     )
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_job",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1188,7 +1214,7 @@ def search_jobs(
     # it declines (legacy assignment) or fails do we fall back to the legacy
     # reranker — skipping both would hand the user raw SQL `created_at DESC`.
     v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_job",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1203,7 +1229,7 @@ def search_jobs(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_jobs",
@@ -1301,7 +1327,7 @@ def search_jobs(
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
 
     # 权限过滤
-    filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+    filtered = permission_service.filter_jobs_batch(batch, user_ctx.role, visibility)
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
@@ -1393,6 +1419,7 @@ def search_workers(
     )
     if not permission_decision.allowed:
         return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, "search_worker", user_ctx.role)
 
     from app.services.recommendation_assignment_service import choose_assignment
     try:
@@ -1485,13 +1512,19 @@ def search_workers(
         return sr, so
 
     candidate_dicts = _resumes_to_dicts(candidates)
+    model_candidate_dicts = [
+        project_for_reranker("candidate_search", user_ctx.role, visibility, candidate)
+        for candidate in candidate_dicts
+    ]
 
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "candidate_search", flags,
     )
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_worker",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1502,7 +1535,7 @@ def search_workers(
     ) if shadow_due else None
     # See search_jobs: v1 first, legacy rerank only as the declined/failed path.
     v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_worker",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1517,7 +1550,7 @@ def search_workers(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_workers",
@@ -1610,7 +1643,9 @@ def search_workers(
     # 构建 users_map 用于权限过滤
     owner_ids = list({r.get("owner_userid", "") for r in batch})
     users_map = _build_users_map(owner_ids, db)
-    filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+    filtered = permission_service.filter_resumes_batch(
+        batch, users_map, user_ctx.role, visibility,
+    )
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
@@ -1702,6 +1737,7 @@ def show_more(
     )
     if not permission_decision.allowed:
         return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, direction, user_ctx.role)
     # §5.4.1: a v1 snapshot is pinned to the fixed page size of 3.  Reading the
     # legacy `match.top_n` here made paging drift off the v1 contract whenever
     # the historical production value was not 3.
@@ -1774,14 +1810,14 @@ def show_more(
             # 重新查询验证有效性
             valid = _validate_job_ids(batch_ids, db)
             valid_dicts = _jobs_to_dicts(valid, db)
-            filtered = permission_service.filter_jobs_batch(valid_dicts, user_ctx.role)
+            filtered = permission_service.filter_jobs_batch(valid_dicts, user_ctx.role, visibility)
         else:
             valid = _validate_resume_ids(batch_ids, db)
             valid_dicts = _resumes_to_dicts(valid)
             owner_ids = list({r.get("owner_userid", "") for r in valid_dicts})
             users_map = _build_users_map(owner_ids, db)
             filtered = permission_service.filter_resumes_batch(
-                valid_dicts, users_map, user_ctx.role,
+                valid_dicts, users_map, user_ctx.role, visibility,
             )
 
         collected.extend(filtered)
@@ -2346,6 +2382,7 @@ def execute_relaxed_search(
     )
     if not permission_decision.allowed:
         return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, direction, user_ctx.role)
 
     if direction == "search_job":
         relaxed = _compute_relaxed_criteria_job(original_criteria, step)
@@ -2428,13 +2465,22 @@ def execute_relaxed_search(
         candidate_dicts = _jobs_to_dicts(candidates, db)
     else:
         candidate_dicts = _resumes_to_dicts(candidates)
+    model_candidate_dicts = [
+        project_for_reranker(
+            "job_search" if direction == "search_job" else "candidate_search",
+            user_ctx.role, visibility, candidate,
+        )
+        for candidate in candidate_dicts
+    ]
 
     frame = "candidate_search" if direction == "search_worker" else "job_search"
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame, flags)
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     digest = conversation_service.compute_query_digest(relaxed)
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction=direction,
         criteria=relaxed,
         userid=user_ctx.external_userid,
@@ -2450,7 +2496,7 @@ def execute_relaxed_search(
     # the *legacy* soft-preference gate and fed those ranks into v1 as semantic
     # scores, which broke both contracts at once.
     v1_meta = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction=direction,
         criteria=relaxed,
         userid=user_ctx.external_userid,
@@ -2469,7 +2515,7 @@ def execute_relaxed_search(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site=f"execute_relaxed_search:{direction}",
@@ -2551,11 +2597,13 @@ def execute_relaxed_search(
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
 
     if direction == "search_job":
-        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role, visibility)
     else:
         owner_ids = list({r.get("owner_userid", "") for r in batch})
         users_map = _build_users_map(owner_ids, db)
-        filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+        filtered = permission_service.filter_resumes_batch(
+            batch, users_map, user_ctx.role, visibility,
+        )
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
