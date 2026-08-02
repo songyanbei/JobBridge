@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import threading
-import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
@@ -35,11 +34,9 @@ PRIMARY_READ_EXECUTION_OPTION = "visibility_policy_primary_read"
 
 PolicySource = Literal["database", "builtin_safe_fallback"]
 POLICY_LOAD_ALERT_THRESHOLD = 3
-POLICY_LOAD_ALERT_DEDUPE_SECONDS = 300
 _metrics_lock = threading.Lock()
 _load_failure_total = 0
 _consecutive_load_failures = 0
-_last_alert_by_reason: dict[str, float] = {}
 
 
 def visibility_policy_load_metrics() -> dict:
@@ -48,7 +45,6 @@ def visibility_policy_load_metrics() -> dict:
             "visibility_policy_load_failure_total": _load_failure_total,
             "consecutive_failures": _consecutive_load_failures,
             "alert_threshold": POLICY_LOAD_ALERT_THRESHOLD,
-            "alert_dedupe_seconds": POLICY_LOAD_ALERT_DEDUPE_SECONDS,
         }
 
 
@@ -60,28 +56,29 @@ def _record_policy_load_success() -> None:
 
 def _record_policy_load_failure(reason: str) -> None:
     global _load_failure_total, _consecutive_load_failures
-    now = time.monotonic()
-    should_alert = False
     with _metrics_lock:
         _load_failure_total += 1
         _consecutive_load_failures += 1
         total = _load_failure_total
         consecutive = _consecutive_load_failures
-        last_alert = _last_alert_by_reason.get(reason, 0.0)
-        if consecutive >= POLICY_LOAD_ALERT_THRESHOLD and now - last_alert >= POLICY_LOAD_ALERT_DEDUPE_SECONDS:
-            _last_alert_by_reason[reason] = now
-            should_alert = True
     log_event(
         "visibility_policy_load_failure_metric",
         metric="visibility_policy_load_failure_total", total=total,
         consecutive_failures=consecutive, failure_reason=reason,
     )
-    if should_alert:
-        log_event(
-            "visibility_policy_load_alert", severity="alert",
-            consecutive_failures=consecutive, failure_reason=reason,
-            dedupe_seconds=POLICY_LOAD_ALERT_DEDUPE_SECONDS,
-        )
+    if consecutive >= POLICY_LOAD_ALERT_THRESHOLD:
+        try:
+            # Shared production channel: Redis dedupe + WeCom group push + retry queue.
+            from app.tasks.worker_monitor import _alert
+            _alert(
+                "visibility_policy_load_alert",
+                f"推荐权限策略连续加载失败 {consecutive} 次，原因：{reason}",
+            )
+        except Exception:
+            log_event(
+                "visibility_policy_load_alert_delivery_failed",
+                consecutive_failures=consecutive, failure_reason=reason,
+            )
 
 
 class VisibilityPolicyValidationError(ValueError):

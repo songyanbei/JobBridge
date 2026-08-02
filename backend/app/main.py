@@ -184,6 +184,7 @@ def health_check():
 
 
 def _readiness_report() -> dict:
+    from app.services.visibility_policy import visibility_policy_load_metrics
     db = SessionLocal()
     try:
         db.execute(text("SELECT 1"))
@@ -192,12 +193,14 @@ def _readiness_report() -> dict:
         return {
             "status": "ready" if policy["ok"] else "not_ready",
             "db": {"ok": True}, "visibility_policy": policy,
+            "visibility_policy_load_metrics": visibility_policy_load_metrics(),
         }
     except Exception as exc:
         logger.warning("readiness check failed: %s", type(exc).__name__)
         return {
             "status": "not_ready", "db": {"ok": False},
             "visibility_policy": {"ok": False, "error": type(exc).__name__},
+            "visibility_policy_load_metrics": visibility_policy_load_metrics(),
         }
     finally:
         db.close()
