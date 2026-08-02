@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app import main as main_module
 from app.api.deps import get_db, require_admin_password_changed
 from app.core.exceptions import BusinessException
 from app.main import app
@@ -101,3 +102,45 @@ def test_viewer_cannot_save_or_restore_policy(method, path, body):
         app.dependency_overrides.clear()
     assert response.status_code == 200
     assert response.json()["code"] == 40301
+
+
+def test_integrity_requires_matching_complete_success_audit():
+    policy = default_policy_document(2)
+    item = _item(2)
+    audit = SimpleNamespace(
+        id=9, operator="admin", created_at=None,
+        snapshot={"after": {"config_value": policy, "revision": 2, "schema_version": 1}},
+    )
+    policy_query, audit_query, ttl_query = MagicMock(), MagicMock(), MagicMock()
+    policy_query.filter.return_value.first.return_value = item
+    audit_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [audit]
+    ttl_query.filter.return_value.first.return_value = SimpleNamespace(config_value="180")
+    db = MagicMock()
+    db.query.side_effect = [policy_query, audit_query, ttl_query]
+    assert service.check_visibility_policy_integrity(db) == {
+        "ok": True, "revision": 2, "audit_id": 9,
+    }
+
+
+def test_integrity_fails_when_active_revision_audit_is_missing():
+    policy_query, audit_query, ttl_query = MagicMock(), MagicMock(), MagicMock()
+    policy_query.filter.return_value.first.return_value = _item(2)
+    audit_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
+    ttl_query.filter.return_value.first.return_value = SimpleNamespace(config_value="180")
+    db = MagicMock()
+    db.query.side_effect = [policy_query, audit_query, ttl_query]
+    result = service.check_visibility_policy_integrity(db)
+    assert result["ok"] is False
+    assert result["error"] == "active_revision_success_audit_missing"
+
+
+def test_readiness_returns_503_but_liveness_stays_200(monkeypatch):
+    monkeypatch.setattr(main_module, "_readiness_report", lambda: {
+        "status": "not_ready", "db": {"ok": True},
+        "visibility_policy": {"ok": False, "error": "visibility_policy_missing"},
+    })
+    client = TestClient(app)
+    ready = client.get("/ready")
+    assert ready.status_code == 503
+    assert ready.json()["status"] == "not_ready"
+    assert client.get("/health").status_code == 200

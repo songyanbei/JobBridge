@@ -22,7 +22,7 @@ from app.config import settings
 from app.core.exceptions import AppError, BusinessException
 from app.core.logging_setup import configure_loguru
 from app.core.responses import fail
-from app.db import engine
+from app.db import SessionLocal
 from app.tasks import scheduler as task_scheduler
 
 logger = logging.getLogger(__name__)
@@ -179,38 +179,32 @@ app.include_router(events_router)
 
 @app.get("/health", tags=["system"])
 def health_check():
-    """健康检查，检测应用与数据库状态。"""
-    db_ok = False
-    db_error: str | None = None
-    visibility_policy_ok = False
-    visibility_policy_error: str | None = None
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            value = conn.execute(text(
-                "SELECT config_value FROM system_config "
-                "WHERE config_key = 'visibility.recommendation_fields'"
-            )).scalar_one_or_none()
-            if value is None:
-                visibility_policy_error = "visibility_policy_missing"
-            else:
-                from app.services.visibility_policy import normalize_policy
-                normalize_policy(value)
-                visibility_policy_ok = True
-        db_ok = True
-    except Exception as exc:
-        db_error = str(exc)
+    """Liveness: the API process is running."""
+    return {"status": "ok", "env": settings.app_env, "version": app.version}
 
-    return {
-        "status": "ok" if db_ok and visibility_policy_ok else "degraded",
-        "env": settings.app_env,
-        "version": app.version,
-        "db": {
-            "ok": db_ok,
-            "error": db_error,
-        },
-        "visibility_policy": {
-            "ok": visibility_policy_ok,
-            "error": visibility_policy_error,
-        },
-    }
+
+def _readiness_report() -> dict:
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        from app.services.system_config_service import check_visibility_policy_integrity
+        policy = check_visibility_policy_integrity(db)
+        return {
+            "status": "ready" if policy["ok"] else "not_ready",
+            "db": {"ok": True}, "visibility_policy": policy,
+        }
+    except Exception as exc:
+        logger.warning("readiness check failed: %s", type(exc).__name__)
+        return {
+            "status": "not_ready", "db": {"ok": False},
+            "visibility_policy": {"ok": False, "error": type(exc).__name__},
+        }
+    finally:
+        db.close()
+
+
+@app.get("/ready", tags=["system"])
+def readiness_check():
+    """Readiness: DB policy and its successful audit must be complete."""
+    report = _readiness_report()
+    return JSONResponse(status_code=200 if report["status"] == "ready" else 503, content=report)

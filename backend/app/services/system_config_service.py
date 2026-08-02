@@ -304,3 +304,28 @@ def restore_visibility_policy(
         db, entry["config_value"], expected_revision, operator,
         confirm_sensitive_expansion, reason=f"visibility_policy_restore:{revision}",
     )
+
+
+def check_visibility_policy_integrity(db: Session) -> dict:
+    """Verify that the active database policy has a complete successful audit."""
+
+    item = _policy_item(db)
+    current = _policy_document(item)
+    rows = db.query(AuditLog).filter(
+        AuditLog.target_type == "system",
+        AuditLog.target_id == VISIBILITY_POLICY_KEY,
+        AuditLog.action == "manual_edit",
+    ).order_by(AuditLog.created_at.desc()).limit(200).all()
+    retention = _audit_retention_days(db)
+    for row in rows:
+        entry = _history_entry(row, retention)
+        if (
+            entry
+            and entry["revision"] == current.revision
+            and entry["config_value"] == current.as_dict()
+        ):
+            return {"ok": True, "revision": current.revision, "audit_id": row.id}
+    return {
+        "ok": False, "revision": current.revision,
+        "error": "active_revision_success_audit_missing",
+    }
