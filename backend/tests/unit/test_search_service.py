@@ -199,6 +199,23 @@ class TestFormatJobResults:
         )
         assert "匹配依据：地点符合 苏州市" in text_with_reason
 
+    def test_hidden_salary_and_location_render_no_empty_lines(self):
+        text = _format_job_results(
+            [{"id": 1, "hiring_company": "甲厂", "hiring_company_source": "job.hiring_company", "job_category": "普工"}],
+            0,
+        )
+        assert "0元/月" not in text
+        assert "💰" not in text
+        assert "📍" not in text
+
+    def test_visible_benefits_without_salary_have_own_line(self):
+        text = _format_job_results(
+            [{"id": 1, "job_category": "普工", "provide_meal": True, "provide_housing": False}],
+            0,
+        )
+        assert "福利：包吃" in text
+        assert "0元/月" not in text
+
 
 class TestFormatResumeResults:
     def test_basic_format(self):
@@ -226,6 +243,28 @@ class TestFormatResumeResults:
         ]
         text = _format_resume_results(resumes, 0)
         assert "联系方式待补充" in text
+
+    def test_category_only_does_not_render_zero_salary(self):
+        text = _format_resume_results(
+            [{"id": 1, "expected_job_categories": ["普工"]}], 0,
+        )
+        assert "期望工种：普工" in text
+        assert "0+/月" not in text
+
+    def test_salary_only_does_not_render_empty_category(self):
+        text = _format_resume_results(
+            [{"id": 1, "salary_expect_floor_monthly": 6000}], 0,
+        )
+        assert "期望薪资：6000+/月" in text
+        assert "期望：，" not in text
+
+    @pytest.mark.parametrize(
+        ("candidate", "expected"),
+        [({"id": 1, "gender": "女"}, "女"), ({"id": 1, "age": 28}, "28岁")],
+    )
+    def test_partial_gender_age_renders_present_component(self, candidate, expected):
+        text = _format_resume_results([candidate], 0)
+        assert expected in text
 
 
 def test_relaxation_summary_shows_original_and_relaxed_salary_values():

@@ -3078,36 +3078,48 @@ def _format_job_results(
         marker = markers[i] if i < len(markers) else f"({i+1})"
         company = j.get("hiring_company") or j.get("company", "")
         company_source = j.get("hiring_company_source")
-        category = j.get("job_category", "")
+        category = j.get("job_category")
         if company and company_source == "job.hiring_company":
-            title = f"招聘工厂：{company} | {category}"
+            company_title = f"招聘工厂：{company}"
         elif company and company_source == "publisher_company_fallback":
-            title = f"发布主体：{company}（历史回退） | {category}"
+            company_title = f"发布主体：{company}（历史回退）"
         else:
-            title = f"{company} | {category}" if company else category
+            company_title = company or ""
+        title = " | ".join(part for part in (company_title, category) if part)
+        if not title:
+            title = "岗位"
 
-        salary_floor = j.get("salary_floor_monthly", 0)
+        salary_floor = j.get("salary_floor_monthly")
         salary_ceil = j.get("salary_ceiling_monthly")
-        pay_type = j.get("pay_type", "")
-        if salary_ceil and salary_ceil > salary_floor:
+        pay_type = j.get("pay_type")
+        if salary_floor is not None and salary_ceil is not None and salary_ceil > salary_floor:
             salary_str = f"{salary_floor}-{salary_ceil}元/月"
-        else:
+        elif salary_floor is not None:
             salary_str = f"{salary_floor}元/月"
+        elif salary_ceil is not None:
+            salary_str = f"最高{salary_ceil}元/月"
+        else:
+            salary_str = ""
 
         benefits = []
         if j.get("provide_meal"):
             benefits.append("包吃")
         if j.get("provide_housing"):
             benefits.append("包住")
-        benefit_str = f"（{pay_type}，{''.join(benefits)}）" if benefits else f"（{pay_type}）"
+        salary_notes = [note for note in (pay_type, "".join(benefits)) if note]
+        benefit_str = f"（{'，'.join(salary_notes)}）" if salary_notes else ""
 
         city = j.get("city", "")
         district = j.get("district", "")
         location = f"{city}{district}" if district else city
 
         lines.append(f"{marker} {title}")
-        lines.append(f"   💰 {salary_str}{benefit_str}")
-        lines.append(f"   📍 {location}")
+        if salary_str:
+            lines.append(f"   💰 {salary_str}{benefit_str}")
+        elif benefits:
+            lines.append(f"   🍱 福利：{'、'.join(benefits)}")
+        if location:
+            lines.append(f"   📍 {location}")
         address = j.get("address")
         address_source = j.get("address_source")
         if address and address_source == "job.address":
@@ -3161,21 +3173,28 @@ def _format_resume_results(
 
     for i, r in enumerate(resumes):
         marker = markers[i] if i < len(markers) else f"({i+1})"
-        name = r.get("display_name", "求职者")
-        gender = r.get("gender", "")
-        age = r.get("age", "")
-        title = f"{name} | {gender} {age}岁" if gender and age else name
+        name = (r.get("display_name") or "求职者") if "display_name" in r else ""
+        gender = r.get("gender")
+        age = r.get("age")
+        demographics = " ".join(
+            part for part in (gender, f"{age}岁" if age is not None else "") if part
+        )
+        title = " | ".join(part for part in (name, demographics) if part) or "候选人"
 
         categories = r.get("expected_job_categories", [])
         cat_str = "/".join(categories) if categories else ""
-        salary = r.get("salary_expect_floor_monthly", 0)
+        salary = r.get("salary_expect_floor_monthly")
 
         cities = r.get("expected_cities", [])
         city_str = "、".join(cities) if cities else ""
 
         lines.append(f"{marker} {title}")
-        if cat_str or salary:
+        if cat_str and salary is not None:
             lines.append(f"   🔧 期望：{cat_str}，{salary}+/月")
+        elif cat_str:
+            lines.append(f"   🔧 期望工种：{cat_str}")
+        elif salary is not None:
+            lines.append(f"   💰 期望薪资：{salary}+/月")
         if city_str:
             lines.append(f"   📍 期望城市：{city_str}")
         for reason_line in (reason_lines_by_id or {}).get(str(r.get("id", "")), []):
