@@ -1,5 +1,6 @@
 """search_service 单元测试。"""
 import json
+import hashlib
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
@@ -20,6 +21,7 @@ from app.services.search_service import (
     _format_no_match_with_suggestions_resume,
     _format_resume_results,
     _is_job_search,
+    _is_phase5_policy_enabled_for_user,
     _job_salary_covers_floor,
     _json_scalar,
     _probe_job_suggestions,
@@ -157,6 +159,18 @@ class TestIsJobSearch:
     def test_broker_worker_direction(self):
         session = _make_session("broker", broker_direction="search_worker")
         assert _is_job_search(session, _make_user_ctx("broker")) is False
+
+
+def test_phase5_rollout_check_does_not_require_intent_service_import():
+    policy = search_service.settings.dialogue_policy
+    userid = "rollout-user"
+    bucket = int(hashlib.md5(userid.encode()).hexdigest()[:8], 16) % 100
+    expected = (
+        policy.post_search_policy_mode == "on"
+        and policy.phase5_rollout_percentage > 0
+        and (policy.phase5_rollout_percentage >= 100 or bucket < policy.phase5_rollout_percentage)
+    )
+    assert _is_phase5_policy_enabled_for_user(userid) is expected
 
 
 class TestFormatJobResults:

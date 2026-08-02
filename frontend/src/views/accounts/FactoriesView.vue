@@ -41,7 +41,7 @@
         <el-button @click="resetFilters">重置</el-button>
       </template>
 
-      <el-table-column prop="userid" label="UserID" width="160" />
+      <el-table-column prop="external_userid" label="UserID" width="180" />
       <el-table-column prop="display_name" label="名称" />
       <el-table-column prop="company" label="公司" />
       <el-table-column prop="contact_person" label="联系人" />
@@ -53,8 +53,8 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column prop="created_at" label="创建时间" width="160">
-        <template #default="{ row }">{{ formatDateTime(row.created_at) }}</template>
+      <el-table-column prop="registered_at" label="创建时间" width="160">
+        <template #default="{ row }">{{ formatDateTime(row.registered_at) }}</template>
       </el-table-column>
       <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
@@ -169,16 +169,16 @@ async function onCreate(payload) {
 }
 
 function openDetail(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   detailVisible.value = true
 }
 
 function openBlock(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   blockVisible.value = true
 }
 function openUnblock(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   unblockVisible.value = true
 }
 

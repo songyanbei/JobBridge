@@ -166,9 +166,22 @@ def _job_salary_covers_floor(salary_floor: int):
 
 
 def _is_phase5_policy_enabled_for_user(userid: str | None) -> bool:
-    from app.services.intent_service import is_phase5_policy_enabled
+    """Evaluate the shared rollout contract without cold-importing intent schemas.
 
-    return is_phase5_policy_enabled(userid or "")
+    Importing ``intent_service`` here used to build every dialogue frame and
+    query job-category dictionaries on the first search request.  Besides
+    coupling search availability to unrelated metadata, an unavailable DB made
+    that cold path wait for every connection timeout before fallback.
+    """
+    normalized_userid = userid or ""
+    policy = settings.dialogue_policy
+    percentage = policy.phase5_rollout_percentage
+    if policy.post_search_policy_mode != "on" or not normalized_userid or percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+    digest = hashlib.md5(normalized_userid.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100 < percentage
 
 
 def _normalize_experience_flags(

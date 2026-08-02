@@ -1,14 +1,14 @@
 <template>
   <DetailDrawer
     v-model="visible"
-    title="账号详情"
+    title="账号详情与编辑"
     :loading="loading"
     :dirty="dirty"
     size="520px"
   >
     <div v-if="detail">
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="UserID">{{ detail.userid }}</el-descriptions-item>
+        <el-descriptions-item label="UserID">{{ detail.external_userid }}</el-descriptions-item>
         <el-descriptions-item label="显示名称">{{ detail.display_name || '--' }}</el-descriptions-item>
         <el-descriptions-item label="公司">
           <el-input v-if="role !== 'worker' && dirty" v-model="accountCompany" @input="markDirty" />
@@ -41,7 +41,7 @@
           </el-descriptions-item>
         </template>
         <el-descriptions-item label="创建时间">
-          {{ formatDateTime(detail.created_at) }}
+          {{ formatDateTime(detail.registered_at) }}
         </el-descriptions-item>
       </el-descriptions>
     </div>
@@ -113,20 +113,18 @@ async function save() {
   if (!detail.value) return
   saving.value = true
   try {
+    const userid = detail.value.external_userid
     if (props.role === 'broker') {
-      await updateBroker(detail.value.userid, {
-        version: detail.value.version,
-        fields: {
-          company: accountCompany.value,
-          address: accountAddress.value,
-          can_search_jobs: capJobs.value,
-          can_search_workers: capWorkers.value,
-        },
+      await updateBroker(userid, {
+        company: accountCompany.value,
+        address: accountAddress.value,
+        can_search_jobs: capJobs.value,
+        can_search_workers: capWorkers.value,
       })
     } else {
-      await updateFactory(detail.value.userid, {
-        version: detail.value.version,
-        fields: { company: accountCompany.value, address: accountAddress.value },
+      await updateFactory(userid, {
+        company: accountCompany.value,
+        address: accountAddress.value,
       })
     }
     ElMessage.success('已保存')
