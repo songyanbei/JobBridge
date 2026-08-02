@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -106,6 +107,23 @@ def test_integrity_requires_matching_complete_success_audit():
     }
 
 
+def test_expired_active_audit_anchor_still_satisfies_readiness_integrity():
+    policy = default_policy_document(2)
+    audit = SimpleNamespace(
+        id=10, operator="admin",
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=181),
+        snapshot={"after": {"config_value": policy, "revision": 2, "schema_version": 1}},
+    )
+    policy_query, audit_query, ttl_query = MagicMock(), MagicMock(), MagicMock()
+    policy_query.filter.return_value.first.return_value = _item(2)
+    audit_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [audit]
+    ttl_query.filter.return_value.first.return_value = SimpleNamespace(config_value="180")
+    db = MagicMock()
+    db.query.side_effect = [policy_query, audit_query, ttl_query]
+    result = service.check_visibility_policy_integrity(db)
+    assert result == {"ok": True, "revision": 2, "audit_id": 10}
+
+
 def test_integrity_fails_when_active_revision_audit_is_missing():
     policy_query, audit_query, ttl_query = MagicMock(), MagicMock(), MagicMock()
     policy_query.filter.return_value.first.return_value = _item(2)
@@ -116,4 +134,3 @@ def test_integrity_fails_when_active_revision_audit_is_missing():
     result = service.check_visibility_policy_integrity(db)
     assert result["ok"] is False
     assert result["error"] == "active_revision_success_audit_missing"
-

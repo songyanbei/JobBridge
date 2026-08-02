@@ -240,6 +240,29 @@ def _batch_hard_delete(db, table: str, where: str) -> int:
     return total
 
 
+def _hard_delete_expired_audit_logs(db, retention_days: int) -> int:
+    """Delete expired history while retaining the active policy audit anchor."""
+
+    where = f"""
+        created_at < NOW() - INTERVAL {int(retention_days)} DAY
+        AND NOT EXISTS (
+            SELECT 1
+            FROM `system_config` sc
+            WHERE sc.config_key = 'visibility.recommendation_fields'
+              AND JSON_VALID(sc.config_value)
+              AND `audit_log`.target_type = 'system'
+              AND `audit_log`.target_id = sc.config_key
+              AND `audit_log`.action = 'manual_edit'
+              AND JSON_VALID(`audit_log`.snapshot)
+              AND CAST(JSON_UNQUOTE(JSON_EXTRACT(`audit_log`.snapshot, '$.after.revision')) AS UNSIGNED)
+                  = CAST(JSON_UNQUOTE(JSON_EXTRACT(sc.config_value, '$.revision')) AS UNSIGNED)
+              AND JSON_EXTRACT(`audit_log`.snapshot, '$.after.config_value')
+                  = CAST(sc.config_value AS JSON)
+        )
+    """
+    return _batch_hard_delete(db, "audit_log", where)
+
+
 def _safe_step(step_name: str, stats: dict, fn) -> None:
     """把每一步包在 try/except 内，单步失败不影响其它步骤。"""
     try:
@@ -586,10 +609,7 @@ def run() -> None:
             _safe_step(
                 "hard_delete_audit_log",
                 stats,
-                lambda: _batch_hard_delete(
-                    db, "audit_log",
-                    f"created_at < NOW() - INTERVAL {int(audit_days)} DAY",
-                ),
+                lambda: _hard_delete_expired_audit_logs(db, audit_days),
             )
 
         log_event("ttl_cleanup_summary", **stats)
