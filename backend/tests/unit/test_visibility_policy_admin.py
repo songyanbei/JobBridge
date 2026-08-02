@@ -134,3 +134,15 @@ def test_integrity_fails_when_active_revision_audit_is_missing():
     result = service.check_visibility_policy_integrity(db)
     assert result["ok"] is False
     assert result["error"] == "active_revision_success_audit_missing"
+
+
+def test_not_ready_report_returns_http_503(monkeypatch):
+    from app import main as main_module
+
+    monkeypatch.setattr(main_module, "_readiness_report", lambda: {
+        "status": "not_ready", "db": {"ok": True},
+        "visibility_policy": {"ok": False},
+        "visibility_policy_load_metrics": {},
+    })
+    response = main_module.readiness_check()
+    assert response.status_code == 503
