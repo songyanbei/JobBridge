@@ -69,6 +69,8 @@ def test_success_increments_revision_and_writes_normalized_audit():
     item = _item()
     db = _db(item)
     policy = default_policy_document(999)
+    policy.pop("schema_version")
+    policy.pop("revision")
     with patch.object(service, "write_admin_log") as write_log:
         result = service.update_visibility_policy(db, policy, 1, "admin")
     assert result["revision"] == 2
