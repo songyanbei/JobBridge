@@ -105,6 +105,7 @@ _JOB_UPLOAD_FIELDS: frozenset[str] = frozenset({
     "height_required", "experience_required", "education_required",
     "rebate", "employment_type", "contract_type", "min_duration",
     "job_sub_category", "age_min", "age_max",
+    "hiring_company", "address", "contact_person", "phone",
 })
 
 # resume_upload frame 合法字段集合
@@ -432,7 +433,17 @@ def _build_job_upload() -> FrameDef:
         sd = job_search.slots.get(name)
         if sd is None:
             # 未在 job_search 显式定义的字段（如某些 upload 专属字段），用 str fallback
-            sd = _slot(name, slot_type=_str_type(), display_name=name)
+            display_names = {
+                "hiring_company": "招聘工厂",
+                "address": "岗位工作地址",
+                "contact_person": "岗位联系人",
+                "phone": "岗位联系电话",
+            }
+            sd = _slot(
+                name,
+                slot_type=_str_type(),
+                display_name=display_names.get(name, name),
+            )
         # upload 必填字段标 askable=True；filter_mode 对 upload 无意义，统一 hard。
         # 模板 search → upload 切换：保留任何 slot 自定义模板（非 SEARCH 默认）。
         if sd.prompt_template == SEARCH_PROMPT_DEFAULT:

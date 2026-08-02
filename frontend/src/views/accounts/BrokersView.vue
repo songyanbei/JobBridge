@@ -41,7 +41,7 @@
         <el-button @click="resetFilters">重置</el-button>
       </template>
 
-      <el-table-column prop="userid" label="UserID" width="160" />
+      <el-table-column prop="external_userid" label="UserID" width="180" />
       <el-table-column prop="display_name" label="名称" />
       <el-table-column prop="company" label="机构" />
       <el-table-column prop="contact_person" label="联系人" />
@@ -64,7 +64,7 @@
       </el-table-column>
       <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
-          <el-button link type="primary" size="small" @click="openDetail(row)">详情</el-button>
+          <el-button link type="primary" size="small" @click="openDetail(row)">编辑</el-button>
           <el-button
             v-if="row.status !== 'blocked'"
             link
@@ -174,15 +174,15 @@ async function onCreate(payload) {
 }
 
 function openDetail(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   detailVisible.value = true
 }
 function openBlock(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   blockVisible.value = true
 }
 function openUnblock(row) {
-  currentUserid.value = row.userid
+  currentUserid.value = row.external_userid
   unblockVisible.value = true
 }
 

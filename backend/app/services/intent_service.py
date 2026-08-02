@@ -828,6 +828,20 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
     if field in {"salary_floor_monthly", "salary_ceiling_monthly", "salary_expect_floor_monthly"}:
         return _normalize_int_field(value, lo=_SALARY_MIN, hi=_SALARY_MAX)
 
+    max_lengths = {
+        "hiring_company": 128,
+        "address": 255,
+        "contact_person": 64,
+        "phone": 32,
+    }
+    if field in max_lengths:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized or len(normalized) > max_lengths[field]:
+            return None
+        return normalized
+
     return value
 
 

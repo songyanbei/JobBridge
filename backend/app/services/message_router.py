@@ -55,6 +55,11 @@ from app.services.intent_service import (
     classify_intent,
 )
 from app.services.recommendation_experience_gate import userid_hash
+from app.services.search_permission import (
+    ResolvedSearchDirection,
+    check_search_permission,
+    denied_search_response,
+)
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -1242,6 +1247,16 @@ def _route_v2_relaxation_response(
         original_criteria = dict(pending.get("original_criteria") or {})
         step = pending.get("step") or ""
         direction = pending.get("direction") or "search_job"
+        permission_decision = check_search_permission(
+            user_ctx,
+            direction,
+            entrypoint="message_router.confirmed_relaxation",
+            request_id=msg.msg_id,
+        )
+        if not permission_decision.allowed:
+            session.pending_relaxation = None
+            denied_result, _ = denied_search_response(permission_decision)
+            return [_reply(userid, denied_result.reply_text)]
         persisted_raw_query = pending.get("raw_query") or ""
         persisted_user_msg_id = pending.get("user_msg_id")
         original_visible_count = int(pending.get("original_visible_count") or 0)
@@ -1796,11 +1811,16 @@ def _handle_show_more(
     db: Session,
 ) -> list[ReplyMessage]:
     # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
-    direction = (
-        "search_job"
-        if (user_ctx.role == "worker" or session.broker_direction == "search_job")
-        else "search_worker"
+    direction = search_service.resolve_show_more_direction(session, user_ctx)
+    permission_decision = check_search_permission(
+        user_ctx,
+        direction,
+        entrypoint="message_router.show_more",
+        request_id=msg.msg_id,
     )
+    if not permission_decision.allowed:
+        denied_result, _ = denied_search_response(permission_decision)
+        return [_reply(msg.from_user, denied_result.reply_text)]
     experience_flags = _experience_flags_for(
         user_ctx, direction=direction, emit_log=True,
     )
@@ -2492,6 +2512,14 @@ def _run_search(
     Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
+    permission_decision = check_search_permission(
+        user_ctx,
+        direction,
+        entrypoint="message_router.run_search",
+        request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
     experience_flags = _experience_flags_for(
         user_ctx, direction=direction, emit_log=True,
     )
@@ -2673,6 +2701,12 @@ def _resolve_search_direction(
         return "search_job"
 
     if intent == "search_job":
+        if user_ctx.role == "factory":
+            return ResolvedSearchDirection(
+                "search_job",
+                supported=False,
+                reason_code="role_direction_forbidden",
+            )
         if user_ctx.role == "broker":
             session.broker_direction = "search_job"
         return "search_job"

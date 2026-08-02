@@ -16,6 +16,10 @@ class JobBase(BaseModel):
     age_max: int | None = None
     is_long_term: bool = True
     raw_text: str
+    hiring_company: str | None = Field(default=None, max_length=128)
+    address: str | None = Field(default=None, max_length=255)
+    contact_person: str | None = Field(default=None, max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
 
 
 class JobCreate(JobBase):
@@ -60,6 +64,10 @@ class JobUpdate(BaseModel):
     age_max: int | None = None
     is_long_term: bool | None = None
     district: str | None = None
+    address: str | None = Field(default=None, max_length=255)
+    hiring_company: str | None = Field(default=None, max_length=128)
+    contact_person: str | None = Field(default=None, max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
     provide_meal: bool | None = None
     provide_housing: bool | None = None
     dorm_condition: str | None = None
@@ -88,6 +96,9 @@ class JobRead(BaseModel):
     """岗位完整输出 DTO。"""
     id: int
     owner_userid: str
+    hiring_company: str | None = None
+    contact_person: str | None = None
+    phone: str | None = None
 
     # 硬过滤
     city: str

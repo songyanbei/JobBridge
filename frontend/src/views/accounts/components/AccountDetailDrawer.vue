@@ -1,16 +1,23 @@
 <template>
   <DetailDrawer
     v-model="visible"
-    title="账号详情"
+    title="账号详情与编辑"
     :loading="loading"
     :dirty="dirty"
     size="520px"
   >
     <div v-if="detail">
       <el-descriptions :column="1" border>
-        <el-descriptions-item label="UserID">{{ detail.userid }}</el-descriptions-item>
+        <el-descriptions-item label="UserID">{{ detail.external_userid }}</el-descriptions-item>
         <el-descriptions-item label="显示名称">{{ detail.display_name || '--' }}</el-descriptions-item>
-        <el-descriptions-item label="公司">{{ detail.company || '--' }}</el-descriptions-item>
+        <el-descriptions-item label="公司">
+          <el-input v-if="role !== 'worker' && dirty" v-model="accountCompany" @input="markDirty" />
+          <span v-else>{{ detail.company || '--' }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="公司 / 经营地址">
+          <el-input v-if="role !== 'worker' && dirty" v-model="accountAddress" @input="markDirty" placeholder="不是岗位工作地址" />
+          <span v-else>{{ detail.address || '--' }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="联系人">{{ detail.contact_person || '--' }}</el-descriptions-item>
         <el-descriptions-item label="电话">{{ detail.phone || '--' }}</el-descriptions-item>
         <el-descriptions-item label="角色">{{ detail.role || role }}</el-descriptions-item>
@@ -34,7 +41,7 @@
           </el-descriptions-item>
         </template>
         <el-descriptions-item label="创建时间">
-          {{ formatDateTime(detail.created_at) }}
+          {{ formatDateTime(detail.registered_at) }}
         </el-descriptions-item>
       </el-descriptions>
     </div>
@@ -73,6 +80,8 @@ const saving = ref(false)
 const dirty = ref(false)
 const capJobs = ref(false)
 const capWorkers = ref(false)
+const accountCompany = ref('')
+const accountAddress = ref('')
 
 watch(
   () => [props.modelValue, props.userid],
@@ -85,6 +94,8 @@ watch(
       const fetcher = props.role === 'broker' ? fetchBrokerDetail : fetchFactoryDetail
       const data = await fetcher(uid)
       detail.value = data
+      accountCompany.value = data.company || ''
+      accountAddress.value = data.address || ''
       capJobs.value = !!data.can_search_jobs
       capWorkers.value = !!data.can_search_workers
     } finally {
@@ -102,18 +113,18 @@ async function save() {
   if (!detail.value) return
   saving.value = true
   try {
+    const userid = detail.value.external_userid
     if (props.role === 'broker') {
-      await updateBroker(detail.value.userid, {
-        version: detail.value.version,
-        fields: {
-          can_search_jobs: capJobs.value,
-          can_search_workers: capWorkers.value,
-        },
+      await updateBroker(userid, {
+        company: accountCompany.value,
+        address: accountAddress.value,
+        can_search_jobs: capJobs.value,
+        can_search_workers: capWorkers.value,
       })
     } else {
-      await updateFactory(detail.value.userid, {
-        version: detail.value.version,
-        fields: {},
+      await updateFactory(userid, {
+        company: accountCompany.value,
+        address: accountAddress.value,
       })
     }
     ElMessage.success('已保存')

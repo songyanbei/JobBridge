@@ -54,6 +54,16 @@ from app.services.recommendation_scoring_service import (
     V1_PRECISION_POOL_SIZE,
 )
 from app.services.user_service import UserContext
+from app.services.search_permission import (
+    PermissionDecision,
+    denied_search_response,
+    ensure_search_permission,
+)
+from app.services.visibility_contract import VisibilityScene
+from app.services.visibility_policy import (
+    EffectivePolicySnapshot, load as load_visibility_policy,
+    project_for_reranker, project_soft_preferences,
+)
 from app.tasks.common import log_event
 
 # 显式 re-export，让 mypy / IDE / runtime 都识别本模块仍提供这些名字。
@@ -69,6 +79,20 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _visibility_snapshot(db: Session, direction: str, role: str) -> EffectivePolicySnapshot:
+    scene = VisibilityScene.JOB_SEARCH if direction == "search_job" else VisibilityScene.CANDIDATE_SEARCH
+    snapshot = load_visibility_policy(db, scene, role)
+    log_event(
+        "recommendation_visibility_applied",
+        scene=scene.value, role=role,
+        policy_source=snapshot.policy_source,
+        policy_revision=snapshot.policy_revision,
+        fallback_policy_id=snapshot.fallback_policy_id,
+        visible_fields=list(snapshot.visible_fields),
+    )
+    return snapshot
 
 # §11.5: this used to be a local "v1" literal that shadowed the real prompt
 # version, so every llm_call log event reported a version the prompt had not
@@ -142,9 +166,22 @@ def _job_salary_covers_floor(salary_floor: int):
 
 
 def _is_phase5_policy_enabled_for_user(userid: str | None) -> bool:
-    from app.services.intent_service import is_phase5_policy_enabled
+    """Evaluate the shared rollout contract without cold-importing intent schemas.
 
-    return is_phase5_policy_enabled(userid or "")
+    Importing ``intent_service`` here used to build every dialogue frame and
+    query job-category dictionaries on the first search request.  Besides
+    coupling search availability to unrelated metadata, an unavailable DB made
+    that cold path wait for every connection timeout before fallback.
+    """
+    normalized_userid = userid or ""
+    policy = settings.dialogue_policy
+    percentage = policy.phase5_rollout_percentage
+    if policy.post_search_policy_mode != "on" or not normalized_userid or percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+    digest = hashlib.md5(normalized_userid.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100 < percentage
 
 
 def _normalize_experience_flags(
@@ -1049,12 +1086,21 @@ def search_jobs(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """工人/中介找岗位。
 
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`，
     本子阶段产出 SearchOutcome 但调用方解构后丢弃；5.1 起 message_router 才开始消费。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, "search_job", permission_decision,
+        entrypoint="search_service.search_jobs", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, "search_job", user_ctx.role)
+
     from app.services.recommendation_assignment_service import choose_assignment
     try:
         assignment_decision = choose_assignment(
@@ -1153,6 +1199,10 @@ def search_jobs(
 
     # 转为 dict 列表用于 rerank
     candidate_dicts = _jobs_to_dicts(candidates, db)
+    model_candidate_dicts = [
+        project_for_reranker("job_search", user_ctx.role, visibility, candidate)
+        for candidate in candidate_dicts
+    ]
 
     # Reranker（含结构化打点）
     # Phase 5 §5.3：soft_preference_ranking_enabled=True 时把 criteria 中的
@@ -1160,9 +1210,11 @@ def search_jobs(
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "job_search", flags,
     )
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_job",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1175,7 +1227,7 @@ def search_jobs(
     # it declines (legacy assignment) or fails do we fall back to the legacy
     # reranker — skipping both would hand the user raw SQL `created_at DESC`.
     v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_job",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1190,7 +1242,7 @@ def search_jobs(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_jobs",
@@ -1288,7 +1340,7 @@ def search_jobs(
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
 
     # 权限过滤
-    filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+    filtered = permission_service.filter_jobs_batch(batch, user_ctx.role, visibility)
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
@@ -1368,11 +1420,20 @@ def search_workers(
     db: Session,
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """厂家/中介找工人。
 
     Phase 5 §5.0：返回类型从 `SearchResult` 改为 `tuple[SearchResult, SearchOutcome]`。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, "search_worker", permission_decision,
+        entrypoint="search_service.search_workers", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, "search_worker", user_ctx.role)
+
     from app.services.recommendation_assignment_service import choose_assignment
     try:
         assignment_decision = choose_assignment(
@@ -1464,13 +1525,19 @@ def search_workers(
         return sr, so
 
     candidate_dicts = _resumes_to_dicts(candidates)
+    model_candidate_dicts = [
+        project_for_reranker("candidate_search", user_ctx.role, visibility, candidate)
+        for candidate in candidate_dicts
+    ]
 
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(
         criteria, "candidate_search", flags,
     )
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_worker",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1481,7 +1548,7 @@ def search_workers(
     ) if shadow_due else None
     # See search_jobs: v1 first, legacy rerank only as the declined/failed path.
     v1 = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction="search_worker",
         criteria=criteria,
         userid=user_ctx.external_userid,
@@ -1496,7 +1563,7 @@ def search_workers(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site="search_workers",
@@ -1589,7 +1656,9 @@ def search_workers(
     # 构建 users_map 用于权限过滤
     owner_ids = list({r.get("owner_userid", "") for r in batch})
     users_map = _build_users_map(owner_ids, db)
-    filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+    filtered = permission_service.filter_resumes_batch(
+        batch, users_map, user_ctx.role, visibility,
+    )
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
@@ -1664,6 +1733,7 @@ def show_more(
     user_ctx: UserContext,
     db: Session,
     experience_flags: RecommendationExperienceFlags | None = None,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """show_more：从快照取下一批，跳过失效条目。
 
@@ -1674,6 +1744,13 @@ def show_more(
     """
     is_job_search = _is_job_search(session, user_ctx)
     direction = "search_job" if is_job_search else "search_worker"
+    permission_decision = ensure_search_permission(
+        user_ctx, direction, permission_decision,
+        entrypoint="search_service.show_more",
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, direction, user_ctx.role)
     # §5.4.1: a v1 snapshot is pinned to the fixed page size of 3.  Reading the
     # legacy `match.top_n` here made paging drift off the v1 contract whenever
     # the historical production value was not 3.
@@ -1746,14 +1823,14 @@ def show_more(
             # 重新查询验证有效性
             valid = _validate_job_ids(batch_ids, db)
             valid_dicts = _jobs_to_dicts(valid, db)
-            filtered = permission_service.filter_jobs_batch(valid_dicts, user_ctx.role)
+            filtered = permission_service.filter_jobs_batch(valid_dicts, user_ctx.role, visibility)
         else:
             valid = _validate_resume_ids(batch_ids, db)
             valid_dicts = _resumes_to_dicts(valid)
             owner_ids = list({r.get("owner_userid", "") for r in valid_dicts})
             users_map = _build_users_map(owner_ids, db)
             filtered = permission_service.filter_resumes_batch(
-                valid_dicts, users_map, user_ctx.role,
+                valid_dicts, users_map, user_ctx.role, visibility,
             )
 
         collected.extend(filtered)
@@ -2300,6 +2377,7 @@ def execute_relaxed_search(
     user_msg_id: str | None = None,
     experience_flags: RecommendationExperienceFlags | None = None,
     original_visible_count: int = 0,
+    permission_decision: PermissionDecision | None = None,
 ) -> tuple[SearchResult, SearchOutcome]:
     """phased-plan §5.2.1 第 4 项：用户确认放宽后的二次检索。
 
@@ -2311,6 +2389,14 @@ def execute_relaxed_search(
     权限过滤 → 文案渲染。**不再走** ``_run_*_fallback_steps`` 级联（reducer
     第二轮已由 recursion_depth=1 守护，不允许再次输出 auto_relax_and_retry）。
     """
+    permission_decision = ensure_search_permission(
+        user_ctx, direction, permission_decision,
+        entrypoint="search_service.execute_relaxed_search", request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
+    visibility = _visibility_snapshot(db, direction, user_ctx.role)
+
     if direction == "search_job":
         relaxed = _compute_relaxed_criteria_job(original_criteria, step)
     else:
@@ -2392,13 +2478,22 @@ def execute_relaxed_search(
         candidate_dicts = _jobs_to_dicts(candidates, db)
     else:
         candidate_dicts = _resumes_to_dicts(candidates)
+    model_candidate_dicts = [
+        project_for_reranker(
+            "job_search" if direction == "search_job" else "candidate_search",
+            user_ctx.role, visibility, candidate,
+        )
+        for candidate in candidate_dicts
+    ]
 
     frame = "candidate_search" if direction == "search_worker" else "job_search"
     soft_prefs, ranking_weights = _extract_soft_prefs_for_rerank(relaxed, frame, flags)
+    soft_prefs = project_soft_preferences(visibility, soft_prefs)
+    ranking_weights = {key: value for key, value in ranking_weights.items() if key in soft_prefs}
     digest = conversation_service.compute_query_digest(relaxed)
     request_now_utc = utc_now()
     shadow = _submit_shadow_candidate(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction=direction,
         criteria=relaxed,
         userid=user_ctx.external_userid,
@@ -2414,7 +2509,7 @@ def execute_relaxed_search(
     # the *legacy* soft-preference gate and fed those ranks into v1 as semantic
     # scores, which broke both contracts at once.
     v1_meta = _try_recommendation_v1(
-        candidate_dicts=candidate_dicts,
+        candidate_dicts=model_candidate_dicts,
         direction=direction,
         criteria=relaxed,
         userid=user_ctx.external_userid,
@@ -2433,7 +2528,7 @@ def execute_relaxed_search(
             top_n = legacy_top_n
         rerank_result = _rerank_with_logging(
             query=raw_query,
-            candidates=candidate_dicts[:legacy_max_candidates],
+            candidates=model_candidate_dicts[:legacy_max_candidates],
             role=user_ctx.role,
             top_n=top_n,
             call_site=f"execute_relaxed_search:{direction}",
@@ -2515,11 +2610,13 @@ def execute_relaxed_search(
     batch = [id_to_dict[cid] for cid in first_batch_ids if cid in id_to_dict]
 
     if direction == "search_job":
-        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role)
+        filtered = permission_service.filter_jobs_batch(batch, user_ctx.role, visibility)
     else:
         owner_ids = list({r.get("owner_userid", "") for r in batch})
         users_map = _build_users_map(owner_ids, db)
-        filtered = permission_service.filter_resumes_batch(batch, users_map, user_ctx.role)
+        filtered = permission_service.filter_resumes_batch(
+            batch, users_map, user_ctx.role, visibility,
+        )
     _set_shadow_served_baseline(
         shadow,
         [str(item.get("id")) for item in filtered],
@@ -2771,6 +2868,13 @@ def _broaden_job_categories(criteria: dict) -> dict | None:
 # ORM → dict 转换
 # ---------------------------------------------------------------------------
 
+def _normalized_optional_text(value) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
     """将 Job ORM 对象转为字典列表，补充关联用户信息。"""
     if not jobs:
@@ -2807,9 +2911,67 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             "accept_minority": j.accept_minority,
         }
         user_data = users_map.get(j.owner_userid, {})
-        d["company"] = user_data.get("company", "")
-        d["contact_person"] = user_data.get("contact_person", "")
-        d["phone"] = user_data.get("phone", "")
+        publisher_company = _normalized_optional_text(user_data.get("company"))
+        job_company = _normalized_optional_text(getattr(j, "hiring_company", None))
+        if job_company:
+            hiring_company = job_company
+            hiring_company_source = "job.hiring_company"
+        elif publisher_company:
+            hiring_company = publisher_company
+            hiring_company_source = "publisher_company_fallback"
+        else:
+            hiring_company = None
+            hiring_company_source = "none"
+
+        publisher_address = _normalized_optional_text(user_data.get("address"))
+        job_address = _normalized_optional_text(getattr(j, "address", None))
+        if job_address:
+            address = job_address
+            address_source = "job.address"
+        elif publisher_address:
+            address = publisher_address
+            address_source = "publisher_address_fallback"
+        else:
+            address = None
+            address_source = "none"
+
+        publisher_contact = _normalized_optional_text(user_data.get("contact_person"))
+        job_contact = _normalized_optional_text(getattr(j, "contact_person", None))
+        if job_contact:
+            contact_person = job_contact
+            contact_source = "job_override"
+        elif publisher_contact:
+            contact_person = publisher_contact
+            contact_source = "publisher_fallback"
+        else:
+            contact_person = None
+            contact_source = "none"
+
+        publisher_phone = _normalized_optional_text(user_data.get("phone"))
+        job_phone = _normalized_optional_text(getattr(j, "phone", None))
+        if job_phone:
+            phone = job_phone
+            phone_source = "job_override"
+        elif publisher_phone:
+            phone = publisher_phone
+            phone_source = "publisher_fallback"
+        else:
+            phone = None
+            phone_source = "none"
+
+        d.update({
+            "hiring_company": hiring_company,
+            "hiring_company_source": hiring_company_source,
+            "publisher_company": publisher_company,
+            "company": hiring_company,
+            "address": address,
+            "address_source": address_source,
+            "contact_person": contact_person,
+            "contact_source": contact_source,
+            "phone": phone,
+            "phone_source": phone_source,
+            "phone_placeholder": "联系方式待补充" if phone is None else None,
+        })
         result.append(d)
     return result
 
@@ -2852,6 +3014,7 @@ def _build_users_map(user_ids: list[str], db: Session) -> dict[str, dict]:
         u.external_userid: {
             "display_name": u.display_name,
             "company": u.company,
+            "address": u.address,
             "contact_person": u.contact_person,
             "phone": u.phone,
         }
@@ -2926,32 +3089,73 @@ def _format_job_results(
 
     for i, j in enumerate(jobs):
         marker = markers[i] if i < len(markers) else f"({i+1})"
-        company = j.get("company", "")
-        category = j.get("job_category", "")
-        title = f"{company} | {category}" if company else category
-
-        salary_floor = j.get("salary_floor_monthly", 0)
-        salary_ceil = j.get("salary_ceiling_monthly")
-        pay_type = j.get("pay_type", "")
-        if salary_ceil and salary_ceil > salary_floor:
-            salary_str = f"{salary_floor}-{salary_ceil}元/月"
+        company = j.get("hiring_company") or j.get("company", "")
+        company_source = j.get("hiring_company_source")
+        category = j.get("job_category")
+        if company and company_source == "job.hiring_company":
+            company_title = f"招聘工厂：{company}"
+        elif company and company_source == "publisher_company_fallback":
+            company_title = f"发布主体：{company}（历史回退）"
         else:
+            company_title = company or ""
+        title = " | ".join(part for part in (company_title, category) if part)
+        if not title:
+            title = "岗位"
+
+        salary_floor = j.get("salary_floor_monthly")
+        salary_ceil = j.get("salary_ceiling_monthly")
+        pay_type = j.get("pay_type")
+        if salary_floor is not None and salary_ceil is not None and salary_ceil > salary_floor:
+            salary_str = f"{salary_floor}-{salary_ceil}元/月"
+        elif salary_floor is not None:
             salary_str = f"{salary_floor}元/月"
+        elif salary_ceil is not None:
+            salary_str = f"最高{salary_ceil}元/月"
+        else:
+            salary_str = ""
 
         benefits = []
         if j.get("provide_meal"):
             benefits.append("包吃")
         if j.get("provide_housing"):
             benefits.append("包住")
-        benefit_str = f"（{pay_type}，{''.join(benefits)}）" if benefits else f"（{pay_type}）"
+        salary_notes = [note for note in (pay_type, "".join(benefits)) if note]
+        benefit_str = f"（{'，'.join(salary_notes)}）" if salary_notes else ""
 
         city = j.get("city", "")
         district = j.get("district", "")
         location = f"{city}{district}" if district else city
 
         lines.append(f"{marker} {title}")
-        lines.append(f"   💰 {salary_str}{benefit_str}")
-        lines.append(f"   📍 {location}")
+        if salary_str:
+            lines.append(f"   💰 {salary_str}{benefit_str}")
+        elif benefits:
+            lines.append(f"   🍱 福利：{'、'.join(benefits)}")
+        if location:
+            lines.append(f"   📍 {location}")
+        address = j.get("address")
+        address_source = j.get("address_source")
+        if address and address_source == "job.address":
+            lines.append(f"   🏭 工作地址：{address}")
+        elif address and address_source == "publisher_address_fallback":
+            lines.append(f"   🏢 发布方经营地址：{address}（岗位地址缺失）")
+
+        publisher_company = j.get("publisher_company")
+        if (
+            publisher_company
+            and company_source == "job.hiring_company"
+            and publisher_company != company
+        ):
+            lines.append(f"   🏢 发布主体：{publisher_company}")
+
+        contact_person = j.get("contact_person")
+        if contact_person:
+            lines.append(f"   👤 联系人：{contact_person}")
+        phone = j.get("phone")
+        if phone:
+            lines.append(f"   📞 联系电话：{phone}")
+        elif j.get("phone_placeholder"):
+            lines.append(f"   📞 {j['phone_placeholder']}")
         for reason_line in (reason_lines_by_id or {}).get(str(j.get("id", "")), []):
             lines.append(reason_line)
 
@@ -2982,21 +3186,28 @@ def _format_resume_results(
 
     for i, r in enumerate(resumes):
         marker = markers[i] if i < len(markers) else f"({i+1})"
-        name = r.get("display_name", "求职者")
-        gender = r.get("gender", "")
-        age = r.get("age", "")
-        title = f"{name} | {gender} {age}岁" if gender and age else name
+        name = (r.get("display_name") or "求职者") if "display_name" in r else ""
+        gender = r.get("gender")
+        age = r.get("age")
+        demographics = " ".join(
+            part for part in (gender, f"{age}岁" if age is not None else "") if part
+        )
+        title = " | ".join(part for part in (name, demographics) if part) or "候选人"
 
         categories = r.get("expected_job_categories", [])
         cat_str = "/".join(categories) if categories else ""
-        salary = r.get("salary_expect_floor_monthly", 0)
+        salary = r.get("salary_expect_floor_monthly")
 
         cities = r.get("expected_cities", [])
         city_str = "、".join(cities) if cities else ""
 
         lines.append(f"{marker} {title}")
-        if cat_str or salary:
+        if cat_str and salary is not None:
             lines.append(f"   🔧 期望：{cat_str}，{salary}+/月")
+        elif cat_str:
+            lines.append(f"   🔧 期望工种：{cat_str}")
+        elif salary is not None:
+            lines.append(f"   💰 期望薪资：{salary}+/月")
         if city_str:
             lines.append(f"   📍 期望城市：{city_str}")
         for reason_line in (reason_lines_by_id or {}).get(str(r.get("id", "")), []):
@@ -3082,12 +3293,27 @@ def _format_no_match_with_suggestions_resume(
 
 def _is_job_search(session: SessionState, user_ctx: UserContext) -> bool:
     """判断当前搜索方向。"""
+    return resolve_show_more_direction(session, user_ctx) == "search_job"
+
+
+def resolve_show_more_direction(
+    session: SessionState,
+    user_ctx: UserContext,
+) -> Literal["search_job", "search_worker"]:
+    """Resolve paging direction from the snapshot before mutable session hints."""
+
+    snapshot_direction = getattr(session.candidate_snapshot, "direction", None)
+    if snapshot_direction in ("search_job", "search_worker"):
+        return snapshot_direction
     if user_ctx.role == "worker":
-        return True
+        return "search_job"
     if user_ctx.role == "broker" and session.broker_direction:
-        return session.broker_direction == "search_job"
+        return (
+            "search_job" if session.broker_direction == "search_job"
+            else "search_worker"
+        )
     # factory 默认找工人
-    return False
+    return "search_worker"
 
 
 def _get_config_int(key: str, db: Session, default: int) -> int:
