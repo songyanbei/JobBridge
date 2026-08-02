@@ -5,8 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
+from app.api.deps import get_db, require_admin_password_changed
 from app.core.exceptions import BusinessException
+from app.main import app
 from app.services import system_config_service as service
 from app.services.visibility_policy import default_policy_document
 
@@ -72,3 +75,29 @@ def test_success_increments_revision_and_writes_normalized_audit():
     write_log.assert_called_once()
     assert write_log.call_args.kwargs["after"]["revision"] == 2
     db.commit.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("put", "/admin/config/visibility-policy", {
+            "policy": default_policy_document(1), "expected_revision": 1,
+            "confirm_sensitive_expansion": True,
+        }),
+        ("post", "/admin/config/visibility-policy/history/1/restore", {
+            "expected_revision": 1, "confirm_sensitive_expansion": True,
+        }),
+    ],
+)
+def test_viewer_cannot_save_or_restore_policy(method, path, body):
+    viewer = SimpleNamespace(
+        id=1, username="viewer", role="viewer", enabled=1, password_changed=1,
+    )
+    app.dependency_overrides[require_admin_password_changed] = lambda: viewer
+    app.dependency_overrides[get_db] = lambda: MagicMock()
+    try:
+        response = getattr(TestClient(app), method)(path, json=body)
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200
+    assert response.json()["code"] == 40301

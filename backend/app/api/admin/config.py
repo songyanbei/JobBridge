@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_db, require_admin_password_changed as require_admin
+from app.api.deps import (
+    get_db, require_admin_password_changed as require_admin, require_admin_role,
+)
 from app.core.responses import ok
 from app.core.exceptions import BusinessException
 from app.models import AdminUser
@@ -13,6 +15,9 @@ from app.schemas.admin import SystemConfigUpdate
 from app.services import system_config_service
 
 router = APIRouter(prefix="/admin/config", tags=["admin-config"])
+_VIEWER = ("viewer", "operator", "super_admin")
+_OPERATOR = ("operator", "super_admin")
+_SUPER = ("super_admin",)
 
 
 class VisibilityPolicyRequest(BaseModel):
@@ -41,7 +46,7 @@ def list_config(
 @router.get("/visibility-policy", summary="读取推荐权限字段策略")
 def get_visibility_policy(
     db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
+    _: AdminUser = Depends(require_admin_role(*_VIEWER)),
 ):
     return ok(system_config_service.get_visibility_policy(db))
 
@@ -50,7 +55,7 @@ def get_visibility_policy(
 def validate_visibility_policy(
     req: VisibilityPolicyValidateRequest,
     db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
+    _: AdminUser = Depends(require_admin_role(*_OPERATOR)),
 ):
     return ok(system_config_service.validate_visibility_policy(db, req.policy))
 
@@ -59,7 +64,7 @@ def validate_visibility_policy(
 def save_visibility_policy(
     req: VisibilityPolicyRequest,
     db: Session = Depends(get_db),
-    current: AdminUser = Depends(require_admin),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
 ):
     return ok(system_config_service.update_visibility_policy(
         db, req.policy, req.expected_revision, current.username,
@@ -70,7 +75,7 @@ def save_visibility_policy(
 @router.get("/visibility-policy/history", summary="推荐权限字段策略历史")
 def visibility_policy_history(
     db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
+    _: AdminUser = Depends(require_admin_role(*_VIEWER)),
 ):
     return ok(system_config_service.list_visibility_policy_history(db))
 
@@ -79,7 +84,7 @@ def visibility_policy_history(
 def visibility_policy_history_detail(
     revision: int,
     db: Session = Depends(get_db),
-    _: AdminUser = Depends(require_admin),
+    _: AdminUser = Depends(require_admin_role(*_VIEWER)),
 ):
     return ok(system_config_service.get_visibility_policy_history(db, revision))
 
@@ -89,7 +94,7 @@ def restore_visibility_policy(
     revision: int,
     req: VisibilityPolicyRestoreRequest,
     db: Session = Depends(get_db),
-    current: AdminUser = Depends(require_admin),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
 ):
     return ok(system_config_service.restore_visibility_policy(
         db, revision, req.expected_revision, current.username,
