@@ -11,14 +11,6 @@ from app.services.visibility_contract import (
 )
 from app.services.visibility_policy import EffectivePolicySnapshot
 
-# Transitional compatibility is used only until P5 wires a request snapshot into
-# every recommendation path.  Unknown roles already fail closed here.
-_LEGACY_WORKER_HIDDEN_JOB_FIELDS = frozenset({
-    "phone", "phone_source", "phone_placeholder", "contact_person", "contact_source",
-    "address", "address_source", "gender_required", "age_min", "age_max",
-    "accept_minority",
-})
-
 _JOB_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
     "hiring_company": ("hiring_company", "hiring_company_source"),
     "job_category": ("job_category",),
@@ -79,7 +71,7 @@ def _effective_visible_fields(
 def filter_job_for_role(
     job_data: dict,
     viewer_role: str,
-    effective_policy: EffectivePolicySnapshot | None = None,
+    effective_policy: EffectivePolicySnapshot | None,
 ) -> dict:
     """Filter a normalized job using policy whitelist ∩ backend hard limit."""
 
@@ -89,13 +81,7 @@ def filter_job_for_role(
         return {"id": job_data.get("id")}
 
     if effective_policy is None:
-        # Removed when P5 has made snapshot propagation mandatory.
-        if role is ViewerRole.WORKER:
-            return {
-                key: value for key, value in job_data.items()
-                if key not in _LEGACY_WORKER_HIDDEN_JOB_FIELDS
-            }
-        return dict(job_data)
+        return {"id": job_data.get("id")}
     if not _snapshot_matches(effective_policy, VisibilityScene.JOB_SEARCH, viewer_role):
         return {"id": job_data.get("id")}
     return _project_visible_candidate(
@@ -111,7 +97,7 @@ def filter_resume_for_role(
     resume_data: dict,
     owner_user: dict | None,
     viewer_role: str,
-    effective_policy: EffectivePolicySnapshot | None = None,
+    effective_policy: EffectivePolicySnapshot | None,
 ) -> dict:
     """Filter a normalized resume and its owner data through one policy snapshot."""
 
@@ -129,15 +115,7 @@ def filter_resume_for_role(
         candidate["phone"] = None
 
     if effective_policy is None:
-        # Removed when P5 has made snapshot propagation mandatory.
-        if role in (ViewerRole.FACTORY, ViewerRole.BROKER):
-            candidate["phone_placeholder"] = (
-                "联系方式待补充" if not candidate.get("phone") else None
-            )
-            return candidate
-        candidate.pop("phone", None)
-        candidate.pop("display_name", None)
-        return candidate
+        return {"id": resume_data.get("id")}
     if not _snapshot_matches(
         effective_policy, VisibilityScene.CANDIDATE_SEARCH, viewer_role,
     ):
@@ -155,7 +133,7 @@ def filter_resume_for_role(
 def filter_jobs_batch(
     jobs: list[dict],
     viewer_role: str,
-    effective_policy: EffectivePolicySnapshot | None = None,
+    effective_policy: EffectivePolicySnapshot | None,
 ) -> list[dict]:
     return [
         filter_job_for_role(job, viewer_role, effective_policy) for job in jobs
@@ -166,7 +144,7 @@ def filter_resumes_batch(
     resumes: list[dict],
     users_map: dict[str, dict],
     viewer_role: str,
-    effective_policy: EffectivePolicySnapshot | None = None,
+    effective_policy: EffectivePolicySnapshot | None,
 ) -> list[dict]:
     return [
         filter_resume_for_role(

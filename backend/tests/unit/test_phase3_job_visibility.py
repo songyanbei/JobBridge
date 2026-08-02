@@ -108,7 +108,9 @@ def test_worker_legacy_filter_does_not_expose_new_sensitive_job_fields() -> None
         "salary_floor_monthly": 6000, "address": "门牌", "address_source": "job.address",
         "phone": "电话", "contact_person": "联系人",
     }
-    filtered = filter_job_for_role(candidate, "worker")
+    policy = normalize_policy(default_policy_document())
+    snapshot = snapshot_from_policy(policy, "job_search", "worker")
+    filtered = filter_job_for_role(candidate, "worker", snapshot)
     assert "address" not in filtered
     assert "phone" not in filtered
     assert "contact_person" not in filtered
