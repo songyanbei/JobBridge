@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -188,8 +189,11 @@ def get_visibility_policy(db: Session) -> dict:
 
 def validate_visibility_policy(db: Session, payload: dict) -> dict:
     current = _policy_document(_policy_item(db))
+    candidate_payload = dict(payload)
+    candidate_payload["schema_version"] = current.schema_version
+    candidate_payload["revision"] = current.revision
     try:
-        candidate = normalize_policy(payload)
+        candidate = normalize_policy(candidate_payload)
     except VisibilityPolicyValidationError as exc:
         raise BusinessException(40101, str(exc), {"error_code": exc.code}) from exc
     return {
@@ -213,6 +217,7 @@ def _save_visibility_policy(
             {"current_revision": current.revision},
         )
     candidate_payload = dict(payload)
+    candidate_payload["schema_version"] = current.schema_version
     candidate_payload["revision"] = current.revision + 1
     try:
         candidate = normalize_policy(candidate_payload)
@@ -268,11 +273,14 @@ def _history_entry(row: AuditLog, retention_days: int) -> dict | None:
         return None
     created = row.created_at
     age_days = ((datetime.now(timezone.utc).replace(tzinfo=None) - created).total_seconds() / 86400) if created else 0
+    remaining_days = max(0, min(retention_days, math.ceil(retention_days - age_days)))
     return {
         "id": row.id, "revision": policy.revision, "operator": row.operator,
         "created_at": created.isoformat() if created else None,
         "config_value": policy.as_dict(), "recoverable": age_days <= retention_days,
         "retention_days": retention_days,
+        "remaining_recovery_days": remaining_days,
+        "expires_at": (created + timedelta(days=retention_days)).isoformat() if created else None,
     }
 
 

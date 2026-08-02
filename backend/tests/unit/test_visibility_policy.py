@@ -200,6 +200,22 @@ def test_loader_failure_log_excludes_raw_config_and_sensitive_values(monkeypatch
     assert events[0][1]["loaded_revision"] is None
 
 
+def test_load_failure_metric_and_deduplicated_threshold_alert(monkeypatch) -> None:
+    events = []
+    monkeypatch.setattr(visibility_policy, "_load_failure_total", 0)
+    monkeypatch.setattr(visibility_policy, "_consecutive_load_failures", 0)
+    monkeypatch.setattr(visibility_policy, "_last_alert_by_reason", {})
+    monkeypatch.setattr(
+        visibility_policy, "log_event", lambda event, **fields: events.append((event, fields)),
+    )
+    for _ in range(4):
+        load(_FakePrimarySession(None), "job_search", "broker")
+    metrics = visibility_policy.visibility_policy_load_metrics()
+    assert metrics["visibility_policy_load_failure_total"] == 4
+    assert metrics["consecutive_failures"] == 4
+    assert sum(event == "visibility_policy_load_alert" for event, _ in events) == 1
+
+
 def test_snapshot_is_immutable_and_unknown_role_has_empty_visibility() -> None:
     snapshot = builtin_safe_snapshot("job_search", "unknown")
     assert snapshot.visible_fields == ()

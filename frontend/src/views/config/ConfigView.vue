@@ -41,8 +41,9 @@
         <div class="history-row">
           <span>历史版本（审计保留 {{ policy.audit_retention_days }} 天）</span>
           <el-select v-model="restoreRevision" placeholder="选择版本" size="small" style="width: 180px">
-            <el-option v-for="item in history" :key="item.revision" :label="`revision ${item.revision}`" :value="item.revision" :disabled="!item.recoverable" />
+            <el-option v-for="item in history" :key="item.revision" :label="`revision ${item.revision}（剩余 ${item.remaining_recovery_days} 天）`" :value="item.revision" :disabled="!item.recoverable" />
           </el-select>
+          <el-button size="small" :disabled="!restoreRevision" @click="viewPolicyHistory">查看详情</el-button>
           <el-button size="small" :disabled="!restoreRevision" @click="restorePolicy">以此版本恢复</el-button>
         </div>
       </el-card>
@@ -130,7 +131,7 @@ import { Refresh } from '@element-plus/icons-vue'
 import JsonEditor from '@/components/JsonEditor.vue'
 import {
   fetchConfig, updateConfig, fetchVisibilityPolicy, saveVisibilityPolicy,
-  fetchVisibilityPolicyHistory, restoreVisibilityPolicy,
+  fetchVisibilityPolicyHistory, fetchVisibilityPolicyHistoryDetail, restoreVisibilityPolicy,
 } from '@/api/config'
 import { DANGEROUS_CONFIG_KEYS } from '@/utils/constants'
 
@@ -212,12 +213,22 @@ async function loadPolicy() {
 }
 
 function policyPayload() {
-  const next = { schema_version: policy.value.schema_version, revision: policy.value.revision }
+  const next = {}
   for (const row of policyRows.value) {
     next[row.scene] ||= {}
     next[row.scene][row.role] = [...row.fields]
   }
   return next
+}
+
+async function viewPolicyHistory() {
+  if (!restoreRevision.value) return
+  const detail = await fetchVisibilityPolicyHistoryDetail(restoreRevision.value)
+  await ElMessageBox.alert(
+    JSON.stringify(detail.config_value, null, 2),
+    `revision ${detail.revision} · 剩余 ${detail.remaining_recovery_days} 天`,
+    { confirmButtonText: '关闭' },
+  )
 }
 
 async function savePolicy() {

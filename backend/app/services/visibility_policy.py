@@ -7,6 +7,8 @@ boundary and pass the immutable snapshot through the rest of the pipeline.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, Mapping
@@ -32,6 +34,54 @@ SUPPORTED_SCHEMA_VERSION = 1
 PRIMARY_READ_EXECUTION_OPTION = "visibility_policy_primary_read"
 
 PolicySource = Literal["database", "builtin_safe_fallback"]
+POLICY_LOAD_ALERT_THRESHOLD = 3
+POLICY_LOAD_ALERT_DEDUPE_SECONDS = 300
+_metrics_lock = threading.Lock()
+_load_failure_total = 0
+_consecutive_load_failures = 0
+_last_alert_by_reason: dict[str, float] = {}
+
+
+def visibility_policy_load_metrics() -> dict:
+    with _metrics_lock:
+        return {
+            "visibility_policy_load_failure_total": _load_failure_total,
+            "consecutive_failures": _consecutive_load_failures,
+            "alert_threshold": POLICY_LOAD_ALERT_THRESHOLD,
+            "alert_dedupe_seconds": POLICY_LOAD_ALERT_DEDUPE_SECONDS,
+        }
+
+
+def _record_policy_load_success() -> None:
+    global _consecutive_load_failures
+    with _metrics_lock:
+        _consecutive_load_failures = 0
+
+
+def _record_policy_load_failure(reason: str) -> None:
+    global _load_failure_total, _consecutive_load_failures
+    now = time.monotonic()
+    should_alert = False
+    with _metrics_lock:
+        _load_failure_total += 1
+        _consecutive_load_failures += 1
+        total = _load_failure_total
+        consecutive = _consecutive_load_failures
+        last_alert = _last_alert_by_reason.get(reason, 0.0)
+        if consecutive >= POLICY_LOAD_ALERT_THRESHOLD and now - last_alert >= POLICY_LOAD_ALERT_DEDUPE_SECONDS:
+            _last_alert_by_reason[reason] = now
+            should_alert = True
+    log_event(
+        "visibility_policy_load_failure_metric",
+        metric="visibility_policy_load_failure_total", total=total,
+        consecutive_failures=consecutive, failure_reason=reason,
+    )
+    if should_alert:
+        log_event(
+            "visibility_policy_load_alert", severity="alert",
+            consecutive_failures=consecutive, failure_reason=reason,
+            dedupe_seconds=POLICY_LOAD_ALERT_DEDUPE_SECONDS,
+        )
 
 
 class VisibilityPolicyValidationError(ValueError):
@@ -309,6 +359,7 @@ def load(
             )
         policy = normalize_policy(row.config_value)
         loaded_revision = policy.revision
+        _record_policy_load_success()
         return snapshot_from_policy(policy, scene_value, role)
     except Exception as exc:
         reason = exc.code if isinstance(exc, VisibilityPolicyValidationError) else type(exc).__name__
@@ -320,6 +371,7 @@ def load(
             policy_source="builtin_safe_fallback",
             fallback_policy_id=BUILTIN_SAFE_POLICY_ID,
         )
+        _record_policy_load_failure(reason)
         return builtin_safe_snapshot(scene_value, role)
 
 
