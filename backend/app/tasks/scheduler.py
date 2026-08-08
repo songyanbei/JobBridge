@@ -27,6 +27,7 @@ def build_scheduler() -> BackgroundScheduler:
         media_cleanup_worker,
         recommendation_privacy_cleanup,
         send_retry_drain,
+        target_cleanup_worker,
         ttl_cleanup,
         worker_monitor,
     )
@@ -57,6 +58,14 @@ def build_scheduler() -> BackgroundScheduler:
         media_cleanup_worker.run,
         IntervalTrigger(minutes=1),
         id="media_cleanup_worker",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        target_cleanup_worker.run,
+        IntervalTrigger(minutes=1),
+        id="target_cleanup_worker",
         max_instances=1,
         coalesce=True,
     )

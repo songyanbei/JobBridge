@@ -2,6 +2,8 @@
 -- Stop all job writes before executing this script.
 SELECT CASE
   WHEN EXISTS (SELECT 1 FROM `job_replacement` LIMIT 1)
+    OR EXISTS (SELECT 1 FROM `target_cleanup_task` LIMIT 1)
+    OR EXISTS (SELECT 1 FROM `media_asset_lifecycle` LIMIT 1)
     OR EXISTS (SELECT 1 FROM `job` WHERE `candidate_expires_at` IS NOT NULL LIMIT 1)
   THEN (SELECT 1 / 0)
   ELSE 1
@@ -21,3 +23,4 @@ ALTER TABLE `job` MODIFY COLUMN `expires_at` DATETIME NOT NULL;
 ALTER TABLE `job` MODIFY COLUMN `delist_reason` ENUM('filled','manual_delist','expired') NULL;
 DROP TABLE `job_replacement`;
 DROP TABLE `media_asset_lifecycle`;
+DROP TABLE `target_cleanup_task`;

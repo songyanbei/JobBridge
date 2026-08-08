@@ -280,6 +280,7 @@ def _soft_delete_expired_resumes(db) -> int:
 def _hard_delete_expired_jobs(db, delay_days: int) -> int:
     """Only hard-delete jobs whose persisted image set is fully deleted."""
     from app.services.job_media_service import hard_delete_media_complete
+    from app.services.target_cleanup_service import job_cleanup_succeeded
 
     deleted = 0
     while True:
@@ -292,6 +293,8 @@ def _hard_delete_expired_jobs(db, delay_days: int) -> int:
             break
         progressed = False
         for job_id, images in rows:
+            if not job_cleanup_succeeded(db, int(job_id)):
+                continue
             if not hard_delete_media_complete(db, int(job_id), images):
                 continue
             result = db.execute(text("DELETE FROM `job` WHERE id=:job_id"), {"job_id": job_id})

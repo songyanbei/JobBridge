@@ -45,6 +45,8 @@ from app.db import SessionLocal
 from app.models import (
     AuditLog,
     ConversationLog,
+    Job,
+    Resume,
     WecomInboundEvent,
     WecomOutboundOutbox,
     RecommendationDelivery,
@@ -1222,12 +1224,62 @@ class Worker:
         状态转移全部收敛到 §9.6 行 1921 的枚举，并用条件 UPDATE 防止旧 Worker
         覆盖新状态（§10.4）。
         """
-        delivery = db.get(RecommendationDelivery, row.recommendation_delivery_id)
-        if delivery is None:
+        snapshot = db.get(RecommendationDelivery, row.recommendation_delivery_id)
+        if snapshot is None:
             row.status = "dead_letter"
             row.locked_at = None
             row.next_attempt_at = None
             row.last_error = "recommendation delivery row missing"
+            return None
+
+        context = snapshot.recommendation_context
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                context = {}
+        references = []
+        for item in (context or {}).get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                references.append((str(item["target_type"]), int(item["target_id"])))
+            except (KeyError, TypeError, ValueError):
+                row.status = "dead_letter"
+                row.last_error = "recommendation context contains an invalid target"
+                return None
+
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        for target_type, target_id in sorted(set(references)):
+            model = Job if target_type == "job" else Resume if target_type == "resume" else None
+            if model is None:
+                row.status = "dead_letter"
+                row.last_error = "recommendation context contains an unsupported target"
+                return None
+            target = db.query(model).filter(model.id == target_id).with_for_update().first()
+            valid = bool(
+                target
+                and target.audit_status == "passed"
+                and target.deleted_at is None
+                and target.expires_at is not None
+                and target.expires_at > now_utc
+            )
+            if target_type == "job":
+                valid = valid and target.delist_reason is None
+            if not valid:
+                row.status = "dead_letter"
+                row.last_error = "recommendation target is no longer active"
+                return None
+
+        locked_delivery = db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.delivery_id == row.recommendation_delivery_id,
+        ).with_for_update().first()
+        delivery = locked_delivery if isinstance(locked_delivery, RecommendationDelivery) else snapshot
+        if delivery is None or (
+            isinstance(locked_delivery, RecommendationDelivery)
+            and delivery.recommendation_context != snapshot.recommendation_context
+        ):
+            self._defer_outbox_row(row, "recommendation delivery changed during claim")
             return None
 
         if delivery.status == DELIVERY_PREPARED:

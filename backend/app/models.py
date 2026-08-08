@@ -208,6 +208,37 @@ class MediaAssetLifecycle(Base):
     )
 
 
+class TargetCleanupTask(Base):
+    __tablename__ = "target_cleanup_task"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
+    target_type = sa.Column(sa.String(32), nullable=False)
+    target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    reason = sa.Column(sa.String(32), nullable=False)
+    reason_history = sa.Column(sa.JSON, nullable=True)
+    status = sa.Column(
+        sa.Enum("pending", "processing", "retry_wait", "succeeded", "dead_letter", name="target_cleanup_status"),
+        nullable=False, server_default="pending",
+    )
+    delivery_ids = sa.Column(sa.JSON, nullable=True)
+    db_redacted_at = sa.Column(sa.DateTime, nullable=True)
+    conversation_redacted_at = sa.Column(sa.DateTime, nullable=True)
+    session_invalidated_at = sa.Column(sa.DateTime, nullable=True)
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    next_attempt_at = sa.Column(sa.DateTime, nullable=True)
+    last_error = sa.Column(sa.String(255), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_expires_at = sa.Column(sa.DateTime, nullable=True)
+    completed_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("target_type", "target_id", name="uq_cleanup_target"),
+        sa.Index("idx_target_cleanup_ready", "status", "next_attempt_at"),
+    )
+
+
 # ============================================================================
 # 3. Resume 简历信息表
 # ============================================================================

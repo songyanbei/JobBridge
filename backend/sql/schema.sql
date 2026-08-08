@@ -184,6 +184,33 @@ CREATE TABLE `job_replacement` (
     KEY `idx_replacement_review_created` (`review_outcome`,`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位全量替换关系';
 
+DROP TABLE IF EXISTS `target_cleanup_task`;
+CREATE TABLE `target_cleanup_task` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `operation_id` CHAR(36) NOT NULL,
+    `target_type` VARCHAR(32) NOT NULL,
+    `target_id` BIGINT UNSIGNED NOT NULL,
+    `reason` VARCHAR(32) NOT NULL,
+    `reason_history` JSON DEFAULT NULL,
+    `status` ENUM('pending','processing','retry_wait','succeeded','dead_letter') NOT NULL DEFAULT 'pending',
+    `delivery_ids` JSON DEFAULT NULL,
+    `db_redacted_at` DATETIME DEFAULT NULL,
+    `conversation_redacted_at` DATETIME DEFAULT NULL,
+    `session_invalidated_at` DATETIME DEFAULT NULL,
+    `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at` DATETIME DEFAULT NULL,
+    `last_error` VARCHAR(255) DEFAULT NULL,
+    `lease_owner` VARCHAR(64) DEFAULT NULL,
+    `lease_expires_at` DATETIME DEFAULT NULL,
+    `completed_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cleanup_operation` (`operation_id`),
+    UNIQUE KEY `uq_cleanup_target` (`target_type`,`target_id`),
+    KEY `idx_target_cleanup_ready` (`status`,`next_attempt_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='目标清理任务';
+
 DROP TABLE IF EXISTS `media_asset_lifecycle`;
 CREATE TABLE `media_asset_lifecycle` (
     `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
