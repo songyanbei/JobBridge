@@ -37,12 +37,18 @@
                   v-if="row.value_type === 'bool'"
                   v-model="row._draft"
                 />
-                <el-input-number
-                  v-else-if="row.value_type === 'int'"
-                  v-model="row._draft"
-                  :min="0"
-                  style="width: 220px"
-                />
+                <div v-else-if="row.value_type === 'int'" class="number-editor">
+                  <el-input-number
+                    v-model="row._draft"
+                    :min="numberRange(row).min"
+                    :max="numberRange(row).max"
+                    style="width: 220px"
+                  />
+                  <span v-if="isJobTtl(row)" class="unit">天</span>
+                  <div v-if="isJobTtl(row)" class="ttl-hint">
+                    {{ ttlHint(row) }}
+                  </div>
+                </div>
                 <JsonEditor
                   v-else-if="row.value_type === 'json'"
                   v-model="row._draft"
@@ -106,6 +112,23 @@ function editorFor(_row) {
 function isDangerous(row) {
   if (typeof row.danger === 'boolean') return row.danger
   return DANGEROUS_CONFIG_KEYS.includes(row.config_key)
+}
+
+function numberRange(row) {
+  if (row.config_key === 'ttl.job.days') return { min: 1, max: 3650 }
+  if (row.config_key === 'ttl.job.candidate.days') return { min: 1, max: 365 }
+  return { min: 0, max: undefined }
+}
+
+function isJobTtl(row) {
+  return row.config_key === 'ttl.job.days' || row.config_key === 'ttl.job.candidate.days'
+}
+
+function ttlHint(row) {
+  if (row.config_key === 'ttl.job.candidate.days') {
+    return '适用于首次发布和全量更新候选，仅影响后续创建的候选。'
+  }
+  return '仅影响后续激活的岗位，不追溯修改已有岗位。'
 }
 
 function normalize(row) {
@@ -190,5 +213,15 @@ load()
 <style scoped>
 .config-container {
   padding-bottom: 20px;
+}
+.number-editor .unit {
+  margin-left: 8px;
+  color: var(--el-text-color-regular);
+}
+.ttl-hint {
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 18px;
 }
 </style>

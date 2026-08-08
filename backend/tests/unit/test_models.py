@@ -131,7 +131,7 @@ class TestKeyColumns:
 
     def test_job_delist_reason_enum(self):
         col = self._col(Job, "delist_reason")
-        expected = {"filled", "manual_delist", "expired"}
+        expected = {"filled", "manual_delist", "expired", "replaced"}
         assert set(col.type.enums) == expected
 
     def test_system_config_pk(self):

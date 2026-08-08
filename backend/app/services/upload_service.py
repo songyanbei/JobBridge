@@ -14,6 +14,7 @@ from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
 from app.models import Job, Resume, SystemConfig
 from app.services import audit_service, conversation_service
+from app.services.lifecycle_config_service import get_job_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
 
@@ -378,6 +379,8 @@ def _infer_upload_frame(missing: list[str]) -> str | None:
 
 def _read_ttl_days(entity_type: str, db: Session) -> int:
     """从 system_config 读取 TTL 天数。"""
+    if entity_type == "job":
+        return get_job_ttl_days(db)
     key = f"ttl.{entity_type}.days"
     config = db.query(SystemConfig).filter(
         SystemConfig.config_key == key,

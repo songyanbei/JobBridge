@@ -17,9 +17,10 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, Job, SystemConfig
+from app.models import AuditLog, Job
 from app.schemas.conversation import ReplyMessage, SessionState  # noqa: F401
 from app.services import conversation_service
+from app.services.lifecycle_config_service import get_job_ttl_days
 from app.services.user_service import UserContext, delete_user_data, get_user_status
 
 # audit_log 可用 action（与 schema.sql 枚举一致）
@@ -473,16 +474,7 @@ def _parse_renew_days(args: str) -> int | None:
 
 def _renew_ttl_cap_days(db: Session) -> int:
     """从 system_config 读取 ttl.job.days，续期上限取 2 倍。"""
-    cfg = db.query(SystemConfig).filter(
-        SystemConfig.config_key == "ttl.job.days",
-    ).first()
-    base = 30
-    if cfg:
-        try:
-            base = int(cfg.config_value)
-        except (ValueError, TypeError):
-            pass
-    return base * 2
+    return get_job_ttl_days(db) * 2
 
 
 def _write_audit_log(

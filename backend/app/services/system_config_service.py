@@ -17,6 +17,10 @@ from app.core.redis_client import invalidate_config_cache
 from app.models import SystemConfig
 
 LOCKED_RECOMMENDATION_KEYS = {"match.max_candidates", "match.top_n"}
+_LIFECYCLE_INT_RANGES = {
+    "ttl.job.days": (1, 3650),
+    "ttl.job.candidate.days": (1, 365),
+}
 from app.services.admin_log_service import write_admin_log
 
 
@@ -82,7 +86,14 @@ def update(
         raise BusinessException(40401, f"配置项 {key} 不存在")
 
     effective_type = value_type_override or item.value_type
+    if key in _LIFECYCLE_INT_RANGES and effective_type != "int":
+        raise BusinessException(40101, f"{key} 的 value_type 必须为 int")
     _validate_value(effective_type, new_value)
+    if key in _LIFECYCLE_INT_RANGES:
+        lower, upper = _LIFECYCLE_INT_RANGES[key]
+        value = int(new_value)
+        if not lower <= value <= upper:
+            raise BusinessException(40101, f"{key} 必须在 {lower} 到 {upper} 之间")
 
     before = {
         "config_value": item.config_value,

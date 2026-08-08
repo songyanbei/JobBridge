@@ -12,8 +12,9 @@ from sqlalchemy import asc, desc
 from sqlalchemy.orm import Query, Session
 
 from app.core.exceptions import BusinessException
-from app.models import Job, SystemConfig
+from app.models import Job
 from app.services.admin_log_service import _json_safe, write_admin_log
+from app.services.lifecycle_config_service import get_job_ttl_days
 
 
 # ---------------------------------------------------------------------------
@@ -42,14 +43,6 @@ _EDIT_WHITELIST = {
     "rebate", "employment_type", "contract_type",
     "min_duration", "description",
 }
-
-
-def _load_config_int(db: Session, key: str, default: int) -> int:
-    cfg = db.query(SystemConfig).filter(SystemConfig.config_key == key).first()
-    try:
-        return int(cfg.config_value) if cfg else default
-    except (TypeError, ValueError):
-        return default
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +223,7 @@ def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> 
 
     before = _snapshot(job)
     now = datetime.now()
-    max_days = _load_config_int(db, "ttl.job.days", 30) * 2
+    max_days = get_job_ttl_days(db) * 2
     base = job.expires_at if job.expires_at and job.expires_at > now else now
     new_expires = base + timedelta(days=days)
     ceiling = (job.created_at or now) + timedelta(days=max_days)

@@ -52,6 +52,7 @@ INSERT INTO `dict_city` (`code`, `name`, `short_name`, `province`, `aliases`, `e
 INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `description`) VALUES
 -- 数据 TTL（天）
 ('ttl.job.days',                  '30',  'int',  '岗位 TTL（天）'),
+('ttl.job.candidate.days',        '7',   'int',  '岗位候选版本保留期（天），适用于首次发布和全量更新候选'),
 ('ttl.resume.days',                '30', 'int',  '简历 TTL（天）'),
 ('ttl.conversation_log.days',      '30', 'int',  '对话日志 TTL（天）'),
 ('ttl.audit_log.days',             '180','int',  '审核日志 TTL（天）— Phase 7 新增'),

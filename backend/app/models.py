@@ -123,25 +123,60 @@ class Job(Base):
     # ---- 生命周期 ----
     created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
-    expires_at = sa.Column(sa.DateTime, nullable=False, comment="过期时间（默认 created_at + 30 天）")
+    expires_at = sa.Column(sa.DateTime, nullable=True, comment="激活后的业务过期时间")
+    activated_at = sa.Column(sa.DateTime, nullable=True, comment="业务激活时间")
+    candidate_expires_at = sa.Column(sa.DateTime, nullable=True, comment="候选版本回收时间")
     delist_reason = sa.Column(
-        sa.Enum("filled", "manual_delist", "expired", name="delist_reason"),
+        sa.Enum("filled", "manual_delist", "expired", "replaced", name="delist_reason"),
         nullable=True, comment="下架原因",
     )
     deleted_at = sa.Column(sa.DateTime, nullable=True, comment="软删除时间")
 
-    # ---- 乐观锁 ----
-    version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"), comment="乐观锁版本号")
-
-    # ---- 扩展 ----
+    version = sa.Column(
+        mysql.INTEGER(unsigned=True), nullable=False,
+        server_default=sa.text("1"), comment="乐观锁版本号",
+    )
     extra = sa.Column(MutableDict.as_mutable(sa.JSON), nullable=True, comment="扩展字段（§7.6）")
 
     __table_args__ = (
         sa.Index("idx_owner", "owner_userid"),
         sa.Index("idx_audit_time", "audit_status", "created_at"),
         sa.Index("idx_expires", "expires_at"),
+        sa.Index("idx_job_candidate_expiry", "audit_status", "candidate_expires_at"),
         sa.Index("idx_filter_hot", "city", "job_category", "is_long_term", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary", "salary_floor_monthly"),
+    )
+
+
+class JobReplacement(Base):
+    __tablename__ = "job_replacement"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
+    source_msg_id = sa.Column(sa.String(128), nullable=False, unique=True)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    old_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    new_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, unique=True)
+    old_job_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    old_expires_at = sa.Column(sa.DateTime, nullable=True)
+    old_business_digest = sa.Column(sa.String(64), nullable=False)
+    old_business_digest_version = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default="1")
+    review_outcome = sa.Column(sa.Enum("pending", "passed", "rejected", name="replacement_review_outcome"), nullable=False)
+    reviewed_at = sa.Column(sa.DateTime, nullable=True)
+    reviewed_by = sa.Column(sa.String(64), nullable=True)
+    lifecycle_status = sa.Column(sa.Enum("awaiting_review", "activated", "closed", "conflict", name="replacement_lifecycle_status"), nullable=False)
+    active_old_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True, unique=True)
+    closed_reason = sa.Column(sa.String(64), nullable=True)
+    conflict_reason = sa.Column(sa.String(255), nullable=True)
+    activated_at = sa.Column(sa.DateTime, nullable=True)
+    candidate_cleaned_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.Index("idx_replacement_old_status", "old_job_id", "lifecycle_status"),
+        sa.Index("idx_replacement_owner_created", "owner_userid", "created_at"),
+        sa.Index("idx_replacement_lifecycle_created", "lifecycle_status", "created_at"),
+        sa.Index("idx_replacement_review_created", "review_outcome", "created_at"),
     )
 
 

@@ -127,8 +127,10 @@ CREATE TABLE `job` (
     -- ---- 生命周期 ----
     `created_at`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    `expires_at`               DATETIME        NOT NULL                      COMMENT '过期时间（默认 created_at + 30 天）',
-    `delist_reason`            ENUM('filled','manual_delist','expired') DEFAULT NULL COMMENT '下架原因：filled=已招满 / manual_delist=主动下架 / expired=TTL到期；null=在线',
+    `activated_at`             DATETIME        DEFAULT NULL                  COMMENT '业务激活时间',
+    `candidate_expires_at`     DATETIME        DEFAULT NULL                  COMMENT '候选版本回收时间',
+    `expires_at`               DATETIME        DEFAULT NULL                  COMMENT '激活后的业务过期时间',
+    `delist_reason`            ENUM('filled','manual_delist','expired','replaced') DEFAULT NULL COMMENT '岗位下架原因；null=在线',
     `deleted_at`               DATETIME        DEFAULT NULL                  COMMENT '软删除时间（null 代表有效）',
 
     -- ---- 乐观锁 ----
@@ -141,11 +143,46 @@ CREATE TABLE `job` (
     KEY `idx_owner`       (`owner_userid`),
     KEY `idx_audit_time`  (`audit_status`, `created_at`),
     KEY `idx_expires`     (`expires_at`),
+    KEY `idx_job_candidate_expiry` (`audit_status`, `candidate_expires_at`),
     -- 硬过滤复合索引：覆盖最热检索路径
     KEY `idx_filter_hot`  (`city`, `job_category`, `is_long_term`, `audit_status`, `deleted_at`, `expires_at`),
     KEY `idx_salary`      (`salary_floor_monthly`),
     CONSTRAINT `fk_job_owner` FOREIGN KEY (`owner_userid`) REFERENCES `user`(`external_userid`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位信息表';
+
+DROP TABLE IF EXISTS `job_replacement`;
+CREATE TABLE `job_replacement` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `operation_id` CHAR(36) NOT NULL,
+    `source_msg_id` VARCHAR(128) NOT NULL,
+    `owner_userid` VARCHAR(64) NOT NULL,
+    `old_job_id` BIGINT UNSIGNED NOT NULL,
+    `new_job_id` BIGINT UNSIGNED NOT NULL,
+    `old_job_version` INT UNSIGNED NOT NULL,
+    `old_expires_at` DATETIME DEFAULT NULL,
+    `old_business_digest` CHAR(64) NOT NULL,
+    `old_business_digest_version` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    `review_outcome` ENUM('pending','passed','rejected') NOT NULL,
+    `reviewed_at` DATETIME DEFAULT NULL,
+    `reviewed_by` VARCHAR(64) DEFAULT NULL,
+    `lifecycle_status` ENUM('awaiting_review','activated','closed','conflict') NOT NULL,
+    `active_old_job_id` BIGINT UNSIGNED DEFAULT NULL,
+    `closed_reason` VARCHAR(64) DEFAULT NULL,
+    `conflict_reason` VARCHAR(255) DEFAULT NULL,
+    `activated_at` DATETIME DEFAULT NULL,
+    `candidate_cleaned_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_replacement_operation` (`operation_id`),
+    UNIQUE KEY `uq_replacement_message` (`source_msg_id`),
+    UNIQUE KEY `uq_replacement_new_job` (`new_job_id`),
+    UNIQUE KEY `uq_replacement_active_old_job` (`active_old_job_id`),
+    KEY `idx_replacement_old_status` (`old_job_id`,`lifecycle_status`),
+    KEY `idx_replacement_owner_created` (`owner_userid`,`created_at`),
+    KEY `idx_replacement_lifecycle_created` (`lifecycle_status`,`created_at`),
+    KEY `idx_replacement_review_created` (`review_outcome`,`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位全量替换关系';
 
 
 -- ============================================================================
