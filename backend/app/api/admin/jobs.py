@@ -169,7 +169,7 @@ def export_jobs(
             r.salary_floor_monthly, r.salary_ceiling_monthly, r.pay_type,
             r.headcount, r.gender_required, r.age_min, r.age_max, r.is_long_term,
             r.audit_status, r.audit_reason, r.delist_reason,
-            r.created_at, r.expires_at, r.version,
+            r.created_at, r.expires_at.isoformat() if r.expires_at else None, r.version,
         ])
     data = rows_to_csv_bytes(headers, body)
     filename = f"jobs_{datetime.now().strftime('%Y%m%d%H%M')}.csv"

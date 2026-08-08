@@ -138,7 +138,8 @@ class JobRead(BaseModel):
     # 生命周期
     created_at: datetime
     updated_at: datetime
-    expires_at: datetime
+    # 先于数据库 nullable 迁移发布，兼容尚未激活的候选岗位。
+    expires_at: datetime | None = None
     delist_reason: str | None = None
     deleted_at: datetime | None = None
 
