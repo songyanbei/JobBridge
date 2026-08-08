@@ -20,3 +20,4 @@ ALTER TABLE `job` DROP COLUMN `candidate_expires_at`, DROP COLUMN `activated_at`
 ALTER TABLE `job` MODIFY COLUMN `expires_at` DATETIME NOT NULL;
 ALTER TABLE `job` MODIFY COLUMN `delist_reason` ENUM('filled','manual_delist','expired') NULL;
 DROP TABLE `job_replacement`;
+DROP TABLE `media_asset_lifecycle`;

@@ -44,6 +44,7 @@ class TestEnsureTtlConfigDefaults:
         keys = {k for k, *_ in _TTL_CONFIG_DEFAULTS}
         assert keys == {
             "ttl.job.days",
+            "ttl.job.candidate.days",
             "ttl.resume.days",
             "ttl.conversation_log.days",
             "ttl.audit_log.days",

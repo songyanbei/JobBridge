@@ -243,6 +243,7 @@ def attach_image(
     image_key: str,
     session: SessionState,
     db: Session,
+    media_lifecycle_id: int | None = None,
 ) -> str:
     """将已保存的图片 key 附加到用户当前上传流程的实体上。
 
@@ -288,6 +289,9 @@ def attach_image(
     if len(images) >= _MAX_IMAGES_PER_RECORD:
         return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
 
+    if media_lifecycle_id is not None:
+        from app.services.job_media_service import attach_media
+        [image_key] = attach_media(db, [media_lifecycle_id], entity_type, record.id)
     images.append(image_key)
     record.images = images
     db.flush()

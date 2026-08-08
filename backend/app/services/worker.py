@@ -693,20 +693,38 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def _download_and_attach_image(self, msg: WeComMessage) -> None:
+        media_id = None
         try:
             from app.storage import get_storage
+            from app.services.job_media_service import record_pending_media
 
             blob = self._wecom_client.download_media(msg.media_id)
             storage = get_storage()
             key = f"images/{msg.from_user}/{msg.msg_id}.jpg"
-            url = storage.save(key, blob, content_type="image/jpeg")
-            msg.image_url = url
+            with SessionLocal() as media_db:
+                media = record_pending_media(
+                    media_db,
+                    key,
+                    owner_userid=msg.from_user,
+                    operation_id=msg.msg_id,
+                )
+                media_db.commit()
+                media_id = media.id
+            storage.save(key, blob, content_type="image/jpeg")
+            msg.image_url = key
+            msg.media_lifecycle_id = media_id
         except Exception:
+            if media_id is not None:
+                from app.services.job_media_service import mark_delete_pending
+                with SessionLocal() as media_db:
+                    mark_delete_pending(media_db, [media_id])
+                    media_db.commit()
             logger.exception(
                 "worker: image download/save failed media_id=%s msg_id=%s",
                 msg.media_id, msg.msg_id,
             )
             msg.image_url = ""
+            msg.media_lifecycle_id = None
 
     # -----------------------------------------------------------------------
     # 回复发送（失败补偿）

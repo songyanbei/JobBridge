@@ -30,6 +30,30 @@ CREATE TABLE `job_replacement` (
   KEY `idx_replacement_lifecycle_created` (`lifecycle_status`,`created_at`),
   KEY `idx_replacement_review_created` (`review_outcome`,`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE `media_asset_lifecycle` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `object_key` VARCHAR(512) NOT NULL,
+  `operation_id` CHAR(36) NULL,
+  `owner_userid` VARCHAR(64) NOT NULL,
+  `entity_type` ENUM('job','resume') NULL,
+  `entity_id` BIGINT UNSIGNED NULL,
+  `state` ENUM('pending','attached','delete_pending','deleted') NOT NULL DEFAULT 'pending',
+  `draft_expires_at` DATETIME NULL,
+  `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
+  `next_attempt_at` DATETIME NULL,
+  `last_error` VARCHAR(255) NULL,
+  `lease_owner` VARCHAR(64) NULL,
+  `lease_expires_at` DATETIME NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  `deleted_at` DATETIME NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_media_object_key` (`object_key`),
+  KEY `idx_media_operation` (`operation_id`),
+  KEY `idx_media_entity` (`entity_type`,`entity_id`,`state`),
+  KEY `idx_media_cleanup` (`state`,`next_attempt_at`),
+  KEY `idx_media_draft_expiry` (`state`,`draft_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 SET @phase10_migration_time = NOW();
 SET @phase10_candidate_days = COALESCE((

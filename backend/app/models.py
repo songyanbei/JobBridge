@@ -171,12 +171,40 @@ class JobReplacement(Base):
     candidate_cleaned_at = sa.Column(sa.DateTime, nullable=True)
     created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
-
     __table_args__ = (
         sa.Index("idx_replacement_old_status", "old_job_id", "lifecycle_status"),
         sa.Index("idx_replacement_owner_created", "owner_userid", "created_at"),
         sa.Index("idx_replacement_lifecycle_created", "lifecycle_status", "created_at"),
         sa.Index("idx_replacement_review_created", "review_outcome", "created_at"),
+    )
+
+
+class MediaAssetLifecycle(Base):
+    __tablename__ = "media_asset_lifecycle"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    object_key = sa.Column(sa.String(512), nullable=False, unique=True)
+    operation_id = sa.Column(sa.String(36), nullable=True, index=True)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    entity_type = sa.Column(sa.Enum("job", "resume", name="media_entity_type"), nullable=True)
+    entity_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    state = sa.Column(
+        sa.Enum("pending", "attached", "delete_pending", "deleted", name="media_asset_state"),
+        nullable=False, server_default="pending",
+    )
+    draft_expires_at = sa.Column(sa.DateTime, nullable=True)
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    next_attempt_at = sa.Column(sa.DateTime, nullable=True)
+    last_error = sa.Column(sa.String(255), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_expires_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+    deleted_at = sa.Column(sa.DateTime, nullable=True)
+
+    __table_args__ = (
+        sa.Index("idx_media_entity", "entity_type", "entity_id", "state"),
+        sa.Index("idx_media_cleanup", "state", "next_attempt_at"),
+        sa.Index("idx_media_draft_expiry", "state", "draft_expires_at"),
     )
 
 

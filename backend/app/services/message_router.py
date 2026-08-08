@@ -2082,6 +2082,7 @@ def _handle_image(
         feedback = upload_service.attach_image(
             external_userid=userid,
             image_key=image_url,
+            media_lifecycle_id=msg.media_lifecycle_id,
             session=session,
             db=db,
         )

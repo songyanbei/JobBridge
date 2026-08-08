@@ -432,6 +432,7 @@ class Settings(BaseSettings):
     oss_bucket: str = ""
     oss_local_dir: str = "uploads"           # 本地存储目录（oss_provider=local 时生效）
     oss_local_url_prefix: str = "/files"     # 本地文件 URL 前缀
+    oss_trusted_origins: str = ""             # 允许反解为 object key 的历史访问域名，逗号分隔
 
     # ---- 运营后台 JWT ----
     admin_jwt_secret: str = "change-me"

@@ -278,11 +278,29 @@ def _soft_delete_expired_resumes(db) -> int:
 
 
 def _hard_delete_expired_jobs(db, delay_days: int) -> int:
-    """岗位软删 ``delay_days`` 天后硬删。"""
-    return _batch_hard_delete(
-        db, "job",
-        f"deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY",
-    )
+    """Only hard-delete jobs whose persisted image set is fully deleted."""
+    from app.services.job_media_service import hard_delete_media_complete
+
+    deleted = 0
+    while True:
+        rows = db.execute(text(
+            "SELECT id, images FROM `job` "
+            f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+            f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE}"
+        )).fetchall()
+        if not rows:
+            break
+        progressed = False
+        for job_id, images in rows:
+            if not hard_delete_media_complete(db, int(job_id), images):
+                continue
+            result = db.execute(text("DELETE FROM `job` WHERE id=:job_id"), {"job_id": job_id})
+            deleted += int(result.rowcount or 0)
+            progressed = progressed or bool(result.rowcount)
+        db.commit()
+        if not progressed:
+            break
+    return deleted
 
 
 def _hard_delete_expired_resumes(db, delay_days: int) -> int:

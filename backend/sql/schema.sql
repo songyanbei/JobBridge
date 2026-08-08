@@ -184,6 +184,32 @@ CREATE TABLE `job_replacement` (
     KEY `idx_replacement_review_created` (`review_outcome`,`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位全量替换关系';
 
+DROP TABLE IF EXISTS `media_asset_lifecycle`;
+CREATE TABLE `media_asset_lifecycle` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `object_key` VARCHAR(512) NOT NULL,
+    `operation_id` CHAR(36) DEFAULT NULL,
+    `owner_userid` VARCHAR(64) NOT NULL,
+    `entity_type` ENUM('job','resume') DEFAULT NULL,
+    `entity_id` BIGINT UNSIGNED DEFAULT NULL,
+    `state` ENUM('pending','attached','delete_pending','deleted') NOT NULL DEFAULT 'pending',
+    `draft_expires_at` DATETIME DEFAULT NULL,
+    `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at` DATETIME DEFAULT NULL,
+    `last_error` VARCHAR(255) DEFAULT NULL,
+    `lease_owner` VARCHAR(64) DEFAULT NULL,
+    `lease_expires_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted_at` DATETIME DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_media_object_key` (`object_key`),
+    KEY `idx_media_operation` (`operation_id`),
+    KEY `idx_media_entity` (`entity_type`,`entity_id`,`state`),
+    KEY `idx_media_cleanup` (`state`,`next_attempt_at`),
+    KEY `idx_media_draft_expiry` (`state`,`draft_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='媒体生命周期';
+
 
 -- ============================================================================
 -- 3. resume 简历信息表
