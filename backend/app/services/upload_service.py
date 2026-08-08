@@ -294,6 +294,8 @@ def attach_image(
         [image_key] = attach_media(db, [media_lifecycle_id], entity_type, record.id)
     images.append(image_key)
     record.images = images
+    from app.services.job_mutation_service import increment_version
+    increment_version(record)
     db.flush()
 
     kind = "岗位" if entity_type == "job" else "简历"

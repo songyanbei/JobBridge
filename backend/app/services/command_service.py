@@ -21,6 +21,11 @@ from app.models import AuditLog, Job
 from app.schemas.conversation import ReplyMessage, SessionState  # noqa: F401
 from app.services import conversation_service
 from app.services.lifecycle_config_service import get_job_ttl_days
+from app.services.job_mutation_service import (
+    close_active_replacement,
+    increment_version,
+    reject_if_replacement_in_progress,
+)
 from app.services.user_service import UserContext, delete_user_data, get_user_status
 
 # audit_log 可用 action（与 schema.sql 枚举一致）
@@ -309,6 +314,7 @@ def _handle_renew_job(
 
     # 单岗位 或 多岗位+明确天数 → 对最近一条执行续期
     target = jobs[0]
+    reject_if_replacement_in_progress(db, target.id)
     ttl_cap = _renew_ttl_cap_days(db)
 
     # TTL 上限：从 now 起算（避免老岗位续期反而缩短）
@@ -321,6 +327,7 @@ def _handle_renew_job(
         capped = new_expires < target.expires_at + timedelta(days=days)
 
     target.expires_at = new_expires
+    increment_version(target)
     db.flush()
     _write_audit_log(
         db,
@@ -419,7 +426,13 @@ def _delist_common(
         return [_reply(user_ctx, empty_text)]
 
     target = jobs[0]
+    close_active_replacement(
+        db,
+        target,
+        reason="old_job_delisted" if delist_reason == "manual_delist" else "old_job_filled",
+    )
     target.delist_reason = delist_reason
+    increment_version(target)
     db.flush()
 
     _write_audit_log(

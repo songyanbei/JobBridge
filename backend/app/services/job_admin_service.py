@@ -15,6 +15,11 @@ from app.core.exceptions import BusinessException
 from app.models import Job
 from app.services.admin_log_service import _json_safe, write_admin_log
 from app.services.lifecycle_config_service import get_job_ttl_days
+from app.services.job_mutation_service import (
+    assert_job_activated,
+    close_active_replacement,
+    reject_if_replacement_in_progress,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +135,8 @@ def _snapshot(job: Job) -> dict:
 
 def update_job(db: Session, job_id: int, version: int, payload: dict, operator: str) -> Job:
     job = get_job(db, job_id)
+    assert_job_activated(job)
+    reject_if_replacement_in_progress(db, job_id)
     if int(job.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(job.version or 0)})
@@ -199,6 +206,8 @@ def delist(db: Session, job_id: int, version: int, reason: str, operator: str) -
     if reason not in ("manual_delist", "filled"):
         raise BusinessException(40101, "无效的下架原因")
     job = get_job(db, job_id)
+    assert_job_activated(job)
+    close_active_replacement(db, job, reason="old_job_delisted")
     if int(job.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(job.version or 0)})
@@ -217,6 +226,8 @@ def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> 
     if days not in (15, 30):
         raise BusinessException(40101, "延期天数仅支持 15 或 30")
     job = get_job(db, job_id)
+    assert_job_activated(job)
+    reject_if_replacement_in_progress(db, job_id)
     if int(job.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(job.version or 0)})
@@ -243,6 +254,8 @@ def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> 
 
 def restore(db: Session, job_id: int, version: int, operator: str) -> None:
     job = get_job(db, job_id)
+    assert_job_activated(job)
+    reject_if_replacement_in_progress(db, job_id)
     if int(job.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(job.version or 0)})
