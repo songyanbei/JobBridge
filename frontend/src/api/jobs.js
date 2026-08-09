@@ -25,6 +25,14 @@ export function restoreJob(id, data) {
   return request.post(`/admin/jobs/${id}/restore`, data)
 }
 
+export function retryReplacement(id, data) {
+  return request.post(`/admin/jobs/replacements/${id}/retry`, data)
+}
+
+export function cancelReplacement(id, data) {
+  return request.post(`/admin/jobs/replacements/${id}/cancel`, data)
+}
+
 export function exportJobs(params) {
   return downloadBlob('/admin/jobs/export', params, 'jobs.csv')
 }

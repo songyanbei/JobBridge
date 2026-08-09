@@ -29,19 +29,23 @@ def increment_version(job: Job) -> None:
 
 
 def close_active_replacement(db: Session, old_job: Job, *, reason: str) -> None:
-    relation = db.query(JobReplacement).filter(
+    relation_hint = db.query(JobReplacement).filter(
         JobReplacement.active_old_job_id == old_job.id,
-    ).with_for_update().first()
-    if not isinstance(relation, JobReplacement):
+    ).first()
+    if not isinstance(relation_hint, JobReplacement):
         return
-    candidate = db.query(Job).filter(Job.id == relation.new_job_id).with_for_update().first()
+    from app.services.job_replacement_lock_service import lock_replacement_graph
+    relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+    if not isinstance(relation, JobReplacement) or relation.active_old_job_id != old_job.id:
+        return
+    candidate = jobs.get(relation.new_job_id)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     relation.lifecycle_status = "closed"
     relation.closed_reason = reason
     relation.active_old_job_id = None
+    relation.candidate_cleaned_at = now
     if candidate and candidate.expires_at is None and candidate.deleted_at is None:
         candidate.deleted_at = now
-        candidate.candidate_expires_at = None
         increment_version(candidate)
         db.query(MediaAssetLifecycle).filter(
             MediaAssetLifecycle.entity_type == "job",
@@ -51,3 +55,5 @@ def close_active_replacement(db: Session, old_job: Job, *, reason: str) -> None:
             "state": "delete_pending",
             "next_attempt_at": now,
         }, synchronize_session=False)
+        from app.services.target_cleanup_service import ensure_job_cleanup_task
+        ensure_job_cleanup_task(db, candidate.id, reason="candidate_cancelled")

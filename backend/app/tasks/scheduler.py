@@ -24,6 +24,7 @@ def build_scheduler() -> BackgroundScheduler:
     # 延迟 import，避免 app 启动时的循环依赖
     from app.tasks import (
         daily_report,
+        job_candidate_cleanup,
         media_cleanup_worker,
         recommendation_privacy_cleanup,
         send_retry_drain,
@@ -66,6 +67,14 @@ def build_scheduler() -> BackgroundScheduler:
         target_cleanup_worker.run,
         IntervalTrigger(minutes=1),
         id="target_cleanup_worker",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        job_candidate_cleanup.run,
+        IntervalTrigger(minutes=10),
+        id="job_candidate_cleanup",
         max_instances=1,
         coalesce=True,
     )

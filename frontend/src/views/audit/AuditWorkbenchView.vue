@@ -592,7 +592,13 @@ async function onPass() {
   try {
     await passAuditItem(target.target_type, target.id, detail.value.version)
     ElMessage.success('已通过')
-    startUndoCountdown(target)
+    if (target.target_type === 'job') {
+      undoSecondsLeft.value = 0
+      undoTarget.value = null
+      ElMessage.info('岗位审核已触发生命周期变化，不能撤销')
+    } else {
+      startUndoCountdown(target)
+    }
     stopLockRenew()
     await moveToNext()
   } catch (err) {
@@ -615,7 +621,13 @@ async function onReject(payload) {
     })
     ElMessage.success('已驳回')
     rejectVisible.value = false
-    startUndoCountdown(target)
+    if (target.target_type === 'job') {
+      undoSecondsLeft.value = 0
+      undoTarget.value = null
+      ElMessage.info('岗位审核已触发生命周期变化，不能撤销')
+    } else {
+      startUndoCountdown(target)
+    }
     stopLockRenew()
     await moveToNext()
   } catch (err) {

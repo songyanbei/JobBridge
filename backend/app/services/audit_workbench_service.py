@@ -280,6 +280,11 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
 
     images = getattr(obj, "images", None)
 
+    lifecycle = {}
+    if target_type == "job":
+        from app.services.job_admin_service import replacement_projections
+        lifecycle = replacement_projections(db, [obj]).get(obj.id, {})
+
     return {
         "id": obj.id,
         "target_type": target_type,
@@ -299,7 +304,10 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
         "audited_at": _json_safe(obj.audited_at),
         "created_at": _json_safe(obj.created_at),
         "expires_at": _json_safe(getattr(obj, "expires_at", None)),
+        "activated_at": _json_safe(getattr(obj, "activated_at", None)),
+        "candidate_expires_at": _json_safe(getattr(obj, "candidate_expires_at", None)),
         "images": images,
+        **lifecycle,
     }
 
 

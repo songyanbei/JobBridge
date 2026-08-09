@@ -5,14 +5,14 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import asc, desc
+from sqlalchemy import and_, asc, desc, or_
 from sqlalchemy.orm import Query, Session
 
 from app.core.exceptions import BusinessException
-from app.models import Job
+from app.models import Job, JobReplacement
 from app.services.admin_log_service import _json_safe, write_admin_log
 from app.services.lifecycle_config_service import get_job_ttl_days
 from app.services.job_mutation_service import (
@@ -48,6 +48,12 @@ _EDIT_WHITELIST = {
     "rebate", "employment_type", "contract_type",
     "min_duration", "description",
 }
+
+_LIFECYCLE_SCOPES = {"active", "candidate", "history", "all"}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -97,19 +103,52 @@ def _apply_sort(query: Query, sort: str | None) -> Query:
     return query.order_by(Job.created_at.desc())
 
 
+def _apply_lifecycle_scope(query: Query, lifecycle_scope: str | None) -> Query:
+    if lifecycle_scope is not None and lifecycle_scope not in _LIFECYCLE_SCOPES:
+        raise BusinessException(40101, "无效的 lifecycle_scope")
+    now = _utcnow()
+    active = and_(
+        Job.audit_status == "passed",
+        Job.activated_at.isnot(None),
+        Job.expires_at.isnot(None),
+        Job.expires_at > now,
+        Job.delist_reason.is_(None),
+        Job.deleted_at.is_(None),
+    )
+    candidate = and_(
+        Job.audit_status.in_(("pending", "rejected")),
+        Job.activated_at.is_(None),
+        Job.expires_at.is_(None),
+        Job.candidate_expires_at.isnot(None),
+        Job.deleted_at.is_(None),
+    )
+    if lifecycle_scope is None:
+        return query.filter(or_(active, candidate))
+    if lifecycle_scope == "active":
+        return query.filter(active)
+    if lifecycle_scope == "candidate":
+        return query.filter(candidate)
+    if lifecycle_scope == "history":
+        return query.filter(or_(
+            Job.deleted_at.isnot(None),
+            Job.delist_reason.isnot(None),
+            and_(Job.expires_at.isnot(None), Job.expires_at <= now),
+        ))
+    return query
+
+
 def list_jobs(
     db: Session,
     filters: dict[str, Any],
     page: int = 1,
     size: int = 20,
     sort: str | None = None,
-    include_deleted: bool = False,
+    lifecycle_scope: str | None = None,
 ) -> tuple[list[Job], int]:
     page = max(1, page)
     size = max(1, min(size, 100))
     query = db.query(Job)
-    if not include_deleted:
-        query = query.filter(Job.deleted_at.is_(None))
+    query = _apply_lifecycle_scope(query, lifecycle_scope)
     query = _apply_filters(query, filters)
     total = query.count()
     query = _apply_sort(query, sort)
@@ -122,6 +161,38 @@ def get_job(db: Session, job_id: int) -> Job:
     if not job:
         raise BusinessException(40401, "岗位不存在")
     return job
+
+
+def replacement_projections(db: Session, jobs: list[Job]) -> dict[int, dict]:
+    """从关系真源构建新旧岗位生命周期投影。"""
+    job_ids = {int(job.id) for job in jobs}
+    if not job_ids:
+        return {}
+    relations = db.query(JobReplacement).filter(
+        (JobReplacement.old_job_id.in_(job_ids))
+        | (JobReplacement.new_job_id.in_(job_ids))
+    ).order_by(JobReplacement.updated_at.desc(), JobReplacement.id.desc()).all()
+    result: dict[int, dict] = {}
+    for relation in relations:
+        common = {
+            "replacement_id": relation.id,
+            "replacement_review_outcome": relation.review_outcome,
+            "replacement_lifecycle_status": relation.lifecycle_status,
+            "replacement_closed_reason": relation.closed_reason,
+        }
+        if relation.new_job_id in job_ids:
+            result.setdefault(relation.new_job_id, {
+                **common,
+                "replaces_job_id": relation.old_job_id,
+                "replaced_by_job_id": None,
+            })
+        if relation.old_job_id in job_ids:
+            result.setdefault(relation.old_job_id, {
+                **common,
+                "replaces_job_id": None,
+                "replaced_by_job_id": relation.new_job_id,
+            })
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +304,7 @@ def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> 
                                 {"current_version": int(job.version or 0)})
 
     before = _snapshot(job)
-    now = datetime.now()
+    now = _utcnow()
     max_days = get_job_ttl_days(db) * 2
     base = job.expires_at if job.expires_at and job.expires_at > now else now
     new_expires = base + timedelta(days=days)
@@ -261,7 +332,7 @@ def restore(db: Session, job_id: int, version: int, operator: str) -> None:
                                 {"current_version": int(job.version or 0)})
     if not job.delist_reason:
         raise BusinessException(40904, "岗位未下架")
-    if job.expires_at and job.expires_at <= datetime.now():
+    if job.expires_at and job.expires_at <= _utcnow():
         raise BusinessException(40904, "岗位已过期，无法取消下架")
 
     before = _snapshot(job)
@@ -279,8 +350,14 @@ def restore(db: Session, job_id: int, version: int, operator: str) -> None:
 # 导出
 # ---------------------------------------------------------------------------
 
-def export_rows(db: Session, filters: dict[str, Any], sort: str | None = None, limit: int = 10000) -> list[Job]:
-    query = db.query(Job).filter(Job.deleted_at.is_(None))
+def export_rows(
+    db: Session,
+    filters: dict[str, Any],
+    sort: str | None = None,
+    limit: int = 10000,
+    lifecycle_scope: str | None = None,
+) -> list[Job]:
+    query = _apply_lifecycle_scope(db.query(Job), lifecycle_scope)
     query = _apply_filters(query, filters)
     query = _apply_sort(query, sort)
     count = query.count()

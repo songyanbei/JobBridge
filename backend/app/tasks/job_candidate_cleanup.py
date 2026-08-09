@@ -1,0 +1,154 @@
+"""Expire unactivated first-publish and replacement Job candidates."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from loguru import logger
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session
+
+from app.db import SessionLocal
+from app.models import Job, JobReplacement, MediaAssetLifecycle
+from app.services.job_mutation_service import increment_version
+from app.services.job_replacement_lock_service import lock_replacement_graph
+from app.services.target_cleanup_service import ensure_job_cleanup_task
+from app.tasks.common import log_event, task_lock
+
+BATCH_SIZE = 500
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _is_due_candidate(candidate: Job, now: datetime) -> bool:
+    return bool(
+        candidate.audit_status in {"pending", "rejected"}
+        and candidate.activated_at is None
+        and candidate.expires_at is None
+        and candidate.candidate_expires_at is not None
+        and candidate.candidate_expires_at <= now
+        and candidate.deleted_at is None
+    )
+
+
+def cleanup_candidate(db: Session, candidate_id: int, *, now: datetime | None = None) -> bool:
+    """Lock one candidate with the shared graph order and move it to cleanup state."""
+    now = now or _utcnow()
+    relation_hint = db.query(JobReplacement).filter(
+        JobReplacement.new_job_id == candidate_id,
+    ).first()
+    relation = None
+    if relation_hint is not None:
+        relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+        candidate = jobs.get(candidate_id) if jobs else None
+    else:
+        candidate = db.query(Job).filter(Job.id == candidate_id).with_for_update().first()
+
+    if candidate is None or not _is_due_candidate(candidate, now):
+        return False
+
+    if relation is not None:
+        relation.lifecycle_status = "closed"
+        relation.candidate_cleaned_at = now
+        relation.active_old_job_id = None
+        if not relation.closed_reason:
+            relation.closed_reason = "candidate_expired"
+
+    candidate.deleted_at = now
+    increment_version(candidate)
+    db.query(MediaAssetLifecycle).filter(
+        MediaAssetLifecycle.entity_type == "job",
+        MediaAssetLifecycle.entity_id == candidate.id,
+        MediaAssetLifecycle.state.in_(("pending", "attached")),
+    ).update({
+        "state": "delete_pending",
+        "next_attempt_at": now,
+    }, synchronize_session=False)
+    ensure_job_cleanup_task(db, candidate.id, reason="candidate_expired")
+    db.flush()
+    return True
+
+
+def process_due_candidates(
+    db: Session,
+    *,
+    now: datetime | None = None,
+    batch_size: int = BATCH_SIZE,
+) -> dict[str, int]:
+    """Drain the due set once in stable candidate_expires_at/id order."""
+    now = now or _utcnow()
+    stats = {"cleaned": 0, "conflicts": 0, "batches": 0}
+    cursor_expiry = None
+    cursor_id = 0
+    while True:
+        query = db.query(Job.id, Job.candidate_expires_at).filter(
+            Job.expires_at.is_(None),
+            Job.candidate_expires_at.isnot(None),
+            Job.candidate_expires_at <= now,
+            Job.audit_status.in_(("pending", "rejected")),
+            Job.deleted_at.is_(None),
+        )
+        if cursor_expiry is not None:
+            query = query.filter(or_(
+                Job.candidate_expires_at > cursor_expiry,
+                and_(
+                    Job.candidate_expires_at == cursor_expiry,
+                    Job.id > cursor_id,
+                ),
+            ))
+        rows = query.order_by(Job.candidate_expires_at, Job.id).limit(batch_size).all()
+        if not rows:
+            break
+        stats["batches"] += 1
+        for candidate_id, candidate_expiry in rows:
+            try:
+                if cleanup_candidate(db, int(candidate_id), now=now):
+                    db.commit()
+                    stats["cleaned"] += 1
+                else:
+                    db.rollback()
+                    stats["conflicts"] += 1
+            except Exception:
+                db.rollback()
+                stats["conflicts"] += 1
+                logger.exception("job candidate cleanup failed: candidate_id={}", candidate_id)
+            cursor_expiry, cursor_id = candidate_expiry, int(candidate_id)
+        if len(rows) < batch_size:
+            break
+    return stats
+
+
+def run() -> None:
+    with task_lock("job_candidate_cleanup", ttl=1200) as acquired:
+        if not acquired:
+            return
+        with SessionLocal() as db:
+            now = _utcnow()
+            due_count, oldest_due = db.query(
+                func.count(Job.id), func.min(Job.candidate_expires_at),
+            ).filter(
+                Job.expires_at.is_(None),
+                Job.candidate_expires_at.isnot(None),
+                Job.candidate_expires_at <= now,
+                Job.audit_status.in_(("pending", "rejected")),
+                Job.deleted_at.is_(None),
+            ).one()
+            invariant_count = db.query(Job).filter(
+                Job.audit_status == "passed",
+                Job.expires_at.is_(None),
+                Job.deleted_at.is_(None),
+            ).count()
+            stats = process_due_candidates(db, now=now)
+            log_event(
+                "job_candidate_cleanup_summary",
+                **stats,
+                job_candidate_due_count=int(due_count or 0),
+                job_candidate_oldest_lag_seconds=(
+                    max(0, int((now - oldest_due).total_seconds()))
+                    if oldest_due else 0
+                ),
+                job_candidate_cleanup_success_total=stats["cleaned"],
+                job_candidate_cleanup_conflict_total=stats["conflicts"],
+                job_passed_without_activation_total=invariant_count,
+            )

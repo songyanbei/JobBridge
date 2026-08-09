@@ -291,10 +291,10 @@ def cancel_candidate(
     relation.lifecycle_status = "closed"
     relation.closed_reason = reason
     relation.active_old_job_id = None
+    relation.candidate_cleaned_at = now
     relation.reviewed_by = operator
     relation.reviewed_at = now
     candidate.deleted_at = now
-    candidate.candidate_expires_at = None
     increment_version(candidate)
     db.query(MediaAssetLifecycle).filter(
         MediaAssetLifecycle.entity_type == "job",
@@ -304,6 +304,7 @@ def cancel_candidate(
         "state": "delete_pending",
         "next_attempt_at": now,
     }, synchronize_session=False)
+    ensure_job_cleanup_task(db, candidate.id, reason="candidate_cancelled")
     write_admin_log(
         db,
         target_type="job",
