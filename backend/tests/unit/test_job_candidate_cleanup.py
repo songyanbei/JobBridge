@@ -8,6 +8,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.models import (
+    AuditLog,
     Job,
     JobReplacement,
     MediaAssetLifecycle,
@@ -44,6 +45,7 @@ def db():
     for table in (
         User.__table__,
         Job.__table__,
+        AuditLog.__table__,
         JobReplacement.__table__,
         MediaAssetLifecycle.__table__,
         TargetCleanupTask.__table__,
@@ -223,6 +225,70 @@ def test_admin_online_operations_reject_candidate(db, operation):
             delist(db, candidate.id, candidate.version, "manual_delist", "admin")
         else:
             restore(db, candidate.id, candidate.version, "admin")
+
+
+def test_restore_rejects_replaced_and_soft_deleted_jobs_without_state_changes(db):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    replaced = _job(
+        db,
+        audit_status="passed",
+        activated_at=now,
+        expires_at=now + timedelta(days=10),
+        candidate_expires_at=None,
+        delist_reason="replaced",
+    )
+    deleted = _job(
+        db,
+        audit_status="passed",
+        activated_at=now,
+        expires_at=now + timedelta(days=10),
+        candidate_expires_at=None,
+        delist_reason="manual_delist",
+        deleted_at=now,
+    )
+    cleanup = TargetCleanupTask(
+        operation_id="restore-blocked-cleanup",
+        target_type="job",
+        target_id=deleted.id,
+        reason="manual_delist",
+        reason_history=["manual_delist"],
+        status="retry_wait",
+    )
+    db.add(cleanup)
+    db.commit()
+
+    for job in (replaced, deleted):
+        original_version = job.version
+        with pytest.raises(BusinessException, match="job_not_restorable"):
+            restore(db, job.id, job.version, "admin")
+        assert job.version == original_version
+
+    assert replaced.delist_reason == "replaced"
+    assert replaced.deleted_at is None
+    assert deleted.delist_reason == "manual_delist"
+    assert deleted.deleted_at == now
+    assert cleanup.status == "retry_wait"
+    assert cleanup.reason_history == ["manual_delist"]
+
+
+def test_restore_allows_ordinary_delisted_job(db):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    job = _job(
+        db,
+        audit_status="passed",
+        activated_at=now,
+        expires_at=now + timedelta(days=10),
+        candidate_expires_at=None,
+        delist_reason="manual_delist",
+        deleted_at=None,
+    )
+    original_version = job.version
+
+    restore(db, job.id, job.version, "admin")
+
+    assert job.delist_reason is None
+    assert job.deleted_at is None
+    assert job.version == original_version + 1
 
 
 def test_delisting_old_job_closes_candidate_with_graph_lock_cleanup(db):

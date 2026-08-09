@@ -328,6 +328,8 @@ def extend(db: Session, job_id: int, version: int, days: int, operator: str) -> 
 
 def restore(db: Session, job_id: int, version: int, operator: str) -> None:
     job = get_job(db, job_id)
+    if job.delist_reason == "replaced" or job.deleted_at is not None:
+        raise BusinessException(40904, "job_not_restorable")
     assert_job_activated(job)
     reject_if_replacement_in_progress(db, job_id)
     if int(job.version or 0) != int(version):
