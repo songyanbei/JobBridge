@@ -55,17 +55,42 @@ def current_active_replacement_hint(
             row = connection.execute(statement).first()
     return _hint_from_row(row)
 
-def lock_replacement_creation(db: Session, old_job_id: int, operation_id: str, source_msg_id: str):
-    identity = (JobReplacement.operation_id == operation_id) | (JobReplacement.source_msg_id == source_msg_id)
-    existing = db.query(JobReplacement).filter(identity).first()
-    if existing: return existing, None
-    old = db.query(Job).filter(Job.id == old_job_id).with_for_update().first()
+def lock_replacement_creation(
+    db: Session,
+    old_job_id: int,
+    operation_id: str,
+    source_msg_id: str,
+):
+    identity = (
+        (JobReplacement.operation_id == operation_id)
+        | (JobReplacement.source_msg_id == source_msg_id)
+    )
     existing = db.query(JobReplacement).filter(identity).first()
     if existing:
+        return existing, None
+    old = (
+        db.query(Job)
+        .populate_existing()
+        .filter(Job.id == old_job_id)
+        .with_for_update()
+        .first()
+    )
+    existing = (
+        db.query(JobReplacement)
+        .populate_existing()
+        .filter(identity)
+        .with_for_update()
+        .first()
+    )
+    if existing:
         return existing, old
-    active = db.query(JobReplacement).filter(
-        JobReplacement.active_old_job_id == old_job_id,
-    ).with_for_update().first()
+    active = (
+        db.query(JobReplacement)
+        .populate_existing()
+        .filter(JobReplacement.active_old_job_id == old_job_id)
+        .with_for_update()
+        .first()
+    )
     if active:
         return active, old
     return None, old

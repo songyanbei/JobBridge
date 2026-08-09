@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -9,13 +10,86 @@ from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
+from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import Job, JobReplacement, TargetCleanupTask, User
 from app.services.job_admin_service import restore
-from app.services.job_replace_service import cancel_candidate
+from app.services.job_replace_service import cancel_candidate, create_replacement_candidate
 
 
 pytestmark = pytest.mark.integration
+
+
+def _active_job(owner_userid: str, now: datetime) -> Job:
+    return Job(
+        owner_userid=owner_userid,
+        city="RR",
+        job_category="RR",
+        salary_floor_monthly=5000,
+        pay_type="月薪",
+        headcount=1,
+        raw_text="repeatable read old job",
+        audit_status="passed",
+        activated_at=now,
+        expires_at=now + timedelta(days=30),
+        candidate_expires_at=None,
+        version=1,
+    )
+
+
+def _create_candidate(
+    db,
+    old_job: Job,
+    *,
+    operation_id: str,
+    source_msg_id: str,
+    audit_status: str,
+):
+    return create_replacement_candidate(
+        db,
+        owner_userid=old_job.owner_userid,
+        target_job_id=old_job.id,
+        expected_version=old_job.version,
+        operation_id=operation_id,
+        source_msg_id=source_msg_id,
+        complete_data={
+            "city": "RR",
+            "job_category": "RR",
+            "salary_floor_monthly": 6000,
+            "pay_type": "月薪",
+            "headcount": 2,
+        },
+        raw_text="repeatable read candidate",
+        media_ids=[],
+        audit_result=SimpleNamespace(status=audit_status, reason=""),
+    )
+
+
+def _cleanup_replacement_rows(owner_userid: str) -> None:
+    db = SessionLocal()
+    try:
+        job_ids = [
+            row[0]
+            for row in db.query(Job.id).filter(Job.owner_userid == owner_userid).all()
+        ]
+        if job_ids:
+            db.query(TargetCleanupTask).filter(
+                TargetCleanupTask.target_type == "job",
+                TargetCleanupTask.target_id.in_(job_ids),
+            ).delete(synchronize_session=False)
+        db.query(JobReplacement).filter(
+            JobReplacement.owner_userid == owner_userid,
+        ).delete(synchronize_session=False)
+        db.query(Job).filter(Job.owner_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.external_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.rollback()
+        db.close()
 
 
 def test_cancel_reason_limit_prevents_mysql_truncation():
@@ -184,3 +258,181 @@ def test_restore_blocks_replaced_and_deleted_jobs_on_mysql():
         if transaction.is_active:
             transaction.rollback()
         connection.close()
+
+
+@pytest.mark.parametrize("repeated_identity", ["operation", "source_message"])
+def test_rr_idempotency_recheck_finds_auto_activated_relation(
+    monkeypatch,
+    repeated_identity,
+):
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    owner_userid = f"rr-idempotency-{uuid4().hex}"
+    operation_id = str(uuid4())
+    source_msg_id = f"msg-{uuid4()}"
+    setup = SessionLocal()
+    stale = None
+    creator = None
+    try:
+        setup.add(User(external_userid=owner_userid, role="factory"))
+        setup.flush()
+        old_job = _active_job(
+            owner_userid,
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+        )
+        setup.add(old_job)
+        setup.commit()
+        old_job_id = old_job.id
+        original_version = old_job.version
+        setup.close()
+
+        stale = SessionLocal()
+        isolation = str(
+            stale.execute(text("SELECT @@transaction_isolation")).scalar_one()
+        ).upper()
+        assert isolation == "REPEATABLE-READ"
+        stale_old = stale.query(Job).filter(Job.id == old_job_id).one()
+        assert stale.query(JobReplacement).filter(
+            JobReplacement.old_job_id == old_job_id,
+        ).first() is None
+
+        creator = SessionLocal()
+        creator_old = creator.query(Job).filter(Job.id == old_job_id).one()
+        first_relation, first_candidate = _create_candidate(
+            creator,
+            creator_old,
+            operation_id=operation_id,
+            source_msg_id=source_msg_id,
+            audit_status="passed",
+        )
+        creator.commit()
+        first_relation_id = first_relation.id
+        first_candidate_id = first_candidate.id
+        creator.close()
+        creator = None
+
+        retry_operation = (
+            operation_id if repeated_identity == "operation" else str(uuid4())
+        )
+        retry_source = (
+            source_msg_id
+            if repeated_identity == "source_message"
+            else f"msg-{uuid4()}"
+        )
+        returned_relation, returned_candidate = create_replacement_candidate(
+            stale,
+            owner_userid=owner_userid,
+            target_job_id=old_job_id,
+            expected_version=original_version,
+            operation_id=retry_operation,
+            source_msg_id=retry_source,
+            complete_data={
+                "city": "unused",
+                "job_category": "unused",
+                "salary_floor_monthly": 1,
+                "pay_type": "月薪",
+                "headcount": 1,
+            },
+            raw_text="idempotent retry",
+            media_ids=[],
+            audit_result=SimpleNamespace(status="pending", reason=""),
+        )
+
+        assert returned_relation.id == first_relation_id
+        assert returned_relation.lifecycle_status == "activated"
+        assert returned_candidate.id == first_candidate_id
+        assert returned_candidate.audit_status == "passed"
+        assert stale_old.delist_reason == "replaced"
+        assert stale_old.deleted_at is not None
+        assert stale_old.version > original_version
+        verifier = SessionLocal()
+        try:
+            assert verifier.query(JobReplacement).filter(
+                JobReplacement.old_job_id == old_job_id,
+            ).count() == 1
+        finally:
+            verifier.close()
+    finally:
+        if creator is not None:
+            creator.rollback()
+            creator.close()
+        if stale is not None:
+            stale.rollback()
+            stale.close()
+        if setup.is_active:
+            setup.rollback()
+            setup.close()
+        _cleanup_replacement_rows(owner_userid)
+
+
+def test_rr_active_relation_recheck_blocks_second_creation(monkeypatch):
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    owner_userid = f"rr-active-{uuid4().hex}"
+    setup = SessionLocal()
+    stale = None
+    creator = None
+    try:
+        setup.add(User(external_userid=owner_userid, role="factory"))
+        setup.flush()
+        old_job = _active_job(
+            owner_userid,
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+        )
+        setup.add(old_job)
+        setup.commit()
+        old_job_id = old_job.id
+        original_version = old_job.version
+        setup.close()
+
+        stale = SessionLocal()
+        stale_old = stale.query(Job).filter(Job.id == old_job_id).one()
+        assert stale.query(JobReplacement).filter(
+            JobReplacement.old_job_id == old_job_id,
+        ).first() is None
+
+        creator = SessionLocal()
+        creator_old = creator.query(Job).filter(Job.id == old_job_id).one()
+        first_relation, _ = _create_candidate(
+            creator,
+            creator_old,
+            operation_id=str(uuid4()),
+            source_msg_id=f"msg-{uuid4()}",
+            audit_status="pending",
+        )
+        creator.commit()
+        first_relation_id = first_relation.id
+        creator.close()
+        creator = None
+
+        with pytest.raises(BusinessException, match="replacement_in_progress"):
+            _create_candidate(
+                stale,
+                stale_old,
+                operation_id=str(uuid4()),
+                source_msg_id=f"msg-{uuid4()}",
+                audit_status="pending",
+            )
+        stale.rollback()
+
+        verifier = SessionLocal()
+        try:
+            relations = verifier.query(JobReplacement).filter(
+                JobReplacement.old_job_id == old_job_id,
+            ).all()
+            assert [relation.id for relation in relations] == [first_relation_id]
+            assert relations[0].active_old_job_id == old_job_id
+            assert relations[0].lifecycle_status == "awaiting_review"
+            assert verifier.query(Job).filter(Job.owner_userid == owner_userid).count() == 2
+            assert original_version < verifier.get(Job, old_job_id).version
+        finally:
+            verifier.close()
+    finally:
+        if creator is not None:
+            creator.rollback()
+            creator.close()
+        if stale is not None:
+            stale.rollback()
+            stale.close()
+        if setup.is_active:
+            setup.rollback()
+            setup.close()
+        _cleanup_replacement_rows(owner_userid)

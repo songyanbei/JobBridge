@@ -11,7 +11,7 @@ from app.services.job_activation_service import activate_job
 from app.services.admin_log_service import write_admin_log
 from app.services.job_business_digest_service import DIGEST_VERSION, business_digest
 from app.services.job_media_service import attach_media
-from app.services.job_mutation_service import increment_version
+from app.services.job_mutation_service import increment_version, lock_job_for_mutation
 from app.services.job_replacement_lock_service import (
     lock_replacement_creation,
     lock_replacement_graph,
@@ -104,7 +104,10 @@ def create_replacement_candidate(
             raise BusinessException(40904, "replacement_in_progress")
         if existing.owner_userid != owner_userid or existing.old_job_id != target_job_id:
             raise BusinessException(40904, "replacement_idempotency_mismatch")
-        return existing, db.query(Job).filter(Job.id == existing.new_job_id).one()
+        candidate = lock_job_for_mutation(db, existing.new_job_id)
+        if candidate is None:
+            raise BusinessException(40904, "replacement_graph_incomplete")
+        return existing, candidate
     if old is None or old.owner_userid != owner_userid:
         raise BusinessException(40401, "岗位不存在或无权更新")
     if old.audit_status != "passed" or old.deleted_at is not None or old.delist_reason is not None:
