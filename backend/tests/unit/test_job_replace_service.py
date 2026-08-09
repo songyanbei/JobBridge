@@ -18,7 +18,7 @@ from app.models import (
     User,
 )
 from app.schemas.conversation import SessionState
-from app.services.audit_workbench_service import pass_action, reject_action, undo
+from app.services.audit_workbench_service import edit_action, pass_action, reject_action, undo
 from app.services.command_service import execute
 from app.services.job_replace_service import (
     activate_replacement,
@@ -60,6 +60,13 @@ def db():
     finally:
         session.close()
         engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def _enable_replacement_feature(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
 
 
 def _job(db, **overrides):
@@ -117,7 +124,10 @@ def _create(db, old, status="pending", operation_id="op-1", source_msg_id="msg-1
     )
 
 
-def test_update_command_selects_only_job_and_starts_empty_draft(db):
+def test_update_command_selects_only_job_and_starts_empty_draft(db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
     old = _job(db)
     session = SessionState(role="factory", pending_upload={"city": "旧草稿"})
     user = UserContext(
@@ -146,7 +156,10 @@ def test_update_job_command_parses_explicit_id():
     assert _match_command("/更新岗位 123") == ("update_job", "123")
 
 
-def test_update_command_requires_explicit_id_for_multiple_jobs(db):
+def test_update_command_requires_explicit_id_for_multiple_jobs(db, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
     first = _job(db)
     second = _job(db)
     session = SessionState(role="factory")
@@ -165,6 +178,7 @@ def test_update_command_requires_explicit_id_for_multiple_jobs(db):
 
 def test_pending_candidate_is_complete_and_does_not_replace_old_job(db):
     old = _job(db, address="旧地址")
+    old_version = old.version
     relation, candidate = _create(db, old, status="pending")
     db.commit()
 
@@ -174,8 +188,25 @@ def test_pending_candidate_is_complete_and_does_not_replace_old_job(db):
     assert candidate.expires_at is None
     assert candidate.candidate_expires_at is not None
     assert old.deleted_at is None and old.delist_reason is None
+    assert old.version == old_version + 1
+    assert relation.old_job_version == old.version
     assert relation.lifecycle_status == "awaiting_review"
     assert relation.active_old_job_id == old.id
+
+
+def test_candidate_creation_is_blocked_by_rollout_gate(db, monkeypatch):
+    from app.config import settings
+
+    old = _job(db)
+    old_version = old.version
+    monkeypatch.setattr(settings, "job_replacement_enabled", False)
+
+    with pytest.raises(BusinessException, match="job_replacement_disabled"):
+        _create(db, old)
+
+    assert old.version == old_version
+    assert db.query(JobReplacement).count() == 0
+    assert db.query(Job).count() == 1
 
 
 def test_rejected_candidate_closes_relation_and_keeps_old_job_online(db):
@@ -191,6 +222,7 @@ def test_rejected_candidate_closes_relation_and_keeps_old_job_online(db):
 
 def test_auto_pass_atomically_activates_new_job_and_replaces_old(db):
     old = _job(db)
+    old_version = old.version
     relation, candidate = _create(db, old, status="passed")
     db.commit()
 
@@ -198,6 +230,8 @@ def test_auto_pass_atomically_activates_new_job_and_replaces_old(db):
     assert candidate.activated_at is not None and candidate.expires_at is not None
     assert candidate.candidate_expires_at is None
     assert old.delist_reason == "replaced" and old.deleted_at is not None
+    assert relation.old_job_version == old_version + 1
+    assert old.version == old_version + 2
     assert relation.lifecycle_status == "activated"
     assert db.query(TargetCleanupTask).filter_by(target_id=old.id).one().reason == "replaced"
 
@@ -257,6 +291,62 @@ def test_manual_pass_conflict_keeps_candidate_pending_then_retry_activates(db):
     db.commit()
     assert candidate.audit_status == "passed"
     assert relation.lifecycle_status == "activated"
+
+
+def test_reviewed_conflict_candidate_cannot_be_edited_before_retry(db):
+    old = _job(db)
+    relation, candidate = _create(db, old)
+    db.commit()
+    old.description = "审核期间被管理员修改"
+    old.version += 1
+    db.commit()
+
+    pass_action(db, "job", candidate.id, candidate.version, "reviewer")
+    original_description = candidate.description
+    original_version = candidate.version
+
+    with pytest.raises(BusinessException, match="replacement_already_reviewed"):
+        edit_action(
+            db,
+            "job",
+            candidate.id,
+            candidate.version,
+            {"description": "试图绕过重新审核"},
+            "reviewer",
+        )
+    db.rollback()
+    db.refresh(candidate)
+    db.refresh(relation)
+
+    assert candidate.description == original_description
+    assert candidate.version == original_version
+    assert relation.review_outcome == "passed"
+    assert relation.lifecycle_status == "conflict"
+
+
+def test_pending_replacement_candidate_edit_stays_awaiting_review(db, monkeypatch):
+    old = _job(db)
+    relation, candidate = _create(db, old)
+    db.commit()
+    previous_version = candidate.version
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.save_undo",
+        lambda *_args, **_kwargs: None,
+    )
+
+    edit_action(
+        db,
+        "job",
+        candidate.id,
+        candidate.version,
+        {"description": "审核员修正后的完整内容"},
+        "reviewer",
+    )
+
+    assert candidate.description == "审核员修正后的完整内容"
+    assert candidate.version == previous_version + 1
+    assert relation.review_outcome == "pending"
+    assert relation.lifecycle_status == "awaiting_review"
 
 
 def test_manual_reject_and_operator_cancel_preserve_old_and_release_media(db):

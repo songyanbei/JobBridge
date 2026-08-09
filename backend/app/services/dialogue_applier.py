@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy.orm import Session as DatabaseSession
+
 from app.llm.base import IntentResult
 from app.schemas.conversation import SessionState
 from app.services import conversation_service
@@ -51,11 +53,13 @@ def apply_decision(
     *,
     msg=None,
     intent_result: IntentResult | None = None,
+    db: DatabaseSession | None = None,
 ) -> ApplyResult:
     """把 decision 中的声明式指令落到 session。
 
-    需要 msg / intent_result 仅当 state_transition=enter_upload_conflict 时
-    （要调 _enter_upload_conflict 派生回复文案）。其它 transition 不依赖 msg。
+    需要 msg / intent_result 仅当 state_transition=enter_upload_conflict 时。
+    运行时应传 db，使 clear_pending_upload 能先回收 durable media；不传 db
+    仅用于不涉及持久化媒体的纯状态机调用。
     """
     transition = decision.state_transition
 
@@ -84,18 +88,15 @@ def apply_decision(
         return ApplyResult(transition_executed="reset_search")
 
     if transition == "clear_pending_upload":
-        # 取消草稿：把上传状态清掉，回 idle
-        session.pending_upload = {}
-        session.pending_upload_intent = None
-        session.awaiting_field = None
-        session.pending_started_at = None
-        session.pending_updated_at = None
-        session.pending_expires_at = None
-        session.pending_raw_text_parts = []
-        session.active_flow = "idle"
-        session.pending_interruption = None
-        session.failed_patch_rounds = 0
-        session.conflict_followup_rounds = 0
+        from app.services.upload_service import abandon_pending_upload, clear_pending_upload
+
+        # Runtime callers pass db so durable media is queued for deletion before
+        # the IDs and replacement context are cleared. The db-less path keeps
+        # the applier usable in pure state-machine tests.
+        if db is not None:
+            abandon_pending_upload(session, db)
+        else:
+            clear_pending_upload(session)
         return ApplyResult(transition_executed="clear_pending_upload")
 
     if transition == "resume_upload_collecting":

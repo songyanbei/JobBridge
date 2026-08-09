@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -225,6 +226,64 @@ class TestP1_1_V2CancelResetReply:
         # 修复后：基于 pre-state 渲染「已取消」，不是反向 NO_DRAFT
         assert replies[0].content == CANCEL_PENDING_OK
         assert replies[0].content != CANCEL_PENDING_NO_DRAFT
+
+    def test_v2_cancel_route_releases_durable_replacement_media(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        from app.llm.base import IntentResult
+        from app.services import message_router
+        from app.services.dialogue_reducer import DialogueDecision
+
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload={"city": "苏州"},
+            pending_upload_intent="upload_job",
+            pending_upload_mode="replace",
+            pending_target_id=42,
+            pending_target_version=7,
+            pending_operation_id="op-v2-cancel",
+            pending_upload_media_ids=[11, 12],
+        )
+        decision = DialogueDecision(
+            dialogue_act="cancel",
+            resolved_frame="none",
+            route_intent="command",
+            state_transition="clear_pending_upload",
+        )
+        route = SimpleNamespace(
+            source="v2_primary",
+            intent_result=IntentResult(intent="command", structured_data={}),
+            decision=decision,
+            parse_result=None,
+        )
+        db = MagicMock()
+        mark_delete_pending = MagicMock()
+        monkeypatch.setattr(message_router._settings_module, "dialogue_v2_mode", "primary")
+        monkeypatch.setattr(message_router, "classify_dialogue", lambda **_kwargs: route)
+        monkeypatch.setattr(
+            message_router.conversation_service, "load_session", lambda *_args: session,
+        )
+        monkeypatch.setattr(
+            message_router.conversation_service, "save_session", lambda *_args: None,
+        )
+        monkeypatch.setattr(
+            "app.services.job_media_service.mark_delete_pending",
+            mark_delete_pending,
+        )
+
+        replies = message_router._handle_text(
+            _make_msg("取消", userid="factory-1"),
+            MagicMock(role="factory", should_welcome=False),
+            db,
+        )
+
+        mark_delete_pending.assert_called_once_with(db, [11, 12])
+        assert session.pending_upload_mode == "create"
+        assert session.pending_target_id is None
+        assert session.pending_operation_id is None
+        assert session.pending_upload_media_ids == []
+        assert replies[0].content == message_router.command_service.CANCEL_PENDING_OK
 
     def test_v2_reset_in_search_active_returns_success_not_empty(self):
         """复现 review 报告：reset 在 search_active 下不再返回反向「当前没有可清空的搜索条件」。"""

@@ -674,7 +674,9 @@ def _handle_text(
                 # 渲染对应文案（以及 proceed 路径消费 pending_interruption）。
                 # 否则 cancel/resume 只改回复但 session 状态不动，是真 bug
                 # （codex review 第二轮 P1）。
-                apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                apply_decision(
+                    decision, session, msg=msg, intent_result=intent_result, db=db,
+                )
                 replies = _route_v2_resolve_conflict(
                     decision, msg, user_ctx, session, db,
                 )
@@ -691,7 +693,9 @@ def _handle_text(
             # 接管二次检索 + 清状态。
             if decision.dialogue_act == "respond_relaxation_offer":
                 if decision.state_transition == "clear_pending_relaxation":
-                    apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                    apply_decision(
+                        decision, session, msg=msg, intent_result=intent_result, db=db,
+                    )
                 replies = _route_v2_relaxation_response(
                     decision, msg, user_ctx, session, db,
                 )
@@ -716,7 +720,9 @@ def _handle_text(
                     ),
                     "active_flow": session.active_flow,
                 }
-                apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                apply_decision(
+                    decision, session, msg=msg, intent_result=intent_result, db=db,
+                )
                 replies = _route_v2_cancel_reset(decision, pre_state, msg, session)
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
@@ -725,7 +731,9 @@ def _handle_text(
                 return replies
             # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
             # 重复调用也是幂等的：consume_search_awaiting 对已消费字段是 no-op）。
-            apply_decision(decision, session, msg=msg, intent_result=intent_result)
+            apply_decision(
+                decision, session, msg=msg, intent_result=intent_result, db=db,
+            )
 
     if user_ctx.role == "broker":
         from app.services.dialogue_reducer import broker_explicit_direction

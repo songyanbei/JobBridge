@@ -88,6 +88,10 @@ def create_replacement_candidate(
     media_ids: list[int],
     audit_result,
 ) -> tuple[JobReplacement, Job]:
+    from app.config import settings
+
+    if not settings.job_replacement_enabled:
+        raise BusinessException(40904, "job_replacement_disabled")
     existing, old = lock_replacement_creation(db, target_job_id, operation_id, source_msg_id)
     if existing is not None:
         same_request = (
@@ -107,6 +111,12 @@ def create_replacement_candidate(
         raise BusinessException(40902, "岗位已发生变化，请重新发起更新", {
             "current_version": int(old.version or 0),
         })
+
+    # Establishing a replacement changes the old Job's mutation boundary.
+    # Keeping this increment under the old Job row lock makes any concurrent
+    # optimistic admin write fail instead of silently editing the audit basis.
+    increment_version(old)
+    replacement_base_version = int(old.version)
 
     candidate_expiry = _utcnow() + timedelta(days=get_job_candidate_ttl_days(db))
     new_job = _candidate_from_complete_data(
@@ -128,7 +138,7 @@ def create_replacement_candidate(
         owner_userid=owner_userid,
         old_job_id=old.id,
         new_job_id=new_job.id,
-        old_job_version=old.version,
+        old_job_version=replacement_base_version,
         old_expires_at=old.expires_at,
         old_business_digest=business_digest(old),
         old_business_digest_version=DIGEST_VERSION,
@@ -147,7 +157,7 @@ def create_replacement_candidate(
             relation,
             old,
             new_job,
-            expected_old_version=expected_version,
+            expected_old_version=replacement_base_version,
         )
     return relation, new_job
 

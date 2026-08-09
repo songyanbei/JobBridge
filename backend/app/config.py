@@ -709,10 +709,10 @@ class Settings(BaseSettings):
 
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"
-    job_replacement_enabled: bool = True
-    job_expiry_cleanup_enabled: bool = True
-    job_candidate_cleanup_enabled: bool = True
-    job_hard_delete_enabled: bool = True
+    job_replacement_enabled: bool = False
+    job_expiry_cleanup_enabled: bool = False
+    job_candidate_cleanup_enabled: bool = False
+    job_hard_delete_enabled: bool = False
     daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送
     monitor_queue_incoming_threshold: int = 50
     monitor_queue_incoming_max_age_seconds: int = 120

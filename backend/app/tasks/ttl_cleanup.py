@@ -255,6 +255,11 @@ def _safe_step(step_name: str, stats: dict, fn) -> None:
 
 def _soft_delete_expired_jobs(db) -> int:
     """每日兜底复用高频任务的行锁、状态复核和 durable 清理生产逻辑。"""
+    from app.config import settings
+
+    if not settings.job_expiry_cleanup_enabled:
+        log_event("job_expiry_cleanup_disabled", source="daily_fallback")
+        return 0
     from app.tasks.job_expiry_cleanup import process_expired_jobs
     stats = process_expired_jobs(db, max_runtime_seconds=None)
     return int(stats["processed"])

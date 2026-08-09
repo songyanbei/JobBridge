@@ -1,11 +1,16 @@
 """Normalize persisted storage references to canonical object keys."""
 from __future__ import annotations
 
+import json
+import logging
 import re
 import unicodedata
+from collections.abc import Iterable
 from urllib.parse import unquote, urlsplit
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -65,3 +70,47 @@ def normalize_storage_reference(raw_value: str) -> str:
 
 
 normalize_object_key = normalize_storage_reference
+
+
+def storage_urls_for_response(raw_values) -> list[str] | None:
+    """Convert persisted media references to presentation URLs.
+
+    Business rows keep canonical object keys.  Legacy local/trusted URLs are
+    normalized through the same contract before the active storage backend
+    generates a URL.  Invalid historical values are omitted so one dirty
+    reference cannot make an entire admin list or audit detail unreadable.
+    """
+    if raw_values is None:
+        return None
+    values = raw_values
+    if isinstance(values, (bytes, str)):
+        try:
+            if isinstance(values, bytes):
+                values = values.decode("utf-8")
+            values = json.loads(values)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            values = [raw_values]
+    if not isinstance(values, Iterable) or isinstance(values, (dict, str, bytes)):
+        logger.warning("invalid_media_response_array value_type=%s", type(raw_values).__name__)
+        return []
+
+    from app.storage import get_storage
+
+    try:
+        storage = get_storage()
+    except Exception:
+        logger.exception("media_response_storage_unavailable")
+        return []
+
+    urls: list[str] = []
+    for index, raw_value in enumerate(values):
+        try:
+            urls.append(storage.get_url(normalize_storage_reference(raw_value)))
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "invalid_media_response_reference index=%s value_type=%s error_code=%s",
+                index,
+                type(raw_value).__name__,
+                str(exc) or type(exc).__name__,
+            )
+    return urls

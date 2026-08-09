@@ -17,6 +17,7 @@ from app.core.responses import ok, paged
 from app.models import AdminUser, User
 from app.schemas.job import JobRead
 from app.services import job_admin_service
+from app.services.storage_reference_service import storage_urls_for_response
 
 router = APIRouter(prefix="/admin/jobs", tags=["admin-jobs"])
 
@@ -54,6 +55,7 @@ def _enrich_with_owner(db: _Session, jobs: list) -> dict[str, dict]:
 
 def _job_to_dict(job, owner_map: dict[str, dict], projection: dict | None = None) -> dict:
     item = JobRead.model_validate(job).model_dump(mode="json")
+    item["images"] = storage_urls_for_response(item.get("images"))
     item.update(owner_map.get(job.owner_userid, {}))
     item.update(projection or {})
     return item

@@ -17,6 +17,7 @@ from app.core.responses import ok, paged
 from app.models import AdminUser, User
 from app.schemas.resume import ResumeRead
 from app.services import resume_admin_service
+from app.services.storage_reference_service import storage_urls_for_response
 
 router = APIRouter(prefix="/admin/resumes", tags=["admin-resumes"])
 
@@ -40,6 +41,7 @@ def _enrich_with_owner(db: _Session, resumes: list) -> dict[str, dict]:
 
 def _resume_to_dict(resume, owner_map: dict[str, dict]) -> dict:
     item = ResumeRead.model_validate(resume).model_dump(mode="json")
+    item["images"] = storage_urls_for_response(item.get("images"))
     item.update(owner_map.get(resume.owner_userid, {}))
     return item
 

@@ -12,7 +12,18 @@ def _make_record_mock(images=None):
     rec = MagicMock()
     rec.id = 100
     rec.images = list(images) if images else None
+    rec.version = 1
     return rec
+
+
+def _set_query_record(db, record):
+    (
+        db.query.return_value
+        .filter.return_value
+        .order_by.return_value
+        .with_for_update.return_value
+        .first.return_value
+    ) = record
 
 
 class TestAttachImage:
@@ -23,7 +34,7 @@ class TestAttachImage:
 
     def test_no_record_found_returns_hint(self):
         db = MagicMock()
-        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
+        _set_query_record(db, None)
         session = SessionState(role="worker", current_intent="upload_resume")
         result = attach_image("u1", "key/img.jpg", session, db)
         assert "未找到正在处理" in result
@@ -31,7 +42,7 @@ class TestAttachImage:
     def test_duplicate_image_not_added(self):
         db = MagicMock()
         rec = _make_record_mock(images=["key/img.jpg"])
-        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = rec
+        _set_query_record(db, rec)
         session = SessionState(role="worker", current_intent="upload_resume")
         result = attach_image("u1", "key/img.jpg", session, db)
         assert "已附加" in result
@@ -40,7 +51,7 @@ class TestAttachImage:
     def test_max_images_rejected(self):
         db = MagicMock()
         rec = _make_record_mock(images=[f"img_{i}.jpg" for i in range(5)])
-        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = rec
+        _set_query_record(db, rec)
         session = SessionState(role="worker", current_intent="upload_resume")
         result = attach_image("u1", "new.jpg", session, db)
         assert "上限" in result
@@ -48,18 +59,20 @@ class TestAttachImage:
     def test_attaches_to_resume_for_worker(self):
         db = MagicMock()
         rec = _make_record_mock()
-        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = rec
+        _set_query_record(db, rec)
         session = SessionState(role="worker", current_intent="upload_resume")
         result = attach_image("u1", "key/img.jpg", session, db)
         assert rec.images == ["key/img.jpg"]
+        assert rec.version == 2
         assert "简历" in result
         db.flush.assert_called_once()
 
     def test_attaches_to_job_for_factory_upload_intent(self):
         db = MagicMock()
         rec = _make_record_mock()
-        db.query.return_value.filter.return_value.order_by.return_value.first.return_value = rec
+        _set_query_record(db, rec)
         session = SessionState(role="factory", current_intent="upload_job")
         result = attach_image("u1", "key/img.jpg", session, db)
         assert rec.images == ["key/img.jpg"]
+        assert rec.version == 2
         assert "岗位" in result

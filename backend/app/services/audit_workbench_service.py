@@ -278,7 +278,9 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
     if isinstance(extra, dict):
         confidence = extra.get("field_confidence") or {}
 
-    images = getattr(obj, "images", None)
+    from app.services.storage_reference_service import storage_urls_for_response
+
+    images = storage_urls_for_response(getattr(obj, "images", None))
 
     lifecycle = {}
     if target_type == "job":
@@ -621,6 +623,55 @@ def edit_action(
     unknown = [f for f in fields.keys() if f not in allowed]
     if unknown:
         raise BusinessException(40101, f"不允许编辑的字段: {','.join(unknown)}")
+
+    if target_type == "job":
+        relation_hint = db.query(JobReplacement).filter(
+            JobReplacement.new_job_id == target_id,
+        ).first()
+        if relation_hint is not None:
+            from app.services.job_mutation_service import increment_version
+            from app.services.job_replacement_lock_service import lock_replacement_graph
+
+            relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+            if relation is None or jobs is None or target_id not in jobs:
+                raise BusinessException(40904, "replacement_graph_incomplete")
+            candidate = jobs[target_id]
+            if (
+                relation.review_outcome != "pending"
+                or relation.lifecycle_status != "awaiting_review"
+            ):
+                raise BusinessException(40904, "replacement_already_reviewed")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if (
+                candidate.audit_status != "pending"
+                or candidate.expires_at is not None
+                or candidate.deleted_at is not None
+                or not candidate.candidate_expires_at
+                or candidate.candidate_expires_at <= now
+            ):
+                raise BusinessException(40904, "job_not_pending_review")
+            _check_version(candidate, version)
+            before = _snapshot(candidate, target_type)
+            for key, value in fields.items():
+                setattr(candidate, key, value)
+            increment_version(candidate)
+            after = _snapshot(candidate, target_type)
+            write_admin_log(
+                db,
+                target_type=target_type,
+                target_id=target_id,
+                action="manual_edit",
+                operator=operator,
+                before=before,
+                after=after,
+            )
+            db.commit()
+            save_undo(target_type, target_id, {
+                "action": "edit", "operator": operator,
+                "before": before, "after": after,
+                "ts": time.time(),
+            })
+            return
 
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)

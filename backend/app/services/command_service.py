@@ -24,6 +24,7 @@ from app.services.lifecycle_config_service import get_job_ttl_days
 from app.services.job_mutation_service import (
     close_active_replacement,
     increment_version,
+    lock_active_job_for_owner,
     reject_if_replacement_in_progress,
 )
 from app.services.user_service import UserContext, delete_user_data, get_user_status
@@ -348,7 +349,7 @@ def _handle_renew_job(
             "续期天数仅支持 15 或 30 天，例如 /续期 15 或 /续期 30。",
         )]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     jobs = db.query(Job).filter(
         Job.owner_userid == user_ctx.external_userid,
         Job.deleted_at.is_(None),
@@ -364,12 +365,19 @@ def _handle_renew_job(
         return [_reply(user_ctx, _render_renew_list(jobs))]
 
     # 单岗位 或 多岗位+明确天数 → 对最近一条执行续期
-    target = jobs[0]
-    reject_if_replacement_in_progress(db, target.id)
+    target = lock_active_job_for_owner(
+        db, jobs[0].id, user_ctx.external_userid, now,
+    )
+    if target is None:
+        return [_reply(user_ctx, NO_RENEWABLE_JOB)]
+    reject_if_replacement_in_progress(db, target.id, lock_relation=True)
     ttl_cap = _renew_ttl_cap_days(db)
 
     # TTL 上限：从 now 起算（避免老岗位续期反而缩短）
-    max_expires = now + timedelta(days=ttl_cap)
+    compare_now = now
+    if target.expires_at.tzinfo is not None:
+        compare_now = now.replace(tzinfo=timezone.utc)
+    max_expires = compare_now + timedelta(days=ttl_cap)
     new_expires = target.expires_at + timedelta(days=days)
     capped = False
     if new_expires > max_expires:
@@ -465,7 +473,7 @@ def _delist_common(
     if user_ctx.role not in ("factory", "broker"):
         return [_reply(user_ctx, ROLE_NOT_ALLOWED)]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     jobs = db.query(Job).filter(
         Job.owner_userid == user_ctx.external_userid,
         Job.deleted_at.is_(None),
@@ -476,12 +484,15 @@ def _delist_common(
     if not jobs:
         return [_reply(user_ctx, empty_text)]
 
-    target = jobs[0]
-    close_active_replacement(
+    target = close_active_replacement(
         db,
-        target,
+        jobs[0],
         reason="old_job_delisted" if delist_reason == "manual_delist" else "old_job_filled",
+        owner_userid=user_ctx.external_userid,
+        active_at=now,
     )
+    if target is None:
+        return [_reply(user_ctx, empty_text)]
     target.delist_reason = delist_reason
     increment_version(target)
     db.flush()

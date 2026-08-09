@@ -326,7 +326,7 @@ def attach_image(
         model_cls.owner_userid == external_userid,
         model_cls.deleted_at.is_(None),
         model_cls.expires_at > now,
-    ).order_by(model_cls.created_at.desc()).first()
+    ).order_by(model_cls.created_at.desc()).with_for_update().first()
 
     if record is None:
         return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"

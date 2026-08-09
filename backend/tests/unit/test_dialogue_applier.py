@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from app.schemas.conversation import SessionState
 from app.services.dialogue_applier import apply_decision
 from app.services.dialogue_reducer import DialogueDecision
@@ -77,6 +79,42 @@ def test_clear_pending_upload_resets_active_flow():
     assert s.pending_upload == {}
     assert s.pending_upload_intent is None
     assert s.awaiting_field is None
+
+
+def test_clear_pending_upload_releases_media_and_replacement_context(monkeypatch):
+    mark_delete_pending = MagicMock()
+    monkeypatch.setattr(
+        "app.services.job_media_service.mark_delete_pending",
+        mark_delete_pending,
+    )
+    db = MagicMock()
+    s = _session(
+        active_flow="upload_collecting",
+        pending_upload={"city": "苏州"},
+        pending_upload_intent="upload_job",
+        pending_upload_mode="replace",
+        pending_target_id=42,
+        pending_target_version=7,
+        pending_operation_id="op-cancel",
+        pending_upload_media_ids=[11, 12],
+    )
+
+    apply_decision(
+        _decision(state_transition="clear_pending_upload"),
+        s,
+        db=db,
+    )
+
+    mark_delete_pending.assert_called_once_with(db, [11, 12])
+    db.flush.assert_called_once_with()
+    assert s.pending_upload == {}
+    assert s.pending_upload_intent is None
+    assert s.pending_upload_mode == "create"
+    assert s.pending_target_id is None
+    assert s.pending_target_version is None
+    assert s.pending_operation_id is None
+    assert s.pending_upload_media_ids == []
+    assert s.active_flow == "idle"
 
 
 def test_resume_upload_collecting():

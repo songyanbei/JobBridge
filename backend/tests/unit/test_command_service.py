@@ -53,6 +53,7 @@ def _make_job_mock(job_id=1, city="苏州", category="电子厂",
     job.expires_at = expires_at or (now + timedelta(days=10))
     job.created_at = created_at or now
     job.delist_reason = None
+    job.version = 1
     return job
 
 
@@ -237,7 +238,22 @@ class TestRenewJob:
         )
         assert replies[0].content == NO_RENEWABLE_JOB
 
-    def test_single_job_renewed_by_default_15_days(self):
+    def test_stale_selection_is_rechecked_under_lock(self, monkeypatch):
+        db = MagicMock()
+        job = _make_job_mock(job_id=10)
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [job]
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: None,
+        )
+
+        replies = execute(
+            "renew_job", "15", _make_user_ctx(role="factory"), None, db,
+        )
+
+        assert replies[0].content == NO_RENEWABLE_JOB
+        assert job.version == 1
+
+    def test_single_job_renewed_by_default_15_days(self, monkeypatch):
         db = MagicMock()
         now = datetime.now(timezone.utc)
         job = _make_job_mock(
@@ -250,14 +266,21 @@ class TestRenewJob:
         cfg = MagicMock()
         cfg.config_value = "30"
         db.query.return_value.filter.return_value.first.return_value = cfg
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: job,
+        )
+        monkeypatch.setattr(
+            command_service, "reject_if_replacement_in_progress", lambda *_args, **_kwargs: None,
+        )
 
         replies = execute(
             "renew_job", "", _make_user_ctx(role="factory"), None, db,
         )
         assert "续期 15 天" in replies[0].content
         assert "#10" in replies[0].content
+        assert job.version == 2
 
-    def test_multiple_jobs_with_explicit_days_renews_latest(self):
+    def test_multiple_jobs_with_explicit_days_renews_latest(self, monkeypatch):
         db = MagicMock()
         now = datetime.now(timezone.utc)
         job1 = _make_job_mock(job_id=1, expires_at=now + timedelta(days=3))
@@ -266,6 +289,12 @@ class TestRenewJob:
         cfg = MagicMock()
         cfg.config_value = "30"
         db.query.return_value.filter.return_value.first.return_value = cfg
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: job1,
+        )
+        monkeypatch.setattr(
+            command_service, "reject_if_replacement_in_progress", lambda *_args, **_kwargs: None,
+        )
 
         replies = execute(
             "renew_job", "15", _make_user_ctx(role="factory"), None, db,
@@ -296,7 +325,7 @@ class TestRenewJob:
         # 提示用户如何确认
         assert "/续期" in content
 
-    def test_ttl_cap_does_not_shrink_existing_expires(self):
+    def test_ttl_cap_does_not_shrink_existing_expires(self, monkeypatch):
         """老岗位已续期多次时，新 cap 不应回退到比 current 更小的值。"""
         db = MagicMock()
         now = datetime.now(timezone.utc)
@@ -310,6 +339,12 @@ class TestRenewJob:
         cfg = MagicMock()
         cfg.config_value = "30"  # ttl.job.days=30 → cap=60 天
         db.query.return_value.filter.return_value.first.return_value = cfg
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: job,
+        )
+        monkeypatch.setattr(
+            command_service, "reject_if_replacement_in_progress", lambda *_args, **_kwargs: None,
+        )
 
         replies = execute(
             "renew_job", "30", _make_user_ctx(role="factory"), None, db,
@@ -335,14 +370,37 @@ class TestDelistJob:
         )
         assert replies[0].content == NO_DELISTABLE_JOB
 
-    def test_delist_sets_reason_manual(self):
+    def test_stale_selection_is_not_delisted_after_lock_recheck(self, monkeypatch):
         db = MagicMock()
         job = _make_job_mock(job_id=7)
         db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [job]
+        monkeypatch.setattr(
+            command_service, "close_active_replacement", lambda *_args, **_kwargs: None,
+        )
+
+        replies = execute(
+            "delist_job", "", _make_user_ctx(role="factory"), None, db,
+        )
+
+        assert replies[0].content == NO_DELISTABLE_JOB
+        assert job.delist_reason is None
+        assert job.version == 1
+
+    def test_delist_sets_reason_manual(self, monkeypatch):
+        db = MagicMock()
+        job = _make_job_mock(job_id=7)
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [job]
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: job,
+        )
+        monkeypatch.setattr(
+            command_service, "close_active_replacement", lambda _db, target, **_kwargs: target,
+        )
         replies = execute(
             "delist_job", "", _make_user_ctx(role="factory"), None, db,
         )
         assert job.delist_reason == "manual_delist"
+        assert job.version == 2
         assert "下架" in replies[0].content
 
 
@@ -355,14 +413,21 @@ class TestFilledJob:
         )
         assert replies[0].content == NO_FILLABLE_JOB
 
-    def test_filled_sets_reason_filled(self):
+    def test_filled_sets_reason_filled(self, monkeypatch):
         db = MagicMock()
         job = _make_job_mock(job_id=9)
         db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [job]
+        monkeypatch.setattr(
+            command_service, "lock_active_job_for_owner", lambda *_args: job,
+        )
+        monkeypatch.setattr(
+            command_service, "close_active_replacement", lambda _db, target, **_kwargs: target,
+        )
         replies = execute(
             "filled_job", "", _make_user_ctx(role="factory"), None, db,
         )
         assert job.delist_reason == "filled"
+        assert job.version == 2
         assert "招满" in replies[0].content
 
 

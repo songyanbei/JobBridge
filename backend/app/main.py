@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.admin import router as admin_router
@@ -175,6 +176,32 @@ app.include_router(webhook_router)
 app.include_router(admin_router)
 # 小程序事件回传（Phase 5）
 app.include_router(events_router)
+
+
+def mount_local_storage_files(
+    target_app: FastAPI,
+    *,
+    provider: str | None = None,
+    url_prefix: str | None = None,
+    directory: str | None = None,
+) -> StaticFiles | None:
+    """Mount the configured local object directory at its presentation prefix."""
+    if (provider or settings.oss_provider) != "local":
+        return None
+    prefix = "/" + (url_prefix or settings.oss_local_url_prefix).strip("/")
+    if prefix == "/":
+        raise ValueError("local storage URL prefix cannot be root")
+    static_files = StaticFiles(
+        directory=directory or settings.oss_local_dir,
+        check_dir=False,
+    )
+    target_app.mount(prefix, static_files, name="local-storage-files")
+    return static_files
+
+
+# Local storage persists object keys in business rows.  Production mounts the
+# same directory in app and worker containers.
+mount_local_storage_files(app)
 
 
 @app.get("/health", tags=["system"])

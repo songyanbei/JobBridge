@@ -6,6 +6,7 @@ import json
 from sqlalchemy import text
 
 from app.db import SessionLocal
+from scripts.backfill_media_lifecycle import backfill_media_lifecycle
 
 
 CHECKS = {
@@ -50,12 +51,42 @@ CHECKS = {
     ),
 }
 
+MEDIA_BLOCKING_CHECKS = (
+    "missing_media_lifecycle_key_count",
+    "repair_required_media_lifecycle_key_count",
+    "non_deleted_soft_deleted_media_key_count",
+    "invalid_images_json_count",
+    "unresolved_media_reference_count",
+    "media_reference_conflict_count",
+)
+
+MEDIA_REPORT_FIELDS = (
+    "raw_reference_count",
+    "normalized_reference_count",
+    "normalized_job_image_key_count",
+    "normalized_resume_image_key_count",
+    "matched_media_lifecycle_key_count",
+    "missing_media_lifecycle_key_count",
+    "repair_required_media_lifecycle_key_count",
+    "non_deleted_soft_deleted_media_key_count",
+    "invalid_images_json_count",
+    "unresolved_media_reference_count",
+    "media_reference_alias_count",
+    "media_reference_conflict_count",
+)
+
+
+def collect_media_coverage(db) -> dict[str, int]:
+    report = backfill_media_lifecycle(db, apply=False)
+    return {name: int(report[name]) for name in MEDIA_REPORT_FIELDS}
+
 
 def collect(db) -> dict:
     counts = {
         name: int(db.execute(text(sql)).scalar() or 0)
         for name, sql in CHECKS.items()
     }
+    counts.update(collect_media_coverage(db))
     next_id, max_id = db.execute(text(
         "SELECT t.AUTO_INCREMENT, COALESCE(MAX(j.id),0) "
         "FROM information_schema.TABLES t LEFT JOIN job j ON 1=1 "
@@ -63,7 +94,8 @@ def collect(db) -> dict:
         "GROUP BY t.AUTO_INCREMENT"
     )).one()
     counts["job_auto_increment_not_above_max"] = int(not next_id or int(next_id) <= int(max_id))
-    counts["ready"] = not any(counts.values())
+    blockers = (*CHECKS, *MEDIA_BLOCKING_CHECKS, "job_auto_increment_not_above_max")
+    counts["ready"] = not any(counts[name] for name in blockers)
     return counts
 
 

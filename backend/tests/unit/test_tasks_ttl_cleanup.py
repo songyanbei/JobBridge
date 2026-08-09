@@ -253,6 +253,9 @@ class TestRunLock:
 
 
 def test_daily_job_soft_delete_delegates_to_lock_safe_processor(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_expiry_cleanup_enabled", True)
     processor = MagicMock(return_value={"processed": 17})
     monkeypatch.setattr(
         "app.tasks.job_expiry_cleanup.process_expired_jobs", processor
@@ -261,6 +264,19 @@ def test_daily_job_soft_delete_delegates_to_lock_safe_processor(monkeypatch):
 
     assert ttl_cleanup._soft_delete_expired_jobs(db) == 17
     processor.assert_called_once_with(db, max_runtime_seconds=None)
+
+
+def test_daily_job_soft_delete_honors_disabled_rollout_gate(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_expiry_cleanup_enabled", False)
+    processor = MagicMock()
+    monkeypatch.setattr(
+        "app.tasks.job_expiry_cleanup.process_expired_jobs", processor
+    )
+
+    assert ttl_cleanup._soft_delete_expired_jobs(MagicMock()) == 0
+    processor.assert_not_called()
 
 
 def _hard_delete_db(*, active_relation=False):

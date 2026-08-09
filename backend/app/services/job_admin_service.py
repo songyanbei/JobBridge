@@ -278,7 +278,7 @@ def delist(db: Session, job_id: int, version: int, reason: str, operator: str) -
         raise BusinessException(40101, "无效的下架原因")
     job = get_job(db, job_id)
     assert_job_activated(job)
-    close_active_replacement(db, job, reason="old_job_delisted")
+    job = close_active_replacement(db, job, reason="old_job_delisted")
     if int(job.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(job.version or 0)})

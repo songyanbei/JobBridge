@@ -80,11 +80,10 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-      - worker_uploads:/app/uploads
+      - ./backend/uploads:/app/uploads
     restart: unless-stopped
     # Worker 纯后台消费，不对外暴露端口
 
 volumes:
   mysql_data:
   redis_data:
-  worker_uploads:

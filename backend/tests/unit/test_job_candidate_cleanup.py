@@ -23,7 +23,9 @@ from app.services.job_admin_service import (
     restore,
     update_job,
 )
+from app.services import job_mutation_service
 from app.services.job_mutation_service import close_active_replacement
+from app.services.job_replacement_lock_service import ReplacementGraphHint
 from app.tasks.job_candidate_cleanup import cleanup_candidate, process_due_candidates
 from app.tasks import job_candidate_cleanup
 
@@ -249,6 +251,91 @@ def test_delisting_old_job_closes_candidate_with_graph_lock_cleanup(db):
     assert candidate.deleted_at is not None
     assert media.state == "delete_pending"
     assert db.query(TargetCleanupTask).filter_by(target_id=candidate.id).one().reason == "candidate_cancelled"
+
+
+def test_close_active_replacement_uses_current_hint_before_graph_lock(monkeypatch):
+    calls = []
+    old = MagicMock(id=10)
+    candidate = MagicMock(id=11, expires_at=datetime.now(), deleted_at=None)
+    relation = JobReplacement(
+        id=7,
+        operation_id="op-lock-order",
+        source_msg_id="msg-lock-order",
+        owner_userid="owner",
+        old_job_id=10,
+        new_job_id=11,
+        old_job_version=1,
+        old_business_digest="digest",
+        old_business_digest_version=1,
+        review_outcome="pending",
+        lifecycle_status="awaiting_review",
+        active_old_job_id=10,
+    )
+    hint = ReplacementGraphHint(7, 10, 11, "op-lock-order")
+
+    def current_hint(_db, _old_job_id):
+        calls.append("current_hint")
+        return hint
+
+    def graph_lock(_db, _replacement_id, *, hint):
+        calls.append("graph_lock")
+        return relation, [old, candidate], {10: old, 11: candidate}
+
+    monkeypatch.setattr(job_mutation_service, "current_active_replacement_hint", current_hint)
+    monkeypatch.setattr(job_mutation_service, "lock_replacement_graph", graph_lock)
+    monkeypatch.setattr(
+        job_mutation_service,
+        "lock_job_for_mutation",
+        lambda *_args: pytest.fail("existing graph must use the global graph lock directly"),
+    )
+
+    locked = close_active_replacement(MagicMock(), old, reason="old_job_delisted")
+
+    assert locked is old
+    assert calls == ["current_hint", "graph_lock"]
+
+
+def test_close_active_replacement_rechecks_creation_race_after_old_job_lock(monkeypatch):
+    calls = []
+    old = MagicMock(id=10)
+    candidate = MagicMock(id=11, expires_at=datetime.now(), deleted_at=None)
+    relation = JobReplacement(
+        id=8,
+        operation_id="op-race",
+        source_msg_id="msg-race",
+        owner_userid="owner",
+        old_job_id=10,
+        new_job_id=11,
+        old_job_version=1,
+        old_business_digest="digest",
+        old_business_digest_version=1,
+        review_outcome="pending",
+        lifecycle_status="awaiting_review",
+        active_old_job_id=10,
+    )
+    hint = ReplacementGraphHint(8, 10, 11, "op-race")
+    hints = iter((None, hint))
+
+    def current_hint(_db, _old_job_id):
+        calls.append("current_hint")
+        return next(hints)
+
+    def old_lock(_db, _old_job_id):
+        calls.append("old_job_lock")
+        return old
+
+    def graph_lock(_db, _replacement_id, *, hint):
+        calls.append("graph_lock")
+        return relation, [old, candidate], {10: old, 11: candidate}
+
+    monkeypatch.setattr(job_mutation_service, "current_active_replacement_hint", current_hint)
+    monkeypatch.setattr(job_mutation_service, "lock_job_for_mutation", old_lock)
+    monkeypatch.setattr(job_mutation_service, "lock_replacement_graph", graph_lock)
+
+    locked = close_active_replacement(MagicMock(), old, reason="old_job_delisted")
+
+    assert locked is old
+    assert calls == ["current_hint", "old_job_lock", "current_hint", "graph_lock"]
 
 
 def test_candidate_cleanup_feature_switch_skips_lock(monkeypatch):

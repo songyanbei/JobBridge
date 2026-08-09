@@ -4,7 +4,10 @@ from unittest.mock import MagicMock
 
 from app.config import settings
 from app.services.job_media_service import hard_delete_media_complete
-from app.services.storage_reference_service import normalize_storage_reference
+from app.services.storage_reference_service import (
+    normalize_storage_reference,
+    storage_urls_for_response,
+)
 
 
 def test_normalizes_raw_key_and_local_url():
@@ -17,6 +20,32 @@ def test_normalizes_trusted_signed_url(monkeypatch):
     assert normalize_storage_reference(
         "https://assets.example.com/files/images/a.jpg?signature=secret#preview"
     ) == "images/a.jpg"
+
+
+def test_response_urls_are_generated_without_persisting_access_paths(monkeypatch):
+    storage = MagicMock()
+    storage.get_url.side_effect = lambda key: f"/files/{key}"
+    monkeypatch.setattr("app.storage.get_storage", lambda: storage)
+
+    assert storage_urls_for_response([
+        "images/user/a.jpg", "/files/images/user/b.jpg",
+    ]) == [
+        "/files/images/user/a.jpg", "/files/images/user/b.jpg",
+    ]
+    assert [call.args[0] for call in storage.get_url.call_args_list] == [
+        "images/user/a.jpg", "images/user/b.jpg",
+    ]
+
+
+def test_response_urls_omit_unresolved_legacy_references(monkeypatch):
+    storage = MagicMock()
+    storage.get_url.side_effect = lambda key: f"/files/{key}"
+    monkeypatch.setattr("app.storage.get_storage", lambda: storage)
+    monkeypatch.setattr(settings, "oss_trusted_origins", "")
+
+    assert storage_urls_for_response([
+        "images/user/a.jpg", "https://external.example/a.jpg",
+    ]) == ["/files/images/user/a.jpg"]
 
 
 @pytest.mark.parametrize("value", [
