@@ -73,9 +73,12 @@ jobs:
         working-directory: backend
         run: python -m pip install -r requirements.txt
 
-      - name: Run MySQL search integration tests
+      - name: Run MySQL integration tests
         working-directory: backend
-        run: pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
+        run: >-
+          pytest -p no:cacheprovider
+          tests/integration/test_search_sql_mysql.py
+          tests/integration/test_phase10_preflight_mysql.py -q
 
   backend-recommendation-mysql:
     name: backend-recommendation-mysql

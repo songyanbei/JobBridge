@@ -88,6 +88,15 @@ def test_preflight_includes_config_and_backup_coverage_gates():
     assert "dead_letter" in enum_gate
 
 
+def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():
+    job_gate = phase10_preflight.CHECKS["invalid_job_ttl_config"]
+    candidate_gate = phase10_preflight.CHECKS["invalid_candidate_ttl_config"]
+
+    assert "BETWEEN 1 AND 3650" in job_gate
+    assert "BETWEEN 1 AND 365" in candidate_gate
+    assert "BETWEEN 1 AND 3650" not in candidate_gate
+
+
 def test_preflight_fails_if_dead_letter_enum_is_missing(monkeypatch):
     monkeypatch.setattr(
         phase10_preflight, "collect_media_coverage", lambda _: _clean_media_coverage()

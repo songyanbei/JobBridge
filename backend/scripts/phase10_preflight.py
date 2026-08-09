@@ -19,7 +19,7 @@ CHECKS = {
     "invalid_job_ttl_config": (
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM system_config "
         "WHERE config_key='ttl.job.days' AND config_value REGEXP '^[0-9]+$' "
-        "AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 365) THEN 0 ELSE 1 END"
+        "AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 3650) THEN 0 ELSE 1 END"
     ),
     "invalid_candidate_ttl_config": (
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM system_config "
