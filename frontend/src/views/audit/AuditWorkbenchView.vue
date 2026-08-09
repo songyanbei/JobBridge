@@ -77,6 +77,14 @@
           >
             中风险内容：请谨慎判断
           </div>
+          <el-alert
+            v-if="isConflictReplacement"
+            title="该候选已完成审核，只能在岗位生命周期详情中重试激活或取消候选"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+          />
 
           <div
             class="detail-card"
@@ -125,7 +133,7 @@
               驳回 (R)
             </el-button>
             <el-button @click="onNext">稍后 (S)</el-button>
-            <el-button :icon="EditPen" @click="editVisible = true">编辑 (E)</el-button>
+            <el-button :icon="EditPen" :disabled="!canEdit" @click="editVisible = true">编辑 (E)</el-button>
             <el-button
               :type="undoSecondsLeft > 0 ? 'warning' : 'default'"
               :disabled="undoSecondsLeft <= 0 || !undoTarget"
@@ -404,9 +412,42 @@ const submitterHistoryFull = computed(() => {
   return detail.value.submitter_history_full || submitter7d.value
 })
 
-const canPass = computed(() => !!currentItem.value && !!detail.value.version && activeTab.value === 'pending')
+function isQueueItemAuditable(item) {
+  if (!item || item.target_type !== 'job' || !item.replacement_id) return true
+  return item.replacement_review_outcome === 'pending'
+    && item.replacement_lifecycle_status === 'awaiting_review'
+}
+
+function isDetailAuditable(targetTypeValue, value) {
+  if (targetTypeValue !== 'job' || !value?.replacement_id) return true
+  return value.replacement_review_outcome === 'pending'
+    && value.replacement_lifecycle_status === 'awaiting_review'
+}
+
+const isConflictReplacement = computed(() => (
+  currentItem.value?.target_type === 'job'
+  && !!detail.value.replacement_id
+  && detail.value.replacement_lifecycle_status === 'conflict'
+))
+const canPass = computed(() => (
+  !!currentItem.value
+  && !!detail.value.version
+  && activeTab.value === 'pending'
+  && isQueueItemAuditable(currentItem.value)
+  && isDetailAuditable(currentItem.value.target_type, detail.value)
+))
 const canReject = computed(() => canPass.value)
-const canBatch = computed(() => activeTab.value === 'pending' && selectedRows.value.length > 0)
+const canEdit = computed(() => (
+  !!currentItem.value
+  && !!detail.value.version
+  && isQueueItemAuditable(currentItem.value)
+  && isDetailAuditable(currentItem.value.target_type, detail.value)
+))
+const canBatch = computed(() => (
+  activeTab.value === 'pending'
+  && selectedRows.value.length > 0
+  && selectedRows.value.every(isQueueItemAuditable)
+))
 
 function isSelfLocked(item) {
   const me = authStore.admin?.username
@@ -638,7 +679,7 @@ async function onReject(payload) {
 }
 
 async function onEdit(fields) {
-  if (!currentItem.value || actionSubmitting.value) return
+  if (!canEdit.value || actionSubmitting.value) return
   actionSubmitting.value = true
   try {
     await editAuditItem(currentItem.value.target_type, currentItem.value.id, {
@@ -706,6 +747,10 @@ async function onBatch(action) {
     return
   }
   if (selectedRows.value.length === 0) return
+  if (!selectedRows.value.every(isQueueItemAuditable)) {
+    ElMessage.warning('已完成审核的替换候选不能再次审核')
+    return
+  }
   if (selectedRows.value.length > BATCH_AUDIT_LIMIT) {
     ElMessage.error(`批量操作一次最多 ${BATCH_AUDIT_LIMIT} 条`)
     return
@@ -740,6 +785,11 @@ async function runBatch() {
         await lockAuditItem(row.target_type, row.id)
         locked = true
         const d = await fetchAuditDetail(row.target_type, row.id)
+        if (!isDetailAuditable(row.target_type, d)) {
+          const error = new Error('该替换候选已完成审核，只能重试激活或取消候选')
+          error.code = 'REPLACEMENT_ALREADY_REVIEWED'
+          throw error
+        }
         const ver = d.version
         if (batchAction.value === 'pass') {
           await passAuditItem(row.target_type, row.id, ver)
@@ -791,8 +841,9 @@ useKeyboard([
   {
     key: 'e',
     handler: () => {
-      if (currentItem.value && !editVisible.value) editVisible.value = true
+      if (canEdit.value && !editVisible.value) editVisible.value = true
     },
+    disabled: () => !canEdit.value,
   },
   {
     key: 'u',

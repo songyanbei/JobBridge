@@ -11,7 +11,10 @@
 """
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -55,6 +58,53 @@ def _delivery_item(**overrides) -> dict:
     }
     item.update(overrides)
     return item
+
+
+def _valid_context(
+    *, target_type: str = "job", target_id: int = 7,
+) -> dict:
+    return {
+        "assignment": "stable",
+        "algorithm_version": "recommendation-v1",
+        "query_digest": "digest",
+        "items": [{
+            "target_type": target_type,
+            "target_id": target_id,
+            "position": 1,
+        }],
+    }
+
+
+def _active_target(*, target_type: str = "job") -> SimpleNamespace:
+    values = {
+        "audit_status": "passed",
+        "deleted_at": None,
+        "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
+    }
+    if target_type == "job":
+        values["delist_reason"] = None
+    return SimpleNamespace(**values)
+
+
+def _claim_db(
+    delivery: MagicMock,
+    *,
+    target: object | None = None,
+    claim_updated: int = 1,
+) -> MagicMock:
+    db = MagicMock()
+    db.get.return_value = delivery
+    target_query = MagicMock()
+    target_query.populate_existing.return_value.filter.return_value.with_for_update.return_value.first.return_value = target
+    delivery_query = MagicMock()
+    delivery_query.populate_existing.return_value.filter.return_value.with_for_update.return_value.first.return_value = MagicMock()
+    delivery_query.filter.return_value.update.return_value = claim_updated
+    db.query.side_effect = lambda model: (
+        target_query
+        if model in (worker_module.Job, worker_module.Resume)
+        else delivery_query
+    )
+    return db
 
 
 def _update_payloads(db: MagicMock) -> list[dict]:
@@ -174,9 +224,13 @@ class TestDeliveryStatusMachine:
         assert delivery_values["last_error_code"] == "60111"
 
     def test_missing_body_marks_permanent_failed(self, worker):
-        db = MagicMock()
-        delivery = MagicMock(status="pending", content_ciphertext=None)
-        db.get.return_value = delivery
+        delivery = MagicMock(
+            status="pending",
+            content_ciphertext=None,
+            recommendation_context=_valid_context(),
+            created_at=datetime.now(timezone.utc),
+        )
+        db = _claim_db(delivery, target=_active_target())
         row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
 
         assert worker._claim_recommendation_body(db, row, MagicMock()) is None
@@ -184,8 +238,12 @@ class TestDeliveryStatusMachine:
         assert row.status == "dead_letter"
 
     def test_prepared_delivery_is_deferred_not_terminated(self, worker):
-        db = MagicMock()
-        db.get.return_value = MagicMock(status="prepared", content_ciphertext=b"x")
+        delivery = MagicMock(
+            status="prepared",
+            content_ciphertext=b"x",
+            recommendation_context=_valid_context(),
+        )
+        db = _claim_db(delivery, target=_active_target())
         row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
 
         assert worker._claim_recommendation_body(db, row, MagicMock()) is None
@@ -193,9 +251,13 @@ class TestDeliveryStatusMachine:
 
     def test_decrypt_failure_keeps_retry_wait_and_alerts(self, worker):
         """P2-8：解密失败 fail-closed，但不得终态化。"""
-        db = MagicMock()
-        delivery = MagicMock(status="pending", content_ciphertext=b"bad", attempt_count=0)
-        db.get.return_value = delivery
+        delivery = MagicMock(
+            status="pending",
+            content_ciphertext=b"bad",
+            attempt_count=0,
+            recommendation_context=_valid_context(),
+        )
+        db = _claim_db(delivery, target=_active_target())
         row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
 
         with patch(
@@ -210,11 +272,13 @@ class TestDeliveryStatusMachine:
         assert log.call_args.args[0] == "recommendation_delivery_decrypt_failed"
 
     def test_claim_lost_to_another_worker_does_not_send(self, worker):
-        db = MagicMock()
-        db.get.return_value = MagicMock(
-            status="pending", content_ciphertext=b"x", attempt_count=0,
+        delivery = MagicMock(
+            status="pending",
+            content_ciphertext=b"x",
+            attempt_count=0,
+            recommendation_context=_valid_context(),
         )
-        db.query.return_value.filter.return_value.update.return_value = 0
+        db = _claim_db(delivery, target=_active_target(), claim_updated=0)
         row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
 
         with patch(
@@ -223,6 +287,181 @@ class TestDeliveryStatusMachine:
         ):
             assert worker._claim_recommendation_body(db, row, MagicMock()) is None
         assert row.status == "pending"
+
+    @pytest.mark.parametrize(("context", "error_code"), [
+        ("{bad-json", "context_parse_failed"),
+        ([], "context_not_object"),
+        ({}, "context_items_missing"),
+        ({"items": "not-a-list"}, "context_items_invalid"),
+        ({"items": []}, "context_targets_missing"),
+        ({"items": ["not-an-object"]}, "context_item_invalid"),
+        ({"items": [{"target_type": "job"}]}, "context_item_invalid"),
+        ({"items": [{"target_type": "other", "target_id": 7}]}, "context_item_invalid"),
+        ({"items": [{"target_type": "job", "target_id": True}]}, "context_item_invalid"),
+    ])
+    def test_invalid_context_terminalizes_outbox_and_delivery(
+        self, worker, context, error_code,
+    ):
+        delivery = MagicMock(
+            delivery_id="d-1",
+            status="pending",
+            recommendation_context=context,
+            created_at=datetime.now(timezone.utc),
+            session_patch_ciphertext=b"patch",
+        )
+        db = MagicMock()
+        db.get.return_value = delivery
+        row = MagicMock(
+            recommendation_delivery_id="d-1",
+            attempt_count=0,
+            locked_at="old-lock",
+            next_attempt_at="old-due",
+        )
+
+        with patch("app.services.worker.log_event") as log:
+            assert worker._claim_recommendation_body(db, row, MagicMock()) is None
+
+        assert row.status == "dead_letter"
+        assert row.locked_at is None
+        assert row.next_attempt_at is None
+        assert delivery.status == "permanent_failed"
+        assert delivery.last_error == row.last_error
+        assert delivery.last_error_code == error_code
+        assert delivery.lease_owner is None
+        assert delivery.lease_expires_at is None
+        assert delivery.session_patch_ciphertext is None
+        assert delivery.content_expires_at is not None
+        assert db.query.call_count == 1  # delivery lock only; no target was trusted
+        log.assert_called_once_with(
+            "recommendation_delivery_claim_rejected",
+            delivery_id="d-1",
+            error_code=error_code,
+            severity="alert",
+        )
+
+    @pytest.mark.parametrize(("target", "error_code"), [
+        (None, "target_missing"),
+        (
+            SimpleNamespace(
+                audit_status="pending",
+                deleted_at=None,
+                expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
+                delist_reason=None,
+            ),
+            "target_inactive",
+        ),
+        (
+            SimpleNamespace(
+                audit_status="passed",
+                deleted_at=None,
+                expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1),
+                delist_reason=None,
+            ),
+            "target_inactive",
+        ),
+    ])
+    def test_missing_or_inactive_target_terminalizes_both_rows(
+        self, worker, target, error_code,
+    ):
+        delivery = MagicMock(
+            delivery_id="d-1",
+            status="retry_wait",
+            recommendation_context=_valid_context(),
+            created_at=datetime.now(timezone.utc),
+        )
+        db = _claim_db(delivery, target=target)
+        row = MagicMock(recommendation_delivery_id="d-1", attempt_count=1)
+
+        with patch("app.services.worker.log_event") as log:
+            assert worker._claim_recommendation_body(db, row, MagicMock()) is None
+
+        assert row.status == "dead_letter"
+        assert delivery.status == "permanent_failed"
+        assert delivery.last_error_code == error_code
+        log.assert_called_once()
+
+    def test_valid_json_string_locks_target_and_can_be_claimed(self, worker):
+        delivery = MagicMock(
+            delivery_id="d-1",
+            status="pending",
+            content_ciphertext=b"ciphertext",
+            attempt_count=0,
+            next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            recommendation_context=json.dumps(_valid_context()),
+        )
+        db = _claim_db(delivery, target=_active_target(), claim_updated=1)
+        row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
+
+        with patch(
+            "app.services.recommendation_delivery_service.decrypt_delivery_body",
+            return_value="正文",
+        ):
+            assert worker._claim_recommendation_body(db, row, MagicMock()) == "正文"
+
+        assert row.status == "sending"
+        assert row.attempt_count == 1
+
+    def test_delivery_lock_refresh_detects_context_change_on_same_identity(self, worker):
+        snapshot = worker_module.RecommendationDelivery(
+            delivery_id="d-1",
+            status="pending",
+            recommendation_context={"items": []},
+        )
+        db = MagicMock()
+        db.get.return_value = snapshot
+
+        def refresh_same_identity():
+            snapshot.recommendation_context = _valid_context()
+            return snapshot
+
+        lock_query = db.query.return_value.populate_existing.return_value
+        lock_query.filter.return_value.with_for_update.return_value.first.side_effect = (
+            refresh_same_identity
+        )
+        row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
+
+        with patch("app.services.worker.log_event") as log:
+            assert worker._claim_recommendation_body(db, row, MagicMock()) is None
+
+        assert row.status == "pending"
+        assert snapshot.status == "pending"
+        log.assert_not_called()
+
+    def test_target_lock_refresh_detects_inactive_state_on_same_identity(self, worker):
+        delivery = MagicMock(
+            delivery_id="d-1",
+            status="pending",
+            recommendation_context=_valid_context(),
+            created_at=datetime.now(timezone.utc),
+        )
+        target = _active_target()
+        db = MagicMock()
+        db.get.return_value = delivery
+
+        target_query = MagicMock()
+
+        def refresh_same_identity():
+            target.audit_status = "rejected"
+            return target
+
+        target_query.populate_existing.return_value.filter.return_value.with_for_update.return_value.first.side_effect = (
+            refresh_same_identity
+        )
+        delivery_query = MagicMock()
+        delivery_query.populate_existing.return_value.filter.return_value.with_for_update.return_value.first.return_value = MagicMock()
+        db.query.side_effect = lambda model: (
+            target_query if model is worker_module.Job else delivery_query
+        )
+        row = MagicMock(recommendation_delivery_id="d-1", attempt_count=0)
+
+        with patch("app.services.worker.log_event") as log:
+            assert worker._claim_recommendation_body(db, row, MagicMock()) is None
+
+        assert row.status == "dead_letter"
+        assert delivery.status == "permanent_failed"
+        assert delivery.last_error_code == "target_inactive"
+        target_query.populate_existing.assert_called_once_with()
+        log.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

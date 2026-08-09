@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import and_, exists, or_
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
@@ -104,6 +105,26 @@ class QueueItem:
     obj: Any  # Job / Resume
     risk_level: str
     locked_by: str | None
+    replacement_id: int | None = None
+    replacement_review_outcome: str | None = None
+    replacement_lifecycle_status: str | None = None
+
+
+def _queue_query(db: Session, target_type: str, status: str):
+    model, _, _ = _model_for(target_type)
+    query = db.query(model).filter(model.audit_status == status)
+    if hasattr(model, "deleted_at"):
+        query = query.filter(model.deleted_at.is_(None))
+
+    if target_type == "job" and status == "pending":
+        any_replacement = exists().where(JobReplacement.new_job_id == Job.id)
+        awaiting_review = exists().where(and_(
+            JobReplacement.new_job_id == Job.id,
+            JobReplacement.review_outcome == "pending",
+            JobReplacement.lifecycle_status == "awaiting_review",
+        ))
+        query = query.filter(or_(~any_replacement, awaiting_review))
+    return query
 
 
 def list_queue(
@@ -132,9 +153,7 @@ def list_queue(
     need = offset + size
     for tt in targets:
         model, _, _ = _model_for(tt)
-        base = db.query(model).filter(model.audit_status == status)
-        if hasattr(model, "deleted_at"):
-            base = base.filter(model.deleted_at.is_(None))
+        base = _queue_query(db, tt, status)
         total += base.count()
         rows = (
             base.with_entities(model.id, model.created_at)
@@ -166,6 +185,15 @@ def list_queue(
         for row in rows:
             obj_map[(tt, row.id)] = row
 
+    replacement_map: dict[int, JobReplacement] = {}
+    if by_type["job"]:
+        replacement_map = {
+            int(relation.new_job_id): relation
+            for relation in db.query(JobReplacement).filter(
+                JobReplacement.new_job_id.in_(by_type["job"]),
+            ).all()
+        }
+
     for tt, rid in order_key:
         obj = obj_map.get((tt, rid))
         if obj is None:
@@ -176,14 +204,23 @@ def list_queue(
             holder = get_audit_lock_holder(tt, obj.id)
         except Exception:
             pass
-        items.append(QueueItem(target_type=tt, obj=obj, risk_level=risk, locked_by=holder))
+        relation = replacement_map.get(int(obj.id)) if tt == "job" else None
+        items.append(QueueItem(
+            target_type=tt,
+            obj=obj,
+            risk_level=risk,
+            locked_by=holder,
+            replacement_id=int(relation.id) if relation is not None else None,
+            replacement_review_outcome=relation.review_outcome if relation is not None else None,
+            replacement_lifecycle_status=relation.lifecycle_status if relation is not None else None,
+        ))
 
     return items, total
 
 
 def get_pending_count(db: Session) -> dict:
-    job_count = db.query(Job).filter(Job.audit_status == "pending", Job.deleted_at.is_(None)).count()
-    resume_count = db.query(Resume).filter(Resume.audit_status == "pending", Resume.deleted_at.is_(None)).count()
+    job_count = _queue_query(db, "job", "pending").count()
+    resume_count = _queue_query(db, "resume", "pending").count()
     return {"job": job_count, "resume": resume_count, "total": job_count + resume_count}
 
 

@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -107,6 +108,52 @@ DELIVERY_ACTIVE_STATUSES = (
 )
 # §10.4 的 claim 条件：只有 pending/retry_wait 允许被 dispatcher 领走发送。
 DELIVERY_SENDABLE_STATUSES = (DELIVERY_PENDING, DELIVERY_RETRY_WAIT)
+
+
+def _recommendation_target_references(
+    raw_context: Any,
+) -> tuple[list[tuple[str, int]] | None, str | None, str | None]:
+    """Strictly decode the target set that guards a recommendation claim.
+
+    The persisted JSON is part of the send authorization boundary.  Returning
+    an empty/partial set would let the dispatcher send without locking every
+    target represented in the recommendation body, so every malformed shape
+    is an explicit permanent failure.
+    """
+    context = raw_context
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return None, "context_parse_failed", "recommendation context is not valid JSON"
+
+    if not isinstance(context, dict):
+        return None, "context_not_object", "recommendation context must be a JSON object"
+    if "items" not in context:
+        return None, "context_items_missing", "recommendation context items are missing"
+
+    items = context["items"]
+    if not isinstance(items, list):
+        return None, "context_items_invalid", "recommendation context items must be a JSON array"
+    if not items:
+        return None, "context_targets_missing", "recommendation context contains no targets"
+
+    references: list[tuple[str, int]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None, "context_item_invalid", "recommendation context contains a non-object item"
+        target_type = item.get("target_type")
+        target_id = item.get("target_id")
+        if (
+            target_type not in ("job", "resume")
+            or isinstance(target_id, bool)
+            or not isinstance(target_id, int)
+            or target_id <= 0
+        ):
+            return None, "context_item_invalid", "recommendation context contains an invalid target"
+        references.append((target_type, target_id))
+
+    return sorted(set(references)), None, None
 
 # §10.4.1：dispatcher / prepared session reconciler 各自独立 250ms 扫描，
 # 每批最多 100 条；§10.5 的 impression deriver 同样 250ms。
@@ -1226,37 +1273,64 @@ class Worker:
         """
         snapshot = db.get(RecommendationDelivery, row.recommendation_delivery_id)
         if snapshot is None:
-            row.status = "dead_letter"
-            row.locked_at = None
-            row.next_attempt_at = None
-            row.last_error = "recommendation delivery row missing"
+            self._terminalize_recommendation_claim(
+                row,
+                None,
+                error_code="delivery_missing",
+                reason="recommendation delivery row missing",
+            )
             return None
 
-        context = snapshot.recommendation_context
-        if isinstance(context, str):
-            try:
-                context = json.loads(context)
-            except (TypeError, ValueError):
-                context = {}
-        references = []
-        for item in (context or {}).get("items") or []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                references.append((str(item["target_type"]), int(item["target_id"])))
-            except (KeyError, TypeError, ValueError):
-                row.status = "dead_letter"
-                row.last_error = "recommendation context contains an invalid target"
+        snapshot_context = copy.deepcopy(snapshot.recommendation_context)
+        references, context_error_code, context_error = (
+            _recommendation_target_references(snapshot_context)
+        )
+
+        # A malformed context has no trustworthy target set to lock.  Lock the
+        # delivery itself, verify that the malformed snapshot is still current,
+        # then make both durable rows permanently unsendable in this transaction.
+        if references is None:
+            locked_delivery = (
+                db.query(RecommendationDelivery)
+                .populate_existing()
+                .filter(
+                    RecommendationDelivery.delivery_id
+                    == row.recommendation_delivery_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            delivery = (
+                locked_delivery
+                if isinstance(locked_delivery, RecommendationDelivery)
+                else snapshot
+            )
+            if isinstance(locked_delivery, RecommendationDelivery) and (
+                delivery.recommendation_context != snapshot_context
+            ):
+                self._defer_outbox_row(
+                    row, "recommendation delivery changed during claim",
+                )
                 return None
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code=context_error_code or "context_invalid",
+                reason=context_error or "recommendation context is invalid",
+            )
+            return None
 
         now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        for target_type, target_id in sorted(set(references)):
+        target_error: tuple[str, str] | None = None
+        for target_type, target_id in references:
             model = Job if target_type == "job" else Resume if target_type == "resume" else None
-            if model is None:
-                row.status = "dead_letter"
-                row.last_error = "recommendation context contains an unsupported target"
-                return None
-            target = db.query(model).filter(model.id == target_id).with_for_update().first()
+            target = (
+                db.query(model)
+                .populate_existing()
+                .filter(model.id == target_id)
+                .with_for_update()
+                .first()
+            )
             valid = bool(
                 target
                 and target.audit_status == "passed"
@@ -1266,20 +1340,39 @@ class Worker:
             )
             if target_type == "job":
                 valid = valid and target.delist_reason is None
-            if not valid:
-                row.status = "dead_letter"
-                row.last_error = "recommendation target is no longer active"
-                return None
+            if not valid and target_error is None:
+                target_error = (
+                    "target_missing" if target is None else "target_inactive",
+                    "recommendation target is missing"
+                    if target is None
+                    else "recommendation target is no longer active",
+                )
 
-        locked_delivery = db.query(RecommendationDelivery).filter(
-            RecommendationDelivery.delivery_id == row.recommendation_delivery_id,
-        ).with_for_update().first()
+        locked_delivery = (
+            db.query(RecommendationDelivery)
+            .populate_existing()
+            .filter(
+                RecommendationDelivery.delivery_id
+                == row.recommendation_delivery_id,
+            )
+            .with_for_update()
+            .first()
+        )
         delivery = locked_delivery if isinstance(locked_delivery, RecommendationDelivery) else snapshot
         if delivery is None or (
             isinstance(locked_delivery, RecommendationDelivery)
-            and delivery.recommendation_context != snapshot.recommendation_context
+            and delivery.recommendation_context != snapshot_context
         ):
             self._defer_outbox_row(row, "recommendation delivery changed during claim")
+            return None
+
+        if target_error is not None:
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code=target_error[0],
+                reason=target_error[1],
+            )
             return None
 
         if delivery.status == DELIVERY_PREPARED:
@@ -1300,13 +1393,12 @@ class Worker:
 
         if not delivery.content_ciphertext:
             # 正文已被 TTL 清理，永远无法再发送。
-            row.status = "dead_letter"
-            row.locked_at = None
-            row.next_attempt_at = None
-            row.last_error = "recommendation delivery body unavailable"
-            delivery.status = DELIVERY_PERMANENT_FAILED
-            delivery.last_error = row.last_error
-            delivery.last_error_code = "content_unavailable"
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code="content_unavailable",
+                reason="recommendation delivery body unavailable",
+            )
             return None
 
         try:
@@ -1360,6 +1452,63 @@ class Worker:
         row.locked_at = now
         row.attempt_count = int(row.attempt_count or 0) + 1
         return content
+
+    @staticmethod
+    def _terminalize_recommendation_claim(
+        row: WecomOutboundOutbox,
+        delivery: RecommendationDelivery | None,
+        *,
+        error_code: str,
+        reason: str,
+    ) -> None:
+        """Persist an unrecoverable claim failure on both sides of the outbox."""
+        outbox_reason = reason[:1000]
+        row.status = "dead_letter"
+        row.locked_at = None
+        row.next_attempt_at = None
+        row.last_error = outbox_reason
+
+        delivery_id = row.recommendation_delivery_id
+        if delivery is not None:
+            delivery_id = delivery.delivery_id
+            # A sending row has crossed the irreversible claim boundary, so its
+            # provider outcome is unknown.  All earlier active states are safe
+            # to stop permanently; existing terminal facts remain untouched.
+            if delivery.status in DELIVERY_ACTIVE_STATUSES:
+                terminal_status = (
+                    DELIVERY_UNKNOWN
+                    if delivery.status == DELIVERY_SENDING
+                    else DELIVERY_PERMANENT_FAILED
+                )
+                delivery.status = terminal_status
+                delivery.last_error = reason[:500]
+                delivery.last_error_code = error_code[:32]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+                delivery.session_patch_ciphertext = None
+
+                from app.core.time_utils import to_naive_utc, utc_now
+                from app.services.recommendation_delivery_service import (
+                    content_expires_at_for_status,
+                )
+                failed_at = utc_now()
+                created_at = getattr(delivery, "created_at", None)
+                if not isinstance(created_at, datetime):
+                    created_at = failed_at
+                delivery.content_expires_at = to_naive_utc(
+                    content_expires_at_for_status(
+                        terminal_status,
+                        created_at=created_at,
+                        terminal_at=failed_at,
+                    ),
+                )
+
+        log_event(
+            "recommendation_delivery_claim_rejected",
+            delivery_id=delivery_id,
+            error_code=error_code,
+            severity="alert",
+        )
 
     @staticmethod
     def _defer_outbox_row(
