@@ -112,11 +112,25 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_updated_at = None
     session.pending_expires_at = None
     session.pending_raw_text_parts = []
+    session.pending_upload_mode = "create"
+    session.pending_target_id = None
+    session.pending_target_version = None
+    session.pending_operation_id = None
+    session.pending_upload_media_ids = []
     session.follow_up_rounds = 0
     session.failed_patch_rounds = 0
     session.conflict_followup_rounds = 0
     session.pending_interruption = None
     session.active_flow = "idle"
+
+
+def abandon_pending_upload(session: SessionState, db: Session) -> None:
+    """将草稿媒体交给持久化删除任务后清空会话。"""
+    if session.pending_upload_media_ids:
+        from app.services.job_media_service import mark_delete_pending
+        mark_delete_pending(db, list(session.pending_upload_media_ids))
+        db.flush()
+    clear_pending_upload(session)
 
 
 def is_pending_upload_expired(session: SessionState) -> bool:
@@ -159,6 +173,7 @@ def process_upload(
     image_keys: list[str],
     session: SessionState,
     db: Session,
+    source_msg_id: str | None = None,
 ) -> UploadResult:
     """上传编排主入口。"""
     entity_type = _resolve_entity_type(intent_result.intent, user_ctx.role)
@@ -210,9 +225,30 @@ def process_upload(
     )
 
     # 入库（带审核结果）
-    if entity_type == "job":
+    if entity_type == "job" and session.pending_upload_mode == "replace":
+        if not (
+            session.pending_target_id
+            and session.pending_target_version
+            and session.pending_operation_id
+        ):
+            raise RuntimeError("replacement_session_context_incomplete")
+        from app.services.job_replace_service import create_replacement_candidate
+        _, entity = create_replacement_candidate(
+            db,
+            owner_userid=user_ctx.external_userid,
+            target_job_id=session.pending_target_id,
+            expected_version=session.pending_target_version,
+            operation_id=session.pending_operation_id,
+            source_msg_id=source_msg_id or session.pending_operation_id,
+            complete_data=data,
+            raw_text=final_raw_text,
+            media_ids=list(session.pending_upload_media_ids),
+            audit_result=audit_result,
+        )
+    elif entity_type == "job":
         entity = _create_job(
             data, user_ctx, audit_result, ttl_days, final_raw_text, image_keys, db,
+            media_ids=list(session.pending_upload_media_ids),
         )
     else:
         entity = _create_resume(
@@ -263,6 +299,19 @@ def attach_image(
     if not image_key:
         return "图片保存失败，请稍后重试。"
 
+    if (
+        session.pending_upload_intent
+        and _attach_target_entity_type(session.pending_upload_intent) == "job"
+    ):
+        if media_lifecycle_id is None:
+            return "图片保存失败，请稍后重试。"
+        if media_lifecycle_id in session.pending_upload_media_ids:
+            return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+        if len(session.pending_upload_media_ids) >= _MAX_IMAGES_PER_RECORD:
+            return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
+        session.pending_upload_media_ids.append(media_lifecycle_id)
+        return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+
     # Stage C1（spec §2.10）：pending_upload_intent 优先 —
     # 草稿存活时（无论 active_flow 是 upload_collecting 还是 upload_conflict）
     # 都按 origin intent 决定实体类型；回落 current_intent 兼容旧 session（C2 删除回落）。
@@ -272,7 +321,7 @@ def attach_image(
         entity_type = _attach_target_entity_type(session.current_intent)
 
     model_cls = Job if entity_type == "job" else Resume
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     record = db.query(model_cls).filter(
         model_cls.owner_userid == external_userid,
         model_cls.deleted_at.is_(None),
@@ -291,7 +340,10 @@ def attach_image(
 
     if media_lifecycle_id is not None:
         from app.services.job_media_service import attach_media
-        [image_key] = attach_media(db, [media_lifecycle_id], entity_type, record.id)
+        [image_key] = attach_media(
+            db, [media_lifecycle_id], entity_type, record.id,
+            owner_userid=external_userid,
+        )
     images.append(image_key)
     record.images = images
     from app.services.job_mutation_service import increment_version
@@ -415,9 +467,13 @@ def _create_job(
     raw_text: str,
     image_keys: list[str],
     db: Session,
+    media_ids: list[int] | None = None,
 ) -> Job:
     """创建岗位记录。"""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    from app.services.job_activation_service import activate_job
+    from app.services.lifecycle_config_service import get_job_candidate_ttl_days
+
     job = Job(
         owner_userid=user_ctx.external_userid,
         city=_extract_scalar(data, "city", ""),
@@ -429,12 +485,14 @@ def _create_job(
         is_long_term=data.get("is_long_term", True),
         raw_text=raw_text,
         description=data.get("description") or raw_text,
-        images=image_keys or None,
-        audit_status=audit_result.status,
+        images=None,
+        audit_status="pending" if audit_result.status == "passed" else audit_result.status,
         audit_reason=audit_result.reason or None,
         audited_by="system",
         audited_at=now,
-        expires_at=now + timedelta(days=ttl_days),
+        expires_at=None,
+        activated_at=None,
+        candidate_expires_at=now + timedelta(days=get_job_candidate_ttl_days(db)),
         # 可选软匹配字段
         district=data.get("district"),
         salary_ceiling_monthly=data.get("salary_ceiling_monthly"),
@@ -459,6 +517,14 @@ def _create_job(
     )
     db.add(job)
     db.flush()
+    if media_ids:
+        from app.services.job_media_service import attach_media
+        job.images = attach_media(
+            db, media_ids, "job", job.id,
+            owner_userid=user_ctx.external_userid,
+        )
+    if audit_result.status == "passed":
+        activate_job(db, job, now=now)
     return job
 
 

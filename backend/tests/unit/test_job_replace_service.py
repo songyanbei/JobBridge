@@ -1,0 +1,334 @@
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.dialects import mysql
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import sessionmaker
+
+from app.core.exceptions import BusinessException
+from app.models import (
+    AuditLog,
+    Job,
+    JobReplacement,
+    MediaAssetLifecycle,
+    SystemConfig,
+    TargetCleanupTask,
+    User,
+)
+from app.schemas.conversation import SessionState
+from app.services.audit_workbench_service import pass_action, reject_action, undo
+from app.services.command_service import execute
+from app.services.job_replace_service import (
+    activate_replacement,
+    cancel_candidate,
+    create_replacement_candidate,
+    retry_activation,
+)
+from app.services.intent_service import _match_command
+from app.services.user_service import UserContext
+
+
+@compiles(mysql.TINYINT, "sqlite")
+@compiles(mysql.SMALLINT, "sqlite")
+@compiles(mysql.INTEGER, "sqlite")
+@compiles(mysql.BIGINT, "sqlite")
+def _compile_mysql_integer_for_sqlite(_type, _compiler, **_kwargs):
+    return "INTEGER"
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine("sqlite:///:memory:")
+    tables = (
+        User.__table__,
+        Job.__table__,
+        JobReplacement.__table__,
+        MediaAssetLifecycle.__table__,
+        TargetCleanupTask.__table__,
+        SystemConfig.__table__,
+        AuditLog.__table__,
+    )
+    for table in tables:
+        table.create(engine)
+    session = sessionmaker(bind=engine)()
+    session.add(User(external_userid="owner-1", role="factory"))
+    session.commit()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def _job(db, **overrides):
+    values = {
+        "owner_userid": "owner-1",
+        "city": "苏州",
+        "job_category": "普工",
+        "salary_floor_monthly": 5000,
+        "pay_type": "月薪",
+        "headcount": 10,
+        "gender_required": "不限",
+        "is_long_term": True,
+        "raw_text": "旧岗位",
+        "description": "旧岗位说明",
+        "audit_status": "passed",
+        "activated_at": datetime.now() - timedelta(days=1),
+        "expires_at": datetime.now() + timedelta(days=30),
+        "version": 1,
+    }
+    values.update(overrides)
+    row = Job(**values)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def _complete_data(**overrides):
+    data = {
+        "city": "无锡",
+        "job_category": "操作工",
+        "salary_floor_monthly": 6500,
+        "pay_type": "月薪",
+        "headcount": 20,
+    }
+    data.update(overrides)
+    return data
+
+
+def _audit(status):
+    return SimpleNamespace(status=status, reason="待人工复核" if status == "pending" else "")
+
+
+def _create(db, old, status="pending", operation_id="op-1", source_msg_id="msg-1", media_ids=None):
+    return create_replacement_candidate(
+        db,
+        owner_userid="owner-1",
+        target_job_id=old.id,
+        expected_version=old.version,
+        operation_id=operation_id,
+        source_msg_id=source_msg_id,
+        complete_data=_complete_data(),
+        raw_text="完整的新岗位",
+        media_ids=media_ids or [],
+        audit_result=_audit(status),
+    )
+
+
+def test_update_command_selects_only_job_and_starts_empty_draft(db):
+    old = _job(db)
+    session = SessionState(role="factory", pending_upload={"city": "旧草稿"})
+    user = UserContext(
+        external_userid="owner-1", role="factory", status="active",
+        display_name=None, company=None, contact_person=None, phone=None,
+        can_search_jobs=False, can_search_workers=True,
+        is_first_touch=False, should_welcome=False,
+    )
+
+    reply = execute("update_job", str(old.id), user, session, db)[0]
+
+    assert "完整的新岗位信息" in reply.content
+    assert session.pending_upload == {}
+    assert session.pending_upload_mode == "replace"
+    assert session.pending_target_id == old.id
+
+
+@pytest.mark.parametrize("text", [
+    "/更新岗位", "更新岗位", "修改岗位", "重新发布岗位",
+])
+def test_update_job_exact_aliases(text):
+    assert _match_command(text) == ("update_job", "")
+
+
+def test_update_job_command_parses_explicit_id():
+    assert _match_command("/更新岗位 123") == ("update_job", "123")
+
+
+def test_update_command_requires_explicit_id_for_multiple_jobs(db):
+    first = _job(db)
+    second = _job(db)
+    session = SessionState(role="factory")
+    user = UserContext(
+        external_userid="owner-1", role="factory", status="active",
+        display_name=None, company=None, contact_person=None, phone=None,
+        can_search_jobs=False, can_search_workers=True,
+        is_first_touch=False, should_welcome=False,
+    )
+
+    reply = execute("update_job", "", user, session, db)[0]
+
+    assert str(first.id) in reply.content and str(second.id) in reply.content
+    assert session.pending_target_id is None
+
+
+def test_pending_candidate_is_complete_and_does_not_replace_old_job(db):
+    old = _job(db, address="旧地址")
+    relation, candidate = _create(db, old, status="pending")
+    db.commit()
+
+    assert candidate.address is None
+    assert candidate.city == "无锡"
+    assert candidate.audit_status == "pending"
+    assert candidate.expires_at is None
+    assert candidate.candidate_expires_at is not None
+    assert old.deleted_at is None and old.delist_reason is None
+    assert relation.lifecycle_status == "awaiting_review"
+    assert relation.active_old_job_id == old.id
+
+
+def test_rejected_candidate_closes_relation_and_keeps_old_job_online(db):
+    old = _job(db)
+    relation, candidate = _create(db, old, status="rejected")
+    db.commit()
+
+    assert candidate.audit_status == "rejected"
+    assert relation.review_outcome == "rejected"
+    assert relation.lifecycle_status == "closed"
+    assert old.deleted_at is None and old.delist_reason is None
+
+
+def test_auto_pass_atomically_activates_new_job_and_replaces_old(db):
+    old = _job(db)
+    relation, candidate = _create(db, old, status="passed")
+    db.commit()
+
+    assert candidate.audit_status == "passed"
+    assert candidate.activated_at is not None and candidate.expires_at is not None
+    assert candidate.candidate_expires_at is None
+    assert old.delist_reason == "replaced" and old.deleted_at is not None
+    assert relation.lifecycle_status == "activated"
+    assert db.query(TargetCleanupTask).filter_by(target_id=old.id).one().reason == "replaced"
+
+
+def test_manual_pass_activates_first_publish_candidate(db):
+    candidate = _job(
+        db,
+        audit_status="pending",
+        activated_at=None,
+        expires_at=None,
+        candidate_expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=7),
+    )
+
+    pass_action(db, "job", candidate.id, candidate.version, "reviewer")
+
+    assert candidate.audit_status == "passed"
+    assert candidate.activated_at is not None and candidate.expires_at is not None
+    assert candidate.candidate_expires_at is None
+
+
+def test_duplicate_operation_or_source_message_returns_same_candidate(db):
+    old = _job(db)
+    first_relation, first_candidate = _create(db, old)
+    db.commit()
+
+    relation_by_operation, candidate_by_operation = _create(
+        db, old, operation_id="op-1", source_msg_id="msg-2",
+    )
+    relation_by_message, candidate_by_message = _create(
+        db, old, operation_id="op-2", source_msg_id="msg-1",
+    )
+
+    assert relation_by_operation.id == first_relation.id
+    assert relation_by_message.id == first_relation.id
+    assert candidate_by_operation.id == first_candidate.id
+    assert candidate_by_message.id == first_candidate.id
+
+
+def test_manual_pass_conflict_keeps_candidate_pending_then_retry_activates(db):
+    old = _job(db)
+    relation, candidate = _create(db, old)
+    db.commit()
+    old.description = "审核期间被管理员修改"
+    old.version += 1
+    db.commit()
+
+    pass_action(db, "job", candidate.id, candidate.version, "reviewer")
+    db.refresh(relation)
+    db.refresh(candidate)
+    assert relation.review_outcome == "passed"
+    assert relation.lifecycle_status == "conflict"
+    assert candidate.audit_status == "pending" and candidate.expires_at is None
+
+    assert retry_activation(
+        db, relation.id, old.version, operator="reviewer", reason="确认使用当前旧版本",
+    )
+    db.commit()
+    assert candidate.audit_status == "passed"
+    assert relation.lifecycle_status == "activated"
+
+
+def test_manual_reject_and_operator_cancel_preserve_old_and_release_media(db):
+    old = _job(db)
+    media = MediaAssetLifecycle(
+        object_key="jobs/draft.jpg", owner_userid="owner-1", state="pending",
+    )
+    db.add(media)
+    db.commit()
+    relation, candidate = _create(db, old, media_ids=[media.id])
+    db.commit()
+
+    reject_action(db, "job", candidate.id, candidate.version, "不合规", "reviewer")
+    assert relation.lifecycle_status == "closed"
+    assert relation.review_outcome == "rejected"
+    assert old.deleted_at is None
+    assert media.entity_id == candidate.id and media.entity_id != old.id
+
+    other_relation, other_candidate = _create(
+        db, old, operation_id="op-2", source_msg_id="msg-2",
+    )
+    db.commit()
+    cancel_candidate(db, other_relation.id, operator="reviewer")
+    db.commit()
+    assert other_relation.lifecycle_status == "closed"
+    assert other_candidate.deleted_at is not None
+
+
+def test_retry_rejects_expired_candidate(db):
+    old = _job(db)
+    relation, candidate = _create(db, old)
+    relation.review_outcome = "passed"
+    relation.lifecycle_status = "conflict"
+    utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+    candidate.candidate_expires_at = utc_now - timedelta(seconds=1)
+    db.commit()
+    db.expire_all()
+    assert db.get(Job, candidate.id).candidate_expires_at < utc_now
+    from app.services.job_replacement_lock_service import lock_replacement_graph
+    locked_relation, _, jobs = lock_replacement_graph(db, relation.id)
+    assert jobs[locked_relation.new_job_id].candidate_expires_at < utc_now
+
+    with pytest.raises(BusinessException, match="candidate_expired"):
+        retry_activation(db, relation.id, old.version, operator="reviewer", reason="retry")
+
+
+def test_candidate_rejects_media_owned_by_another_user(db):
+    old = _job(db)
+    media = MediaAssetLifecycle(
+        object_key="jobs/not-owned.jpg", owner_userid="another-user", state="pending",
+    )
+    db.add(media)
+    db.commit()
+
+    with pytest.raises(ValueError, match="media_lifecycle_owner_mismatch"):
+        _create(db, old, media_ids=[media.id])
+
+
+def test_undo_rejects_job_lifecycle_transition_before_consuming_snapshot(db, monkeypatch):
+    active = _job(db)
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo",
+        lambda *_args: {"action": "pass", "before": {}},
+    )
+    pop = SimpleNamespace(called=False)
+
+    def _pop(*_args):
+        pop.called = True
+        return {"action": "pass", "before": {}}
+
+    monkeypatch.setattr("app.services.audit_workbench_service.pop_undo", _pop)
+
+    with pytest.raises(BusinessException, match="job_lifecycle_transition_not_undoable"):
+        undo(db, "job", active.id, "reviewer")
+    assert pop.called is False

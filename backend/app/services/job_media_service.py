@@ -35,7 +35,14 @@ def record_pending_media(
     return row
 
 
-def attach_media(db: Session, media_ids: list[int], entity_type: str, entity_id: int) -> list[str]:
+def attach_media(
+    db: Session,
+    media_ids: list[int],
+    entity_type: str,
+    entity_id: int,
+    *,
+    owner_userid: str | None = None,
+) -> list[str]:
     unique_ids = sorted(set(media_ids))
     rows = (
         db.query(MediaAssetLifecycle)
@@ -46,6 +53,8 @@ def attach_media(db: Session, media_ids: list[int], entity_type: str, entity_id:
     )
     if len(rows) != len(unique_ids) or any(row.state != "pending" for row in rows):
         raise ValueError("media_lifecycle_incomplete_or_consumed")
+    if owner_userid is not None and any(row.owner_userid != owner_userid for row in rows):
+        raise ValueError("media_lifecycle_owner_mismatch")
     for row in rows:
         row.state = "attached"
         row.entity_type = entity_type

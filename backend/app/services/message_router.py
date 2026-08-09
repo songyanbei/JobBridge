@@ -949,7 +949,7 @@ def _route_upload_collecting(
     # 1. 过期
     if upload_service.is_pending_upload_expired(session):
         was_patch = _looks_like_upload_patch(content)
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         if was_patch:
             return [_reply(userid, PENDING_EXPIRED_REPLY)]
         # 未补丁就放行到 idle 分发
@@ -957,7 +957,7 @@ def _route_upload_collecting(
 
     # 2. cancel 强规则
     if _is_cancel(content, intent_result):
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
     # 3. 闲聊穿插（spec §9.8）
@@ -1015,7 +1015,7 @@ def _route_upload_conflict(
         not has_proceed_signal
         and (_is_cancel(content, intent_result) or "取消草稿" in content)
     ):
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
     # 继续发布 —— 仅在不含 proceed 信号时；spec §2.7 要求允许裸 "继续"
@@ -1045,7 +1045,7 @@ def _route_upload_conflict(
         forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
 
         # 清掉 pending 草稿和 interruption 后再分发
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
         return [_reply(userid, CONFLICT_PROCEED_ACK)] + forwarded
 
@@ -1159,7 +1159,7 @@ def _route_v2_resolve_conflict(
         forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
 
         # 消费 pending_interruption + 清草稿（applier 只清了 active_flow）
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         session.pending_interruption = None
 
         forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
@@ -1528,6 +1528,7 @@ def _handle_upload(
         image_keys=[],  # 图片在 _handle_image 单独处理
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
     # Stage C1：upload_service 已自行维护 active_flow（保存草稿→upload_collecting；
     # 清空草稿→idle）。这里仅兜底确保 active_flow 与 pending 状态一致。
@@ -1564,6 +1565,7 @@ def _handle_upload_and_search(
         image_keys=[],
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
 
     replies: list[ReplyMessage] = [_reply(msg.from_user, upload_result.reply_text)]
@@ -2350,6 +2352,7 @@ def _commit_pending_or_followup(
         image_keys=[],
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
     return [_reply(userid, result.reply_text)]
 

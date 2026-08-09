@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, Job
+from app.models import AuditLog, Job, JobReplacement
 from app.schemas.conversation import ReplyMessage, SessionState  # noqa: F401
 from app.services import conversation_service
 from app.services.lifecycle_config_service import get_job_ttl_days
@@ -53,6 +53,7 @@ HELP_TEXT = (
     "  /找岗位        切换到找岗位模式（中介）\n"
     "  /找工人        切换到找工人模式（中介）\n"
     "  /续期 [天数]   延长岗位有效期（默认 15 天）\n"
+    "  /更新岗位 [ID] 提交完整的新岗位信息替换旧岗位\n"
     "  /下架          下架岗位\n"
     "  /招满了        标记岗位为已招满\n"
     "  /我的状态      查询账号和最近提交状态\n"
@@ -148,9 +149,56 @@ def _handle_cancel_pending(
     if session is None or not session.pending_upload_intent:
         return [_reply(user_ctx, CANCEL_PENDING_NO_DRAFT)]
     from app.services import upload_service
-    upload_service.clear_pending_upload(session)
+    upload_service.abandon_pending_upload(session, db)
     conversation_service.save_session(user_ctx.external_userid, session)
     return [_reply(user_ctx, CANCEL_PENDING_OK)]
+
+
+def _handle_update_job(
+    *, args: str, user_ctx: UserContext, session: SessionState | None, db,
+) -> list[ReplyMessage]:
+    if user_ctx.role == "worker":
+        return [_reply(user_ctx, "工人账号不能更新岗位。")]
+    if session is None:
+        return [_reply(user_ctx, "会话不可用，请稍后重试。")]
+    try:
+        target_id = int(args.strip()) if args.strip() else None
+    except ValueError:
+        return [_reply(user_ctx, "岗位 ID 必须是数字。")]
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    jobs = db.query(Job).filter(
+        Job.owner_userid == user_ctx.external_userid,
+        Job.audit_status == "passed",
+        Job.deleted_at.is_(None),
+        Job.delist_reason.is_(None),
+        Job.expires_at > now,
+    ).order_by(Job.id).all()
+    active_replacement_ids = {
+        row[0] for row in db.query(JobReplacement.active_old_job_id).filter(
+            JobReplacement.active_old_job_id.isnot(None),
+        ).all()
+    }
+    jobs = [job for job in jobs if job.id not in active_replacement_ids]
+    if target_id is not None:
+        jobs = [job for job in jobs if job.id == target_id]
+    if not jobs:
+        return [_reply(user_ctx, "未找到可更新的在线岗位，请重新发布。")]
+    if len(jobs) != 1:
+        return [_reply(user_ctx, "请使用 /更新岗位 岗位ID 选择：" + "、".join(str(job.id) for job in jobs))]
+    import uuid
+    from app.services import upload_service
+
+    job = jobs[0]
+    if session.pending_upload_intent or session.pending_upload_media_ids:
+        upload_service.abandon_pending_upload(session, db)
+    else:
+        upload_service.clear_pending_upload(session)
+    session.pending_upload = {}
+    session.pending_upload_mode, session.pending_target_id = "replace", job.id
+    session.pending_target_version, session.pending_operation_id = job.version, str(uuid.uuid4())
+    session.pending_upload_media_ids, session.pending_upload_intent = [], "upload_job"
+    session.active_flow = "upload_collecting"
+    return [_reply(user_ctx, "请发送完整的新岗位信息；审核通过后才会替换旧岗位。")]
 
 
 def _handle_reset_search(
@@ -528,6 +576,7 @@ _HANDLERS = {
     "switch_to_job": _handle_switch_to_job,
     "switch_to_worker": _handle_switch_to_worker,
     "renew_job": _handle_renew_job,
+    "update_job": _handle_update_job,
     "delist_job": _handle_delist_job,
     "filled_job": _handle_filled_job,
     "delete_my_data": _handle_delete_my_data,

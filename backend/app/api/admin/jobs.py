@@ -77,6 +77,15 @@ class RestoreRequest(BaseModel):
     version: int = Field(..., ge=1)
 
 
+class ReplacementRetryRequest(BaseModel):
+    old_job_version: int = Field(..., ge=1)
+    reason: str = Field(..., min_length=1, max_length=200)
+
+
+class ReplacementCancelRequest(BaseModel):
+    reason: str = Field(default="operator_cancelled", min_length=1, max_length=200)
+
+
 def _collect_filters(
     city: str | None, district: str | None, job_category: str | None,
     pay_type: str | None, audit_status: str | None, delist_reason: str | None,
@@ -231,4 +240,43 @@ def restore_job(
     current: AdminUser = Depends(require_admin),
 ):
     job_admin_service.restore(db, job_id, req.version, current.username)
+    return ok()
+
+
+@router.post("/replacements/{replacement_id}/retry", summary="重试岗位替换激活")
+def retry_replacement(
+    replacement_id: int,
+    req: ReplacementRetryRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    from app.services.job_replace_service import retry_activation
+
+    activated = retry_activation(
+        db,
+        replacement_id,
+        req.old_job_version,
+        operator=current.username,
+        reason=req.reason,
+    )
+    db.commit()
+    return ok({"activated": activated})
+
+
+@router.post("/replacements/{replacement_id}/cancel", summary="取消岗位替换候选")
+def cancel_replacement(
+    replacement_id: int,
+    req: ReplacementCancelRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    from app.services.job_replace_service import cancel_candidate
+
+    cancel_candidate(
+        db,
+        replacement_id,
+        operator=current.username,
+        reason=req.reason,
+    )
+    db.commit()
     return ok()

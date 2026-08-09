@@ -569,6 +569,17 @@ def save_undo(target_type: str, target_id: int | str, payload: dict, ttl: int = 
     r.setex(key, ttl, json.dumps(payload, ensure_ascii=False, default=str))
 
 
+def get_undo(target_type: str, target_id: int | str) -> dict | None:
+    """读取 Undo 快照但不消费，用于执行前的生命周期门禁。"""
+    data = get_redis().get(f"{UNDO_PREFIX}{target_type}:{target_id}")
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
 def pop_undo(target_type: str, target_id: int | str) -> dict | None:
     """取出并删除 Undo 快照；超过 TTL 返回 None。"""
     r = get_redis()
