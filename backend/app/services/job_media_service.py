@@ -65,14 +65,23 @@ def attach_media(
 
 def mark_delete_pending(db: Session, media_ids: list[int]) -> None:
     if media_ids:
-        db.query(MediaAssetLifecycle).filter(MediaAssetLifecycle.id.in_(media_ids)).update(
+        db.query(MediaAssetLifecycle).filter(
+            MediaAssetLifecycle.id.in_(media_ids),
+            MediaAssetLifecycle.state.in_(("pending", "attached")),
+        ).update(
             {"state": "delete_pending", "next_attempt_at": datetime.utcnow()}, synchronize_session=False)
 
 
-def mark_job_media_delete_pending(db: Session, job_id: int) -> int:
+def mark_entity_media_delete_pending(
+    db: Session,
+    entity_type: str,
+    entity_id: int,
+) -> int:
+    if entity_type not in ("job", "resume"):
+        raise ValueError("unsupported_media_entity_type")
     result = db.query(MediaAssetLifecycle).filter(
-        MediaAssetLifecycle.entity_type == "job",
-        MediaAssetLifecycle.entity_id == job_id,
+        MediaAssetLifecycle.entity_type == entity_type,
+        MediaAssetLifecycle.entity_id == entity_id,
         MediaAssetLifecycle.state == "attached",
     ).update({
         "state": "delete_pending",
@@ -81,7 +90,22 @@ def mark_job_media_delete_pending(db: Session, job_id: int) -> int:
     return int(result or 0)
 
 
-def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
+def mark_job_media_delete_pending(db: Session, job_id: int) -> int:
+    return mark_entity_media_delete_pending(db, "job", job_id)
+
+
+def mark_resume_media_delete_pending(db: Session, resume_id: int) -> int:
+    return mark_entity_media_delete_pending(db, "resume", resume_id)
+
+
+def entity_hard_delete_media_complete(
+    db: Session,
+    entity_type: str,
+    entity_id: int,
+    images,
+) -> bool:
+    if entity_type not in ("job", "resume"):
+        return False
     try:
         values = json.loads(images) if isinstance(images, str) else (images or [])
         if not isinstance(values, list):
@@ -90,8 +114,8 @@ def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
     all_rows = db.query(MediaAssetLifecycle).filter(
-        MediaAssetLifecycle.entity_type == "job",
-        MediaAssetLifecycle.entity_id == job_id,
+        MediaAssetLifecycle.entity_type == entity_type,
+        MediaAssetLifecycle.entity_id == entity_id,
     ).all()
     if not keys:
         return all(row.state == "deleted" for row in all_rows)
@@ -101,3 +125,11 @@ def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
         and all(by_key[key].state == "deleted" for key in keys)
         and all(row.state == "deleted" for row in all_rows)
     )
+
+
+def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
+    return entity_hard_delete_media_complete(db, "job", job_id, images)
+
+
+def resume_hard_delete_media_complete(db: Session, resume_id: int, images) -> bool:
+    return entity_hard_delete_media_complete(db, "resume", resume_id, images)

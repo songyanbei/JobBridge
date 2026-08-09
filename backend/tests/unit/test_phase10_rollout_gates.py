@@ -24,6 +24,29 @@ def test_additive_migration_contains_rollout_invariants():
     assert "candidate_expires_at` IS NULL" in sql
 
 
+def test_media_dead_letter_schema_and_upgrade_migration_are_complete():
+    from app.models import MediaAssetLifecycle
+
+    assert "dead_letter" in MediaAssetLifecycle.__table__.columns["state"].type.enums
+
+    additive = (
+        ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql"
+    ).read_text(encoding="utf-8")
+    schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
+    upgrade = (
+        ROOT / "sql/migrations/phase10_002_media_dead_letter.sql"
+    ).read_text(encoding="utf-8")
+
+    for sql in (additive, schema, upgrade):
+        assert "'dead_letter'" in sql
+    assert "ALTER TABLE `media_asset_lifecycle`" in upgrade
+    assert "`attempt_count` >= 10" in upgrade
+    assert "`state` = 'dead_letter'" in upgrade
+    assert "`next_attempt_at` = NULL" in upgrade
+    assert "`lease_owner` = NULL" in upgrade
+    assert "`lease_expires_at` = NULL" in upgrade
+
+
 def test_down_migration_blocks_new_model_data_and_validates_restore_checksum():
     sql = (ROOT / "sql/migrations/phase10_down_001_job_lifecycle.sql").read_text(
         encoding="utf-8"
@@ -55,9 +78,36 @@ def test_preflight_reports_all_clean_database_as_ready(monkeypatch):
 
 
 def test_preflight_includes_config_and_backup_coverage_gates():
+    assert "media_state_enum_missing_dead_letter" in phase10_preflight.CHECKS
     assert "invalid_job_ttl_config" in phase10_preflight.CHECKS
     assert "invalid_candidate_ttl_config" in phase10_preflight.CHECKS
     assert "job_backup_coverage_mismatch" in phase10_preflight.CHECKS
+    enum_gate = phase10_preflight.CHECKS["media_state_enum_missing_dead_letter"]
+    assert "information_schema.COLUMNS" in enum_gate
+    assert "COLUMN_TYPE" in enum_gate
+    assert "dead_letter" in enum_gate
+
+
+def test_preflight_fails_if_dead_letter_enum_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        phase10_preflight, "collect_media_coverage", lambda _: _clean_media_coverage()
+    )
+    db = MagicMock()
+    scalar_results = [MagicMock() for _ in phase10_preflight.CHECKS]
+    for result in scalar_results:
+        result.scalar.return_value = 0
+    enum_index = list(phase10_preflight.CHECKS).index(
+        "media_state_enum_missing_dead_letter"
+    )
+    scalar_results[enum_index].scalar.return_value = 1
+    auto_increment = MagicMock()
+    auto_increment.one.return_value = (101, 100)
+    db.execute.side_effect = [*scalar_results, auto_increment]
+
+    result = phase10_preflight.collect(db)
+
+    assert result["ready"] is False
+    assert result["media_state_enum_missing_dead_letter"] == 1
 
 
 def test_preflight_fails_on_any_invariant_or_invalid_auto_increment(monkeypatch):

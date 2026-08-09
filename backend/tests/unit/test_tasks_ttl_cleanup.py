@@ -3,14 +3,12 @@
 验证：
 - ``_load_ttl_config`` 在 DB 缺失/有值/非法值三种场景下的回退行为
 - ``_safe_step`` 捕获异常并写 -1 而不影响其它步骤
-- ``_extract_image_keys`` 兼容 list / JSON 字符串 / None / 非法 JSON
 - ``_batch_hard_delete`` 分批 DELETE LIMIT 500，最后一批 < 500 时退出
 - ``_escape_literal`` 防御性转义单引号 / 反斜杠
 - ``run()`` 未获取锁时直接 return，不读 DB
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -116,35 +114,6 @@ class TestSafeStep:
 
 
 # ---------------------------------------------------------------------------
-# _extract_image_keys
-# ---------------------------------------------------------------------------
-
-class TestExtractImageKeys:
-    def test_none_returns_empty(self):
-        assert ttl_cleanup._extract_image_keys(None) == []
-
-    def test_list_passthrough(self):
-        assert ttl_cleanup._extract_image_keys(["a/b.jpg", "c.png"]) == ["a/b.jpg", "c.png"]
-
-    def test_list_filters_falsy(self):
-        assert ttl_cleanup._extract_image_keys(["a", "", None, "b"]) == ["a", "b"]
-
-    def test_json_string(self):
-        raw = json.dumps(["x.jpg", "y.png"])
-        assert ttl_cleanup._extract_image_keys(raw) == ["x.jpg", "y.png"]
-
-    def test_json_bytes(self):
-        raw = json.dumps(["x.jpg"]).encode("utf-8")
-        assert ttl_cleanup._extract_image_keys(raw) == ["x.jpg"]
-
-    def test_invalid_json_returns_empty(self):
-        assert ttl_cleanup._extract_image_keys("{not json") == []
-
-    def test_json_non_list_returns_empty(self):
-        assert ttl_cleanup._extract_image_keys(json.dumps({"k": "v"})) == []
-
-
-# ---------------------------------------------------------------------------
 # _batch_hard_delete 分批
 # ---------------------------------------------------------------------------
 
@@ -211,7 +180,8 @@ def test_deleted_user_cleanup_includes_only_terminal_inbound(monkeypatch):
     monkeypatch.setattr(ttl_cleanup, "_batch_hard_delete", fake_delete)
     monkeypatch.setattr(ttl_cleanup, "log_event", MagicMock())
 
-    assert ttl_cleanup._hard_delete_deleted_users(db, 7) == 4
+    assert ttl_cleanup._hard_delete_deleted_users(db, 7) == 3
+    assert all(table != "resume" for table, _where in calls)
     inbound = [where for table, where in calls if table == "wecom_inbound_event"]
     assert len(inbound) == 1
     assert "from_userid = 'u1'" in inbound[0]
@@ -368,4 +338,78 @@ def test_job_hard_delete_rechecks_cleanup_and_replacement_in_delete(monkeypatch)
     assert "target_cleanup_task" in delete_sql
     assert "t.status='succeeded'" in delete_sql
     assert "NOT EXISTS" in delete_sql
+    assert "media_asset_lifecycle" in delete_sql
+    assert "m.state<>'deleted'" in delete_sql
     assert "job_replacement" in delete_sql
+
+
+def _resume_hard_delete_db():
+    db = MagicMock()
+
+    def execute(statement, _params=None):
+        sql = str(statement)
+        result = MagicMock()
+        if sql.lstrip().startswith("SELECT id, images, deleted_at"):
+            result.fetchall.return_value = [
+                (9, '["images/resume/a.jpg"]', datetime(2026, 1, 1))
+            ]
+        elif sql.lstrip().startswith("DELETE FROM `resume`"):
+            result.rowcount = 1
+        else:
+            raise AssertionError(f"unexpected SQL: {sql}")
+        return result
+
+    db.execute.side_effect = execute
+    return db
+
+
+@pytest.mark.parametrize(
+    "media_marked,media_complete",
+    [(1, True), (0, False)],
+)
+def test_resume_hard_delete_blocks_until_durable_media_finishes(
+    monkeypatch, media_marked, media_complete,
+):
+    from app.services import job_media_service
+
+    monkeypatch.setattr(
+        job_media_service,
+        "mark_resume_media_delete_pending",
+        lambda *_: media_marked,
+    )
+    monkeypatch.setattr(
+        job_media_service,
+        "resume_hard_delete_media_complete",
+        lambda *_: media_complete,
+    )
+    db = _resume_hard_delete_db()
+
+    assert ttl_cleanup._hard_delete_expired_resumes(db, 7) == 0
+    assert not any(
+        str(call.args[0]).lstrip().startswith("DELETE FROM `resume`")
+        for call in db.execute.call_args_list
+    )
+
+
+def test_resume_hard_delete_rechecks_media_state_in_delete(monkeypatch):
+    from app.services import job_media_service
+
+    monkeypatch.setattr(
+        job_media_service,
+        "mark_resume_media_delete_pending",
+        lambda *_: 0,
+    )
+    monkeypatch.setattr(
+        job_media_service,
+        "resume_hard_delete_media_complete",
+        lambda *_: True,
+    )
+    db = _resume_hard_delete_db()
+
+    assert ttl_cleanup._hard_delete_expired_resumes(db, 7) == 1
+    select_sql = str(db.execute.call_args_list[0].args[0])
+    delete_sql = str(db.execute.call_args_list[1].args[0])
+    assert "ORDER BY deleted_at, id" in select_sql
+    assert "FOR UPDATE SKIP LOCKED" in select_sql
+    assert "media_asset_lifecycle" in delete_sql
+    assert "m.state<>'deleted'" in delete_sql

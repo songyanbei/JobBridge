@@ -57,10 +57,10 @@ class LocalStorage(StorageBackend):
         return f"{base}/{normalized}"
 
     def delete(self, key: str) -> bool:
-        """删除文件。文件不存在时返回 False。"""
+        """Delete a file idempotently; an already absent file is success."""
         path = self._full_path(key)
         if not os.path.exists(path):
-            return False
+            return True
         os.remove(path)
         logger.info("LocalStorage: deleted %s", key)
         return True

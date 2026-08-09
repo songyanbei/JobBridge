@@ -22,14 +22,11 @@
 """
 from __future__ import annotations
 
-from typing import Any
-
 from loguru import logger
 from sqlalchemy import text
 
 from app.core.logging_setup import identifier_hash
 from app.db import SessionLocal
-from app.storage import get_storage
 from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 
 BATCH_SIZE = 500
@@ -333,6 +330,9 @@ def _hard_delete_expired_jobs(db, delay_days: int) -> int:
                 "AND EXISTS (SELECT 1 FROM `target_cleanup_task` t "
                 "WHERE t.target_type='job' AND t.target_id=:job_id "
                 "AND t.status='succeeded') "
+                "AND NOT EXISTS (SELECT 1 FROM `media_asset_lifecycle` m "
+                "WHERE m.entity_type='job' AND m.entity_id=:job_id "
+                "AND m.state<>'deleted') "
                 "AND NOT EXISTS (SELECT 1 FROM `job_replacement` r "
                 "WHERE (r.old_job_id=:job_id OR r.new_job_id=:job_id) "
                 "AND r.lifecycle_status IN ('awaiting_review','conflict'))"
@@ -347,65 +347,54 @@ def _hard_delete_expired_jobs(db, delay_days: int) -> int:
 
 
 def _hard_delete_expired_resumes(db, delay_days: int) -> int:
-    """简历软删 ``delay_days`` 天后硬删；删除前先收集 images 中的对象存储 key 并调用 storage.delete()。"""
-    storage = None
-    try:
-        storage = get_storage()
-    except Exception:
-        logger.exception("ttl_cleanup: get_storage failed (skip storage cleanup)")
+    """Hard-delete resumes only after durable media cleanup is complete."""
+    from app.services.job_media_service import (
+        mark_resume_media_delete_pending,
+        resume_hard_delete_media_complete,
+    )
 
     total_deleted = 0
+    cursor_deleted_at = None
+    cursor_id = 0
     while True:
-        rows = db.execute(
-            text(
-                "SELECT id, images FROM `resume` "
-                f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
-                f"LIMIT {BATCH_SIZE}"
+        cursor_sql = ""
+        params = {"cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id}
+        if cursor_deleted_at is not None:
+            cursor_sql = (
+                "AND (deleted_at > :cursor_deleted_at "
+                "OR (deleted_at = :cursor_deleted_at AND id > :cursor_id)) "
             )
-        ).fetchall()
+        rows = db.execute(text(
+            "SELECT id, images, deleted_at FROM `resume` "
+            f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+            + cursor_sql
+            + f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE} FOR UPDATE SKIP LOCKED"
+        ), params).fetchall()
         if not rows:
             break
 
-        # 1) 清理对象存储
-        for rid, images in rows:
-            keys = _extract_image_keys(images)
-            for key in keys:
-                if storage is None:
-                    continue
-                try:
-                    storage.delete(key)
-                except Exception:
-                    logger.exception(
-                        f"ttl_cleanup: storage.delete failed key={key} resume_id={rid}"
-                    )
+        # Hand attached objects to the durable worker before checking the gate.
+        for resume_id, images, _deleted_at in rows:
+            resume_id = int(resume_id)
+            if mark_resume_media_delete_pending(db, resume_id):
+                continue
+            if not resume_hard_delete_media_complete(db, resume_id, images):
+                continue
+            result = db.execute(text(
+                "DELETE FROM `resume` WHERE id=:resume_id "
+                f"AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+                "AND NOT EXISTS (SELECT 1 FROM `media_asset_lifecycle` m "
+                "WHERE m.entity_type='resume' AND m.entity_id=:resume_id "
+                "AND m.state<>'deleted')"
+            ), {"resume_id": resume_id})
+            total_deleted += int(result.rowcount or 0)
 
-        # 2) 删库
-        ids = [str(r[0]) for r in rows]
-        id_list = ",".join(ids)
-        result = db.execute(text(f"DELETE FROM `resume` WHERE id IN ({id_list})"))
         db.commit()
-        deleted = int(result.rowcount or 0)
-        total_deleted += deleted
-        if deleted < BATCH_SIZE:
+        cursor_id = int(rows[-1][0])
+        cursor_deleted_at = rows[-1][2]
+        if len(rows) < BATCH_SIZE:
             break
     return total_deleted
-
-
-def _extract_image_keys(images: Any) -> list[str]:
-    """images 列存的是 storage key 数组，既可能是 list 也可能是 JSON 字符串。"""
-    if images is None:
-        return []
-    if isinstance(images, list):
-        return [str(k) for k in images if k]
-    if isinstance(images, (bytes, str)):
-        import json
-        try:
-            data = json.loads(images)
-        except Exception:
-            return []
-        if isinstance(data, list):
-            return [str(k) for k in data if k]
-    return []
 
 
 def _hard_delete_deleted_users(db, delay_days: int) -> int:
@@ -465,18 +454,6 @@ def _hard_delete_deleted_users(db, delay_days: int) -> int:
 
     total_deleted = 0
     for uid in userids:
-        # 硬删该用户 resume（含 storage 清理）
-        try:
-            total_deleted += _batch_hard_delete(
-                db,
-                "resume",
-                f"owner_userid = {_escape_literal(uid)}",
-            )
-        except Exception:
-            logger.exception(
-                "ttl_cleanup: hard delete resume failed user_hash={}",
-                identifier_hash(uid),
-            )
         # 硬删其 conversation_log 残留
         try:
             total_deleted += _batch_hard_delete(

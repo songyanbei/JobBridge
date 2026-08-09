@@ -137,6 +137,14 @@ def build_scheduler() -> BackgroundScheduler:
     )
 
     sched.add_job(
+        worker_monitor.check_media_cleanup,
+        IntervalTrigger(seconds=60),
+        id="media_cleanup_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
         worker_monitor.check_session_commits,
         IntervalTrigger(seconds=60),
         id="session_commit_health",

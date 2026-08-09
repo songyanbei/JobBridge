@@ -3,7 +3,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from app.config import settings
-from app.services.job_media_service import hard_delete_media_complete
+from app.services.job_media_service import (
+    hard_delete_media_complete,
+    resume_hard_delete_media_complete,
+)
 from app.services.storage_reference_service import (
     normalize_storage_reference,
     storage_urls_for_response,
@@ -104,3 +107,17 @@ def test_deleted_historical_alias_row_does_not_block_complete_coverage():
         SimpleNamespace(object_key="images/old-alias.jpg", state="deleted"),
     ]
     assert hard_delete_media_complete(_media_db(rows), 7, ["images/a.jpg"]) is True
+
+
+def test_resume_hard_delete_uses_the_same_fail_closed_media_gate():
+    deleted = [SimpleNamespace(object_key="images/resume/a.jpg", state="deleted")]
+    dead_letter = [
+        SimpleNamespace(object_key="images/resume/a.jpg", state="dead_letter")
+    ]
+
+    assert resume_hard_delete_media_complete(
+        _media_db(deleted), 9, ["images/resume/a.jpg"]
+    ) is True
+    assert resume_hard_delete_media_complete(
+        _media_db(dead_letter), 9, ["images/resume/a.jpg"]
+    ) is False

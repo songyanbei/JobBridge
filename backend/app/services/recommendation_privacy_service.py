@@ -1075,24 +1075,30 @@ def _delete_target_facts(
 
 
 # ---------------------------------------------------------------------------
-# 步骤 6：本人内容与存储对象
+# 步骤 6：本人日志删除与实体清理移交
 # ---------------------------------------------------------------------------
-
-def _image_keys(images: Any) -> list[str]:
-    values = _as_list(images)
-    if values is None:
-        return []
-    return [str(k) for k in values if k]
-
 
 def _delete_owned_content(
     db: Session,
     external_userid: str,
+    targets: Sequence[TargetRef],
     report: PrivacyReport,
     *,
+    now: datetime,
     commit: bool,
 ) -> None:
-    """§9.11.1 步骤 6：conversation_log、resume/job 与对象存储。"""
+    """Delete logs and hand owned entities to the durable cleanup pipelines."""
+    grouped = _target_map(targets)
+    job_ids = sorted(int(value) for value in grouped.get("job", set()))
+    for job_chunk in _chunks(job_ids):
+        active_job = db.query(Job.id).filter(
+            Job.id.in_(job_chunk),
+            Job.owner_userid == external_userid,
+            Job.deleted_at.is_(None),
+        ).first()
+        if active_job is not None:
+            raise RuntimeError("active_job_requires_lifecycle_cleanup")
+
     count = _delete_by_pk(
         db, ConversationLog, ConversationLog.id,
         [ConversationLog.userid == external_userid], commit=commit,
@@ -1100,45 +1106,33 @@ def _delete_owned_content(
     report.add("conversation_log", count)
     _log_batch(report.batch_id, "owned_content", "conversation_log", count)
 
-    storage = None
-    try:
-        from app.storage import get_storage
+    from app.services.job_media_service import mark_entity_media_delete_pending
+    from app.services.target_cleanup_service import ensure_job_cleanup_task
 
-        storage = get_storage()
-    except Exception as exc:
-        logger.error(
-            "recommendation_privacy: get_storage failed batch=%s error=%s",
-            report.batch_id, type(exc).__name__,
-        )
-
-    for model, table in ((Resume, "resume"), (Job, "job")):
-        removed = 0
-        while True:
-            rows = db.query(model.id, model.images).filter(
+    deleted_at = to_naive_utc(now)
+    for model, table in ((Job, "job"), (Resume, "resume")):
+        target_ids = sorted(int(value) for value in grouped.get(table, set()))
+        transitioned = 0
+        for id_chunk in _chunks(target_ids):
+            rows = db.query(model).populate_existing().filter(
                 model.owner_userid == external_userid,
-            ).limit(BATCH_SIZE).all()
-            if not rows:
-                break
-            if storage is not None:
-                for _row_id, images in rows:
-                    for key in _image_keys(images):
-                        try:
-                            storage.delete(key)
-                        except Exception:
-                            logger.warning(
-                                "recommendation_privacy: storage delete failed batch=%s table=%s",
-                                report.batch_id, table,
-                            )
-            ids = [row[0] for row in rows]
-            deleted = db.query(model).filter(model.id.in_(ids)).delete(
-                synchronize_session=False,
-            )
+                model.id.in_(id_chunk),
+            ).order_by(model.id).with_for_update().limit(BATCH_SIZE).all()
+            for row in rows:
+                changed = False
+                if isinstance(row, Job):
+                    if row.deleted_at is None:
+                        raise RuntimeError("active_job_requires_lifecycle_cleanup")
+                    ensure_job_cleanup_task(db, int(row.id), reason="manual_delete")
+                elif row.deleted_at is None:
+                    row.deleted_at = deleted_at
+                    changed = True
+                media_marked = mark_entity_media_delete_pending(db, table, int(row.id))
+                changed = changed or bool(media_marked)
+                transitioned += int(changed)
             _settle(db, commit)
-            removed += int(deleted or 0)
-            if len(rows) < BATCH_SIZE:
-                break
-        report.add(table, removed)
-        _log_batch(report.batch_id, "owned_content", table, removed)
+        report.add(table, transitioned)
+        _log_batch(report.batch_id, "owned_content", table, transitioned)
 
 
 # ---------------------------------------------------------------------------
@@ -1233,10 +1227,10 @@ def delete_recommendation_user_data(
         db, sorted(touched_deliveries), commit=commit,
     ))
 
-    # 步骤 6：本人 conversation_log、resume/job 与存储对象。
-    if delete_owned_content:
+    # 步骤 6：本人日志删除，并把原始 target 快照移交 durable 清理。
+    if delete_owned_content and report.ok:
         _step("delete_owned_content", lambda: _delete_owned_content(
-            db, external_userid, report, commit=commit,
+            db, external_userid, targets, report, now=moment, commit=commit,
         ))
 
     logger.info(

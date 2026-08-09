@@ -188,7 +188,14 @@ class MediaAssetLifecycle(Base):
     entity_type = sa.Column(sa.Enum("job", "resume", name="media_entity_type"), nullable=True)
     entity_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
     state = sa.Column(
-        sa.Enum("pending", "attached", "delete_pending", "deleted", name="media_asset_state"),
+        sa.Enum(
+            "pending",
+            "attached",
+            "delete_pending",
+            "deleted",
+            "dead_letter",
+            name="media_asset_state",
+        ),
         nullable=False, server_default="pending",
     )
     draft_expires_at = sa.Column(sa.DateTime, nullable=True)

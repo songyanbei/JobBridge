@@ -62,7 +62,7 @@ CREATE TABLE `media_asset_lifecycle` (
   `owner_userid` VARCHAR(64) NOT NULL,
   `entity_type` ENUM('job','resume') NULL,
   `entity_id` BIGINT UNSIGNED NULL,
-  `state` ENUM('pending','attached','delete_pending','deleted') NOT NULL DEFAULT 'pending',
+  `state` ENUM('pending','attached','delete_pending','deleted','dead_letter') NOT NULL DEFAULT 'pending',
   `draft_expires_at` DATETIME NULL,
   `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
   `next_attempt_at` DATETIME NULL,

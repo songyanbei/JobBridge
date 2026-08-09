@@ -21,12 +21,14 @@ from app.models import (
     ConversationLog,
     EventLog,
     Job,
+    MediaAssetLifecycle,
     RecommendationDelivery,
     RecommendationExposureDaily,
     RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
     Resume,
+    TargetCleanupTask,
     User,
     WecomOutboundOutbox,
 )
@@ -61,6 +63,8 @@ _TABLES = [
     User.__table__,
     Job.__table__,
     Resume.__table__,
+    MediaAssetLifecycle.__table__,
+    TargetCleanupTask.__table__,
     ConversationLog.__table__,
     AuditLog.__table__,
     EventLog.__table__,
@@ -171,6 +175,42 @@ def _add_resume(db, owner: str, resume_id: int, images=None) -> Resume:
     db.add(resume)
     db.flush()
     return resume
+
+
+def _add_job(db, owner: str, job_id: int, images=None) -> Job:
+    job = Job(
+        id=job_id,
+        owner_userid=owner,
+        city="苏州市",
+        job_category="普工",
+        salary_floor_monthly=5000,
+        pay_type="月薪",
+        headcount=10,
+        gender_required="不限",
+        is_long_term=1,
+        raw_text="招聘",
+        images=images,
+        audit_status="passed",
+        activated_at=datetime(2026, 1, 1),
+        expires_at=datetime(2030, 1, 1),
+        version=1,
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def _add_attached_media(db, owner: str, entity_type: str, entity_id: int, key: str):
+    media = MediaAssetLifecycle(
+        object_key=key,
+        owner_userid=owner,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        state="attached",
+    )
+    db.add(media)
+    db.flush()
+    return media
 
 
 def _add_request(db, request_id: str, viewer: str, served_top_ids) -> RecommendationRequest:
@@ -325,6 +365,7 @@ def _build_full_fixture(db):
     _add_user(db, OWNER)
     _add_user(db, VIEWER)
     _add_resume(db, OWNER, 7, images=["oss/resume-7.jpg"])
+    _add_attached_media(db, OWNER, "resume", 7, "oss/resume-7.jpg")
     _add_resume(db, VIEWER, 9)
 
     # OWNER 自己作为 viewer 的推荐事实
@@ -434,16 +475,86 @@ class TestDeleteRecommendationUserData:
         assert log.criteria_snapshot is None
         assert log.redaction_state == "redacted"
 
-    def test_deletes_own_content_and_storage_objects(self, db):
+    def test_hands_owned_content_to_durable_media_cleanup(self, db):
         _build_full_fixture(db)
         _FakeStorage.deleted = []
 
         privacy.delete_recommendation_user_data(db, OWNER, commit=False)
 
         assert db.query(ConversationLog).filter_by(userid=OWNER).count() == 0
-        assert db.query(Resume).filter_by(owner_userid=OWNER).count() == 0
+        owned = db.query(Resume).filter_by(owner_userid=OWNER).one()
+        assert owned.deleted_at is not None
         assert db.query(Resume).filter_by(owner_userid=VIEWER).count() == 1
-        assert "oss/resume-7.jpg" in _FakeStorage.deleted
+        media = db.query(MediaAssetLifecycle).filter_by(
+            object_key="oss/resume-7.jpg"
+        ).one()
+        assert media.state == "delete_pending"
+        assert media.next_attempt_at is not None
+        assert _FakeStorage.deleted == []
+
+    def test_hands_soft_deleted_jobs_to_target_and_media_cleanup(self, db):
+        _add_user(db, OWNER)
+        job = _add_job(db, OWNER, 11, images=["oss/job-11.jpg"])
+        job.deleted_at = datetime(2026, 1, 2)
+        job.delist_reason = "manual_delist"
+        media = _add_attached_media(db, OWNER, "job", 11, "oss/job-11.jpg")
+        db.flush()
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert report.ok, report.failed_steps
+        assert job.deleted_at is not None
+        assert job.delist_reason == "manual_delist"
+        assert job.version == 1
+        db.refresh(media)
+        assert media.state == "delete_pending"
+        task = db.query(TargetCleanupTask).filter_by(
+            target_type="job", target_id=job.id
+        ).one()
+        assert task.reason == "manual_delete"
+        assert task.status == "pending"
+
+    def test_active_job_anomaly_fails_closed_without_deleting_media(self, db):
+        _add_user(db, OWNER)
+        job = _add_job(db, OWNER, 12, images=["oss/job-12.jpg"])
+        media = _add_attached_media(db, OWNER, "job", 12, "oss/job-12.jpg")
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert not report.ok
+        assert "delete_owned_content" in report.failed_steps
+        assert job.deleted_at is None
+        assert job.delist_reason is None
+        assert job.version == 1
+        db.refresh(media)
+        assert media.state == "attached"
+        assert db.query(TargetCleanupTask).count() == 0
+
+    def test_owned_content_handoff_uses_collected_target_snapshot(self, db, monkeypatch):
+        _add_user(db, OWNER)
+        first = _add_resume(db, OWNER, 21, images=["oss/resume-21.jpg"])
+        first_media = _add_attached_media(
+            db, OWNER, "resume", 21, "oss/resume-21.jpg"
+        )
+        later = _add_resume(db, OWNER, 22, images=["oss/resume-22.jpg"])
+        later_media = _add_attached_media(
+            db, OWNER, "resume", 22, "oss/resume-22.jpg"
+        )
+        monkeypatch.setattr(
+            privacy,
+            "owned_target_refs",
+            lambda *_args: [privacy.TargetRef("resume", first.id)],
+        )
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert report.ok, report.failed_steps
+        assert first.deleted_at is not None
+        assert later.deleted_at is None
+        db.refresh(first_media)
+        db.refresh(later_media)
+        assert first_media.state == "delete_pending"
+        assert later_media.state == "attached"
 
     def test_is_idempotent(self, db):
         _build_full_fixture(db)
@@ -455,6 +566,7 @@ class TestDeleteRecommendationUserData:
         assert second.rows.get("viewer_request", 0) == 0
         assert second.rows.get("target_impression", 0) == 0
         assert second.rows.get("resume", 0) == 0
+        assert db.query(Resume).filter_by(owner_userid=OWNER).one().deleted_at is not None
         log = db.query(ConversationLog).filter_by(userid=VIEWER).one()
         assert log.content == privacy.REDACTED_PLACEHOLDER
 
@@ -483,7 +595,7 @@ class TestDeleteRecommendationUserData:
 
         assert report.ok, report.failed_steps
         assert db.query(RecommendationRequest).filter_by(viewer_userid=OWNER).count() == 0
-        assert db.query(Resume).filter_by(owner_userid=OWNER).count() == 0
+        assert db.query(Resume).filter_by(owner_userid=OWNER).one().deleted_at is not None
         assert db.query(RecommendationExposureDaily).filter_by(target_id=7).count() == 0
 
     def test_logs_never_contain_userid_target_or_body(self, db, caplog):
@@ -515,6 +627,10 @@ class TestDeleteRecommendationUserData:
 
         assert not report.ok
         assert "redact_conversation_logs" in report.failed_steps
+        owned = db.query(Resume).filter_by(owner_userid=OWNER).one()
+        media = db.query(MediaAssetLifecycle).filter_by(entity_id=owned.id).one()
+        assert owned.deleted_at is None
+        assert media.state == "attached"
         # 正文清理排在失败步骤之前：§10.1.1 行 2240 不允许留下可解密正文。
         assert db.get(RecommendationDelivery, "d-other").content_ciphertext is None
         blob = "\n".join(

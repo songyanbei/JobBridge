@@ -207,6 +207,61 @@ def test_backfill_reconciles_unreferenced_media_bound_to_soft_deleted_entity(db)
     assert all(ready[name] == 0 for name in phase10_preflight.MEDIA_BLOCKING_CHECKS)
 
 
+def test_backfill_never_revives_dead_letter_for_soft_deleted_entity(db):
+    _resume(db, 3, images=["images/resume/dead.jpg"], deleted_at=_now())
+    media = MediaAssetLifecycle(
+        object_key="images/resume/dead.jpg",
+        owner_userid="owner-1",
+        entity_type="resume",
+        entity_id=3,
+        state="dead_letter",
+        attempt_count=10,
+        last_error="operator action required",
+    )
+    db.add(media)
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    db.refresh(media)
+    assert media.state == "dead_letter"
+    assert media.attempt_count == 10
+    assert media.next_attempt_at is None
+    assert report["updated_media_lifecycle_count"] == 0
+    assert report["repair_required_media_lifecycle_key_count"] == 0
+    assert report["non_deleted_soft_deleted_media_key_count"] == 1
+    detail = next(
+        item for item in report["details"]
+        if item["normalized_object_key"] == media.object_key
+    )
+    assert detail["error_code"] == "media_delete_dead_letter_requires_manual_recovery"
+
+
+def test_backfill_reports_active_entity_dead_letter_as_conflict(db):
+    _job(db, 4, images=["images/job/dead.jpg"])
+    media = MediaAssetLifecycle(
+        object_key="images/job/dead.jpg",
+        owner_userid="owner-1",
+        entity_type="job",
+        entity_id=4,
+        state="dead_letter",
+        attempt_count=10,
+    )
+    db.add(media)
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    db.refresh(media)
+    assert media.state == "dead_letter"
+    assert report["media_reference_conflict_count"] == 1
+    detail = next(
+        item for item in report["details"]
+        if item["normalized_object_key"] == media.object_key
+    )
+    assert detail["error_code"] == "active_entity_media_state_dead_letter"
+
+
 def test_backfill_does_not_delete_unreferenced_key_used_by_another_entity(db):
     _job(db, 1, images=[], deleted_at=_now())
     _resume(db, 2, images=["images/shared-live.jpg"])

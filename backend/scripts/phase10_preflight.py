@@ -10,6 +10,12 @@ from scripts.backfill_media_lifecycle import backfill_media_lifecycle
 
 
 CHECKS = {
+    "media_state_enum_missing_dead_letter": (
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='media_asset_lifecycle' "
+        "AND COLUMN_NAME='state' "
+        "AND COLUMN_TYPE LIKE '%''dead_letter''%') THEN 0 ELSE 1 END"
+    ),
     "invalid_job_ttl_config": (
         "SELECT CASE WHEN EXISTS (SELECT 1 FROM system_config "
         "WHERE config_key='ttl.job.days' AND config_value REGEXP '^[0-9]+$' "

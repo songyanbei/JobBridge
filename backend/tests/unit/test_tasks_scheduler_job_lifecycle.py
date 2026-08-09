@@ -17,6 +17,13 @@ def test_scheduler_registers_ten_minute_job_lifecycle_tasks():
     assert candidate.trigger.interval.total_seconds() == 600
 
 
+def test_scheduler_registers_media_dead_letter_monitor():
+    sched = scheduler.build_scheduler()
+    monitor = sched.get_job("media_cleanup_health")
+    assert monitor is not None
+    assert monitor.trigger.interval.total_seconds() == 60
+
+
 def test_expiry_continuation_is_one_shot_five_seconds_later(monkeypatch):
     fake_scheduler = MagicMock()
     monkeypatch.setattr(scheduler, "_scheduler", fake_scheduler)

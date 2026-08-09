@@ -165,8 +165,15 @@ def _repair_existing(
     if target != expected and not unbound:
         return "conflict", "media_key_bound_to_other_entity", False
 
-    if desired_state == "attached" and row.state in {"delete_pending", "deleted"}:
+    if desired_state == "attached" and row.state in {
+        "delete_pending",
+        "deleted",
+        "dead_letter",
+    }:
         return "conflict", f"active_entity_media_state_{row.state}", False
+
+    if row.state == "dead_letter":
+        return "matched", "media_delete_dead_letter_requires_manual_recovery", False
 
     if desired_state == "delete_pending" and row.state == "deleted":
         if not unbound:

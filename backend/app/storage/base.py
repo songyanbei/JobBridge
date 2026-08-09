@@ -30,7 +30,7 @@ class StorageBackend(ABC):
 
     @abstractmethod
     def delete(self, key: str) -> bool:
-        """删除文件，返回是否成功。"""
+        """Delete an object idempotently; return True if deleted or already absent."""
         ...
 
     @abstractmethod
