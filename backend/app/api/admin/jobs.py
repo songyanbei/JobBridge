@@ -17,6 +17,7 @@ from app.core.responses import ok, paged
 from app.models import AdminUser, User
 from app.schemas.job import JobRead
 from app.services import job_admin_service
+from app.services.job_replace_service import REPLACEMENT_CANCEL_REASON_MAX_LENGTH
 from app.services.storage_reference_service import storage_urls_for_response
 
 router = APIRouter(prefix="/admin/jobs", tags=["admin-jobs"])
@@ -86,7 +87,11 @@ class ReplacementRetryRequest(BaseModel):
 
 
 class ReplacementCancelRequest(BaseModel):
-    reason: str = Field(default="operator_cancelled", min_length=1, max_length=200)
+    reason: str = Field(
+        default="operator_cancelled",
+        min_length=1,
+        max_length=REPLACEMENT_CANCEL_REASON_MAX_LENGTH,
+    )
 
 
 def _collect_filters(

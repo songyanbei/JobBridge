@@ -19,6 +19,8 @@ from app.services.job_replacement_lock_service import (
 from app.services.lifecycle_config_service import get_job_candidate_ttl_days
 from app.services.target_cleanup_service import ensure_job_cleanup_task
 
+REPLACEMENT_CANCEL_REASON_MAX_LENGTH = 64
+
 _COPY_FIELDS = (
     "city", "district", "address", "job_category", "job_sub_category",
     "salary_floor_monthly", "salary_ceiling_monthly", "pay_type", "headcount",
@@ -292,6 +294,8 @@ def cancel_candidate(
     operator: str,
     reason: str = "operator_cancelled",
 ) -> None:
+    if not isinstance(reason, str) or not 1 <= len(reason) <= REPLACEMENT_CANCEL_REASON_MAX_LENGTH:
+        raise BusinessException(40101, "replacement_cancel_reason_invalid")
     relation, _, by_id = lock_replacement_graph(db, replacement_id)
     if relation is None or relation.lifecycle_status not in {"awaiting_review", "conflict"}:
         raise BusinessException(40904, "replacement_not_cancellable")

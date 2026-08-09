@@ -78,7 +78,8 @@ jobs:
         run: >-
           pytest -p no:cacheprovider
           tests/integration/test_search_sql_mysql.py
-          tests/integration/test_phase10_preflight_mysql.py -q
+          tests/integration/test_phase10_preflight_mysql.py
+          tests/integration/test_job_replace_mysql.py -q
 
   backend-recommendation-mysql:
     name: backend-recommendation-mysql

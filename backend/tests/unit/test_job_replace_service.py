@@ -2,12 +2,14 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.core.exceptions import BusinessException
+from app.api.admin.jobs import ReplacementCancelRequest
 from app.models import (
     AuditLog,
     Job,
@@ -373,6 +375,39 @@ def test_manual_reject_and_operator_cancel_preserve_old_and_release_media(db):
     db.commit()
     assert other_relation.lifecycle_status == "closed"
     assert other_candidate.deleted_at is not None
+
+
+def test_replacement_cancel_reason_is_limited_at_api_and_service_boundaries(db):
+    accepted_reason = "r" * 64
+    rejected_reason = "r" * 65
+
+    assert ReplacementCancelRequest(reason=accepted_reason).reason == accepted_reason
+    with pytest.raises(ValidationError):
+        ReplacementCancelRequest(reason=rejected_reason)
+
+    old = _job(db)
+    relation, candidate = _create(db, old)
+    db.commit()
+
+    with pytest.raises(BusinessException, match="replacement_cancel_reason_invalid"):
+        cancel_candidate(
+            db,
+            relation.id,
+            operator="reviewer",
+            reason=rejected_reason,
+        )
+    assert relation.lifecycle_status == "awaiting_review"
+    assert relation.closed_reason is None
+    assert candidate.deleted_at is None
+
+    cancel_candidate(
+        db,
+        relation.id,
+        operator="reviewer",
+        reason=accepted_reason,
+    )
+    db.flush()
+    assert relation.closed_reason == accepted_reason
 
 
 def test_retry_rejects_expired_candidate(db):
