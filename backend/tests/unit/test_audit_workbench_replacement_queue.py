@@ -1,5 +1,8 @@
+import csv
 from datetime import datetime, timedelta
+import io
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import MetaData, create_engine
@@ -8,6 +11,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.api.admin.audit import _serialize_queue_item
+from app.api.admin import jobs as jobs_api
 from app.core.exceptions import BusinessException
 from app.models import Job, JobReplacement, Resume, User
 from app.services import audit_workbench_service as workbench
@@ -163,6 +167,118 @@ def test_pending_queue_and_count_exclude_reviewed_replacement_candidates(db, mon
     assert payload["replacement_id"] == relation.id
     assert payload["replacement_review_outcome"] == "pending"
     assert payload["replacement_lifecycle_status"] == "awaiting_review"
+
+
+def test_replacement_chain_projects_both_sides_in_list_detail_and_csv(db):
+    job_a = _job(db, audit_status="passed", active=True, raw_text="chain-a")
+    job_x = _job(db, raw_text="closed-chain-x")
+    job_b = _job(db, audit_status="passed", active=True, raw_text="chain-b")
+    job_c = _job(db, raw_text="chain-c")
+    relation_ax = _replacement(
+        db,
+        old_job_id=job_a.id,
+        new_job_id=job_x.id,
+        suffix="chain-ax-closed",
+        review_outcome="rejected",
+        lifecycle_status="closed",
+    )
+    relation_ab = _replacement(
+        db,
+        old_job_id=job_a.id,
+        new_job_id=job_b.id,
+        suffix="chain-ab",
+        review_outcome="passed",
+        lifecycle_status="activated",
+    )
+    relation_bc = _replacement(
+        db,
+        old_job_id=job_b.id,
+        new_job_id=job_c.id,
+        suffix="chain-bc",
+        review_outcome="pending",
+        lifecycle_status="awaiting_review",
+    )
+    relation_ax.created_at = datetime(2026, 1, 1)
+    relation_ax.updated_at = datetime(2026, 1, 4)
+    relation_ab.created_at = datetime(2026, 1, 2)
+    relation_ab.updated_at = datetime(2026, 1, 3)
+    relation_bc.created_at = datetime(2026, 1, 3)
+    relation_bc.updated_at = datetime(2026, 1, 3)
+    db.commit()
+
+    projections = replacement_projections(db, [job_a, job_b, job_c])
+    assert projections[job_a.id] == {
+        "replacement_id": relation_ab.id,
+        "replacement_review_outcome": "passed",
+        "replacement_lifecycle_status": "activated",
+        "replacement_closed_reason": None,
+        "replaces_job_id": None,
+        "replaced_by_job_id": job_b.id,
+    }
+    assert projections[job_b.id] == {
+        "replacement_id": relation_ab.id,
+        "replacement_review_outcome": "passed",
+        "replacement_lifecycle_status": "activated",
+        "replacement_closed_reason": None,
+        "replaces_job_id": job_a.id,
+        "replaced_by_job_id": job_c.id,
+    }
+    assert projections[job_c.id] == {
+        "replacement_id": relation_bc.id,
+        "replacement_review_outcome": "pending",
+        "replacement_lifecycle_status": "awaiting_review",
+        "replacement_closed_reason": None,
+        "replaces_job_id": job_b.id,
+        "replaced_by_job_id": None,
+    }
+
+    filters = {
+        "city": None,
+        "district": None,
+        "job_category": None,
+        "pay_type": None,
+        "audit_status": None,
+        "delist_reason": None,
+        "owner_userid": None,
+        "created_from": None,
+        "created_to": None,
+        "expires_from": None,
+        "expires_to": None,
+        "salary_min": None,
+        "salary_max": None,
+    }
+    admin = SimpleNamespace(username="reviewer")
+    listed = jobs_api.list_jobs(
+        **filters,
+        lifecycle_scope="all",
+        page=1,
+        size=20,
+        sort="id:asc",
+        db=db,
+        _=admin,
+    )
+    listed_by_id = {item["id"]: item for item in listed["data"]["items"]}
+    assert listed_by_id[job_b.id]["replaces_job_id"] == job_a.id
+    assert listed_by_id[job_b.id]["replaced_by_job_id"] == job_c.id
+    assert listed_by_id[job_b.id]["replacement_id"] == relation_ab.id
+
+    detail = jobs_api.get_job(job_b.id, db=db, _=admin)["data"]
+    assert detail["replaces_job_id"] == job_a.id
+    assert detail["replaced_by_job_id"] == job_c.id
+    assert detail["replacement_id"] == relation_ab.id
+
+    response = jobs_api.export_jobs(
+        **filters,
+        lifecycle_scope="all",
+        sort="id:asc",
+        db=db,
+        _=admin,
+    )
+    exported = list(csv.DictReader(io.StringIO(response.body.decode("utf-8-sig"))))
+    exported_by_id = {int(row["id"]): row for row in exported}
+    assert exported_by_id[job_b.id]["replaces_job_id"] == str(job_a.id)
+    assert exported_by_id[job_b.id]["replaced_by_job_id"] == str(job_c.id)
+    assert exported_by_id[job_b.id]["replacement_id"] == str(relation_ab.id)
 
 
 @pytest.mark.parametrize("action", ["pass", "reject"])

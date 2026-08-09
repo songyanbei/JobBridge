@@ -171,27 +171,30 @@ def replacement_projections(db: Session, jobs: list[Job]) -> dict[int, dict]:
     relations = db.query(JobReplacement).filter(
         (JobReplacement.old_job_id.in_(job_ids))
         | (JobReplacement.new_job_id.in_(job_ids))
-    ).order_by(JobReplacement.updated_at.desc(), JobReplacement.id.desc()).all()
-    result: dict[int, dict] = {}
+    ).order_by(JobReplacement.created_at.desc(), JobReplacement.id.desc()).all()
+    incoming_by_job: dict[int, JobReplacement] = {}
+    outgoing_by_job: dict[int, JobReplacement] = {}
     for relation in relations:
-        common = {
-            "replacement_id": relation.id,
-            "replacement_review_outcome": relation.review_outcome,
-            "replacement_lifecycle_status": relation.lifecycle_status,
-            "replacement_closed_reason": relation.closed_reason,
-        }
         if relation.new_job_id in job_ids:
-            result.setdefault(relation.new_job_id, {
-                **common,
-                "replaces_job_id": relation.old_job_id,
-                "replaced_by_job_id": None,
-            })
+            incoming_by_job.setdefault(int(relation.new_job_id), relation)
         if relation.old_job_id in job_ids:
-            result.setdefault(relation.old_job_id, {
-                **common,
-                "replaces_job_id": None,
-                "replaced_by_job_id": relation.new_job_id,
-            })
+            outgoing_by_job.setdefault(int(relation.old_job_id), relation)
+
+    result: dict[int, dict] = {}
+    for job_id in job_ids:
+        incoming = incoming_by_job.get(job_id)
+        outgoing = outgoing_by_job.get(job_id)
+        metadata_relation = incoming or outgoing
+        if metadata_relation is None:
+            continue
+        result[job_id] = {
+            "replacement_id": metadata_relation.id,
+            "replacement_review_outcome": metadata_relation.review_outcome,
+            "replacement_lifecycle_status": metadata_relation.lifecycle_status,
+            "replacement_closed_reason": metadata_relation.closed_reason,
+            "replaces_job_id": incoming.old_job_id if incoming else None,
+            "replaced_by_job_id": outgoing.new_job_id if outgoing else None,
+        }
     return result
 
 
