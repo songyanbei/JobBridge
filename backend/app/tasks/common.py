@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import secrets
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Generator
 
 from loguru import logger
@@ -32,6 +33,36 @@ else
     return 0
 end
 """
+
+_RENEW_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+
+@dataclass
+class TaskLease:
+    redis: Any
+    key: str
+    token: str
+    ttl: int
+    acquired: bool
+
+    def __bool__(self) -> bool:
+        return self.acquired
+
+    def renew(self) -> bool:
+        if not self.acquired:
+            return False
+        renewed = bool(self.redis.eval(
+            _RENEW_SCRIPT, 1, self.key, self.token, int(self.ttl),
+        ))
+        if not renewed:
+            self.acquired = False
+        return renewed
 
 
 @contextmanager
@@ -61,6 +92,29 @@ def task_lock(name: str, ttl: int = 3600) -> Generator[bool, None, None]:
         yield acquired
     finally:
         if acquired:
+            try:
+                r.eval(_RELEASE_SCRIPT, 1, key, token)
+            except Exception:
+                logger.exception(f"task_lock release failed: name={name}")
+
+
+@contextmanager
+def renewable_task_lock(name: str, ttl: int = 1200) -> Generator[TaskLease, None, None]:
+    """Owner-token task lock whose lease can be refreshed between committed batches."""
+    r = get_redis()
+    key = f"task_lock:{name}"
+    token = secrets.token_hex(16)
+    lease = TaskLease(
+        redis=r,
+        key=key,
+        token=token,
+        ttl=int(ttl),
+        acquired=bool(r.set(key, token, nx=True, ex=int(ttl))),
+    )
+    try:
+        yield lease
+    finally:
+        if lease.acquired:
             try:
                 r.eval(_RELEASE_SCRIPT, 1, key, token)
             except Exception:

@@ -1,5 +1,9 @@
 import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 from app.config import settings
+from app.services.job_media_service import hard_delete_media_complete
 from app.services.storage_reference_service import normalize_storage_reference
 
 
@@ -28,3 +32,46 @@ def test_normalizes_trusted_signed_url(monkeypatch):
 def test_rejects_unsafe_or_untrusted_references(value):
     with pytest.raises(ValueError):
         normalize_storage_reference(value)
+
+
+def _media_db(rows):
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = rows
+    return db
+
+
+def test_hard_delete_media_requires_exact_deleted_key_coverage():
+    rows = [
+        SimpleNamespace(object_key="images/a.jpg", state="deleted"),
+        SimpleNamespace(object_key="images/b.jpg", state="deleted"),
+    ]
+    assert hard_delete_media_complete(
+        _media_db(rows), 7, ["/files/images/a.jpg", "images/b.jpg"]
+    ) is True
+
+
+@pytest.mark.parametrize("rows", [
+    [SimpleNamespace(object_key="images/a.jpg", state="delete_pending")],
+    [],
+    [
+        SimpleNamespace(object_key="images/a.jpg", state="deleted"),
+        SimpleNamespace(object_key="images/untracked.jpg", state="delete_pending"),
+    ],
+])
+def test_hard_delete_media_fails_closed_for_incomplete_or_mismatched_rows(rows):
+    assert hard_delete_media_complete(_media_db(rows), 7, ["images/a.jpg"]) is False
+
+
+def test_empty_images_waits_for_any_attached_lifecycle_rows_to_finish():
+    pending = [SimpleNamespace(object_key="images/orphan.jpg", state="delete_pending")]
+    deleted = [SimpleNamespace(object_key="images/orphan.jpg", state="deleted")]
+    assert hard_delete_media_complete(_media_db(pending), 7, []) is False
+    assert hard_delete_media_complete(_media_db(deleted), 7, []) is True
+
+
+def test_deleted_historical_alias_row_does_not_block_complete_coverage():
+    rows = [
+        SimpleNamespace(object_key="images/a.jpg", state="deleted"),
+        SimpleNamespace(object_key="images/old-alias.jpg", state="deleted"),
+    ]
+    assert hard_delete_media_complete(_media_db(rows), 7, ["images/a.jpg"]) is True

@@ -116,3 +116,22 @@ WHERE (`deleted_at` IS NULL AND `audit_status` = 'passed'
    OR (`deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')
        AND (`activated_at` IS NOT NULL OR `expires_at` IS NOT NULL
             OR `candidate_expires_at` IS NULL));
+
+-- Deployment gate: AUTO_INCREMENT must remain strictly above every existing Job ID.
+SELECT
+  t.`AUTO_INCREMENT` AS `next_job_id`,
+  COALESCE(MAX(j.`id`), 0) AS `max_job_id`,
+  t.`AUTO_INCREMENT` > COALESCE(MAX(j.`id`), 0) AS `auto_increment_valid`
+FROM `information_schema`.`TABLES` AS t
+LEFT JOIN `job` AS j ON 1=1
+WHERE t.`TABLE_SCHEMA` = DATABASE() AND t.`TABLE_NAME` = 'job'
+GROUP BY t.`AUTO_INCREMENT`;
+
+-- Backup coverage/checksum baseline for rollout and controlled rollback records.
+SELECT
+  (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`) AS `backup_rows`,
+  (SELECT COUNT(*) FROM `job`) AS `job_rows`,
+  (SELECT BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
+      COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+      COALESCE(`delist_reason`, ''), `version`)))
+   FROM `phase10_job_lifecycle_backup`) AS `backup_checksum`;

@@ -69,6 +69,18 @@ def mark_delete_pending(db: Session, media_ids: list[int]) -> None:
             {"state": "delete_pending", "next_attempt_at": datetime.utcnow()}, synchronize_session=False)
 
 
+def mark_job_media_delete_pending(db: Session, job_id: int) -> int:
+    result = db.query(MediaAssetLifecycle).filter(
+        MediaAssetLifecycle.entity_type == "job",
+        MediaAssetLifecycle.entity_id == job_id,
+        MediaAssetLifecycle.state == "attached",
+    ).update({
+        "state": "delete_pending",
+        "next_attempt_at": datetime.utcnow(),
+    }, synchronize_session=False)
+    return int(result or 0)
+
+
 def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
     try:
         values = json.loads(images) if isinstance(images, str) else (images or [])
@@ -77,11 +89,15 @@ def hard_delete_media_complete(db: Session, job_id: int, images) -> bool:
         keys = {normalize_storage_reference(v) for v in values}
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
-    if not keys:
-        return True
-    rows = db.query(MediaAssetLifecycle).filter(
+    all_rows = db.query(MediaAssetLifecycle).filter(
         MediaAssetLifecycle.entity_type == "job",
         MediaAssetLifecycle.entity_id == job_id,
-        MediaAssetLifecycle.object_key.in_(keys),
     ).all()
-    return len(rows) == len(keys) and all(row.state == "deleted" for row in rows)
+    if not keys:
+        return all(row.state == "deleted" for row in all_rows)
+    by_key = {row.object_key: row for row in all_rows}
+    return (
+        keys.issubset(by_key)
+        and all(by_key[key].state == "deleted" for key in keys)
+        and all(row.state == "deleted" for row in all_rows)
+    )

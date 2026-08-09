@@ -157,6 +157,9 @@ def _handle_cancel_pending(
 def _handle_update_job(
     *, args: str, user_ctx: UserContext, session: SessionState | None, db,
 ) -> list[ReplyMessage]:
+    from app.config import settings
+    if not settings.job_replacement_enabled:
+        return [_reply(user_ctx, "岗位更新功能暂不可用，请稍后再试。")]
     if user_ctx.role == "worker":
         return [_reply(user_ctx, "工人账号不能更新岗位。")]
     if session is None:

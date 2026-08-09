@@ -1,7 +1,9 @@
 """Expire unactivated first-publish and replacement Job candidates."""
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
+from typing import Callable
 
 from loguru import logger
 from sqlalchemy import and_, func, or_
@@ -12,9 +14,10 @@ from app.models import Job, JobReplacement, MediaAssetLifecycle
 from app.services.job_mutation_service import increment_version
 from app.services.job_replacement_lock_service import lock_replacement_graph
 from app.services.target_cleanup_service import ensure_job_cleanup_task
-from app.tasks.common import log_event, task_lock
+from app.tasks.common import log_event, renewable_task_lock
 
 BATCH_SIZE = 500
+MAX_RUNTIME_SECONDS = 8 * 60
 
 
 def _utcnow() -> datetime:
@@ -75,13 +78,32 @@ def process_due_candidates(
     *,
     now: datetime | None = None,
     batch_size: int = BATCH_SIZE,
-) -> dict[str, int]:
+    max_runtime_seconds: int | None = MAX_RUNTIME_SECONDS,
+    lease=None,
+    continuation: Callable[[], None] | None = None,
+) -> dict[str, int | bool]:
     """Drain the due set once in stable candidate_expires_at/id order."""
     now = now or _utcnow()
-    stats = {"cleaned": 0, "conflicts": 0, "batches": 0}
+    started = time.monotonic()
+    stats: dict[str, int | bool] = {
+        "cleaned": 0,
+        "conflicts": 0,
+        "batches": 0,
+        "continuation_scheduled": False,
+    }
     cursor_expiry = None
     cursor_id = 0
     while True:
+        if (
+            max_runtime_seconds is not None
+            and time.monotonic() - started >= max_runtime_seconds
+        ):
+            if continuation is None:
+                from app.tasks.scheduler import schedule_job_candidate_continuation
+                continuation = schedule_job_candidate_continuation
+            continuation()
+            stats["continuation_scheduled"] = True
+            break
         query = db.query(Job.id, Job.candidate_expires_at).filter(
             Job.expires_at.is_(None),
             Job.candidate_expires_at.isnot(None),
@@ -114,14 +136,21 @@ def process_due_candidates(
                 stats["conflicts"] += 1
                 logger.exception("job candidate cleanup failed: candidate_id={}", candidate_id)
             cursor_expiry, cursor_id = candidate_expiry, int(candidate_id)
+        if lease is not None and not lease.renew():
+            logger.error("job candidate cleanup lost distributed lease")
+            break
         if len(rows) < batch_size:
             break
     return stats
 
 
 def run() -> None:
-    with task_lock("job_candidate_cleanup", ttl=1200) as acquired:
-        if not acquired:
+    from app.config import settings
+    if not settings.job_candidate_cleanup_enabled:
+        log_event("job_candidate_cleanup_disabled")
+        return
+    with renewable_task_lock("job_candidate_cleanup", ttl=1200) as lease:
+        if not lease:
             return
         with SessionLocal() as db:
             now = _utcnow()
@@ -139,7 +168,7 @@ def run() -> None:
                 Job.expires_at.is_(None),
                 Job.deleted_at.is_(None),
             ).count()
-            stats = process_due_candidates(db, now=now)
+            stats = process_due_candidates(db, now=now, lease=lease)
             log_event(
                 "job_candidate_cleanup_summary",
                 **stats,

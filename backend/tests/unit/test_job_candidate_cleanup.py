@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine
@@ -24,6 +25,7 @@ from app.services.job_admin_service import (
 )
 from app.services.job_mutation_service import close_active_replacement
 from app.tasks.job_candidate_cleanup import cleanup_candidate, process_due_candidates
+from app.tasks import job_candidate_cleanup
 
 
 @compiles(mysql.TINYINT, "sqlite")
@@ -247,3 +249,42 @@ def test_delisting_old_job_closes_candidate_with_graph_lock_cleanup(db):
     assert candidate.deleted_at is not None
     assert media.state == "delete_pending"
     assert db.query(TargetCleanupTask).filter_by(target_id=candidate.id).one().reason == "candidate_cancelled"
+
+
+def test_candidate_cleanup_feature_switch_skips_lock(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_candidate_cleanup_enabled", False)
+    lock = MagicMock()
+    monkeypatch.setattr(job_candidate_cleanup, "renewable_task_lock", lock)
+
+    job_candidate_cleanup.run()
+
+    lock.assert_not_called()
+
+
+def test_candidate_cleanup_renews_each_batch(db):
+    _job(db)
+    lease = MagicMock()
+    lease.renew.return_value = True
+
+    stats = process_due_candidates(
+        db, batch_size=1, max_runtime_seconds=None, lease=lease
+    )
+
+    assert stats["cleaned"] == 1
+    lease.renew.assert_called_once_with()
+
+
+def test_candidate_cleanup_schedules_continuation_at_runtime_limit(monkeypatch):
+    continuation = MagicMock()
+    monkeypatch.setattr(
+        job_candidate_cleanup.time, "monotonic", MagicMock(side_effect=[0, 481])
+    )
+
+    stats = process_due_candidates(
+        MagicMock(), max_runtime_seconds=480, continuation=continuation
+    )
+
+    assert stats["continuation_scheduled"] is True
+    continuation.assert_called_once_with()

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -249,3 +250,106 @@ class TestRunLock:
             ttl_cleanup.run()
 
             mock_session.assert_not_called()
+
+
+def test_daily_job_soft_delete_delegates_to_lock_safe_processor(monkeypatch):
+    processor = MagicMock(return_value={"processed": 17})
+    monkeypatch.setattr(
+        "app.tasks.job_expiry_cleanup.process_expired_jobs", processor
+    )
+    db = MagicMock()
+
+    assert ttl_cleanup._soft_delete_expired_jobs(db) == 17
+    processor.assert_called_once_with(db, max_runtime_seconds=None)
+
+
+def _hard_delete_db(*, active_relation=False):
+    db = MagicMock()
+
+    def execute(statement, _params=None):
+        sql = str(statement)
+        result = MagicMock()
+        if sql.lstrip().startswith("SELECT id, images, deleted_at"):
+            result.fetchall.return_value = [(7, '["images/a.jpg"]', datetime(2026, 1, 1))]
+        elif sql.lstrip().startswith("DELETE FROM `job`"):
+            result.rowcount = 1
+        else:
+            raise AssertionError(f"unexpected SQL: {sql}")
+        return result
+
+    db.execute.side_effect = execute
+    db.query.return_value.filter.return_value.first.return_value = (
+        (1,) if active_relation else None
+    )
+    return db
+
+
+def test_job_hard_delete_feature_switch_is_fail_closed(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_hard_delete_enabled", False)
+    db = MagicMock()
+    assert ttl_cleanup._hard_delete_expired_jobs(db, 7) == 0
+    db.execute.assert_not_called()
+
+
+def test_job_hard_delete_blocks_active_replacement(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_hard_delete_enabled", True)
+    db = _hard_delete_db(active_relation=True)
+    assert ttl_cleanup._hard_delete_expired_jobs(db, 7) == 0
+    assert not any(
+        str(call.args[0]).lstrip().startswith("DELETE FROM `job`")
+        for call in db.execute.call_args_list
+    )
+
+
+@pytest.mark.parametrize(
+    "media_marked,cleanup_succeeded,media_complete",
+    [(1, True, True), (0, False, True), (0, True, False)],
+)
+def test_job_hard_delete_blocks_each_cleanup_gate(
+    monkeypatch, media_marked, cleanup_succeeded, media_complete,
+):
+    from app.config import settings
+    from app.services import job_media_service, target_cleanup_service
+
+    monkeypatch.setattr(settings, "job_hard_delete_enabled", True)
+    monkeypatch.setattr(
+        job_media_service, "mark_job_media_delete_pending", lambda *_: media_marked
+    )
+    monkeypatch.setattr(
+        target_cleanup_service, "job_cleanup_succeeded", lambda *_: cleanup_succeeded
+    )
+    monkeypatch.setattr(
+        job_media_service, "hard_delete_media_complete", lambda *_: media_complete
+    )
+    db = _hard_delete_db()
+
+    assert ttl_cleanup._hard_delete_expired_jobs(db, 7) == 0
+    assert not any(
+        str(call.args[0]).lstrip().startswith("DELETE FROM `job`")
+        for call in db.execute.call_args_list
+    )
+
+
+def test_job_hard_delete_rechecks_cleanup_and_replacement_in_delete(monkeypatch):
+    from app.config import settings
+    from app.services import job_media_service, target_cleanup_service
+
+    monkeypatch.setattr(settings, "job_hard_delete_enabled", True)
+    monkeypatch.setattr(job_media_service, "mark_job_media_delete_pending", lambda *_: 0)
+    monkeypatch.setattr(target_cleanup_service, "job_cleanup_succeeded", lambda *_: True)
+    monkeypatch.setattr(job_media_service, "hard_delete_media_complete", lambda *_: True)
+    db = _hard_delete_db()
+
+    assert ttl_cleanup._hard_delete_expired_jobs(db, 7) == 1
+    delete_sql = next(
+        str(call.args[0]) for call in db.execute.call_args_list
+        if str(call.args[0]).lstrip().startswith("DELETE FROM `job`")
+    )
+    assert "target_cleanup_task" in delete_sql
+    assert "t.status='succeeded'" in delete_sql
+    assert "NOT EXISTS" in delete_sql
+    assert "job_replacement" in delete_sql

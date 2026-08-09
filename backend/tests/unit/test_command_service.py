@@ -68,6 +68,17 @@ class TestHelp:
         assert replies[0].userid == "u1"
 
 
+def test_update_job_feature_switch_returns_maintenance_message(monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "job_replacement_enabled", False)
+    replies = command_service._handle_update_job(
+        args="", user_ctx=_make_user_ctx(role="factory"),
+        session=_make_session(role="factory"), db=MagicMock(),
+    )
+    assert replies[0].content == "岗位更新功能暂不可用，请稍后再试。"
+
+
 class TestHumanAgent:
     def test_returns_human_agent_text(self):
         replies = execute("human_agent", "", _make_user_ctx(), None, MagicMock())

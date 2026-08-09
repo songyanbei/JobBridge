@@ -254,15 +254,10 @@ def _safe_step(step_name: str, stats: dict, fn) -> None:
 # ---------------------------------------------------------------------------
 
 def _soft_delete_expired_jobs(db) -> int:
-    """岗位过期软删：标记 delist_reason='expired' 并写 deleted_at。"""
-    result = db.execute(
-        text(
-            "UPDATE `job` SET delist_reason='expired', deleted_at=NOW() "
-            "WHERE expires_at < NOW() AND delist_reason IS NULL AND deleted_at IS NULL"
-        )
-    )
-    db.commit()
-    return int(result.rowcount or 0)
+    """每日兜底复用高频任务的行锁、状态复核和 durable 清理生产逻辑。"""
+    from app.tasks.job_expiry_cleanup import process_expired_jobs
+    stats = process_expired_jobs(db, max_runtime_seconds=None)
+    return int(stats["processed"])
 
 
 def _soft_delete_expired_resumes(db) -> int:
@@ -278,30 +273,70 @@ def _soft_delete_expired_resumes(db) -> int:
 
 
 def _hard_delete_expired_jobs(db, delay_days: int) -> int:
-    """Only hard-delete jobs whose persisted image set is fully deleted."""
-    from app.services.job_media_service import hard_delete_media_complete
+    """Fail-closed Job hard delete with replacement, cleanup and media gates."""
+    from app.config import settings
+    from app.models import JobReplacement
+    from app.services.job_media_service import (
+        hard_delete_media_complete,
+        mark_job_media_delete_pending,
+    )
     from app.services.target_cleanup_service import job_cleanup_succeeded
 
+    if not settings.job_hard_delete_enabled:
+        log_event("job_hard_delete_disabled")
+        return 0
+
     deleted = 0
+    cursor_deleted_at = None
+    cursor_id = 0
     while True:
+        cursor_sql = ""
+        params = {"cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id}
+        if cursor_deleted_at is not None:
+            cursor_sql = (
+                "AND (deleted_at > :cursor_deleted_at "
+                "OR (deleted_at = :cursor_deleted_at AND id > :cursor_id)) "
+            )
         rows = db.execute(text(
-            "SELECT id, images FROM `job` "
+            "SELECT id, images, deleted_at FROM `job` "
             f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
-            f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE}"
-        )).fetchall()
+            + cursor_sql
+            + f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE}"
+        ), params).fetchall()
         if not rows:
             break
-        progressed = False
-        for job_id, images in rows:
+        for job_id, images, deleted_at in rows:
+            job_id = int(job_id)
+            active_relation = db.query(JobReplacement.id).filter(
+                (
+                    (JobReplacement.old_job_id == job_id)
+                    | (JobReplacement.new_job_id == job_id)
+                ),
+                JobReplacement.lifecycle_status.in_(("awaiting_review", "conflict")),
+            ).first()
+            if active_relation is not None:
+                continue
+            if mark_job_media_delete_pending(db, job_id):
+                continue
             if not job_cleanup_succeeded(db, int(job_id)):
                 continue
             if not hard_delete_media_complete(db, int(job_id), images):
                 continue
-            result = db.execute(text("DELETE FROM `job` WHERE id=:job_id"), {"job_id": job_id})
+            result = db.execute(text(
+                "DELETE FROM `job` WHERE id=:job_id "
+                f"AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+                "AND EXISTS (SELECT 1 FROM `target_cleanup_task` t "
+                "WHERE t.target_type='job' AND t.target_id=:job_id "
+                "AND t.status='succeeded') "
+                "AND NOT EXISTS (SELECT 1 FROM `job_replacement` r "
+                "WHERE (r.old_job_id=:job_id OR r.new_job_id=:job_id) "
+                "AND r.lifecycle_status IN ('awaiting_review','conflict'))"
+            ), {"job_id": job_id})
             deleted += int(result.rowcount or 0)
-            progressed = progressed or bool(result.rowcount)
         db.commit()
-        if not progressed:
+        cursor_id = int(rows[-1][0])
+        cursor_deleted_at = rows[-1][2]
+        if len(rows) < BATCH_SIZE:
             break
     return deleted
 
