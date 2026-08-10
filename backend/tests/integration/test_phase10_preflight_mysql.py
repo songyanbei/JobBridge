@@ -5,10 +5,31 @@ import pytest
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from scripts.phase10_preflight import CHECKS
+from scripts.phase10_preflight import CHECKS, collect_redis_policy
 
 
 pytestmark = pytest.mark.integration
+
+
+def test_session_schema_and_live_redis_rollout_gates_pass():
+    db = SessionLocal()
+    try:
+        for name in (
+            "session_commit_deadline_schema_mismatch",
+            "session_apply_lease_owner_schema_mismatch",
+            "session_commit_due_index_mismatch",
+        ):
+            assert int(db.execute(text(CHECKS[name])).scalar_one()) == 0, name
+    finally:
+        db.close()
+
+    redis_policy = collect_redis_policy()
+    assert redis_policy == {
+        "redis_durability_policy_mismatch": 0,
+        "redis_maxmemory_policy": "noeviction",
+        "redis_appendonly": "yes",
+        "redis_appendfsync": "always",
+    }
 
 
 def test_job_ttl_preflight_accepts_full_supported_range():

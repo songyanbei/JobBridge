@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from scripts import phase10_preflight
 
 
@@ -11,6 +13,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _clean_media_coverage():
     return {name: 0 for name in phase10_preflight.MEDIA_REPORT_FIELDS}
+
+
+@pytest.fixture(autouse=True)
+def _stable_redis_policy(monkeypatch):
+    monkeypatch.setattr(
+        phase10_preflight,
+        "validate_redis_durability_policy",
+        lambda: {
+            "maxmemory-policy": "noeviction",
+            "appendonly": "yes",
+            "appendfsync": "always",
+        },
+    )
 
 
 def test_additive_migration_contains_rollout_invariants():
@@ -78,6 +93,9 @@ def test_preflight_reports_all_clean_database_as_ready(monkeypatch):
 
 
 def test_preflight_includes_config_and_backup_coverage_gates():
+    assert "session_commit_deadline_schema_mismatch" in phase10_preflight.CHECKS
+    assert "session_apply_lease_owner_schema_mismatch" in phase10_preflight.CHECKS
+    assert "session_commit_due_index_mismatch" in phase10_preflight.CHECKS
     assert "media_state_enum_missing_dead_letter" in phase10_preflight.CHECKS
     assert "invalid_job_ttl_config" in phase10_preflight.CHECKS
     assert "invalid_candidate_ttl_config" in phase10_preflight.CHECKS
@@ -86,6 +104,85 @@ def test_preflight_includes_config_and_backup_coverage_gates():
     assert "information_schema.COLUMNS" in enum_gate
     assert "COLUMN_TYPE" in enum_gate
     assert "dead_letter" in enum_gate
+
+
+def test_session_schema_gates_check_exact_types_nullable_and_index_order():
+    deadline_gate = phase10_preflight.CHECKS[
+        "session_commit_deadline_schema_mismatch"
+    ]
+    owner_gate = phase10_preflight.CHECKS[
+        "session_apply_lease_owner_schema_mismatch"
+    ]
+    index_gate = phase10_preflight.CHECKS["session_commit_due_index_mismatch"]
+
+    assert "COLUMN_TYPE='decimal(20,6)'" in deadline_gate
+    assert "NUMERIC_PRECISION=20" in deadline_gate
+    assert "NUMERIC_SCALE=6" in deadline_gate
+    assert "IS_NULLABLE='YES'" in deadline_gate
+    assert "COLUMN_TYPE='varchar(64)'" in owner_gate
+    assert "CHARACTER_MAXIMUM_LENGTH=64" in owner_gate
+    assert "IS_NULLABLE='YES'" in owner_gate
+    assert "ORDER BY SEQ_IN_INDEX" in index_gate
+    assert "status,session_next_attempt_at,session_apply_locked_at,id" in index_gate
+
+
+def test_preflight_fails_when_live_redis_policy_is_unsafe(monkeypatch):
+    monkeypatch.setattr(
+        phase10_preflight, "collect_media_coverage", lambda _: _clean_media_coverage()
+    )
+    monkeypatch.setattr(
+        phase10_preflight,
+        "collect_redis_policy",
+        lambda: {
+            "redis_durability_policy_mismatch": 1,
+            "redis_policy_error": "RedisDurabilityPolicyError",
+        },
+    )
+    db = MagicMock()
+    scalar_results = [MagicMock() for _ in phase10_preflight.CHECKS]
+    for result in scalar_results:
+        result.scalar.return_value = 0
+    auto_increment = MagicMock()
+    auto_increment.one.return_value = (101, 100)
+    db.execute.side_effect = [*scalar_results, auto_increment]
+
+    result = phase10_preflight.collect(db)
+
+    assert result["ready"] is False
+    assert result["redis_durability_policy_mismatch"] == 1
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        phase10_preflight.RedisDurabilityPolicyError("unsafe"),
+        phase10_preflight.RedisError("unavailable"),
+    ],
+)
+def test_redis_policy_collection_fails_closed(monkeypatch, error):
+    monkeypatch.setattr(
+        phase10_preflight,
+        "validate_redis_durability_policy",
+        MagicMock(side_effect=error),
+    )
+
+    result = phase10_preflight.collect_redis_policy()
+
+    assert result == {
+        "redis_durability_policy_mismatch": 1,
+        "redis_policy_error": type(error).__name__,
+    }
+
+
+def test_fresh_schema_contains_phase10_session_columns_in_final_order():
+    schema = (ROOT / "sql/schema.sql").read_text(encoding="utf-8")
+    locked = schema.index("`session_apply_locked_at` DATETIME(6)")
+    owner = schema.index("`session_apply_lease_owner` VARCHAR(64)")
+    next_attempt = schema.index("`session_next_attempt_at` DATETIME(6)")
+    deadline = schema.index("`session_commit_deadline_epoch` DECIMAL(20,6)")
+    applied = schema.index("`session_applied_at` DATETIME(6)")
+
+    assert locked < owner < next_attempt < deadline < applied
 
 
 def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():
