@@ -100,10 +100,6 @@ jobs:
           --health-interval=10s
           --health-timeout=5s
           --health-retries=10
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
     env:
       PHASE9_DSN: mysql+pymysql://jobbridge_test:jobbridge_test@127.0.0.1:3306/jobbridge_test
       APP_ENV: test
@@ -124,6 +120,25 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: python -m pip install -r requirements.txt
+      - name: Start durable Redis
+        run: |
+          docker run -d --name jobbridge-ci-redis \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-retries 30 \
+            -p 6379:6379 \
+            redis:7 redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec jobbridge-ci-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs jobbridge-ci-redis
+          exit 1
       - name: Load base schema and conversation migrations
         working-directory: backend
         run: |
@@ -143,4 +158,15 @@ jobs:
         # single file made this job look far broader than it actually was.
         run: |
           pytest -p no:cacheprovider -q tests/unit -k "recommendation or click_attribution or delivery_state_machine"
-          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py
+          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py tests/integration/test_redis.py
+      - name: Verify revocation fence survives Redis restart
+        run: |
+          docker exec jobbridge-ci-redis redis-cli SET phase10:ci:revocation-fence retained
+          docker restart jobbridge-ci-redis
+          for attempt in {1..30}; do
+            if docker exec jobbridge-ci-redis redis-cli ping | grep -q PONG; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(docker exec jobbridge-ci-redis redis-cli --raw GET phase10:ci:revocation-fence)" = retained

@@ -44,6 +44,38 @@ def get_redis() -> redis.Redis:
     return redis.Redis(connection_pool=_get_pool())
 
 
+REQUIRED_DURABILITY_POLICY = {
+    "maxmemory-policy": "noeviction",
+    "appendonly": "yes",
+    "appendfsync": "always",
+}
+
+
+class RedisDurabilityPolicyError(RuntimeError):
+    """Raised when Redis cannot safely hold revocation fences."""
+
+
+def validate_redis_durability_policy(
+    client: redis.Redis | None = None,
+) -> dict[str, str]:
+    """Validate the Redis persistence and eviction settings used by fences."""
+    redis_client = client or get_redis()
+    actual: dict[str, str] = {}
+    mismatches: list[str] = []
+    for name, expected in REQUIRED_DURABILITY_POLICY.items():
+        configured = redis_client.config_get(name).get(name)
+        value = "" if configured is None else str(configured).lower()
+        actual[name] = value
+        if value != expected:
+            mismatches.append(f"{name}={value or '<missing>'} (expected {expected})")
+
+    if mismatches:
+        raise RedisDurabilityPolicyError(
+            "Redis durability policy is unsafe: " + "; ".join(mismatches)
+        )
+    return actual
+
+
 # ---------------------------------------------------------------------------
 # 会话状态操作
 # ---------------------------------------------------------------------------

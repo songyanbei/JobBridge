@@ -5,6 +5,7 @@ import time
 import pytest
 
 from app.core.redis_client import (
+    RedisDurabilityPolicyError,
     get_redis,
     get_session,
     save_session,
@@ -20,6 +21,7 @@ from app.core.redis_client import (
     QUEUE_INCOMING,
     RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX,
     RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
+    validate_redis_durability_policy,
 )
 
 
@@ -71,6 +73,38 @@ class TestRedisConnection:
     def test_ping(self):
         r = get_redis()
         assert r.ping()
+
+    def test_durability_policy_matches_fence_requirements(self):
+        assert validate_redis_durability_policy() == {
+            "maxmemory-policy": "noeviction",
+            "appendonly": "yes",
+            "appendfsync": "always",
+        }
+
+    @pytest.mark.parametrize(
+        ("name", "unsafe_value", "safe_value"),
+        [
+            ("maxmemory-policy", "allkeys-lru", "noeviction"),
+            ("appendfsync", "everysec", "always"),
+        ],
+    )
+    def test_durability_policy_rejects_live_unsafe_config(
+        self,
+        name,
+        unsafe_value,
+        safe_value,
+    ):
+        r = get_redis()
+        original = r.config_get(name)[name]
+        assert original == safe_value
+        try:
+            r.config_set(name, unsafe_value)
+            with pytest.raises(RedisDurabilityPolicyError, match=name):
+                validate_redis_durability_policy(r)
+        finally:
+            r.config_set(name, original)
+
+        assert validate_redis_durability_policy(r)[name] == safe_value
 
 
 class TestSessionOperations:

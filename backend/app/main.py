@@ -22,6 +22,7 @@ from app.api.webhook import router as webhook_router
 from app.config import settings
 from app.core.exceptions import AppError, BusinessException
 from app.core.logging_setup import configure_loguru
+from app.core.redis_client import validate_redis_durability_policy
 from app.core.responses import fail
 from app.db import engine
 from app.tasks import scheduler as task_scheduler
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
     """
     configure_loguru(settings.app_env)
+    validate_redis_durability_policy()
     from app.services.recommendation_shadow_service import start_shadow_runner
     from app.services.recommendation_strategy_service import (
         start_runtime_control_watcher,

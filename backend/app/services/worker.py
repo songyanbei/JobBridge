@@ -40,6 +40,7 @@ from app.core.redis_client import (
     enqueue_message,
     get_redis,
     user_lock,
+    validate_redis_durability_policy,
 )
 from app.core.logging_setup import configure_loguru, identifier_hash
 from app.db import SessionLocal
@@ -197,6 +198,7 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def start(self) -> None:
+        validate_redis_durability_policy(self._redis)
         logger.info("worker: starting pid=%d", self._pid)
         from app.services.recommendation_shadow_service import start_shadow_runner
         from app.services.recommendation_strategy_service import (
