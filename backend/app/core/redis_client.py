@@ -151,12 +151,32 @@ def save_session(userid: str, session: dict) -> None:
 
 
 _SAVE_SESSION_WITH_INDEXES_SCRIPT = """
-redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
 local registry = KEYS[2]
 local userid = ARGV[3]
 local ttl = tonumber(ARGV[1])
 local new_indexes = cjson.decode(ARGV[4])
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+for _, index_key in ipairs(new_indexes) do
+    require_set_or_none(index_key, 'new_index')
+end
+redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -176,10 +196,27 @@ return 1
 """
 
 _DELETE_SESSION_WITH_INDEXES_SCRIPT = """
-redis.call('DEL', KEYS[1])
 local registry = KEYS[2]
 local userid = ARGV[1]
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+redis.call('DEL', KEYS[1])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -206,11 +243,31 @@ if current then
 elseif expected ~= 0 and ARGV[5] ~= '1' then
     return 0
 end
-redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 local registry = KEYS[3]
 local userid = ARGV[6]
 local new_indexes = cjson.decode(ARGV[7])
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+for _, index_key in ipairs(new_indexes) do
+    require_set_or_none(index_key, 'new_index')
+end
+redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -246,10 +303,27 @@ else
         return 0
     end
 end
-redis.call('DEL', KEYS[1])
 local registry = KEYS[3]
 local userid = ARGV[3]
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+redis.call('DEL', KEYS[1])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then

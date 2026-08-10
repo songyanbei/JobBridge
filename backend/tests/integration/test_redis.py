@@ -3,6 +3,7 @@ import json
 import time
 
 import pytest
+from redis.exceptions import ResponseError
 
 from app.core.redis_client import (
     RedisDurabilityPolicyError,
@@ -11,6 +12,7 @@ from app.core.redis_client import (
     save_session,
     save_session_if_version,
     delete_session,
+    delete_session_if_version,
     check_msg_duplicate,
     check_rate_limit,
     enqueue_message,
@@ -20,6 +22,7 @@ from app.core.redis_client import (
     UserLockLost,
     QUEUE_INCOMING,
     RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX,
+    RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX,
     RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
     validate_redis_durability_policy,
 )
@@ -183,6 +186,202 @@ class TestSessionOperations:
         finally:
             delete_session(userid)
             assert userid not in r.smembers(target_9)
+
+    @pytest.mark.parametrize(
+        ("operation", "wrong_role"),
+        [
+            ("save", "registry"),
+            ("save", "existing_index"),
+            ("save", "new_index"),
+            ("cas_save", "registry"),
+            ("cas_save", "existing_index"),
+            ("cas_save", "new_index"),
+            ("delete", "registry"),
+            ("delete", "existing_index"),
+            ("cas_delete", "registry"),
+            ("cas_delete", "existing_index"),
+        ],
+    )
+    def test_all_session_index_scripts_preflight_wrong_types(
+        self,
+        operation,
+        wrong_role,
+    ):
+        userid = f"integration-wrong-type-{operation}-{wrong_role}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        existing_index = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}old-{userid}"
+        )
+        candidate_id = f"new-{userid}"
+        new_index = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:{candidate_id}"
+        )
+        keys = (session_key, registry_key, existing_index, new_index)
+        r = get_redis()
+        r.delete(*keys)
+        original = json.dumps({"role": "old", "session_version": 1})
+        r.set(session_key, original)
+        if wrong_role == "registry":
+            r.set(registry_key, "not-a-set")
+        else:
+            r.sadd(registry_key, existing_index)
+            if wrong_role == "existing_index":
+                r.set(existing_index, "not-a-set")
+            else:
+                r.sadd(existing_index, userid)
+                r.set(new_index, "not-a-set")
+
+        payload = {
+            "role": "new",
+            "session_version": 2,
+            "candidate_snapshot": {
+                "direction": "search_worker",
+                "candidate_ids": [candidate_id],
+            },
+        }
+
+        def _snapshot():
+            snapshot = {}
+            for key in keys:
+                key_type = r.type(key)
+                if key_type == "string":
+                    content = r.get(key)
+                elif key_type == "set":
+                    content = sorted(r.smembers(key))
+                else:
+                    content = None
+                snapshot[key] = (key_type, content, r.pttl(key))
+            return snapshot
+
+        before = _snapshot()
+        try:
+            with pytest.raises(
+                ResponseError,
+                match=f"SESSION_INDEX_WRONGTYPE {wrong_role}",
+            ):
+                if operation == "save":
+                    save_session(userid, payload)
+                elif operation == "cas_save":
+                    save_session_if_version(userid, payload, 1)
+                elif operation == "delete":
+                    delete_session(userid)
+                else:
+                    delete_session_if_version(userid, 1)
+
+            assert _snapshot() == before
+        finally:
+            r.delete(*keys)
+
+    @pytest.mark.parametrize("operation", ["cas_save", "cas_delete"])
+    def test_cas_scripts_do_not_write_after_malformed_session_json(
+        self,
+        operation,
+    ):
+        userid = f"integration-malformed-session-{operation}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        existing_index = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}old-{userid}"
+        )
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:{userid}"
+        keys = (session_key, registry_key, existing_index, new_index)
+        r = get_redis()
+        r.delete(*keys)
+        r.set(session_key, "{malformed-json")
+        r.sadd(registry_key, existing_index)
+        r.sadd(existing_index, userid)
+        try:
+            with pytest.raises(ResponseError):
+                if operation == "cas_save":
+                    save_session_if_version(userid, {
+                        "session_version": 2,
+                        "candidate_snapshot": {
+                            "direction": "search_worker",
+                            "candidate_ids": [userid],
+                        },
+                    }, 1)
+                else:
+                    delete_session_if_version(userid, 1)
+
+            assert r.get(session_key) == "{malformed-json"
+            assert r.smembers(registry_key) == {existing_index}
+            assert r.smembers(existing_index) == {userid}
+            assert r.exists(new_index) == 0
+        finally:
+            r.delete(*keys)
+
+    def test_cas_session_indexes_preserve_state_on_stale_or_lost_fence(self):
+        userid = "integration-cas-index-lifecycle"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        old_index = f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}cas-old"
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:cas-new"
+        stale_index = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:cas-stale"
+        )
+        lock_key = "lock:integration-cas-index-lifecycle"
+        keys = (
+            session_key,
+            registry_key,
+            old_index,
+            new_index,
+            stale_index,
+            lock_key,
+        )
+        r = get_redis()
+        r.delete(*keys)
+        try:
+            save_session(userid, {
+                "session_version": 1,
+                "history": [{"delivery_id": "cas-old"}],
+            })
+            assert save_session_if_version(userid, {
+                "session_version": 2,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["cas-new"],
+                },
+            }, 1)
+            assert r.exists(old_index) == 0
+            assert r.smembers(registry_key) == {new_index}
+            assert r.smembers(new_index) == {userid}
+            committed = r.get(session_key)
+
+            assert save_session_if_version(userid, {
+                "session_version": 3,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["cas-stale"],
+                },
+            }, 1) is False
+            assert r.get(session_key) == committed
+            assert r.smembers(registry_key) == {new_index}
+            assert r.exists(stale_index) == 0
+
+            r.set(lock_key, "new-owner")
+            with pytest.raises(UserLockLost):
+                save_session_if_version(
+                    userid,
+                    {"session_version": 3},
+                    2,
+                    lock_fence=(lock_key, "old-owner"),
+                )
+            assert delete_session_if_version(userid, 1) is False
+            with pytest.raises(UserLockLost):
+                delete_session_if_version(
+                    userid,
+                    2,
+                    lock_fence=(lock_key, "old-owner"),
+                )
+            assert r.get(session_key) == committed
+            assert r.smembers(registry_key) == {new_index}
+            assert r.smembers(new_index) == {userid}
+
+            assert delete_session_if_version(userid, 2) is True
+            assert r.exists(session_key, registry_key, new_index) == 0
+        finally:
+            r.delete(*keys)
 
 
 class TestDedup:
