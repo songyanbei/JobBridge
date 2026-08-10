@@ -55,6 +55,10 @@ class RedisDurabilityPolicyError(RuntimeError):
     """Raised when Redis cannot safely hold revocation fences."""
 
 
+class SessionCommitDeadlineExceeded(RuntimeError):
+    """Raised before Redis writes when a durable commit deadline has passed."""
+
+
 def validate_redis_durability_policy(
     client: redis.Redis | None = None,
 ) -> dict[str, str]:
@@ -281,6 +285,13 @@ for _, index_key in ipairs(new_indexes) do
         error('SESSION_INDEX_REVOKED key=' .. index_key)
     end
 end
+if ARGV[8] ~= '' then
+    local now = redis.call('TIME')
+    local now_epoch = tonumber(now[1]) + tonumber(now[2]) / 1000000
+    if now_epoch >= tonumber(ARGV[8]) then
+        return -2
+    end
+end
 redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
@@ -336,6 +347,13 @@ if registry_type == 'set' then
 end
 for _, index_key in ipairs(old_indexes) do
     require_set_or_none(index_key, 'existing_index')
+end
+if ARGV[4] ~= '' then
+    local now = redis.call('TIME')
+    local now_epoch = tonumber(now[1]) + tonumber(now[2]) / 1000000
+    if now_epoch >= tonumber(ARGV[4]) then
+        return -2
+    end
 end
 redis.call('DEL', KEYS[1])
 for _, index_key in ipairs(old_indexes) do
@@ -448,6 +466,7 @@ def save_session_if_version(
     lock_fence: tuple[str, Any] | None = None,
     *,
     allow_missing: bool = False,
+    deadline_epoch: Any = None,
 ) -> bool:
     """原子保存 session；仅当前版本等于 ``expected_version`` 时成功。
 
@@ -471,9 +490,12 @@ def save_session_if_version(
         "1" if allow_missing else "0",
         userid,
         json.dumps(recommendation_session_index_keys(session)),
+        "" if deadline_epoch is None else str(deadline_epoch),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session commit")
+    if int(result) == -2:
+        raise SessionCommitDeadlineExceeded("durable session commit deadline exceeded")
     return bool(result)
 
 
@@ -493,6 +515,8 @@ def delete_session_if_version(
     userid: str,
     expected_version: int,
     lock_fence: tuple[str, Any] | None = None,
+    *,
+    deadline_epoch: Any = None,
 ) -> bool:
     """仅当 session 版本和用户锁 owner 都匹配时原子删除。"""
     r = get_redis()
@@ -506,9 +530,12 @@ def delete_session_if_version(
         int(expected_version),
         lock_token,
         userid,
+        "" if deadline_epoch is None else str(deadline_epoch),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session delete")
+    if int(result) == -2:
+        raise SessionCommitDeadlineExceeded("durable session commit deadline exceeded")
     return bool(result)
 
 

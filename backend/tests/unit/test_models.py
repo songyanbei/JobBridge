@@ -110,8 +110,13 @@ class TestKeyColumns:
             "session_apply_attempts",
             "session_apply_locked_at",
             "session_next_attempt_at",
+            "session_commit_deadline_epoch",
             "session_applied_at",
         } <= names
+        deadline = WecomInboundEvent.__table__.c.session_commit_deadline_epoch
+        assert deadline.type.precision == 20
+        assert deadline.type.scale == 6
+        assert deadline.nullable is True
 
     def test_wecom_inbound_event_msg_id_unique(self):
         col = self._col(WecomInboundEvent, "msg_id")

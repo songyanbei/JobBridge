@@ -33,7 +33,7 @@ def test_redis_session_cas_passes_expected_version_and_payload():
         1800,
     )
     assert '"session_version": 4' in args[8]
-    assert args[10:] == ("0", "u-1", "[]")
+    assert args[10:] == ("0", "u-1", "[]", "")
 
 
 def test_redis_session_cas_rejects_lost_lock_fence():
@@ -85,6 +85,7 @@ def test_redis_session_delete_cas_passes_version_and_fence():
         7,
         "owner-token",
         "u-1",
+        "",
     )
 
 
@@ -185,6 +186,7 @@ def test_apply_staged_save_allows_restore_after_redis_ttl_expiry():
         operation="save",
         expected_version=7,
         payload={"role": "worker", "session_version": 8},
+        deadline_epoch=123.456789,
     )
     with patch.object(
         conversation_service,
@@ -194,3 +196,22 @@ def test_apply_staged_save_allows_restore_after_redis_ttl_expiry():
         assert conversation_service.apply_staged_session(commit) is True
 
     assert save.call_args.kwargs["allow_missing"] is True
+    assert save.call_args.kwargs["deadline_epoch"] == 123.456789
+
+
+def test_apply_staged_delete_passes_absolute_deadline():
+    commit = conversation_service.StagedSessionCommit(
+        userid="u-1",
+        operation="delete",
+        expected_version=7,
+        payload=None,
+        deadline_epoch=987.654321,
+    )
+    with patch.object(
+        conversation_service,
+        "redis_delete_session_if_version",
+        return_value=True,
+    ) as delete:
+        assert conversation_service.apply_staged_session(commit) is True
+
+    assert delete.call_args.kwargs["deadline_epoch"] == 987.654321

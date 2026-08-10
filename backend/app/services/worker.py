@@ -37,6 +37,7 @@ from app.core.redis_client import (
     QUEUE_INCOMING,
     QUEUE_RATE_LIMIT_NOTIFY,
     QUEUE_SEND_RETRY,
+    SESSION_TTL,
     enqueue_message,
     get_redis,
     user_lock,
@@ -801,6 +802,9 @@ class Worker:
             "session_apply_attempts": 0,
             "session_apply_locked_at": None,
             "session_next_attempt_at": None,
+            "session_commit_deadline_epoch": (
+                func.unix_timestamp(func.now(6)) + SESSION_TTL
+            ),
             "session_applied_at": None,
             "worker_finished_at": None,
         })
@@ -909,6 +913,7 @@ class Worker:
                             row.session_expected_version or 0,
                         ),
                         payload=payload,
+                        deadline_epoch=row.session_commit_deadline_epoch,
                     ),
                 })
             db.commit()

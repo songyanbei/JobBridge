@@ -9,6 +9,7 @@ import logging
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.core.redis_client import (
     current_user_lock_fence,
@@ -34,6 +35,7 @@ class StagedSessionCommit:
     operation: str
     expected_version: int
     payload: dict | None
+    deadline_epoch: Decimal | float | None = None
 
 
 @dataclass
@@ -226,6 +228,7 @@ def apply_staged_session(commit: StagedSessionCommit) -> bool:
             commit.userid,
             commit.expected_version,
             lock_fence=fence,
+            deadline_epoch=commit.deadline_epoch,
         )
     if commit.operation == "save" and commit.payload is not None:
         return redis_save_session_if_version(
@@ -237,6 +240,7 @@ def apply_staged_session(commit: StagedSessionCommit) -> bool:
             # session_pending, the durable per-user order gate prevents a later
             # turn from advancing state, so restoring an expired key is safe.
             allow_missing=True,
+            deadline_epoch=commit.deadline_epoch,
         )
     raise ValueError(f"invalid staged session operation: {commit.operation}")
 

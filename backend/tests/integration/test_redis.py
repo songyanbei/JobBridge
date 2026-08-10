@@ -9,6 +9,7 @@ from redis.exceptions import ResponseError
 
 from app.core.redis_client import (
     RedisDurabilityPolicyError,
+    SessionCommitDeadlineExceeded,
     get_redis,
     get_session,
     save_session,
@@ -116,6 +117,103 @@ class TestRedisConnection:
 
 
 class TestSessionOperations:
+    @staticmethod
+    def _redis_epoch(offset=0):
+        seconds, micros = get_redis().time()
+        return f"{seconds + micros / 1000000 + offset:.6f}"
+
+    def test_session_commit_before_deadline_can_write(self):
+        userid = "integration-session-deadline-before"
+        delete_session(userid)
+        try:
+            assert save_session_if_version(
+                userid,
+                {"session_version": 1},
+                0,
+                deadline_epoch=self._redis_epoch(offset=2),
+            )
+            assert get_session(userid)["session_version"] == 1
+        finally:
+            delete_session(userid)
+
+    @pytest.mark.parametrize("offset", [0, -1])
+    @pytest.mark.parametrize("operation", ["save", "delete"])
+    def test_session_commit_at_or_after_deadline_writes_nothing(
+        self,
+        offset,
+        operation,
+    ):
+        userid = f"integration-session-deadline-{operation}-{offset}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        old_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:deadline-old"
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:deadline-new"
+        r = get_redis()
+        r.delete(session_key, registry_key, old_index, new_index)
+        save_session(userid, {
+            "session_version": 1,
+            "candidate_snapshot": {
+                "direction": "search_worker",
+                "candidate_ids": ["deadline-old"],
+            },
+        })
+        before = (
+            r.get(session_key),
+            r.smembers(registry_key),
+            r.smembers(old_index),
+            r.exists(new_index),
+        )
+        try:
+            with pytest.raises(SessionCommitDeadlineExceeded):
+                if operation == "save":
+                    save_session_if_version(
+                        userid,
+                        {
+                            "session_version": 2,
+                            "candidate_snapshot": {
+                                "direction": "search_worker",
+                                "candidate_ids": ["deadline-new"],
+                            },
+                        },
+                        1,
+                        deadline_epoch=self._redis_epoch(offset=offset),
+                    )
+                else:
+                    delete_session_if_version(
+                        userid,
+                        1,
+                        deadline_epoch=self._redis_epoch(offset=offset),
+                    )
+
+            assert (
+                r.get(session_key),
+                r.smembers(registry_key),
+                r.smembers(old_index),
+                r.exists(new_index),
+            ) == before
+        finally:
+            r.delete(session_key, registry_key, old_index, new_index)
+
+    def test_session_commit_waiting_past_deadline_is_rejected(self):
+        userid = "integration-session-deadline-waiting"
+        r = get_redis()
+        delete_session(userid)
+        deadline = self._redis_epoch(offset=0.03)
+        try:
+            r.execute_command("CLIENT", "PAUSE", 100, "ALL")
+            started = time.monotonic()
+            with pytest.raises(SessionCommitDeadlineExceeded):
+                save_session_if_version(
+                    userid,
+                    {"session_version": 1},
+                    0,
+                    deadline_epoch=deadline,
+                )
+            assert time.monotonic() - started >= 0.03
+            assert get_session(userid) is None
+        finally:
+            delete_session(userid)
+
     def test_save_and_get(self):
         save_session("test_user_001", {"role": "worker", "intent": "search_job"})
         data = get_session("test_user_001")

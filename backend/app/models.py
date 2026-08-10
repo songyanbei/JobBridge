@@ -590,6 +590,7 @@ class WecomInboundEvent(Base):
     )
     session_apply_locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     session_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_commit_deadline_epoch = sa.Column(sa.Numeric(20, 6), nullable=True)
     session_applied_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     worker_started_at = sa.Column(
         mysql.DATETIME(fsp=6), nullable=True, comment="Worker 开始处理时间",
