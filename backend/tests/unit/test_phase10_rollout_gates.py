@@ -197,6 +197,71 @@ def test_release_manual_orders_target_backfill_before_full_preflight():
     assert dry_run < apply < missing_zero < preflight
 
 
+def test_release_manual_covers_complete_phase10_sequence_and_module_commands():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+
+    for migration in (
+        "phase10_001_job_lifecycle_additive.sql",
+        "phase10_002_media_dead_letter.sql",
+        "phase10_003_session_commit_deadline.sql",
+        "phase10_004_session_commit_lease_owner.sql",
+    ):
+        assert migration in manual
+    for module in (
+        "scripts.backfill_media_lifecycle",
+        "scripts.backfill_target_cleanup_tasks",
+        "scripts.phase10_clock_check",
+        "scripts.phase10_preflight",
+    ):
+        assert f"python -m {module}" in manual
+    assert "python scripts/" not in manual
+    assert "2 秒" in manual
+    for flag in (
+        "JOB_REPLACEMENT_ENABLED",
+        "JOB_EXPIRY_CLEANUP_ENABLED",
+        "JOB_CANDIDATE_CLEANUP_ENABLED",
+        "JOB_HARD_DELETE_ENABLED",
+    ):
+        assert flag in manual
+    for topic in ("迁移", "媒体回填", "Target cleanup 回填", "监控", "回滚"):
+        assert topic in manual
+
+
+def test_release_manual_uses_one_verified_mysql_target_and_orders_backup_evidence():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert '--defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE"' in manual
+    assert "SELECT DATABASE(), @@hostname, @@port" in manual
+    assert "phase10_down_001_job_lifecycle.sql" in manual
+    assert manual.count("set -euo pipefail") >= 2
+    migration = manual.index("phase10_001_job_lifecycle_additive.sql")
+    backup_evidence = manual.index("backup rows/checksum")
+    down_evidence = manual.index("phase10-down-backup-evidence.txt")
+    down_approval = manual.index("审批完成后才单独执行")
+    down_command = manual.index(
+        "< sql/migrations/phase10_down_001_job_lifecycle.sql"
+    )
+
+    assert migration < backup_evidence
+    assert down_evidence < down_approval < down_command
+
+
+def test_release_manual_restarts_and_verifies_all_phase10_processes():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+
+    deployment = manual[manual.index("## 5. 同版本部署"):manual.index("## 6. 开关顺序")]
+    for process in ("API", "消息 Worker", "scheduler", "session recovery Worker"):
+        assert process in deployment
+    assert "heartbeat" in deployment
+    assert "镜像 digest" in deployment
+
+
 def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():
     job_gate = phase10_preflight.CHECKS["invalid_job_ttl_config"]
     candidate_gate = phase10_preflight.CHECKS["invalid_candidate_ttl_config"]

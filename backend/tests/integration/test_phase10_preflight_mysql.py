@@ -5,10 +5,19 @@ import pytest
 from sqlalchemy import text
 
 from app.db import SessionLocal
+from scripts.phase10_clock_check import collect_clock_report
 from scripts.phase10_preflight import CHECKS, collect_redis_policy
 
 
 pytestmark = pytest.mark.integration
+
+
+def test_mysql_and_redis_clock_skew_is_within_rollout_limit():
+    with SessionLocal() as db:
+        report = collect_clock_report(db)
+
+    assert report["clock_skew_seconds"] <= 2.0
+    assert report["ready"] is True
 
 
 def test_session_schema_and_live_redis_rollout_gates_pass():
