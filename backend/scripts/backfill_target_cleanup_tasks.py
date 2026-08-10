@@ -2,14 +2,38 @@
 from __future__ import annotations
 
 import argparse
+import json
+
+from sqlalchemy import and_, func
 
 from app.db import SessionLocal
 from app.models import Job, TargetCleanupTask
 from app.services.target_cleanup_service import upsert_job_cleanup_task
 
 
+def count_missing_cleanup_tasks(db) -> int:
+    return int(
+        db.query(func.count(Job.id))
+        .outerjoin(
+            TargetCleanupTask,
+            and_(
+                TargetCleanupTask.target_type == "job",
+                TargetCleanupTask.target_id == Job.id,
+            ),
+        )
+        .filter(
+            Job.deleted_at.isnot(None),
+            TargetCleanupTask.id.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+
+
 def run(*, apply: bool, batch_size: int = 500) -> dict[str, int]:
-    scanned = created = missing_count = 0
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    scanned = created = 0
     last_id = 0
     with SessionLocal() as db:
         while True:
@@ -34,22 +58,27 @@ def run(*, apply: bool, batch_size: int = 500) -> dict[str, int]:
                     )
                     created += int(was_created)
                 db.commit()
-                covered = {
-                    row[0] for row in db.query(TargetCleanupTask.target_id).filter(
-                        TargetCleanupTask.target_type == "job",
-                        TargetCleanupTask.target_id.in_(ids),
-                    ).all()
-                }
-                missing_count += len(set(ids) - covered)
-            else:
-                missing_count += len(missing)
             last_id = ids[-1]
+
+        # Start a fresh RR snapshot so jobs soft-deleted behind the keyset cursor
+        # and tasks created by racing writers are reflected in final coverage.
+        db.commit()
+        missing_count = count_missing_cleanup_tasks(db)
     return {"scanned": scanned, "created": created, "missing": missing_count}
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--batch-size", type=int, default=500)
     args = parser.parse_args()
-    print(run(apply=args.apply, batch_size=args.batch_size))
+    result = run(apply=args.apply, batch_size=args.batch_size)
+    print(json.dumps({
+        "mode": "apply" if args.apply else "dry-run",
+        **result,
+    }, ensure_ascii=False, indent=2))
+    return 0 if result["missing"] == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

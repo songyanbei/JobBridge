@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+import json
+import sys
 
 import pytest
 from sqlalchemy import create_engine
@@ -125,3 +127,99 @@ def test_backfill_does_not_count_task_created_by_racing_writer(
         "created": 0,
         "missing": 0,
     }
+
+
+def test_backfill_rechecks_global_coverage_after_keyset_scan(
+    session_factory, monkeypatch,
+):
+    with session_factory() as db:
+        db.add(User(external_userid="late-owner", role="factory"))
+        db.add_all([
+            Job(
+                id=job_id,
+                owner_userid="late-owner",
+                city="N17",
+                job_category="N17",
+                salary_floor_monthly=5000,
+                pay_type=Job.__table__.c.pay_type.type.enums[0],
+                headcount=1,
+                raw_text="target cleanup final coverage",
+                deleted_at=(
+                    None if job_id == 1
+                    else datetime.now(timezone.utc).replace(tzinfo=None)
+                ),
+            )
+            for job_id in (1, 2)
+        ])
+        db.commit()
+
+    real_upsert = backfill_target_cleanup_tasks.upsert_job_cleanup_task
+
+    def _soft_delete_behind_cursor(db, job_id, **kwargs):
+        db.get(Job, 1).deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        return real_upsert(db, job_id, **kwargs)
+
+    monkeypatch.setattr(
+        backfill_target_cleanup_tasks, "SessionLocal", session_factory,
+    )
+    monkeypatch.setattr(
+        backfill_target_cleanup_tasks,
+        "upsert_job_cleanup_task",
+        _soft_delete_behind_cursor,
+    )
+
+    assert backfill_target_cleanup_tasks.run(apply=True, batch_size=1) == {
+        "scanned": 1,
+        "created": 1,
+        "missing": 1,
+    }
+
+
+def test_backfill_rejects_non_positive_batch_size():
+    with pytest.raises(ValueError, match="batch_size must be positive"):
+        backfill_target_cleanup_tasks.run(apply=False, batch_size=0)
+
+
+@pytest.mark.parametrize(
+    ("argv", "result", "expected_apply", "expected_batch", "expected_exit", "mode"),
+    [
+        (
+            ["backfill_target_cleanup_tasks"],
+            {"scanned": 2, "created": 0, "missing": 1},
+            False,
+            500,
+            1,
+            "dry-run",
+        ),
+        (
+            ["backfill_target_cleanup_tasks", "--apply", "--batch-size", "17"],
+            {"scanned": 2, "created": 1, "missing": 0},
+            True,
+            17,
+            0,
+            "apply",
+        ),
+    ],
+)
+def test_cli_mode_arguments_and_missing_exit_code(
+    monkeypatch,
+    capsys,
+    argv,
+    result,
+    expected_apply,
+    expected_batch,
+    expected_exit,
+    mode,
+):
+    calls = []
+
+    def _run(*, apply, batch_size):
+        calls.append((apply, batch_size))
+        return result
+
+    monkeypatch.setattr(backfill_target_cleanup_tasks, "run", _run)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    assert backfill_target_cleanup_tasks.main() == expected_exit
+    assert calls == [(expected_apply, expected_batch)]
+    assert json.loads(capsys.readouterr().out) == {"mode": mode, **result}

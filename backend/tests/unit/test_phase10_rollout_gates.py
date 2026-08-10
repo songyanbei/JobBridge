@@ -185,6 +185,18 @@ def test_fresh_schema_contains_phase10_session_columns_in_final_order():
     assert locked < owner < next_attempt < deadline < applied
 
 
+def test_release_manual_orders_target_backfill_before_full_preflight():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+    dry_run = manual.index("python -m scripts.backfill_target_cleanup_tasks\n")
+    apply = manual.index("python -m scripts.backfill_target_cleanup_tasks --apply")
+    missing_zero = manual.index("missing=0")
+    preflight = manual.index("python -m scripts.phase10_preflight")
+
+    assert dry_run < apply < missing_zero < preflight
+
+
 def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():
     job_gate = phase10_preflight.CHECKS["invalid_job_ttl_config"]
     candidate_gate = phase10_preflight.CHECKS["invalid_candidate_ttl_config"]

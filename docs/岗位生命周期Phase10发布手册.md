@@ -19,3 +19,19 @@
 新版本的绝对截止和 owner fencing；发现任何旧实例仍存活时，发布必须停止。
 
 完整迁移、回填、开关、监控和回滚顺序将在后续发布门禁章节补全。
+
+## Target cleanup 回填门禁
+
+Target cleanup 回填必须按以下顺序执行，不得跳过 dry-run 或 coverage 复核：
+
+```bash
+python -m scripts.backfill_target_cleanup_tasks
+python -m scripts.backfill_target_cleanup_tasks --apply
+python -m scripts.backfill_target_cleanup_tasks
+# 上一步输出必须为 missing=0
+python -m scripts.phase10_preflight
+```
+
+第一次 dry-run 在发现缺失任务时会以非零状态退出，这是预期的发布阻断信号。apply
+完成后必须重新执行 dry-run；只有全局重查结果为 `missing=0`，才允许进入完整 preflight。
+回填脚本在每批唯一键竞争后复用已有任务，并在扫描结束后使用新事务重新核对全库 coverage。
