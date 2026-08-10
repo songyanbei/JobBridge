@@ -589,6 +589,7 @@ class WecomInboundEvent(Base):
         mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"),
     )
     session_apply_locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_apply_lease_owner = sa.Column(sa.String(64), nullable=True)
     session_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     session_commit_deadline_epoch = sa.Column(sa.Numeric(20, 6), nullable=True)
     session_applied_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)

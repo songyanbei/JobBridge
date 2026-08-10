@@ -801,6 +801,7 @@ class Worker:
             "session_payload": null() if patched else commit.payload,
             "session_apply_attempts": 0,
             "session_apply_locked_at": None,
+            "session_apply_lease_owner": None,
             "session_next_attempt_at": None,
             "session_commit_deadline_epoch": (
                 func.unix_timestamp(func.now(6)) + SESSION_TTL
@@ -898,7 +899,9 @@ class Worker:
                     # §10.6：解密失败 fail-closed，保持 prepared 并告警，绝不走明文旁路。
                     self._backoff_session_commit(row, exc)
                     continue
+                claim_owner = uuid.uuid4().hex
                 row.session_apply_locked_at = now
+                row.session_apply_lease_owner = claim_owner
                 row.session_apply_attempts = int(
                     row.session_apply_attempts or 0,
                 ) + 1
@@ -906,6 +909,7 @@ class Worker:
                     "event_id": int(row.id),
                     "userid": row.from_userid,
                     "attempts": int(row.session_apply_attempts),
+                    "lease_owner": claim_owner,
                     "commit": conversation_service.StagedSessionCommit(
                         userid=row.from_userid,
                         operation=str(row.session_operation or ""),
@@ -951,6 +955,7 @@ class Worker:
         ]
         row.session_apply_attempts = attempts
         row.session_apply_locked_at = None
+        row.session_apply_lease_owner = None
         row.session_next_attempt_at = func.timestampadd(
             text("SECOND"), backoff, func.now(6),
         )
@@ -963,12 +968,26 @@ class Worker:
             severity="alert",
         )
 
-    def _mark_session_commit_applied(self, event_id: int) -> bool:
+    @staticmethod
+    def _current_session_claim_filters(event_id: int, lease_owner: str) -> tuple:
+        stale_before = func.timestampadd(
+            text("SECOND"), -SESSION_COMMIT_STALE_SECONDS, func.now(6),
+        )
+        return (
+            WecomInboundEvent.id == event_id,
+            WecomInboundEvent.status == "session_pending",
+            WecomInboundEvent.session_apply_lease_owner == lease_owner,
+            WecomInboundEvent.session_apply_locked_at.is_not(None),
+            WecomInboundEvent.session_apply_locked_at > stale_before,
+        )
+
+    def _mark_session_commit_applied(
+        self, event_id: int, lease_owner: str,
+    ) -> bool:
         db = SessionLocal()
         try:
             updated = db.query(WecomInboundEvent).filter(
-                WecomInboundEvent.id == event_id,
-                WecomInboundEvent.status == "session_pending",
+                *self._current_session_claim_filters(event_id, lease_owner),
             ).update({
                 "status": "done",
                 # The payload can contain transient search/draft PII. It is only
@@ -978,6 +997,7 @@ class Worker:
                 "session_expected_version": None,
                 "session_payload": null(),
                 "session_apply_locked_at": None,
+                "session_apply_lease_owner": None,
                 "session_next_attempt_at": None,
                 "session_applied_at": func.now(6),
                 "worker_finished_at": func.now(6),
@@ -997,30 +1017,34 @@ class Worker:
         finally:
             db.close()
 
-    def _mark_session_commit_retry(self, item: dict, error: Exception) -> None:
+    def _mark_session_commit_retry(self, item: dict, error: Exception) -> bool:
         db = SessionLocal()
         try:
             attempts = int(item["attempts"])
             backoff = SESSION_COMMIT_RETRY_BACKOFFS[
                 min(attempts - 1, len(SESSION_COMMIT_RETRY_BACKOFFS) - 1)
             ]
-            db.query(WecomInboundEvent).filter(
-                WecomInboundEvent.id == item["event_id"],
-                WecomInboundEvent.status == "session_pending",
+            updated = db.query(WecomInboundEvent).filter(
+                *self._current_session_claim_filters(
+                    item["event_id"], item["lease_owner"],
+                ),
             ).update({
                 "session_apply_locked_at": None,
+                "session_apply_lease_owner": None,
                 "session_next_attempt_at": func.timestampadd(
                     text("SECOND"), backoff, func.now(6),
                 ),
                 "error_message": f"{type(error).__name__}: {error}"[:1000],
             })
             db.commit()
+            return updated == 1
         except Exception:
             db.rollback()
             logger.exception(
                 "worker: persist session commit retry failed event_id=%s",
                 item.get("event_id"),
             )
+            return False
         finally:
             db.close()
 
@@ -1037,7 +1061,9 @@ class Worker:
         except Exception as exc:
             self._mark_session_commit_retry(item, exc)
             return False
-        return self._mark_session_commit_applied(item["event_id"])
+        return self._mark_session_commit_applied(
+            item["event_id"], item["lease_owner"],
+        )
 
     def _apply_session_commit_for_event(
         self,

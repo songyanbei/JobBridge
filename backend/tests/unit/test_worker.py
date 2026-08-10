@@ -315,6 +315,7 @@ class TestDurableSessionCommit:
         item = {
             "event_id": 42,
             "attempts": 2,
+            "lease_owner": "claim-1",
             "commit": MagicMock(),
         }
         with patch(
@@ -330,8 +331,47 @@ class TestDurableSessionCommit:
         ) as mark_retry:
             assert worker._apply_session_commit_item(item) is True
 
-        mark_applied.assert_called_once_with(42)
+        mark_applied.assert_called_once_with(42, "claim-1")
         mark_retry.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    def test_stale_session_claim_owner_cannot_mark_commit_applied(
+        self, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        query = db.query.return_value
+        query.filter.return_value.update.return_value = 0
+        mock_session_factory.return_value = db
+
+        with patch("app.services.worker._promote_prepared_deliveries") as promote:
+            assert worker._mark_session_commit_applied(42, "stale-owner") is False
+
+        filters = " ".join(str(value) for value in query.filter.call_args.args)
+        assert "session_apply_lease_owner" in filters
+        assert "session_apply_locked_at" in filters
+        promote.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    def test_stale_session_claim_owner_cannot_schedule_retry(
+        self, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        query = db.query.return_value
+        query.filter.return_value.update.return_value = 0
+        mock_session_factory.return_value = db
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "lease_owner": "stale-owner",
+        }
+
+        assert worker._mark_session_commit_retry(
+            item, RuntimeError("retry"),
+        ) is False
+
+        filters = " ".join(str(value) for value in query.filter.call_args.args)
+        assert "session_apply_lease_owner" in filters
+        assert "session_apply_locked_at" in filters
 
     @patch("app.services.worker.SessionLocal")
     @patch("app.services.worker.message_router")

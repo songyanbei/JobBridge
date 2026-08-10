@@ -109,6 +109,7 @@ class TestKeyColumns:
             "session_payload",
             "session_apply_attempts",
             "session_apply_locked_at",
+            "session_apply_lease_owner",
             "session_next_attempt_at",
             "session_commit_deadline_epoch",
             "session_applied_at",
