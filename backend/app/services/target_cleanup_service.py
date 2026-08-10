@@ -255,10 +255,6 @@ def fail_cleanup_task(
 
 
 def process_cleanup_task(db: Session, task_id: int, owner: str) -> bool:
-    snapshot = renew_cleanup_task_lease(db, task_id, owner, _utcnow())
-    if snapshot is None:
-        return False
-
     try:
         from app.services.recommendation_privacy_service import (
             TargetRef,
@@ -267,39 +263,55 @@ def process_cleanup_task(db: Session, task_id: int, owner: str) -> bool:
             scrub_recommendation_sessions,
         )
 
-        target = TargetRef(snapshot["target_type"], snapshot["target_id"])
-        if snapshot["db_redacted_at"] is None:
+        # Keep the durable task lock while each database stage acquires its
+        # downstream outbox/delivery locks. This preserves the global order
+        # TargetCleanupTask -> outbox -> RecommendationDelivery.
+        now = _utcnow()
+        task = _lock_claimed_task(db, task_id, owner, now)
+        if task is None:
+            db.rollback()
+            return False
+        task.lease_expires_at = now + TARGET_CLEANUP_LEASE
+        target = TargetRef(task.target_type, int(task.target_id))
+        if task.db_redacted_at is None:
             deliveries = redact_deliveries_for_targets(db, [target], commit=False)
-            now = _utcnow()
-            if not checkpoint_cleanup_task(
-                db,
-                task_id,
-                owner,
-                "db_redacted_at",
-                now,
-                delivery_ids=list(deliveries),
+            checkpoint_at = _utcnow()
+            if (
+                task.lease_expires_at is None
+                or task.lease_expires_at <= checkpoint_at
             ):
+                db.rollback()
                 return False
+            task.delivery_ids = sorted(set(deliveries))
+            task.db_redacted_at = checkpoint_at
+            task.lease_expires_at = checkpoint_at + TARGET_CLEANUP_LEASE
+        db.commit()
 
-        snapshot = renew_cleanup_task_lease(db, task_id, owner, _utcnow())
-        if snapshot is None:
+        now = _utcnow()
+        task = _lock_claimed_task(db, task_id, owner, now)
+        if task is None:
+            db.rollback()
             return False
-        if snapshot["conversation_redacted_at"] is None:
+        task.lease_expires_at = now + TARGET_CLEANUP_LEASE
+        if task.conversation_redacted_at is None:
             redact_conversation_logs(
-                db, snapshot["delivery_ids"], commit=False,
+                db, list(task.delivery_ids or []), commit=False,
             )
-            if not checkpoint_cleanup_task(
-                db,
-                task_id,
-                owner,
-                "conversation_redacted_at",
-                _utcnow(),
+            checkpoint_at = _utcnow()
+            if (
+                task.lease_expires_at is None
+                or task.lease_expires_at <= checkpoint_at
             ):
+                db.rollback()
                 return False
+            task.conversation_redacted_at = checkpoint_at
+            task.lease_expires_at = checkpoint_at + TARGET_CLEANUP_LEASE
+        db.commit()
 
         snapshot = renew_cleanup_task_lease(db, task_id, owner, _utcnow())
         if snapshot is None:
             return False
+        target = TargetRef(snapshot["target_type"], snapshot["target_id"])
         if snapshot["session_invalidated_at"] is None:
             scrub_recommendation_sessions(
                 snapshot["delivery_ids"], [target],

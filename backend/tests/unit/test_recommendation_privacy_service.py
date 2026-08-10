@@ -403,6 +403,64 @@ class TestImmediateRedaction:
         ).count() == 0
         assert db.get(RecommendationDelivery, "batch-0500").content_ciphertext is None
 
+    @pytest.mark.parametrize(
+        ("commit", "expected_events"),
+        [
+            (False, [("outbox", 501), ("delivery", 500), ("delivery", 1)]),
+            (
+                True,
+                [
+                    ("outbox", 500),
+                    ("delivery", 500),
+                    ("outbox", 1),
+                    ("delivery", 1),
+                ],
+            ),
+        ],
+    )
+    def test_uses_global_or_per_batch_outbox_delivery_lock_order(
+        self, db, monkeypatch, commit, expected_events,
+    ):
+        candidate_ids = [f"own-lock-order-{index:04d}" for index in range(501)]
+        events = []
+
+        class _CandidateQuery:
+            def filter(self, *_args):
+                return self
+
+            def order_by(self, *_args):
+                return self
+
+            def limit(self, size):
+                self.size = size
+                return self
+
+            def all(self):
+                size = getattr(self, "size", len(candidate_ids))
+                start = sum(
+                    count for kind, count in events if kind == "delivery"
+                )
+                return [(value,) for value in candidate_ids[start:start + size]]
+
+        monkeypatch.setattr(db, "query", lambda *_args: _CandidateQuery())
+        monkeypatch.setattr(
+            privacy,
+            "_lock_outboxes_for_deliveries",
+            lambda _db, ids: events.append(("outbox", len(ids))),
+        )
+        monkeypatch.setattr(
+            privacy,
+            "_lock_redactable_deliveries",
+            lambda _db, _userid, ids, _filter: (
+                events.append(("delivery", len(ids))) or []
+            ),
+        )
+        monkeypatch.setattr(privacy, "_settle", lambda *_args: None)
+
+        privacy.redact_user_recommendation_content(db, OWNER, commit=commit)
+
+        assert events == expected_events
+
 
 @pytest.mark.parametrize(
     ("commit", "expected_events"),
@@ -511,7 +569,7 @@ def _build_full_fixture(db):
 
 
 class TestDeleteRecommendationUserData:
-    def test_user_cleanup_enters_target_redaction_outbox_first(
+    def test_user_cleanup_locks_outboxes_before_target_deliveries(
         self, db, monkeypatch,
     ):
         _build_full_fixture(db)
@@ -539,7 +597,9 @@ class TestDeleteRecommendationUserData:
         )
 
         assert report.ok, report.failed_steps
-        assert events[:2] == ["outbox", "delivery"]
+        first_delivery = events.index("delivery")
+        assert first_delivery > 0
+        assert all(event == "outbox" for event in events[:first_delivery])
 
     def test_removes_every_viewer_side_fact(self, db):
         _build_full_fixture(db)

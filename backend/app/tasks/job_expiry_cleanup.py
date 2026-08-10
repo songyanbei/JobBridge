@@ -9,7 +9,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.db import SessionLocal
-from app.models import MediaAssetLifecycle
+from app.services.job_media_service import mark_job_media_delete_pending
 from app.services.target_cleanup_service import ensure_job_cleanup_task
 from app.tasks.common import log_event, renewable_task_lock
 
@@ -45,15 +45,8 @@ def expire_locked_batch(db, *, now: datetime, batch_size: int = BATCH_SIZE) -> l
         if int(result.rowcount or 0) != 1:
             continue
         expired_ids.append(job_id)
+        mark_job_media_delete_pending(db, job_id)
         ensure_job_cleanup_task(db, job_id, reason="expired")
-        db.query(MediaAssetLifecycle).filter(
-            MediaAssetLifecycle.entity_type == "job",
-            MediaAssetLifecycle.entity_id == job_id,
-            MediaAssetLifecycle.state == "attached",
-        ).update({
-            "state": "delete_pending",
-            "next_attempt_at": now,
-        }, synchronize_session=False)
     db.commit()
     return expired_ids
 

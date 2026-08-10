@@ -20,6 +20,11 @@ def test_locked_batch_is_ordered_skip_locked_and_conditionally_produces_cleanup(
         _result(rowcount=0),
     ]
     ensure = MagicMock()
+    media = MagicMock()
+    order = []
+    media.side_effect = lambda *_args, **_kwargs: order.append("media")
+    ensure.side_effect = lambda *_args, **_kwargs: order.append("target")
+    monkeypatch.setattr(job_expiry_cleanup, "mark_job_media_delete_pending", media)
     monkeypatch.setattr(job_expiry_cleanup, "ensure_job_cleanup_task", ensure)
 
     expired = job_expiry_cleanup.expire_locked_batch(
@@ -35,8 +40,9 @@ def test_locked_batch_is_ordered_skip_locked_and_conditionally_produces_cleanup(
     assert "deleted_at IS NULL" in update_sql
     assert "delist_reason IS NULL" in update_sql
     assert "version=version+1" in update_sql
+    media.assert_called_once_with(db, 11)
     ensure.assert_called_once_with(db, 11, reason="expired")
-    db.query.return_value.filter.return_value.update.assert_called_once()
+    assert order == ["media", "target"]
     db.commit.assert_called_once()
 
 

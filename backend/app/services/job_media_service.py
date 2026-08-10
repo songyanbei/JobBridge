@@ -64,34 +64,61 @@ def attach_media(
 
 
 def mark_delete_pending(db: Session, media_ids: list[int]) -> None:
-    if media_ids:
-        db.query(MediaAssetLifecycle).filter(
-            MediaAssetLifecycle.id.in_(media_ids),
+    unique_ids = sorted(set(media_ids))
+    if not unique_ids:
+        return
+    rows = (
+        db.query(MediaAssetLifecycle)
+        .populate_existing()
+        .filter(
+            MediaAssetLifecycle.id.in_(unique_ids),
             MediaAssetLifecycle.state.in_(("pending", "attached")),
-        ).update(
-            {"state": "delete_pending", "next_attempt_at": datetime.utcnow()}, synchronize_session=False)
+        )
+        .order_by(MediaAssetLifecycle.id)
+        .with_for_update()
+        .all()
+    )
+    now = datetime.utcnow()
+    for row in rows:
+        row.state = "delete_pending"
+        row.next_attempt_at = now
 
 
 def mark_entity_media_delete_pending(
     db: Session,
     entity_type: str,
     entity_id: int,
+    *,
+    include_pending: bool = False,
 ) -> int:
     if entity_type not in ("job", "resume"):
         raise ValueError("unsupported_media_entity_type")
-    result = db.query(MediaAssetLifecycle).filter(
-        MediaAssetLifecycle.entity_type == entity_type,
-        MediaAssetLifecycle.entity_id == entity_id,
-        MediaAssetLifecycle.state == "attached",
-    ).update({
-        "state": "delete_pending",
-        "next_attempt_at": datetime.utcnow(),
-    }, synchronize_session=False)
-    return int(result or 0)
+    states = ("pending", "attached") if include_pending else ("attached",)
+    rows = (
+        db.query(MediaAssetLifecycle)
+        .populate_existing()
+        .filter(
+            MediaAssetLifecycle.entity_type == entity_type,
+            MediaAssetLifecycle.entity_id == entity_id,
+            MediaAssetLifecycle.state.in_(states),
+        )
+        .order_by(MediaAssetLifecycle.id)
+        .with_for_update()
+        .all()
+    )
+    now = datetime.utcnow()
+    for row in rows:
+        row.state = "delete_pending"
+        row.next_attempt_at = now
+    return len(rows)
 
 
-def mark_job_media_delete_pending(db: Session, job_id: int) -> int:
-    return mark_entity_media_delete_pending(db, "job", job_id)
+def mark_job_media_delete_pending(
+    db: Session, job_id: int, *, include_pending: bool = False,
+) -> int:
+    return mark_entity_media_delete_pending(
+        db, "job", job_id, include_pending=include_pending,
+    )
 
 
 def mark_resume_media_delete_pending(db: Session, resume_id: int) -> int:

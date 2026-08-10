@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.redis_client import (
@@ -41,12 +42,14 @@ from app.models import (
     ConversationLog,
     EventLog,
     Job,
+    MediaAssetLifecycle,
     RecommendationDelivery,
     RecommendationExposureDaily,
     RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
     Resume,
+    TargetCleanupTask,
     WecomOutboundOutbox,
 )
 
@@ -437,7 +440,6 @@ def redact_user_recommendation_content(
     moment = now or utc_now()
     trace = batch_id or _new_batch_id()
     redacted = 0
-    touched: list[str] = []
     # 过滤条件只挑「本批一定会被改写」的行：还有密文、还有 session patch，或状态
     # 仍可迁移。这样每批必然缩小候选集合，分批扫描不会在幂等重入时空转。
     pending_filter = (
@@ -445,40 +447,59 @@ def redact_user_recommendation_content(
         | RecommendationDelivery.session_patch_ciphertext.isnot(None)
         | RecommendationDelivery.status.in_(tuple(_STATUS_AFTER_REDACTION))
     )
-    last_candidate_id: str | None = None
-    while True:
+
+    def _candidate_ids_after(last_id: str | None, limit: int | None) -> list[str]:
         candidate_query = db.query(
             RecommendationDelivery.delivery_id,
         ).filter(
             RecommendationDelivery.userid == external_userid,
             pending_filter,
         )
-        if last_candidate_id is not None:
+        if last_id is not None:
             candidate_query = candidate_query.filter(
-                RecommendationDelivery.delivery_id > last_candidate_id,
+                RecommendationDelivery.delivery_id > last_id,
             )
-        candidate_ids = [
+        candidate_query = candidate_query.order_by(
+            RecommendationDelivery.delivery_id,
+        )
+        if limit is not None:
+            candidate_query = candidate_query.limit(limit)
+        return [
             str(row[0])
-            for row in candidate_query.order_by(
-                RecommendationDelivery.delivery_id,
-            ).limit(BATCH_SIZE).all()
+            for row in candidate_query.all()
         ]
-        if not candidate_ids:
-            break
+
+    def _redact_candidate_batch(candidate_ids: list[str]) -> None:
+        nonlocal redacted
         rows = _lock_redactable_deliveries(
             db, external_userid, candidate_ids, pending_filter,
         )
+        batch_touched = []
         for delivery in rows:
             if _redact_delivery_row(delivery, moment):
                 redacted += 1
-                touched.append(delivery.delivery_id)
+                batch_touched.append(delivery.delivery_id)
+        if batch_touched:
+            _fail_pending_outbox(db, batch_touched)
         _settle(db, commit)
-        last_candidate_id = candidate_ids[-1]
-        if len(candidate_ids) < BATCH_SIZE:
-            break
-    if touched:
-        _fail_pending_outbox(db, touched)
-        _settle(db, commit)
+
+    if commit:
+        last_candidate_id: str | None = None
+        while True:
+            candidate_ids = _candidate_ids_after(last_candidate_id, BATCH_SIZE)
+            if not candidate_ids:
+                break
+            _lock_outboxes_for_deliveries(db, candidate_ids)
+            _redact_candidate_batch(candidate_ids)
+            last_candidate_id = candidate_ids[-1]
+            if len(candidate_ids) < BATCH_SIZE:
+                break
+    else:
+        all_candidate_ids = _candidate_ids_after(None, None)
+        _lock_outboxes_for_deliveries(db, all_candidate_ids)
+        for candidate_ids in _chunks(all_candidate_ids):
+            _redact_candidate_batch(candidate_ids)
+
     _log_batch(trace, "immediate_redaction", "recommendation_delivery", redacted)
     return redacted
 
@@ -1150,6 +1171,84 @@ def _delete_target_facts(
 # 步骤 6：本人日志删除与实体清理移交
 # ---------------------------------------------------------------------------
 
+def _lock_owned_cleanup_graph(
+    db: Session,
+    external_userid: str,
+    targets: Sequence[TargetRef],
+) -> None:
+    """Pre-lock one-transaction cleanup in the shared global lock order."""
+    grouped = _target_map(targets)
+    job_ids = sorted(int(value) for value in grouped.get("job", set()))
+    resume_ids = sorted(int(value) for value in grouped.get("resume", set()))
+
+    jobs = (
+        db.query(Job)
+        .populate_existing()
+        .filter(Job.owner_userid == external_userid, Job.id.in_(job_ids))
+        .order_by(Job.id)
+        .with_for_update()
+        .all()
+        if job_ids
+        else []
+    )
+    if any(row.deleted_at is None for row in jobs):
+        raise RuntimeError("active_job_requires_lifecycle_cleanup")
+    locked_job_ids = [int(row.id) for row in jobs]
+
+    locked_resume_ids = []
+    if resume_ids:
+        locked_resume_ids = [
+            int(row[0])
+            for row in (
+                db.query(Resume.id)
+                .populate_existing()
+                .filter(
+                    Resume.owner_userid == external_userid,
+                    Resume.id.in_(resume_ids),
+                )
+                .order_by(Resume.id)
+                .with_for_update()
+                .all()
+            )
+        ]
+
+    media_filters = []
+    if locked_job_ids:
+        media_filters.append(
+            (MediaAssetLifecycle.entity_type == "job")
+            & (MediaAssetLifecycle.entity_id.in_(locked_job_ids))
+        )
+    if locked_resume_ids:
+        media_filters.append(
+            (MediaAssetLifecycle.entity_type == "resume")
+            & (MediaAssetLifecycle.entity_id.in_(locked_resume_ids))
+        )
+    if media_filters:
+        (
+            db.query(MediaAssetLifecycle.id)
+            .filter(
+                or_(*media_filters),
+                MediaAssetLifecycle.state == "attached",
+            )
+            .order_by(MediaAssetLifecycle.id)
+            .with_for_update()
+            .all()
+        )
+
+    if locked_job_ids:
+        (
+            db.query(TargetCleanupTask.id)
+            .populate_existing()
+            .filter(
+                TargetCleanupTask.target_type == "job",
+                TargetCleanupTask.target_id.in_(locked_job_ids),
+            )
+            .order_by(TargetCleanupTask.id)
+            .with_for_update()
+            .all()
+        )
+
+
 def _delete_owned_content(
     db: Session,
     external_userid: str,
@@ -1195,11 +1294,12 @@ def _delete_owned_content(
                 if isinstance(row, Job):
                     if row.deleted_at is None:
                         raise RuntimeError("active_job_requires_lifecycle_cleanup")
-                    ensure_job_cleanup_task(db, int(row.id), reason="manual_delete")
                 elif row.deleted_at is None:
                     row.deleted_at = deleted_at
                     changed = True
                 media_marked = mark_entity_media_delete_pending(db, table, int(row.id))
+                if isinstance(row, Job):
+                    ensure_job_cleanup_task(db, int(row.id), reason="manual_delete")
                 changed = changed or bool(media_marked)
                 transitioned += int(changed)
             _settle(db, commit)
@@ -1251,6 +1351,14 @@ def delete_recommendation_user_data(
         "collect_targets", lambda: owned_target_refs(db, external_userid),
     ) or []
     report.targets = len(targets)
+
+    # A caller-owned transaction retains every lock until its final commit.
+    # Establish the upstream Job/Resume -> Media -> Target order before any
+    # outbox/delivery work, without changing durable state yet.
+    if delete_owned_content and not commit and report.ok:
+        _step("delete_owned_content", lambda: _lock_owned_cleanup_graph(
+            db, external_userid, targets,
+        ))
 
     # 无论后续哪一步失败，正文都必须先没：§10.1.1 行 2240「不得继续保留可解密正文」。
     _step("redact_own_content", lambda: redact_user_recommendation_content(

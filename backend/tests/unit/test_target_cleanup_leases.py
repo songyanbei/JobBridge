@@ -250,8 +250,19 @@ def test_process_renews_and_checkpoints_each_stage(db, monkeypatch):
     db.add(task)
     db.commit()
     calls = []
+    lock_order = []
+    real_lock = target_cleanup_service._lock_claimed_task
+
+    def _record_task_lock(*args, **kwargs):
+        lock_order.append("target_task")
+        return real_lock(*args, **kwargs)
+
+    monkeypatch.setattr(
+        target_cleanup_service, "_lock_claimed_task", _record_task_lock,
+    )
 
     def _redact_deliveries(_db, targets, *, commit):
+        lock_order.append("delivery_redaction")
         calls.append((
             "deliveries",
             targets[0].target_type,
@@ -299,3 +310,43 @@ def test_process_renews_and_checkpoints_each_stage(db, monkeypatch):
         ("conversations", ["delivery-1", "delivery-2"], False),
         ("sessions", ["delivery-1", "delivery-2"], task.target_id),
     ]
+    assert lock_order[:2] == ["target_task", "delivery_redaction"]
+
+
+def test_process_rolls_back_database_stage_when_lease_expires(db, monkeypatch):
+    now = _now()
+    task = _task(
+        status="processing",
+        attempt_count=1,
+        lease_owner="worker-1",
+        lease_expires_at=now + timedelta(minutes=1),
+    )
+    db.add(task)
+    db.commit()
+
+    moments = iter([
+        now,
+        now + target_cleanup_service.TARGET_CLEANUP_LEASE + timedelta(seconds=1),
+    ])
+    monkeypatch.setattr(target_cleanup_service, "_utcnow", lambda: next(moments))
+
+    def _redact_deliveries(stage_db, _targets, *, commit):
+        assert commit is False
+        stage_task = stage_db.get(TargetCleanupTask, task.id)
+        stage_task.reason_history = ["expired", "uncommitted-stage"]
+        return {"delivery-1"}
+
+    monkeypatch.setattr(
+        recommendation_privacy_service,
+        "redact_deliveries_for_targets",
+        _redact_deliveries,
+    )
+
+    assert not target_cleanup_service.process_cleanup_task(
+        db, task.id, "worker-1",
+    )
+
+    db.refresh(task)
+    assert task.db_redacted_at is None
+    assert task.delivery_ids is None
+    assert task.reason_history == ["expired"]

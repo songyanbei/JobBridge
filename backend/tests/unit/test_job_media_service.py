@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from app.config import settings
 from app.services.job_media_service import (
     hard_delete_media_complete,
+    mark_entity_media_delete_pending,
     resume_hard_delete_media_complete,
 )
 from app.services.storage_reference_service import (
@@ -121,3 +122,23 @@ def test_resume_hard_delete_uses_the_same_fail_closed_media_gate():
     assert resume_hard_delete_media_complete(
         _media_db(dead_letter), 9, ["images/resume/a.jpg"]
     ) is False
+
+
+def test_entity_cleanup_locks_media_in_id_order_before_transitioning():
+    first = SimpleNamespace(id=3, state="attached", next_attempt_at=None)
+    second = SimpleNamespace(id=7, state="attached", next_attempt_at=None)
+    db = MagicMock()
+    query = db.query.return_value
+    locked = (
+        query.populate_existing.return_value.filter.return_value
+        .order_by.return_value.with_for_update.return_value
+    )
+    locked.all.return_value = [first, second]
+
+    assert mark_entity_media_delete_pending(db, "job", 42) == 2
+
+    query.populate_existing.return_value.filter.return_value.order_by.assert_called_once()
+    locked.all.assert_called_once_with()
+    assert first.state == second.state == "delete_pending"
+    assert first.next_attempt_at is not None
+    assert second.next_attempt_at is not None

@@ -10,7 +10,8 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import Job, JobReplacement, MediaAssetLifecycle
+from app.models import Job, JobReplacement
+from app.services.job_media_service import mark_job_media_delete_pending
 from app.services.job_mutation_service import increment_version
 from app.services.job_replacement_lock_service import lock_replacement_graph
 from app.services.target_cleanup_service import ensure_job_cleanup_task
@@ -60,14 +61,7 @@ def cleanup_candidate(db: Session, candidate_id: int, *, now: datetime | None = 
 
     candidate.deleted_at = now
     increment_version(candidate)
-    db.query(MediaAssetLifecycle).filter(
-        MediaAssetLifecycle.entity_type == "job",
-        MediaAssetLifecycle.entity_id == candidate.id,
-        MediaAssetLifecycle.state.in_(("pending", "attached")),
-    ).update({
-        "state": "delete_pending",
-        "next_attempt_at": now,
-    }, synchronize_session=False)
+    mark_job_media_delete_pending(db, candidate.id, include_pending=True)
     ensure_job_cleanup_task(db, candidate.id, reason="candidate_expired")
     db.flush()
     return True

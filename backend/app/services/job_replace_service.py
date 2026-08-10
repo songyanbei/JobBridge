@@ -6,11 +6,11 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
-from app.models import Job, JobReplacement, MediaAssetLifecycle
+from app.models import Job, JobReplacement
 from app.services.job_activation_service import activate_job
 from app.services.admin_log_service import write_admin_log
 from app.services.job_business_digest_service import DIGEST_VERSION, business_digest
-from app.services.job_media_service import attach_media
+from app.services.job_media_service import attach_media, mark_job_media_delete_pending
 from app.services.job_mutation_service import increment_version, lock_job_for_mutation
 from app.services.job_replacement_lock_service import (
     lock_replacement_creation,
@@ -313,14 +313,7 @@ def cancel_candidate(
     relation.reviewed_at = now
     candidate.deleted_at = now
     increment_version(candidate)
-    db.query(MediaAssetLifecycle).filter(
-        MediaAssetLifecycle.entity_type == "job",
-        MediaAssetLifecycle.entity_id == candidate.id,
-        MediaAssetLifecycle.state.in_(("pending", "attached")),
-    ).update({
-        "state": "delete_pending",
-        "next_attempt_at": now,
-    }, synchronize_session=False)
+    mark_job_media_delete_pending(db, candidate.id, include_pending=True)
     ensure_job_cleanup_task(db, candidate.id, reason="candidate_cancelled")
     write_admin_log(
         db,

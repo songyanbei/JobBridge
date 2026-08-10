@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
-from app.models import Job, JobReplacement, MediaAssetLifecycle
+from app.models import Job, JobReplacement
+from app.services.job_media_service import mark_job_media_delete_pending
 from app.services.job_replacement_lock_service import (
     current_active_replacement_hint,
     lock_replacement_graph,
@@ -147,14 +148,7 @@ def close_active_replacement(
     if candidate and candidate.expires_at is None and candidate.deleted_at is None:
         candidate.deleted_at = now
         increment_version(candidate)
-        db.query(MediaAssetLifecycle).filter(
-            MediaAssetLifecycle.entity_type == "job",
-            MediaAssetLifecycle.entity_id == candidate.id,
-            MediaAssetLifecycle.state.in_(("pending", "attached")),
-        ).update({
-            "state": "delete_pending",
-            "next_attempt_at": now,
-        }, synchronize_session=False)
+        mark_job_media_delete_pending(db, candidate.id, include_pending=True)
         from app.services.target_cleanup_service import ensure_job_cleanup_task
         ensure_job_cleanup_task(db, candidate.id, reason="candidate_cancelled")
     return locked_old
