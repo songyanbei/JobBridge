@@ -599,17 +599,29 @@ class _RecordingDb:
 
 class TestRecommendationTtl:
     def test_sent_is_terminal_and_retry_wait_is_covered(self):
-        db = MagicMock()
-        ttl_cleanup._redact_expired_recommendation_content(db)
-        sql = " ".join(str(call.args[0]) for call in db.execute.call_args_list)
+        now = datetime(2026, 8, 10, 12)
+        common = {
+            "content_ciphertext": b"body",
+            "session_patch_ciphertext": b"patch",
+            "content_expires_at": now - timedelta(seconds=1),
+            "lease_expires_at": None,
+            "created_at": now,
+            "updated_at": now,
+            "last_error": None,
+            "last_error_code": None,
+        }
+        sent = SimpleNamespace(status="sent", **common)
+        retry_wait = SimpleNamespace(status="retry_wait", **common)
 
-        assert "redacted" not in sql
-        assert "'expired'" not in sql
-        assert "retry_wait" in sql
-        # sent 只清正文，不出现在任何状态改写的 CASE 分支里
-        assert "WHEN d.status='sent'" not in sql
-        assert "d.content_ciphertext=NULL" in sql
-        assert "d.session_patch_ciphertext=NULL" in sql
+        assert ttl_cleanup._apply_expired_content_rules(sent, None, now)
+        assert sent.status == "sent"
+        assert sent.content_ciphertext is None
+        assert sent.session_patch_ciphertext is None
+
+        assert ttl_cleanup._apply_expired_content_rules(retry_wait, None, now)
+        assert retry_wait.status == "permanent_failed"
+        assert retry_wait.content_ciphertext is None
+        assert retry_wait.session_patch_ciphertext is None
 
     def test_detail_purge_follows_the_mandated_fk_order(self):
         db = _RecordingDb([[("r-1",)]])

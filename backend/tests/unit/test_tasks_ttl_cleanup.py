@@ -9,12 +9,181 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from app.tasks import ttl_cleanup
+
+
+def _ttl_delivery(status: str, now: datetime, **overrides):
+    values = {
+        "delivery_id": f"delivery-{status}",
+        "status": status,
+        "content_ciphertext": b"content",
+        "session_patch_ciphertext": b"patch",
+        "content_expires_at": now - timedelta(seconds=1),
+        "lease_owner": None,
+        "lease_expires_at": None,
+        "created_at": now,
+        "updated_at": now,
+        "last_error": None,
+        "last_error_code": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _ttl_outbox(status: str = "pending"):
+    return SimpleNamespace(
+        status=status,
+        locked_at=datetime(2026, 1, 1),
+        next_attempt_at=datetime(2026, 1, 1),
+        last_error=None,
+    )
+
+
+class TestRecommendationContentTtl:
+    def test_pending_and_retry_wait_expiry_terminalize_unsent_rows(self):
+        now = datetime(2026, 8, 10, 12)
+        for status in ("prepared", "pending", "retry_wait"):
+            delivery = _ttl_delivery(status, now)
+            outbox = _ttl_outbox()
+
+            assert ttl_cleanup._apply_expired_content_rules(
+                delivery, outbox, now,
+            )
+            assert delivery.status == "permanent_failed"
+            assert delivery.content_ciphertext is None
+            assert delivery.session_patch_ciphertext is None
+            assert outbox.status == "dead_letter"
+            assert outbox.locked_at is None
+            assert outbox.next_attempt_at is None
+
+    def test_active_sending_is_untouched_until_lease_expires(self):
+        now = datetime(2026, 8, 10, 12)
+        delivery = _ttl_delivery(
+            "sending", now,
+            lease_owner="worker-a",
+            lease_expires_at=now + timedelta(seconds=1),
+        )
+        outbox = _ttl_outbox("sending")
+
+        assert not ttl_cleanup._apply_expired_content_rules(
+            delivery, outbox, now,
+        )
+        assert delivery.status == "sending"
+        assert delivery.content_ciphertext == b"content"
+        assert outbox.status == "sending"
+
+    def test_expired_sending_becomes_unknown_and_stops_outbox(self):
+        now = datetime(2026, 8, 10, 12)
+        delivery = _ttl_delivery(
+            "sending", now,
+            lease_owner="worker-a",
+            lease_expires_at=now,
+        )
+        outbox = _ttl_outbox("sending")
+
+        assert ttl_cleanup._apply_expired_content_rules(delivery, outbox, now)
+        assert delivery.status == "unknown"
+        assert delivery.lease_owner is None
+        assert delivery.lease_expires_at is None
+        assert delivery.content_ciphertext is None
+        assert outbox.status == "dead_letter"
+        assert "ambiguous provider outcome" in outbox.last_error
+
+    def test_terminal_statuses_only_clear_ciphertext(self):
+        now = datetime(2026, 8, 10, 12)
+        for status in ("sent", "permanent_failed", "unknown"):
+            delivery = _ttl_delivery(status, now)
+            outbox = _ttl_outbox("sent")
+
+            assert ttl_cleanup._apply_expired_content_rules(
+                delivery, outbox, now,
+            )
+            assert delivery.status == status
+            assert delivery.content_ciphertext is None
+            assert delivery.session_patch_ciphertext is None
+            assert outbox.status == "sent"
+
+    def test_stale_prepared_and_unknown_fallbacks_remain_bounded(self):
+        now = datetime(2026, 8, 10, 12)
+        prepared = _ttl_delivery(
+            "prepared", now,
+            content_expires_at=now + timedelta(days=1),
+            created_at=now - timedelta(hours=24, microseconds=1),
+        )
+        unknown = _ttl_delivery(
+            "unknown", now,
+            content_expires_at=now + timedelta(days=1),
+            updated_at=now - timedelta(days=7, microseconds=1),
+        )
+
+        assert ttl_cleanup._apply_expired_content_rules(prepared, None, now)
+        assert prepared.status == "permanent_failed"
+        assert prepared.last_error_code == "session_commit_timeout"
+        assert ttl_cleanup._apply_expired_content_rules(unknown, None, now)
+        assert unknown.status == "unknown"
+        assert unknown.content_ciphertext is None
+
+    def test_cleanup_locks_outbox_then_delivery_before_applying(self, monkeypatch):
+        db = MagicMock()
+        db.execute.return_value.scalar_one.return_value = datetime(2026, 8, 10, 12)
+        delivery = _ttl_delivery("pending", datetime(2026, 8, 10, 12))
+        calls = []
+        pages = [[delivery.delivery_id]]
+
+        monkeypatch.setattr(
+            ttl_cleanup,
+            "_expired_content_candidate_ids",
+            lambda *_args: pages.pop(0),
+        )
+
+        def lock_outboxes(_db, delivery_ids):
+            calls.append(("outbox", list(delivery_ids)))
+            return {delivery.delivery_id: _ttl_outbox()}
+
+        def lock_deliveries(_db, delivery_ids):
+            calls.append(("delivery", list(delivery_ids)))
+            return [delivery]
+
+        monkeypatch.setattr(
+            ttl_cleanup, "_lock_outboxes_for_deliveries", lock_outboxes,
+        )
+        monkeypatch.setattr(
+            ttl_cleanup, "_lock_expired_content_deliveries", lock_deliveries,
+        )
+
+        assert ttl_cleanup._redact_expired_recommendation_content(db) == 1
+        assert calls == [
+            ("outbox", [delivery.delivery_id]),
+            ("delivery", [delivery.delivery_id]),
+        ]
+        db.commit.assert_called_once()
+
+    def test_candidate_query_contains_state_gates_and_no_join_update(self):
+        import inspect
+
+        db = MagicMock()
+        db.execute.return_value.fetchall.return_value = []
+
+        assert ttl_cleanup._expired_content_candidate_ids(db, None) == []
+        candidate_sql = str(db.execute.call_args.args[0])
+        assert "d.status IN ('prepared','pending','retry_wait')" in candidate_sql
+        assert "d.status='sending'" in candidate_sql
+        assert "d.lease_expires_at <= NOW(6)" in candidate_sql
+        assert "d.status IN ('sent','permanent_failed','unknown')" in candidate_sql
+        assert "INTERVAL 24 HOUR" in candidate_sql
+        assert "INTERVAL 7 DAY" in candidate_sql
+
+        function_source = inspect.getsource(
+            ttl_cleanup._redact_expired_recommendation_content,
+        )
+        assert "UPDATE recommendation_delivery" not in function_source
+        assert "JOIN wecom_outbound_outbox" not in function_source
 
 
 # ---------------------------------------------------------------------------

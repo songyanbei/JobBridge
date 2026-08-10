@@ -22,14 +22,171 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from loguru import logger
 from sqlalchemy import text
 
 from app.core.logging_setup import identifier_hash
 from app.db import SessionLocal
+from app.models import RecommendationDelivery, WecomOutboundOutbox
 from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 
 BATCH_SIZE = 500
+
+_DELIVERY_CONTENT_EXPIRED = "recommendation content expired before send"
+_OUTBOX_CONTENT_EXPIRED = "recommendation delivery expired before send"
+_SENDING_CONTENT_EXPIRED = "sending lease expired after content TTL"
+_OUTBOX_SENDING_AMBIGUOUS = (
+    "ambiguous provider outcome; automatic resend disabled"
+)
+
+
+def _expired_content_candidate_ids(db, after_id: str | None) -> list[str]:
+    """Read one keyset page without locking either durable table."""
+    rows = db.execute(
+        text(
+            "SELECT d.delivery_id FROM recommendation_delivery d "
+            "WHERE (:after_id IS NULL OR d.delivery_id > :after_id) AND ("
+            "  (d.content_expires_at IS NOT NULL "
+            "   AND d.content_expires_at <= NOW(6) AND ("
+            "     d.status IN ('prepared','pending','retry_wait') "
+            "     OR (d.status='sending' AND d.lease_expires_at IS NOT NULL "
+            "         AND d.lease_expires_at <= NOW(6)) "
+            "     OR (d.status IN ('sent','permanent_failed','unknown') "
+            "         AND (d.content_ciphertext IS NOT NULL "
+            "              OR d.session_patch_ciphertext IS NOT NULL))"
+            "   )) "
+            "  OR (d.status='prepared' "
+            "      AND d.created_at < NOW(6) - INTERVAL 24 HOUR) "
+            "  OR (d.status='unknown' AND d.content_ciphertext IS NOT NULL "
+            "      AND d.updated_at < NOW(6) - INTERVAL 7 DAY)"
+            ") ORDER BY d.delivery_id LIMIT :limit"
+        ),
+        {"after_id": after_id, "limit": BATCH_SIZE},
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _lock_outboxes_for_deliveries(
+    db, delivery_ids: list[str],
+) -> dict[str, WecomOutboundOutbox]:
+    if not delivery_ids:
+        return {}
+    rows = (
+        db.query(WecomOutboundOutbox)
+        .populate_existing()
+        .filter(WecomOutboundOutbox.recommendation_delivery_id.in_(delivery_ids))
+        .order_by(WecomOutboundOutbox.id)
+        .with_for_update()
+        .all()
+    )
+    return {
+        str(row.recommendation_delivery_id): row
+        for row in rows
+        if row.recommendation_delivery_id is not None
+    }
+
+
+def _lock_expired_content_deliveries(
+    db, delivery_ids: list[str],
+) -> list[RecommendationDelivery]:
+    if not delivery_ids:
+        return []
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
+def _clear_delivery_ciphertext(delivery: RecommendationDelivery) -> bool:
+    changed = False
+    if delivery.content_ciphertext is not None:
+        delivery.content_ciphertext = None
+        changed = True
+    if delivery.session_patch_ciphertext is not None:
+        delivery.session_patch_ciphertext = None
+        changed = True
+    return changed
+
+
+def _dead_letter_outbox(
+    outbox: WecomOutboundOutbox | None, *, ambiguous: bool,
+) -> None:
+    if outbox is None:
+        return
+    eligible = ("pending", "sending") if ambiguous else ("pending",)
+    if outbox.status not in eligible:
+        return
+    outbox.status = "dead_letter"
+    outbox.locked_at = None
+    outbox.next_attempt_at = None
+    outbox.last_error = (
+        _OUTBOX_SENDING_AMBIGUOUS if ambiguous else _OUTBOX_CONTENT_EXPIRED
+    )
+
+
+def _apply_expired_content_rules(
+    delivery: RecommendationDelivery,
+    outbox: WecomOutboundOutbox | None,
+    now: datetime,
+) -> bool:
+    """Apply TTL transitions after both tables have been locked."""
+    status = str(delivery.status or "")
+    content_expired = (
+        delivery.content_expires_at is not None
+        and delivery.content_expires_at <= now
+    )
+
+    if (
+        status == "sending"
+        and content_expired
+        and delivery.lease_expires_at is not None
+        and delivery.lease_expires_at <= now
+    ):
+        delivery.status = "unknown"
+        delivery.last_error = _SENDING_CONTENT_EXPIRED
+        delivery.last_error_code = "sending_lease_expired"
+        delivery.lease_owner = None
+        delivery.lease_expires_at = None
+        _clear_delivery_ciphertext(delivery)
+        _dead_letter_outbox(outbox, ambiguous=True)
+        return True
+
+    if content_expired and status in ("prepared", "pending", "retry_wait"):
+        delivery.status = "permanent_failed"
+        delivery.last_error = _DELIVERY_CONTENT_EXPIRED
+        _clear_delivery_ciphertext(delivery)
+        _dead_letter_outbox(outbox, ambiguous=False)
+        return True
+
+    if content_expired and status in ("sent", "permanent_failed", "unknown"):
+        return _clear_delivery_ciphertext(delivery)
+
+    if (
+        status == "prepared"
+        and delivery.created_at is not None
+        and delivery.created_at < now - timedelta(hours=24)
+    ):
+        delivery.status = "permanent_failed"
+        delivery.last_error = "prepared session never committed within 24h"
+        delivery.last_error_code = "session_commit_timeout"
+        _clear_delivery_ciphertext(delivery)
+        return True
+
+    if (
+        status == "unknown"
+        and delivery.content_ciphertext is not None
+        and delivery.updated_at is not None
+        and delivery.updated_at < now - timedelta(days=7)
+    ):
+        return _clear_delivery_ciphertext(delivery)
+
+    return False
 
 
 def _redact_expired_recommendation_content(db) -> int:
@@ -44,59 +201,29 @@ def _redact_expired_recommendation_content(db) -> int:
       （旧实现写的 ``expired`` 不在枚举内）；
     - sending 且租约已过期转 ``unknown``，不自动重发（§10.3）。
     """
-    unknown = db.execute(text(
-        "UPDATE recommendation_delivery d "
-        "JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
-        "SET d.status='unknown', d.last_error='sending lease expired after content TTL', "
-        "d.last_error_code='sending_lease_expired', "
-        "o.status='dead_letter', o.locked_at=NULL, o.next_attempt_at=NULL, "
-        "o.last_error='ambiguous provider outcome; automatic resend disabled' "
-        "WHERE d.status='sending' AND d.lease_expires_at IS NOT NULL "
-        "AND d.lease_expires_at <= NOW(6) "
-        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
-    ))
-    expired = db.execute(text(
-        "UPDATE recommendation_delivery d "
-        "LEFT JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
-        "SET d.content_ciphertext=NULL, d.session_patch_ciphertext=NULL, "
-        # MySQL 的多列 UPDATE 是左到右求值，后面的 CASE 会读到已经被改写的列值，
-        # 因此所有依赖旧 status 的赋值必须排在 status 之前。
-        "d.last_error=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
-        "             THEN 'recommendation content expired before send' ELSE d.last_error END, "
-        # P2-12：retry_wait 同样是“还没发出去”的可恢复状态，必须纳入。
-        "d.status=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
-        "             THEN 'permanent_failed' ELSE d.status END, "
-        "o.last_error=CASE WHEN o.status='pending' "
-        "                 THEN 'recommendation delivery expired before send' ELSE o.last_error END, "
-        "o.status=CASE WHEN o.status='pending' THEN 'dead_letter' ELSE o.status END, "
-        "o.locked_at=NULL, o.next_attempt_at=NULL "
-        "WHERE d.status IN ('prepared','pending','retry_wait','sent','permanent_failed','unknown') "
-        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
-    ))
-    # §9.11 行 2109：prepared 超过 24 小时仍无法提交 session 时转 permanent_failed
-    # 并同时清空正文，避免可解密的推荐正文无限期停留。
-    stale_prepared = db.execute(text(
-        "UPDATE recommendation_delivery "
-        "SET status='permanent_failed', content_ciphertext=NULL, "
-        "session_patch_ciphertext=NULL, "
-        "last_error='prepared session never committed within 24h', "
-        "last_error_code='session_commit_timeout' "
-        "WHERE status='prepared' AND created_at < NOW(6) - INTERVAL 24 HOUR"
-    ))
-    # unknown 最多保留 7 天正文，供人工按 msgid 核对后再清理。
-    stale_unknown = db.execute(text(
-        "UPDATE recommendation_delivery "
-        "SET content_ciphertext=NULL, session_patch_ciphertext=NULL "
-        "WHERE status='unknown' AND content_ciphertext IS NOT NULL "
-        "AND updated_at < NOW(6) - INTERVAL 7 DAY"
-    ))
-    db.commit()
-    return (
-        int(unknown.rowcount or 0)
-        + int(expired.rowcount or 0)
-        + int(stale_prepared.rowcount or 0)
-        + int(stale_unknown.rowcount or 0)
-    )
+    total = 0
+    after_id: str | None = None
+    while True:
+        candidate_ids = _expired_content_candidate_ids(db, after_id)
+        if not candidate_ids:
+            break
+
+        # Global order shared with the worker terminalizer: every outbox row
+        # first, then every delivery row. No write starts until both sets are held.
+        outboxes = _lock_outboxes_for_deliveries(db, candidate_ids)
+        deliveries = _lock_expired_content_deliveries(db, candidate_ids)
+        now = db.execute(text("SELECT NOW(6)")).scalar_one()
+        for delivery in deliveries:
+            if _apply_expired_content_rules(
+                delivery, outboxes.get(str(delivery.delivery_id)), now,
+            ):
+                total += 1
+
+        db.commit()
+        after_id = candidate_ids[-1]
+        if len(candidate_ids) < BATCH_SIZE:
+            break
+    return total
 
 
 # ---------------------------------------------------------------------------
