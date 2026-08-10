@@ -159,6 +159,49 @@ def _recommendation_target_references(
 
     return sorted(set(references)), None, None
 
+
+def _build_outbox_claim_query(
+    db: Session,
+    due,
+    *,
+    inbound_event_id: Any = None,
+    limit: int = OUTBOX_CLAIM_BATCH_SIZE,
+):
+    earlier = aliased(WecomOutboundOutbox)
+    no_earlier_unsent_for_user = ~exists().where(and_(
+        earlier.userid == WecomOutboundOutbox.userid,
+        earlier.id < WecomOutboundOutbox.id,
+        earlier.status.in_(("pending", "sending")),
+    ))
+    current_delivery = aliased(RecommendationDelivery)
+    earlier_delivery = aliased(RecommendationDelivery)
+    no_earlier_active_delivery = ~exists().where(and_(
+        current_delivery.delivery_id
+        == WecomOutboundOutbox.recommendation_delivery_id,
+        earlier_delivery.userid == current_delivery.userid,
+        earlier_delivery.delivery_order < current_delivery.delivery_order,
+        earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
+    ))
+    inbound_done = exists().where(and_(
+        WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
+        WecomInboundEvent.status == "done",
+    ))
+    query = db.query(WecomOutboundOutbox).filter(
+        due,
+        no_earlier_unsent_for_user,
+        no_earlier_active_delivery,
+        inbound_done,
+    )
+    if inbound_event_id:
+        query = query.filter(
+            WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
+        )
+    return (
+        query.order_by(WecomOutboundOutbox.id)
+        .with_for_update(skip_locked=True)
+        .limit(limit)
+    )
+
 # §10.4.1：dispatcher / prepared session reconciler 各自独立 250ms 扫描，
 # 每批最多 100 条；§10.5 的 impression deriver 同样 250ms。
 AUX_LOOP_INTERVAL_SECONDS = 0.25
@@ -1454,50 +1497,14 @@ class Worker:
                     WecomOutboundOutbox.recommendation_delivery_id.is_(None),
                 ),
             )
-            earlier = aliased(WecomOutboundOutbox)
-            no_earlier_unsent_for_user = ~exists().where(and_(
-                earlier.userid == WecomOutboundOutbox.userid,
-                earlier.id < WecomOutboundOutbox.id,
-                earlier.status.in_(("pending", "sending")),
-            ))
-            # §10.4.1：claim 某用户 delivery 前必须确认不存在该用户更小
-            # delivery_order 的 prepared/pending/sending/retry_wait。outbox 的 id 序
-            # 只覆盖有 outbox 行的回复，delivery_order 才是跨进程恢复的稳定序。
-            current_delivery = aliased(RecommendationDelivery)
-            earlier_delivery = aliased(RecommendationDelivery)
-            no_earlier_active_delivery = ~exists().where(and_(
-                earlier_delivery.userid == current_delivery.userid,
-                earlier_delivery.delivery_order < current_delivery.delivery_order,
-                earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
-            ))
-            query = db.query(WecomOutboundOutbox).join(
-                WecomInboundEvent,
-                WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
-            ).outerjoin(
-                current_delivery,
-                current_delivery.delivery_id
-                == WecomOutboundOutbox.recommendation_delivery_id,
-            ).filter(
+            # All readiness gates stay in correlated EXISTS clauses so this
+            # locking SELECT owns only outbox rows.
+            rows = _build_outbox_claim_query(
+                db,
                 due,
-                no_earlier_unsent_for_user,
-                # 非推荐回复没有 delivery 行，outer join 后 delivery_order 为 NULL，
-                # 子查询恒不命中，等价于不受该门禁影响。
-                no_earlier_active_delivery,
-                WecomInboundEvent.status == "done",
-            )
-            if inbound_event_id:
-                query = query.filter(
-                    WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
-                )
-            rows = (
-                query.order_by(
-                    WecomOutboundOutbox.inbound_event_id,
-                    WecomOutboundOutbox.reply_index,
-                )
-                .with_for_update(skip_locked=True, of=WecomOutboundOutbox)
-                .limit(limit)
-                .all()
-            )
+                inbound_event_id=inbound_event_id,
+                limit=limit,
+            ).all()
             claimed: list[dict] = []
             for row in rows:
                 content = row.content

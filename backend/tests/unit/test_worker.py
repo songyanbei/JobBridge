@@ -15,8 +15,11 @@ import time
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from sqlalchemy.dialects import mysql
+from sqlalchemy.orm import Session
 
 from app.core.redis_client import SessionCommitDeadlineExceeded, UserLockUnavailable
+from app.models import WecomOutboundOutbox
 from app.schemas.conversation import ReplyMessage
 from app.services.worker import (
     MAX_RETRY,
@@ -24,6 +27,7 @@ from app.services.worker import (
     QUEUE_SEND_RETRY,
     SEND_RETRY_BACKOFFS,
     Worker,
+    _build_outbox_claim_query,
     _build_wecom_message,
     _coerce_log_msg_type,
 )
@@ -879,6 +883,25 @@ class TestSendErrorHandling:
 # ---------------------------------------------------------------------------
 
 class TestTransactionalOutbox:
+    def test_claim_sql_locks_only_outer_outbox_rows(self):
+        db = Session()
+        query = _build_outbox_claim_query(
+            db,
+            WecomOutboundOutbox.status == "pending",
+            limit=5,
+        )
+
+        sql = " ".join(str(query.statement.compile(
+            dialect=mysql.dialect(),
+        )).lower().split())
+        outer_from = sql.split(" where ", 1)[0]
+
+        assert outer_from.endswith("from wecom_outbound_outbox")
+        assert " join " not in outer_from
+        assert sql.count("exists (select") >= 3
+        assert "order by wecom_outbound_outbox.id" in sql
+        assert sql.endswith("for update skip locked")
+
     def test_stage_outbox_preserves_reply_order_and_metadata(self, worker):
         from app.models import WecomOutboundOutbox
 
