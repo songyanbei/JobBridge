@@ -5,11 +5,11 @@ import argparse
 
 from app.db import SessionLocal
 from app.models import Job, TargetCleanupTask
-from app.services.target_cleanup_service import ensure_job_cleanup_task
+from app.services.target_cleanup_service import upsert_job_cleanup_task
 
 
 def run(*, apply: bool, batch_size: int = 500) -> dict[str, int]:
-    scanned = created = 0
+    scanned = created = missing_count = 0
     last_id = 0
     with SessionLocal() as db:
         while True:
@@ -27,13 +27,24 @@ def run(*, apply: bool, batch_size: int = 500) -> dict[str, int]:
             }
             scanned += len(ids)
             missing = [job_id for job_id in ids if job_id not in existing]
-            created += len(missing)
             if apply:
                 for job_id in missing:
-                    ensure_job_cleanup_task(db, job_id, reason="historical_soft_delete")
+                    _, was_created = upsert_job_cleanup_task(
+                        db, job_id, reason="historical_soft_delete",
+                    )
+                    created += int(was_created)
                 db.commit()
+                covered = {
+                    row[0] for row in db.query(TargetCleanupTask.target_id).filter(
+                        TargetCleanupTask.target_type == "job",
+                        TargetCleanupTask.target_id.in_(ids),
+                    ).all()
+                }
+                missing_count += len(set(ids) - covered)
+            else:
+                missing_count += len(missing)
             last_id = ids[-1]
-    return {"scanned": scanned, "created": created if apply else 0, "missing": created}
+    return {"scanned": scanned, "created": created, "missing": missing_count}
 
 
 if __name__ == "__main__":

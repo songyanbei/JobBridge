@@ -4,19 +4,44 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import TargetCleanupTask
+from app.models import Job, TargetCleanupTask
 
 
-def ensure_job_cleanup_task(
+def _lock_job_cleanup_task(
+    db: Session, job_id: int,
+) -> TargetCleanupTask | None:
+    return (
+        db.query(TargetCleanupTask)
+        .populate_existing()
+        .filter(
+            TargetCleanupTask.target_type == "job",
+            TargetCleanupTask.target_id == job_id,
+        )
+        .with_for_update()
+        .first()
+    )
+
+
+def upsert_job_cleanup_task(
     db: Session,
     job_id: int,
     *,
     reason: str,
     operation_id: str | None = None,
-) -> TargetCleanupTask:
-    task = db.query(TargetCleanupTask).filter_by(target_type="job", target_id=job_id).first()
+) -> tuple[TargetCleanupTask, bool]:
+    # The Job row serializes creation while no target_cleanup_task row exists.
+    (
+        db.query(Job.id)
+        .populate_existing()
+        .filter(Job.id == job_id)
+        .with_for_update()
+        .one()
+    )
+    task = _lock_job_cleanup_task(db, job_id)
+    created = False
     if task is None:
         task = TargetCleanupTask(
             operation_id=operation_id or str(uuid.uuid4()),
@@ -26,10 +51,41 @@ def ensure_job_cleanup_task(
             reason_history=[reason],
             status="pending",
         )
-        db.add(task)
+        # Flush unrelated outer work before opening the savepoint so an insert
+        # race cannot roll back the caller's whole transaction.
         db.flush()
-    elif reason not in (task.reason_history or []):
-        task.reason_history = [*(task.reason_history or [task.reason]), reason]
+        try:
+            with db.begin_nested():
+                db.add(task)
+                db.flush()
+            created = True
+        except IntegrityError:
+            task = _lock_job_cleanup_task(db, job_id)
+            if task is None:
+                raise
+
+    history = list(task.reason_history or [])
+    if task.reason and task.reason not in history:
+        history.append(task.reason)
+    if reason not in history:
+        history.append(reason)
+    task.reason_history = history
+    return task, created
+
+
+def ensure_job_cleanup_task(
+    db: Session,
+    job_id: int,
+    *,
+    reason: str,
+    operation_id: str | None = None,
+) -> TargetCleanupTask:
+    task, _ = upsert_job_cleanup_task(
+        db,
+        job_id,
+        reason=reason,
+        operation_id=operation_id,
+    )
     return task
 
 
