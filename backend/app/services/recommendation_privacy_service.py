@@ -870,44 +870,46 @@ def scrub_recommendation_sessions(
     if not index_keys:
         return 0
 
-    r = redis_client.get_redis()
-    userids: set[str] = set()
-    for key in index_keys:
-        try:
-            members = r.smembers(key)
-        except Exception:
-            # 索引键可能被写入侧建成别的类型；单键失败不该拖垮整轮清理。
-            logger.warning("recommendation_privacy: session index unreadable batch=%s", trace)
-            continue
-        for member in members or ():
-            userids.add(member.decode() if isinstance(member, bytes) else str(member))
-    if owner_userid:
-        # 被删用户自己的 session 由 conversation_service.clear_session 处理，
-        # 这里不重复写回，避免把已清空的会话又建出来。
-        userids.discard(owner_userid)
+    index_keys = sorted(set(index_keys))
+    userids = redis_client.fence_recommendation_session_indexes(index_keys)
 
     rewritten = 0
     for userid in sorted(userids):
-        session = redis_client.get_session(userid)
-        if not session:
+        if owner_userid and userid == owner_userid:
+            redis_client.remove_recommendation_session_index_members(
+                userid, index_keys,
+            )
             continue
-        current_version = int(session.get("session_version") or 0)
-        if not _scrub_session_payload(session, delivery_set, grouped):
-            continue
-        # 版本 +1：任何按旧版本算好的 staged mutation 会 CAS 失败，不会把刚擦掉的
-        # 推荐正文再写回来。
-        session["session_version"] = current_version + 1
-        try:
-            if redis_client.save_session_if_version(userid, session, current_version):
-                rewritten += 1
-        except Exception:
-            logger.warning("recommendation_privacy: session rewrite failed batch=%s", trace)
-
-    for key in index_keys:
-        try:
-            r.delete(key)
-        except Exception:
-            logger.warning("recommendation_privacy: session index delete failed batch=%s", trace)
+        cleaned = False
+        for _attempt in range(3):
+            session = redis_client.get_session(userid)
+            if not session:
+                cleaned = True
+                break
+            current_version = int(session.get("session_version") or 0)
+            if not _scrub_session_payload(session, delivery_set, grouped):
+                cleaned = True
+                break
+            session["session_version"] = current_version + 1
+            try:
+                if redis_client.save_session_if_version(
+                    userid, session, current_version,
+                ):
+                    rewritten += 1
+                    cleaned = True
+                    break
+            except Exception:
+                logger.warning(
+                    "recommendation_privacy: session rewrite failed batch=%s",
+                    trace,
+                )
+                raise
+        if cleaned:
+            redis_client.remove_recommendation_session_index_members(
+                userid, index_keys,
+            )
+        else:
+            raise RuntimeError("session_scrub_cas_conflict")
     _log_batch(trace, "session_scrub", "redis_session", rewritten)
     return rewritten
 

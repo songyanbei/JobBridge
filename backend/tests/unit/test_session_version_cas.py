@@ -23,16 +23,17 @@ def test_redis_session_cas_passes_expected_version_and_payload():
         ) is True
 
     args = redis.eval.call_args.args
-    assert args[1:7] == (
-        3,
+    assert args[1:8] == (
+        4,
         "session:u-1",
         "__no_user_lock_fence__",
         "recommendation:session:indexes:u-1",
+        "recommendation:session:revoked_indexes",
         3,
         1800,
     )
-    assert '"session_version": 4' in args[7]
-    assert args[9:] == ("0", "u-1", "[]")
+    assert '"session_version": 4' in args[8]
+    assert args[10:] == ("0", "u-1", "[]")
 
 
 def test_redis_session_cas_rejects_lost_lock_fence():
@@ -64,7 +65,7 @@ def test_redis_session_cas_can_restore_missing_durable_state():
             allow_missing=True,
         ) is True
 
-    assert redis.eval.call_args.args[9] == "1"
+    assert redis.eval.call_args.args[10] == "1"
 
 
 def test_redis_session_delete_cas_passes_version_and_fence():

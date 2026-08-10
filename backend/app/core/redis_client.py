@@ -89,6 +89,9 @@ RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX = "recommendation:session:target:"
 RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX = (
     "recommendation:session:indexes:"
 )
+RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY = (
+    "recommendation:session:revoked_indexes"
+)
 
 
 def recommendation_session_index_keys(session: dict) -> list[str]:
@@ -140,9 +143,10 @@ def save_session(userid: str, session: dict) -> None:
     r = get_redis()
     r.eval(
         _SAVE_SESSION_WITH_INDEXES_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),
         userid,
@@ -152,6 +156,7 @@ def save_session(userid: str, session: dict) -> None:
 
 _SAVE_SESSION_WITH_INDEXES_SCRIPT = """
 local registry = KEYS[2]
+local revoked_indexes = KEYS[3]
 local userid = ARGV[3]
 local ttl = tonumber(ARGV[1])
 local new_indexes = cjson.decode(ARGV[4])
@@ -166,6 +171,7 @@ local function require_set_or_none(key, role)
     return key_type
 end
 local registry_type = require_set_or_none(registry, 'registry')
+require_set_or_none(revoked_indexes, 'revocation_fence')
 local old_indexes = {}
 if registry_type == 'set' then
     old_indexes = redis.call('SMEMBERS', registry)
@@ -175,6 +181,9 @@ for _, index_key in ipairs(old_indexes) do
 end
 for _, index_key in ipairs(new_indexes) do
     require_set_or_none(index_key, 'new_index')
+    if redis.call('SISMEMBER', revoked_indexes, index_key) == 1 then
+        error('SESSION_INDEX_REVOKED key=' .. index_key)
+    end
 end
 redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
 for _, index_key in ipairs(old_indexes) do
@@ -244,6 +253,7 @@ elseif expected ~= 0 and ARGV[5] ~= '1' then
     return 0
 end
 local registry = KEYS[3]
+local revoked_indexes = KEYS[4]
 local userid = ARGV[6]
 local new_indexes = cjson.decode(ARGV[7])
 local function require_set_or_none(key, role)
@@ -257,6 +267,7 @@ local function require_set_or_none(key, role)
     return key_type
 end
 local registry_type = require_set_or_none(registry, 'registry')
+require_set_or_none(revoked_indexes, 'revocation_fence')
 local old_indexes = {}
 if registry_type == 'set' then
     old_indexes = redis.call('SMEMBERS', registry)
@@ -266,6 +277,9 @@ for _, index_key in ipairs(old_indexes) do
 end
 for _, index_key in ipairs(new_indexes) do
     require_set_or_none(index_key, 'new_index')
+    if redis.call('SISMEMBER', revoked_indexes, index_key) == 1 then
+        error('SESSION_INDEX_REVOKED key=' .. index_key)
+    end
 end
 redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 for _, index_key in ipairs(old_indexes) do
@@ -335,6 +349,98 @@ return 1
 """
 
 
+_FENCE_SESSION_INDEXES_SCRIPT = """
+local fence = KEYS[1]
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+end
+require_set_or_none(fence, 'revocation_fence')
+for _, index_key in ipairs(ARGV) do
+    require_set_or_none(index_key, 'revoked_index')
+end
+for _, index_key in ipairs(ARGV) do
+    redis.call('SADD', fence, index_key)
+end
+local members = {}
+local seen = {}
+for _, index_key in ipairs(ARGV) do
+    for _, userid in ipairs(redis.call('SMEMBERS', index_key)) do
+        if not seen[userid] then
+            seen[userid] = true
+            table.insert(members, userid)
+        end
+    end
+end
+return members
+"""
+
+
+_REMOVE_SESSION_INDEX_MEMBERS_SCRIPT = """
+local registry = KEYS[1]
+local userid = ARGV[1]
+local registry_type = redis.call('TYPE', registry)['ok']
+if registry_type ~= 'none' and registry_type ~= 'set' then
+    error(
+        'SESSION_INDEX_WRONGTYPE registry' ..
+        ' key=' .. registry .. ' type=' .. registry_type
+    )
+end
+for index = 2, #ARGV do
+    local index_key = ARGV[index]
+    local key_type = redis.call('TYPE', index_key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE revoked_index' ..
+            ' key=' .. index_key .. ' type=' .. key_type
+        )
+    end
+end
+for index = 2, #ARGV do
+    redis.call('SREM', ARGV[index], userid)
+    redis.call('SREM', registry, ARGV[index])
+end
+return 1
+"""
+
+
+def fence_recommendation_session_indexes(index_keys: list[str]) -> set[str]:
+    """Fence revoked reverse indexes and return their current session owners."""
+    if not index_keys:
+        return set()
+    members = get_redis().eval(
+        _FENCE_SESSION_INDEXES_SCRIPT,
+        1,
+        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+        *sorted(set(index_keys)),
+    )
+    return {
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in members
+    }
+
+
+def remove_recommendation_session_index_members(
+    userid: str,
+    index_keys: list[str],
+) -> None:
+    """Remove one session from revoked indexes without deleting whole keys."""
+    if not index_keys:
+        return
+    get_redis().eval(
+        _REMOVE_SESSION_INDEX_MEMBERS_SCRIPT,
+        1,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        userid,
+        *sorted(set(index_keys)),
+    )
+
+
 def save_session_if_version(
     userid: str,
     session: dict,
@@ -353,10 +459,11 @@ def save_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _SAVE_SESSION_CAS_SCRIPT,
-        3,
+        4,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
         f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
         int(expected_version),
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),

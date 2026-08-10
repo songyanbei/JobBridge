@@ -1,6 +1,8 @@
 """Redis 集成测试（需要真实 Redis）。"""
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from redis.exceptions import ResponseError
@@ -23,7 +25,10 @@ from app.core.redis_client import (
     QUEUE_INCOMING,
     RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX,
     RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX,
+    RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
     RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
+    fence_recommendation_session_indexes,
+    remove_recommendation_session_index_members,
     validate_redis_durability_policy,
 )
 
@@ -382,6 +387,228 @@ class TestSessionOperations:
             assert r.exists(session_key, registry_key, new_index) == 0
         finally:
             r.delete(*keys)
+
+    def test_revocation_fence_rejects_new_and_cas_session_writes(self):
+        userid = "integration-revocation-existing"
+        rejected_userid = "integration-revocation-rejected"
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:revoked"
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+        delete_session(userid)
+        delete_session(rejected_userid)
+        try:
+            payload = {
+                "session_version": 1,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["revoked"],
+                },
+            }
+            save_session(userid, payload)
+            assert fence_recommendation_session_indexes([index_key]) == {userid}
+
+            with pytest.raises(ResponseError, match="SESSION_INDEX_REVOKED"):
+                save_session(rejected_userid, payload)
+            assert get_session(rejected_userid) is None
+
+            with pytest.raises(ResponseError, match="SESSION_INDEX_REVOKED"):
+                save_session_if_version(userid, {
+                    **payload,
+                    "session_version": 2,
+                }, 1)
+            assert get_session(userid)["session_version"] == 1
+
+            assert save_session_if_version(
+                userid,
+                {"session_version": 2},
+                1,
+            )
+            remove_recommendation_session_index_members(userid, [index_key])
+            assert r.exists(index_key) == 0
+        finally:
+            delete_session(userid)
+            delete_session(rejected_userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+
+    def test_revoked_member_cleanup_updates_index_and_registry_atomically(self):
+        userid = "integration-revocation-stale-member"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:stale"
+        r = get_redis()
+        r.delete(registry_key, index_key)
+        r.sadd(registry_key, index_key)
+        r.sadd(index_key, userid)
+        try:
+            remove_recommendation_session_index_members(userid, [index_key])
+            assert r.exists(registry_key) == 0
+            assert r.exists(index_key) == 0
+        finally:
+            r.delete(registry_key, index_key)
+
+    def test_revocation_fence_preflights_all_indexes_before_writing(self):
+        valid_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:valid"
+        wrong_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:wrong"
+        r = get_redis()
+        r.srem(
+            RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+            valid_index,
+            wrong_index,
+        )
+        r.delete(valid_index, wrong_index)
+        r.sadd(valid_index, "existing-user")
+        r.set(wrong_index, "not-a-set")
+        try:
+            with pytest.raises(
+                ResponseError,
+                match="SESSION_INDEX_WRONGTYPE revoked_index",
+            ):
+                fence_recommendation_session_indexes([
+                    valid_index,
+                    wrong_index,
+                ])
+
+            assert r.smembers(valid_index) == {"existing-user"}
+            assert r.get(wrong_index) == "not-a-set"
+            assert not r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                valid_index,
+            )
+            assert not r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                wrong_index,
+            )
+        finally:
+            r.delete(valid_index, wrong_index)
+            r.srem(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                valid_index,
+                wrong_index,
+            )
+
+    def test_revoked_member_cleanup_preflights_before_removing_any_member(self):
+        userid = "integration-revocation-remove-preflight"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        valid_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:remove-ok"
+        wrong_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:remove-wrong"
+        r = get_redis()
+        r.delete(registry_key, valid_index, wrong_index)
+        r.sadd(registry_key, valid_index, wrong_index)
+        r.sadd(valid_index, userid)
+        r.set(wrong_index, "not-a-set")
+        try:
+            with pytest.raises(
+                ResponseError,
+                match="SESSION_INDEX_WRONGTYPE revoked_index",
+            ):
+                remove_recommendation_session_index_members(
+                    userid,
+                    [valid_index, wrong_index],
+                )
+
+            assert r.smembers(registry_key) == {valid_index, wrong_index}
+            assert r.smembers(valid_index) == {userid}
+            assert r.get(wrong_index) == "not-a-set"
+        finally:
+            r.delete(registry_key, valid_index, wrong_index)
+
+    def test_concurrent_save_is_observed_or_rejected_by_revocation_fence(self):
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:race"
+        userids = [f"integration-revocation-race-{index}" for index in range(12)]
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+        for userid in userids:
+            delete_session(userid)
+        barrier = threading.Barrier(len(userids) + 1)
+
+        def _save(userid):
+            barrier.wait()
+            try:
+                save_session(userid, {
+                    "session_version": 1,
+                    "candidate_snapshot": {
+                        "direction": "search_worker",
+                        "candidate_ids": ["race"],
+                    },
+                })
+                return userid, "saved"
+            except ResponseError as exc:
+                assert "SESSION_INDEX_REVOKED" in str(exc)
+                return userid, "rejected"
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(userids)) as executor:
+                futures = [executor.submit(_save, userid) for userid in userids]
+                barrier.wait()
+                fenced_members = fence_recommendation_session_indexes([index_key])
+                results = dict(future.result() for future in futures)
+
+            for userid, result in results.items():
+                if result == "saved":
+                    assert userid in fenced_members
+                else:
+                    assert get_session(userid) is None
+        finally:
+            for userid in userids:
+                delete_session(userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+
+    def test_real_session_scrub_fences_and_rewrites_all_indexes(self):
+        from app.services.recommendation_privacy_service import (
+            REDACTED_PLACEHOLDER,
+            TargetRef,
+            scrub_recommendation_sessions,
+        )
+
+        userid = "integration-revocation-scrub"
+        delivery_key = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}scrub-delivery"
+        )
+        target_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:42"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        revoked_keys = [delivery_key, target_key]
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, *revoked_keys)
+        delete_session(userid)
+        try:
+            save_session(userid, {
+                "session_version": 1,
+                "history": [{
+                    "role": "assistant",
+                    "content": "sensitive recommendation",
+                    "delivery_id": "scrub-delivery",
+                }],
+                "shown_items": ["42"],
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["42"],
+                },
+            })
+
+            assert scrub_recommendation_sessions(
+                ["scrub-delivery"],
+                [TargetRef("resume", 42)],
+            ) == 1
+
+            session = get_session(userid)
+            assert session["session_version"] == 2
+            assert session["history"][0] == {
+                "role": "assistant",
+                "content": REDACTED_PLACEHOLDER,
+            }
+            assert session["shown_items"] == []
+            assert session["candidate_snapshot"] is None
+            assert r.exists(registry_key, delivery_key, target_key) == 0
+            assert r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                delivery_key,
+            )
+            assert r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                target_key,
+            )
+        finally:
+            delete_session(userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, *revoked_keys)
 
 
 class TestDedup:

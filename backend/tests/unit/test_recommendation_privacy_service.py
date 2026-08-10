@@ -654,8 +654,7 @@ class _FakeRedis:
         return set(self._index.get(key, set()))
 
     def delete(self, key):
-        self.deleted.append(key)
-        self._index.pop(key, None)
+        raise AssertionError("session scrub must not delete whole index keys")
 
     def keys(self, *args, **kwargs):  # pragma: no cover - 必须永远不被调用
         raise AssertionError("§10.1.1 禁止全库 KEYS 扫描")
@@ -691,13 +690,23 @@ class TestSessionScrub:
             },
         }
         saved: dict = {}
+        removed: list[tuple[str, tuple[str, ...]]] = []
 
         def _save(userid, session, expected_version, *a, **k):
             assert expected_version == 4
             saved[userid] = session
             return True
 
-        monkeypatch.setattr(redis_client, "get_redis", lambda: fake)
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: set().union(*(fake._index.get(key, set()) for key in keys)),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
         monkeypatch.setattr(redis_client, "get_session", lambda uid: stored.get(uid))
         monkeypatch.setattr(redis_client, "save_session_if_version", _save)
 
@@ -719,23 +728,127 @@ class TestSessionScrub:
         }
         # 版本 +1，让按旧版本算好的 staged mutation CAS 失败，不会把正文写回来。
         assert session["session_version"] == 5
-        # 索引用完即删，且全程没有 KEYS 扫描。
-        assert set(fake.deleted) == {
+        assert removed == [(VIEWER, tuple(sorted({
             f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-other",
             f"{privacy.SESSION_TARGET_INDEX_PREFIX}resume:7",
-        }
+        })))]
 
     def test_skips_owner_session(self, monkeypatch):
         from app.core import redis_client
 
         fake = _FakeRedis({f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-own": {OWNER}})
-        monkeypatch.setattr(redis_client, "get_redis", lambda: fake)
+        removed = []
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {OWNER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
         monkeypatch.setattr(
             redis_client, "get_session",
             lambda uid: pytest.fail("被删用户自己的 session 由 clear_session 处理"),
         )
 
         assert _REAL_SCRUB(["d-own"], [], owner_userid=OWNER) == 0
+        assert removed == [(
+            OWNER,
+            (f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-own",),
+        )]
+
+    def test_cas_conflicts_raise_without_removing_indexes_and_can_retry(
+        self,
+        monkeypatch,
+    ):
+        import copy
+        from app.core import redis_client
+
+        index_key = f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-conflict"
+        original = {
+            "session_version": 4,
+            "history": [{
+                "role": "assistant",
+                "content": PHONE_IN_BODY,
+                "delivery_id": "d-conflict",
+            }],
+        }
+        removed = []
+        attempts = []
+        should_conflict = {"value": True}
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {VIEWER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "get_session",
+            lambda userid: copy.deepcopy(original),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
+
+        def _save(*args, **kwargs):
+            attempts.append(args[2])
+            return not should_conflict["value"]
+
+        monkeypatch.setattr(redis_client, "save_session_if_version", _save)
+
+        with pytest.raises(RuntimeError, match="session_scrub_cas_conflict"):
+            _REAL_SCRUB(["d-conflict"], [])
+        assert attempts == [4, 4, 4]
+        assert removed == []
+
+        should_conflict["value"] = False
+        assert _REAL_SCRUB(["d-conflict"], []) == 1
+        assert removed == [(VIEWER, (index_key,))]
+
+    def test_redis_rewrite_error_propagates_without_removing_indexes(
+        self,
+        monkeypatch,
+    ):
+        import copy
+        from app.core import redis_client
+
+        original = {
+            "session_version": 2,
+            "history": [{
+                "role": "assistant",
+                "content": PHONE_IN_BODY,
+                "delivery_id": "d-error",
+            }],
+        }
+        removed = []
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {VIEWER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "get_session",
+            lambda userid: copy.deepcopy(original),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "save_session_if_version",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("down")),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
+
+        with pytest.raises(ConnectionError, match="down"):
+            _REAL_SCRUB(["d-error"], [])
+        assert removed == []
 
 
 # ---------------------------------------------------------------------------
