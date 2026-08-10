@@ -401,6 +401,26 @@ def _fail_pending_outbox(db: Session, delivery_ids: Sequence[str]) -> int:
     return int(total or 0)
 
 
+def _lock_redactable_deliveries(
+    db: Session,
+    external_userid: str,
+    candidate_ids: Sequence[str],
+    pending_filter,
+) -> list[RecommendationDelivery]:
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(
+            RecommendationDelivery.userid == external_userid,
+            RecommendationDelivery.delivery_id.in_(candidate_ids),
+            pending_filter,
+        )
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
 def redact_user_recommendation_content(
     db: Session,
     external_userid: str,
@@ -425,19 +445,36 @@ def redact_user_recommendation_content(
         | RecommendationDelivery.session_patch_ciphertext.isnot(None)
         | RecommendationDelivery.status.in_(tuple(_STATUS_AFTER_REDACTION))
     )
+    last_candidate_id: str | None = None
     while True:
-        rows = db.query(RecommendationDelivery).filter(
+        candidate_query = db.query(
+            RecommendationDelivery.delivery_id,
+        ).filter(
             RecommendationDelivery.userid == external_userid,
             pending_filter,
-        ).limit(BATCH_SIZE).all()
-        if not rows:
+        )
+        if last_candidate_id is not None:
+            candidate_query = candidate_query.filter(
+                RecommendationDelivery.delivery_id > last_candidate_id,
+            )
+        candidate_ids = [
+            str(row[0])
+            for row in candidate_query.order_by(
+                RecommendationDelivery.delivery_id,
+            ).limit(BATCH_SIZE).all()
+        ]
+        if not candidate_ids:
             break
+        rows = _lock_redactable_deliveries(
+            db, external_userid, candidate_ids, pending_filter,
+        )
         for delivery in rows:
             if _redact_delivery_row(delivery, moment):
                 redacted += 1
                 touched.append(delivery.delivery_id)
         _settle(db, commit)
-        if len(rows) < BATCH_SIZE:
+        last_candidate_id = candidate_ids[-1]
+        if len(candidate_ids) < BATCH_SIZE:
             break
     if touched:
         _fail_pending_outbox(db, touched)

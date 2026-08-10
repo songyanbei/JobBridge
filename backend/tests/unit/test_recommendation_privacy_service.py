@@ -355,6 +355,54 @@ class TestImmediateRedaction:
         assert privacy.redact_user_recommendation_content(db, OWNER) == 1
         assert privacy.redact_user_recommendation_content(db, OWNER) == 0
 
+    def test_full_candidate_page_continues_when_locked_rows_shrink(
+        self, db, monkeypatch,
+    ):
+        _add_user(db, OWNER)
+        _add_request(db, "req-batch", OWNER, [])
+        for index in range(501):
+            _add_delivery(
+                db,
+                f"batch-{index:04d}",
+                userid=OWNER,
+                request_id="req-batch",
+                target_ids=[],
+            )
+        db.commit()
+
+        original_lock = privacy._lock_redactable_deliveries
+        candidate_page_sizes = []
+
+        def _shrink_first_locked_page(
+            session, external_userid, candidate_ids, pending_filter,
+        ):
+            candidate_page_sizes.append(len(candidate_ids))
+            if len(candidate_page_sizes) == 1:
+                concurrent = session.get(
+                    RecommendationDelivery, candidate_ids[0],
+                )
+                privacy._redact_delivery_row(concurrent, _naive(datetime.now(timezone.utc)))
+                session.flush()
+            return original_lock(
+                session, external_userid, candidate_ids, pending_filter,
+            )
+
+        monkeypatch.setattr(
+            privacy, "_lock_redactable_deliveries", _shrink_first_locked_page,
+        )
+
+        changed = privacy.redact_user_recommendation_content(
+            db, OWNER, commit=False,
+        )
+
+        assert candidate_page_sizes == [500, 1]
+        assert changed == 500
+        assert db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.userid == OWNER,
+            RecommendationDelivery.content_ciphertext.isnot(None),
+        ).count() == 0
+        assert db.get(RecommendationDelivery, "batch-0500").content_ciphertext is None
+
 
 # ---------------------------------------------------------------------------
 # §9.11.1 步骤 1~7 闭环
