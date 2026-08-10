@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from redis.exceptions import ResponseError
 
+from app.services import conversation_service
 from app.core.redis_client import (
     RedisDurabilityPolicyError,
     SessionCommitDeadlineExceeded,
@@ -89,6 +90,31 @@ class TestRedisConnection:
             "appendonly": "yes",
             "appendfsync": "always",
         }
+
+
+    @pytest.mark.parametrize(
+        ("operation", "payload"),
+        [
+            ("", None),
+            ("unknown", None),
+            (None, None),
+            ("save", None),
+            ("save", {}),
+        ],
+    )
+    def test_real_applied_check_rejects_invalid_empty_session_commits(
+        self, operation, payload,
+    ):
+        userid = "integration-invalid-staged-session"
+        delete_session(userid)
+        commit = conversation_service.StagedSessionCommit(
+            userid=userid,
+            operation=operation,
+            expected_version=0,
+            payload=payload,
+        )
+
+        assert conversation_service.is_staged_session_applied(commit) is False
 
     @pytest.mark.parametrize(
         ("name", "unsafe_value", "safe_value"),

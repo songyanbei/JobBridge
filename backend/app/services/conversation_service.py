@@ -247,10 +247,15 @@ def apply_staged_session(commit: StagedSessionCommit) -> bool:
 
 def is_staged_session_applied(commit: StagedSessionCommit) -> bool:
     """识别“Redis 已成功、DB 状态回写前崩溃”的幂等恢复窗口。"""
-    current = redis_get_session(commit.userid)
     if commit.operation == "delete":
-        return current is None
-    return current == commit.payload
+        return redis_get_session(commit.userid) is None
+    if (
+        commit.operation != "save"
+        or not isinstance(commit.payload, dict)
+        or not commit.payload
+    ):
+        return False
+    return redis_get_session(commit.userid) == commit.payload
 
 
 # ---------------------------------------------------------------------------
