@@ -404,6 +404,55 @@ class TestImmediateRedaction:
         assert db.get(RecommendationDelivery, "batch-0500").content_ciphertext is None
 
 
+@pytest.mark.parametrize(
+    ("commit", "expected_events"),
+    [
+        (False, [("outbox", 501), ("delivery", 500), ("delivery", 1)]),
+        (
+            True,
+            [
+                ("outbox", 500),
+                ("delivery", 500),
+                ("outbox", 1),
+                ("delivery", 1),
+            ],
+        ),
+    ],
+)
+def test_target_redaction_uses_global_or_per_batch_lock_order(
+    db, monkeypatch, commit, expected_events,
+):
+    delivery_ids = {f"lock-order-{index:04d}" for index in range(501)}
+    events = []
+    monkeypatch.setattr(
+        privacy,
+        "_delivery_ids_referencing_targets",
+        lambda *_args: delivery_ids,
+    )
+
+    def _lock_outboxes(_db, ids):
+        events.append(("outbox", len(ids)))
+
+    def _lock_deliveries(_db, ids):
+        events.append(("delivery", len(ids)))
+        return []
+
+    monkeypatch.setattr(
+        privacy, "_lock_outboxes_for_deliveries", _lock_outboxes,
+    )
+    monkeypatch.setattr(
+        privacy, "_lock_target_deliveries", _lock_deliveries,
+    )
+
+    privacy.redact_deliveries_for_targets(
+        db,
+        [privacy.TargetRef("resume", 7)],
+        commit=commit,
+    )
+
+    assert events == expected_events
+
+
 # ---------------------------------------------------------------------------
 # §9.11.1 步骤 1~7 闭环
 # ---------------------------------------------------------------------------
@@ -462,6 +511,36 @@ def _build_full_fixture(db):
 
 
 class TestDeleteRecommendationUserData:
+    def test_user_cleanup_enters_target_redaction_outbox_first(
+        self, db, monkeypatch,
+    ):
+        _build_full_fixture(db)
+        events = []
+        original_outbox_lock = privacy._lock_outboxes_for_deliveries
+        original_delivery_lock = privacy._lock_target_deliveries
+
+        def _lock_outboxes(session, delivery_ids):
+            events.append("outbox")
+            return original_outbox_lock(session, delivery_ids)
+
+        def _lock_deliveries(session, delivery_ids):
+            events.append("delivery")
+            return original_delivery_lock(session, delivery_ids)
+
+        monkeypatch.setattr(
+            privacy, "_lock_outboxes_for_deliveries", _lock_outboxes,
+        )
+        monkeypatch.setattr(
+            privacy, "_lock_target_deliveries", _lock_deliveries,
+        )
+
+        report = privacy.delete_recommendation_user_data(
+            db, OWNER, commit=False,
+        )
+
+        assert report.ok, report.failed_steps
+        assert events[:2] == ["outbox", "delivery"]
+
     def test_removes_every_viewer_side_fact(self, db):
         _build_full_fixture(db)
 

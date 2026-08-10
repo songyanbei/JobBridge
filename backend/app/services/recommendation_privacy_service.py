@@ -684,6 +684,31 @@ def _scrub_request_facts(
     return changed
 
 
+def _lock_outboxes_for_deliveries(
+    db: Session,
+    delivery_ids: Sequence[str],
+) -> None:
+    if not delivery_ids:
+        return
+    db.query(WecomOutboundOutbox.id).filter(
+        WecomOutboundOutbox.recommendation_delivery_id.in_(delivery_ids),
+    ).order_by(WecomOutboundOutbox.id).with_for_update().all()
+
+
+def _lock_target_deliveries(
+    db: Session,
+    delivery_ids: Sequence[str],
+) -> list[RecommendationDelivery]:
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
 def redact_deliveries_for_targets(
     db: Session,
     targets: Sequence[TargetRef],
@@ -706,12 +731,17 @@ def redact_deliveries_for_targets(
     if not delivery_ids:
         return set()
 
+    ordered_delivery_ids = sorted(delivery_ids)
+    if not commit:
+        _lock_outboxes_for_deliveries(db, ordered_delivery_ids)
+
     touched: set[str] = set()
     request_ids: set[str] = set()
-    for chunk in _chunks(sorted(delivery_ids)):
-        deliveries = db.query(RecommendationDelivery).filter(
-            RecommendationDelivery.delivery_id.in_(chunk),
-        ).all()
+    for chunk in _chunks(ordered_delivery_ids):
+        if commit:
+            _lock_outboxes_for_deliveries(db, chunk)
+        deliveries = _lock_target_deliveries(db, chunk)
+        batch_touched: list[str] = []
         for delivery in deliveries:
             if exclude_userid is not None and delivery.userid == exclude_userid:
                 # 被删用户自己的 delivery 在步骤 2 整行删除，不用逐字段擦。
@@ -725,11 +755,14 @@ def redact_deliveries_for_targets(
             _recount_impressions(db, delivery)
             request_ids.add(delivery.request_id)
             touched.add(delivery.delivery_id)
+            batch_touched.append(delivery.delivery_id)
             if context_changed or body_changed:
                 _log_batch(trace, "target_redaction", "recommendation_delivery", 1)
+        if commit and batch_touched:
+            _fail_pending_outbox(db, batch_touched)
         _settle(db, commit)
 
-    if touched:
+    if touched and not commit:
         _fail_pending_outbox(db, sorted(touched))
     scrubbed = _scrub_request_facts(db, sorted(request_ids), grouped)
     _settle(db, commit)
