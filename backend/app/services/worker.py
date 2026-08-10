@@ -38,6 +38,8 @@ from app.core.redis_client import (
     QUEUE_RATE_LIMIT_NOTIFY,
     QUEUE_SEND_RETRY,
     SESSION_TTL,
+    SessionCommitDeadlineExceeded,
+    UserLockUnavailable,
     enqueue_message,
     get_redis,
     user_lock,
@@ -858,6 +860,35 @@ class Worker:
             .all()
         )
 
+    @staticmethod
+    def _lock_outboxes_for_event(
+        db: Session, inbound_event_id: Any,
+    ) -> list[WecomOutboundOutbox]:
+        if not inbound_event_id:
+            return []
+        return (
+            db.query(WecomOutboundOutbox)
+            .filter(WecomOutboundOutbox.inbound_event_id == int(inbound_event_id))
+            .order_by(WecomOutboundOutbox.id)
+            .with_for_update()
+            .all()
+        )
+
+    @staticmethod
+    def _lock_deliveries_by_id(
+        db: Session, delivery_ids: list[str],
+    ) -> list[RecommendationDelivery]:
+        if not delivery_ids:
+            return []
+        return (
+            db.query(RecommendationDelivery)
+            .populate_existing()
+            .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+            .order_by(RecommendationDelivery.delivery_id)
+            .with_for_update()
+            .all()
+        )
+
     def _claim_session_commits(
         self,
         *,
@@ -870,11 +901,34 @@ class Worker:
             stale_before = func.timestampadd(
                 text("SECOND"), -SESSION_COMMIT_STALE_SECONDS, now,
             )
-            query = db.query(WecomInboundEvent).filter(
+            deadline_epoch_value = func.coalesce(
+                WecomInboundEvent.session_commit_deadline_epoch,
+                func.unix_timestamp(func.coalesce(
+                    WecomInboundEvent.worker_started_at,
+                    WecomInboundEvent.created_at,
+                )) + SESSION_TTL,
+            )
+            deadline_epoch = deadline_epoch_value.label(
+                "session_commit_deadline_epoch",
+            )
+            deadline_reached_value = (
+                deadline_epoch_value <= func.unix_timestamp(now)
+            )
+            deadline_reached = deadline_reached_value.label(
+                "session_commit_deadline_reached",
+            )
+            query = db.query(
+                WecomInboundEvent,
+                deadline_epoch,
+                deadline_reached,
+            ).filter(
                 WecomInboundEvent.status == "session_pending",
                 or_(
-                    WecomInboundEvent.session_next_attempt_at.is_(None),
-                    WecomInboundEvent.session_next_attempt_at <= now,
+                    or_(
+                        WecomInboundEvent.session_next_attempt_at.is_(None),
+                        WecomInboundEvent.session_next_attempt_at <= now,
+                    ),
+                    deadline_reached_value,
                 ),
                 or_(
                     WecomInboundEvent.session_apply_locked_at.is_(None),
@@ -892,13 +946,26 @@ class Worker:
                 .all()
             )
             claimed: list[dict] = []
-            for row in rows:
+            for row, raw_deadline_epoch, reached in rows:
+                operation = str(row.session_operation or "")
+                payload_available = True
                 try:
                     payload = self._load_session_patch(db, row)
                 except Exception as exc:
                     # §10.6：解密失败 fail-closed，保持 prepared 并告警，绝不走明文旁路。
-                    self._backoff_session_commit(row, exc)
-                    continue
+                    if not reached:
+                        self._backoff_session_commit(row, exc)
+                        continue
+                    payload = None
+                    payload_available = operation == "delete"
+                if operation == "save" and payload is None:
+                    payload_available = False
+                    if not reached:
+                        self._backoff_session_commit(
+                            row,
+                            RuntimeError("durable session save payload is missing"),
+                        )
+                        continue
                 claim_owner = uuid.uuid4().hex
                 row.session_apply_locked_at = now
                 row.session_apply_lease_owner = claim_owner
@@ -910,14 +977,17 @@ class Worker:
                     "userid": row.from_userid,
                     "attempts": int(row.session_apply_attempts),
                     "lease_owner": claim_owner,
+                    "deadline_epoch": raw_deadline_epoch,
+                    "deadline_reached": bool(reached),
+                    "payload_available": payload_available,
                     "commit": conversation_service.StagedSessionCommit(
                         userid=row.from_userid,
-                        operation=str(row.session_operation or ""),
+                        operation=operation,
                         expected_version=int(
                             row.session_expected_version or 0,
                         ),
                         payload=payload,
-                        deadline_epoch=row.session_commit_deadline_epoch,
+                        deadline_epoch=raw_deadline_epoch,
                     ),
                 })
             db.commit()
@@ -1048,8 +1118,139 @@ class Worker:
         finally:
             db.close()
 
+    def _terminalize_session_commit_locked(
+        self,
+        db: Session,
+        row: WecomInboundEvent,
+        *,
+        error_code: str,
+        error: Exception,
+    ) -> None:
+        from app.services.recommendation_delivery_service import (
+            purge_delivery_content,
+        )
+
+        outboxes = self._lock_outboxes_for_event(db, row.id)
+        delivery_ids = sorted({
+            str(outbox.recommendation_delivery_id)
+            for outbox in outboxes
+            if outbox.recommendation_delivery_id is not None
+        })
+        for delivery in self._lock_deliveries_by_id(db, delivery_ids):
+            if delivery.status in (
+                DELIVERY_PREPARED,
+                DELIVERY_PENDING,
+                DELIVERY_RETRY_WAIT,
+            ):
+                delivery.status = DELIVERY_PERMANENT_FAILED
+                delivery.last_error_code = error_code[:32]
+                delivery.last_error = str(error)[:500]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+            elif delivery.status == DELIVERY_SENDING:
+                delivery.status = DELIVERY_UNKNOWN
+                delivery.last_error_code = error_code[:32]
+                delivery.last_error = str(error)[:500]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+            purge_delivery_content(delivery)
+
+        db.flush()
+        for outbox in outboxes:
+            if outbox.status not in ("pending", "sending"):
+                continue
+            was_sending = outbox.status == "sending"
+            outbox.status = "dead_letter"
+            outbox.locked_at = None
+            outbox.next_attempt_at = None
+            outbox.last_error = (
+                "ambiguous provider outcome; session commit terminalized"
+                if was_sending
+                else f"session commit terminalized: {error_code}"
+            )[:1000]
+
+        row.status = "dead_letter"
+        row.session_operation = None
+        row.session_expected_version = None
+        row.session_payload = None
+        row.session_apply_locked_at = None
+        row.session_apply_lease_owner = None
+        row.session_next_attempt_at = None
+        row.session_commit_deadline_epoch = None
+        row.worker_finished_at = func.now(6)
+        row.error_message = f"{type(error).__name__}: {error}"[:1000]
+
+    def _mark_session_commit_terminal(
+        self,
+        item: dict,
+        *,
+        error_code: str,
+        error: Exception,
+    ) -> bool:
+        db = SessionLocal()
+        try:
+            row = db.query(WecomInboundEvent).filter(
+                *self._current_session_claim_filters(
+                    item["event_id"], item["lease_owner"],
+                ),
+            ).with_for_update().first()
+            if row is None:
+                db.rollback()
+                return False
+            self._terminalize_session_commit_locked(
+                db,
+                row,
+                error_code=error_code,
+                error=error,
+            )
+            db.commit()
+            log_event(
+                "session_commit_terminal",
+                inbound_event_id=int(row.id),
+                error_code=error_code,
+                severity="alert",
+            )
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: terminalize durable session commit failed event_id=%s",
+                item.get("event_id"),
+            )
+            return False
+        finally:
+            db.close()
+
+    def _finish_expired_session_commit(
+        self,
+        item: dict,
+        error: Exception,
+    ) -> bool:
+        if item.get("payload_available", True):
+            try:
+                if conversation_service.is_staged_session_applied(item["commit"]):
+                    return self._mark_session_commit_applied(
+                        item["event_id"], item["lease_owner"],
+                    )
+            except Exception as check_error:
+                error = RuntimeError(
+                    "durable session commit deadline reached and Redis state "
+                    f"could not be verified: {check_error}"
+                )
+        self._mark_session_commit_terminal(
+            item,
+            error_code="session_commit_deadline",
+            error=error,
+        )
+        return False
+
     def _apply_session_commit_item(self, item: dict) -> bool:
         commit = item["commit"]
+        if item.get("deadline_reached", False):
+            return self._finish_expired_session_commit(
+                item,
+                RuntimeError("durable session commit deadline exceeded"),
+            )
         try:
             applied = conversation_service.apply_staged_session(commit)
             if not applied:
@@ -1058,6 +1259,8 @@ class Worker:
                 raise conversation_service.SessionVersionConflict(
                     "durable session CAS rejected",
                 )
+        except SessionCommitDeadlineExceeded as exc:
+            return self._finish_expired_session_commit(item, exc)
         except Exception as exc:
             self._mark_session_commit_retry(item, exc)
             return False
@@ -1100,12 +1303,39 @@ class Worker:
             try:
                 with user_lock(item["userid"], timeout=5) as lease:
                     if not lease:
-                        self._mark_session_commit_retry(
-                            item, RuntimeError("user lock busy"),
-                        )
+                        if (
+                            lease.unavailable
+                            and item.get("deadline_reached", False)
+                        ):
+                            self._mark_session_commit_terminal(
+                                item,
+                                error_code="session_commit_deadline",
+                                error=RuntimeError(
+                                    "durable session commit deadline reached while "
+                                    "Redis user lock was unavailable"
+                                ),
+                            )
+                        else:
+                            self._mark_session_commit_retry(
+                                item,
+                                RuntimeError(
+                                    "user lock unavailable"
+                                    if lease.unavailable
+                                    else "user lock busy"
+                                ),
+                            )
                         continue
                     lease.assert_owned()
                     self._apply_session_commit_item(item)
+            except UserLockUnavailable as exc:
+                if item.get("deadline_reached", False):
+                    self._mark_session_commit_terminal(
+                        item,
+                        error_code="session_commit_deadline",
+                        error=exc,
+                    )
+                else:
+                    self._mark_session_commit_retry(item, exc)
             except Exception as exc:
                 self._mark_session_commit_retry(item, exc)
         return len(items)

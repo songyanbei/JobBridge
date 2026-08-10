@@ -621,6 +621,10 @@ class UserLockLost(RuntimeError):
     """用户锁已丢失；当前处理结果不得继续提交。"""
 
 
+class UserLockUnavailable(UserLockLost):
+    """Redis unavailable while acquiring or verifying the user lock."""
+
+
 @dataclass
 class UserLockLease:
     acquired: bool
@@ -629,19 +633,25 @@ class UserLockLease:
     lock_id: str
     lock_key: str | None = None
     token: Any = None
+    unavailable: bool = False
 
     def __bool__(self) -> bool:
         return self.acquired
 
     def assert_owned(self) -> None:
         """提交副作用前验证租约仍属于当前处理者。"""
+        if self.unavailable:
+            raise UserLockUnavailable(
+                f"user lock service unavailable: lock_id={self.lock_id}",
+            )
         if not self.acquired or self.lost_event.is_set():
             raise UserLockLost(f"user lock lease lost: lock_id={self.lock_id}")
         try:
             owned = self.lock.owned()
         except redis.exceptions.RedisError as exc:
+            self.unavailable = True
             self.lost_event.set()
-            raise UserLockLost(
+            raise UserLockUnavailable(
                 f"unable to verify user lock: lock_id={self.lock_id}",
             ) from exc
         if not owned:
@@ -668,7 +678,7 @@ def current_user_lock_fence() -> tuple[str, Any] | None:
 def _renew_user_lock(
     lock,
     stop_event: threading.Event,
-    lost_event: threading.Event,
+    lease: UserLockLease,
     lock_id: str,
 ) -> None:
     """在消息处理期间续租用户锁，避免慢 LLM 调用超过固定租约。
@@ -681,10 +691,15 @@ def _renew_user_lock(
         try:
             if not lock.extend(LOCK_TTL, replace_ttl=True):
                 logger.error("user_lock renewal returned false: lock_id=%s", lock_id)
-                lost_event.set()
+                lease.lost_event.set()
                 return
-        except (redis.exceptions.LockError, redis.exceptions.RedisError):
-            lost_event.set()
+        except redis.exceptions.LockError:
+            lease.lost_event.set()
+            logger.exception("user_lock renewal lost ownership: lock_id=%s", lock_id)
+            return
+        except redis.exceptions.RedisError:
+            lease.unavailable = True
+            lease.lost_event.set()
             logger.exception("user_lock renewal failed: lock_id=%s", lock_id)
             return
 
@@ -718,7 +733,14 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[UserLockLease, None, 
         # Worker 会尝试重入队；若重入队同样失败，则把 durable event 标成
         # processing 交给启动恢复。
         logger.exception("user_lock acquire failed: lock_id=%s", lock_id)
-        yield UserLockLease(False, lock, threading.Event(), lock_id, lock_key)
+        yield UserLockLease(
+            False,
+            lock,
+            threading.Event(),
+            lock_id,
+            lock_key,
+            unavailable=True,
+        )
         return
     stop_renewal = threading.Event()
     lost_event = threading.Event()
@@ -728,7 +750,7 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[UserLockLease, None, 
     if acquired:
         renewal_thread = threading.Thread(
             target=_renew_user_lock,
-            args=(lock, stop_renewal, lost_event, lock_id),
+            args=(lock, stop_renewal, lease, lock_id),
             name="user-lock-renewal",
             daemon=True,
         )
