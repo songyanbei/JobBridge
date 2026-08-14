@@ -595,6 +595,51 @@ def test_rollout_feature_defaults_are_fail_closed():
         assert f"{name}=false" in env_example
 
 
+def test_phase10_ci_runs_complete_real_mysql_and_redis_gate():
+    workflow = (ROOT.parent / ".github/workflows/backend-ci.yml").read_text(
+        encoding="utf-8"
+    )
+    start = workflow.index("  backend-phase10-mysql-redis:")
+    end = workflow.index("  backend-recommendation-mysql:", start)
+    job = workflow[start:end]
+
+    assert "DB_USER: root" in job
+    assert "jobbridge_test < sql/schema.sql" in job
+    assert "REDIS_OUTAGE_CONTAINER: jobbridge-phase10-ci-redis" in job
+    for policy in (
+        "--appendonly yes",
+        "--appendfsync always",
+        "--maxmemory-policy noeviction",
+    ):
+        assert policy in job
+    required_tests = (
+        "test_search_sql_mysql.py",
+        "test_phase10_preflight_mysql.py",
+        "test_phase10_down_migration_mysql.py",
+        "test_job_candidate_creation_gate_mysql.py",
+        "test_job_media_hard_delete_delay_mysql.py",
+        "test_job_replace_mysql.py",
+        "test_media_target_cleanup_lock_order_mysql.py",
+        "test_outbox_claim_lock_scope_mysql.py",
+        "test_privacy_lock_order_mysql.py",
+        "test_privacy_redaction_batch_mysql.py",
+        "test_session_commit_deadline_mysql.py",
+        "test_session_commit_lease_owner_mysql.py",
+        "test_target_cleanup_backfill_mysql.py",
+        "test_target_cleanup_checkpoint_redis_mysql.py",
+        "test_target_cleanup_lease_mysql.py",
+        "test_target_cleanup_upsert_mysql.py",
+        "test_ttl_outbox_delivery_lock_order_mysql.py",
+        "test_redis.py",
+        "test_session_commit_redis_unavailable_mysql.py",
+    )
+    for test_file in required_tests:
+        assert job.count(test_file) == 1
+    assert job.index("test_redis.py") < job.index(
+        "test_session_commit_redis_unavailable_mysql.py"
+    )
+
+
 def test_local_media_route_and_shared_directory_contracts():
     from fastapi.staticfiles import StaticFiles
     from app.main import app
