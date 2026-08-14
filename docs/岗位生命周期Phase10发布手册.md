@@ -5,7 +5,7 @@
 ## 1. 发布前冻结
 
 1. 确认待发布制品的 commit、镜像 digest 和回滚制品均已记录。
-2. 确认 `JOB_REPLACEMENT_ENABLED=false`、`JOB_EXPIRY_CLEANUP_ENABLED=false`、`JOB_CANDIDATE_CLEANUP_ENABLED=false`、`JOB_HARD_DELETE_ENABLED=false`。
+2. 确认 `JOB_REPLACEMENT_ENABLED=false`、`JOB_EXPIRY_CLEANUP_ENABLED=false`、`JOB_CANDIDATE_CLEANUP_ENABLED=false`、`JOB_HARD_DELETE_ENABLED=false`。在所有 API、消息 Worker、scheduler 和 session recovery Worker 上预先配置同一份 `RECOMMENDATION_CONTENT_KEY` 或 `RECOMMENDATION_CONTENT_KEY_RING`，并统一 `RECOMMENDATION_CONTENT_KEY_ACTIVE_VERSION`；密钥材料只能来自 secrets/KMS，不得写入日志或发布证据。
 3. 停止全部 API、消息 Worker、scheduler 和 session recovery Worker，等待当前请求结束并确认旧进程全部退出。
 4. 禁止新旧 API 或 Worker 混跑，禁止跨 003/004 schema 边界滚动发布。
 5. 完成并校验 MySQL 全量备份。确认 Redis AOF 文件及持久化目录可恢复；不得清空 revocation fence。
@@ -70,7 +70,7 @@ python -m scripts.phase10_preflight
 
 1. 构建一次制品，API、消息 Worker 和 scheduler 必须使用同一镜像 digest。
 2. 保持四个岗位生命周期开关为 `false`，同时启动新版本 API、消息 Worker、scheduler 和 session recovery Worker；不得让旧版本回流。
-3. 检查 `/health`、消息 Worker/scheduler/session recovery Worker heartbeat、各进程版本和镜像 digest、Redis durability policy 及数据库连接；四类进程必须与已记录的同一制品一致。
+3. 检查 `/health`、消息 Worker/scheduler/session recovery Worker heartbeat、各进程版本和镜像 digest、Redis durability policy、推荐正文活动密钥版本及数据库连接；四类进程必须与已记录的同一制品和同一配置版本一致，只核对密钥版本和可解析状态，不输出密钥材料。
 4. 执行一轮不创建 replacement 的基础消息、后台查询和推荐发送 smoke test。
 5. 再次执行 `python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，结果必须通过。
 
@@ -78,7 +78,7 @@ python -m scripts.phase10_preflight
 
 每一步至少观察一个完整 worker 调度周期；任一门禁或监控异常时停止，不得继续打开后续开关。
 
-1. 开启 `JOB_REPLACEMENT_ENABLED=true`，验证候选创建、审核、取消和激活。
+1. 先以待启用的相同配置执行 `JOB_REPLACEMENT_ENABLED=true python -m scripts.phase10_preflight`，确认 `recommendation_content_key_unavailable=0` 且 `ready=true`；再在所有 API、消息 Worker、scheduler 和 session recovery Worker 同步开启 `JOB_REPLACEMENT_ENABLED=true`，验证候选创建、审核、取消、激活和推荐消息投递。缺少活动版本密钥或各实例配置版本不一致时禁止开启。
 2. 开启 `JOB_CANDIDATE_CLEANUP_ENABLED=true`，验证过期候选进入 media/target durable cleanup。
 3. 开启 `JOB_EXPIRY_CLEANUP_ENABLED=true`，验证到期岗位软删除、version 增长和 cleanup task 创建。
 4. 仅在 media/target backlog 收敛、无 dead-letter 且 hard-delete 延迟窗口满足后，开启 `JOB_HARD_DELETE_ENABLED=true`。

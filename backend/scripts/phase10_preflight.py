@@ -10,6 +10,7 @@ from app.core.redis_client import (
     RedisDurabilityPolicyError,
     validate_redis_durability_policy,
 )
+from app.config import settings
 from app.db import SessionLocal
 from scripts.backfill_media_lifecycle import backfill_media_lifecycle
 
@@ -134,6 +135,21 @@ def collect_redis_policy() -> dict[str, int | str]:
     }
 
 
+def collect_recommendation_content_key_gate(config=settings) -> dict[str, int]:
+    """Block replacement rollout when its active encryption key is unavailable."""
+    active_version = int(config.recommendation_content_key_active_version)
+    return {
+        "recommendation_content_key_unavailable": int(
+            bool(config.job_replacement_enabled)
+            and (
+                not 1 <= active_version <= 65_535
+                or not config.recommendation_content_key_configured
+            )
+        ),
+        "recommendation_content_key_active_version": active_version,
+    }
+
+
 def collect(db) -> dict:
     counts = {
         name: int(db.execute(text(sql)).scalar() or 0)
@@ -141,6 +157,7 @@ def collect(db) -> dict:
     }
     counts.update(collect_media_coverage(db))
     counts.update(collect_redis_policy())
+    counts.update(collect_recommendation_content_key_gate())
     next_id, max_id = db.execute(text(
         "SELECT t.AUTO_INCREMENT, COALESCE(MAX(j.id),0) "
         "FROM information_schema.TABLES t LEFT JOIN job j ON 1=1 "
@@ -152,6 +169,7 @@ def collect(db) -> dict:
         *CHECKS,
         *MEDIA_BLOCKING_CHECKS,
         "redis_durability_policy_mismatch",
+        "recommendation_content_key_unavailable",
         "job_auto_increment_not_above_max",
     )
     counts["ready"] = not any(counts[name] for name in blockers)

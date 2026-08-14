@@ -305,13 +305,23 @@ class Settings(BaseSettings):
         "recommendation_shadow_persistence_threads",
         "recommendation_shadow_persistence_queue_capacity",
         "recommendation_shadow_max_output_tokens",
-        "recommendation_content_key_active_version",
         mode="after",
     )
     @classmethod
     def _at_least_one(cls, v: int) -> int:
         """0 / 负数会让 semaphore、队列和密钥版本静默失效，一律夹到 1。"""
         return max(1, int(v))
+
+    @field_validator("recommendation_content_key_active_version", mode="after")
+    @classmethod
+    def _valid_recommendation_content_key_version(cls, v: int) -> int:
+        """Keep key versions representable by the envelope and MySQL SMALLINT."""
+        version = max(1, int(v))
+        if version > 65_535:
+            raise ValueError(
+                "recommendation_content_key_active_version must be between 1 and 65535"
+            )
+        return version
 
     @field_validator("recommendation_shadow_timeout_seconds", mode="after")
     @classmethod

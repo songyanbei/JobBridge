@@ -153,6 +153,105 @@ def test_preflight_fails_when_live_redis_policy_is_unsafe(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("config_values", "expected"),
+    [
+        (
+            {
+                "job_replacement_enabled": True,
+                "recommendation_content_key": "active-secret",
+                "recommendation_content_key_active_version": 65_535,
+            },
+            0,
+        ),
+        (
+            {
+                "job_replacement_enabled": True,
+                "recommendation_content_key_ring": "1:old-secret,2:active-secret",
+                "recommendation_content_key_active_version": 2,
+            },
+            0,
+        ),
+        ({"job_replacement_enabled": True}, 1),
+        (
+            {
+                "job_replacement_enabled": True,
+                "recommendation_content_key_ring": "1:old-secret",
+                "recommendation_content_key_active_version": 2,
+            },
+            1,
+        ),
+        ({"job_replacement_enabled": False}, 0),
+    ],
+)
+def test_replacement_content_key_gate(config_values, expected):
+    from app.config import Settings
+
+    values = {
+        "recommendation_content_key": "",
+        "recommendation_content_key_ring": "",
+        "recommendation_content_key_active_version": 1,
+        **config_values,
+    }
+    config = Settings(_env_file=None, **values)
+
+    result = phase10_preflight.collect_recommendation_content_key_gate(config)
+
+    assert result["recommendation_content_key_unavailable"] == expected
+    assert result["recommendation_content_key_active_version"] == int(
+        config.recommendation_content_key_active_version
+    )
+
+
+def test_replacement_content_key_version_above_smallint_range_is_blocked():
+    from app.config import Settings
+
+    config = MagicMock(
+        job_replacement_enabled=True,
+        recommendation_content_key_configured=True,
+        recommendation_content_key_active_version=65_536,
+    )
+
+    result = phase10_preflight.collect_recommendation_content_key_gate(config)
+
+    assert result["recommendation_content_key_unavailable"] == 1
+    assert result["recommendation_content_key_active_version"] == 65_536
+    with pytest.raises(ValueError, match="between 1 and 65535"):
+        Settings(
+            _env_file=None,
+            job_replacement_enabled=True,
+            recommendation_content_key="active-secret",
+            recommendation_content_key_active_version=65_536,
+        )
+
+
+def test_preflight_fails_when_replacement_content_key_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        phase10_preflight, "collect_media_coverage", lambda _: _clean_media_coverage()
+    )
+    monkeypatch.setattr(
+        phase10_preflight,
+        "collect_recommendation_content_key_gate",
+        lambda: {
+            "recommendation_content_key_unavailable": 1,
+            "recommendation_content_key_active_version": 2,
+        },
+    )
+    db = MagicMock()
+    scalar_results = [MagicMock() for _ in phase10_preflight.CHECKS]
+    for result in scalar_results:
+        result.scalar.return_value = 0
+    auto_increment = MagicMock()
+    auto_increment.one.return_value = (101, 100)
+    db.execute.side_effect = [*scalar_results, auto_increment]
+
+    result = phase10_preflight.collect(db)
+
+    assert result["ready"] is False
+    assert result["recommendation_content_key_unavailable"] == 1
+    assert result["recommendation_content_key_active_version"] == 2
+
+
+@pytest.mark.parametrize(
     "error",
     [
         phase10_preflight.RedisDurabilityPolicyError("unsafe"),
