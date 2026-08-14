@@ -62,6 +62,7 @@ from app.services import (
     message_router,
     recommendation_shadow_service,
     search_service,
+    upload_service,
 )
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -789,12 +790,32 @@ class Worker:
     # 图片下载并附加到消息对象
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _media_operation_id(msg: WeComMessage) -> str:
+        session = conversation_service.load_session(msg.from_user)
+        if session is None or session.pending_upload_mode != "replace":
+            return msg.msg_id
+        valid_target = (
+            session.pending_upload_intent == "upload_job"
+            and type(session.pending_target_id) is int
+            and session.pending_target_id > 0
+            and type(session.pending_target_version) is int
+            and session.pending_target_version > 0
+        )
+        if not valid_target or upload_service.is_pending_upload_expired(session):
+            raise RuntimeError("replacement_media_context_invalid")
+        operation_id = session.pending_operation_id
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 36:
+            raise RuntimeError("replacement_media_operation_id_invalid")
+        return operation_id
+
     def _download_and_attach_image(self, msg: WeComMessage) -> None:
         media_id = None
         try:
             from app.storage import get_storage
             from app.services.job_media_service import record_pending_media
 
+            operation_id = self._media_operation_id(msg)
             blob = self._wecom_client.download_media(msg.media_id)
             storage = get_storage()
             key = f"images/{msg.from_user}/{msg.msg_id}.jpg"
@@ -803,7 +824,7 @@ class Worker:
                     media_db,
                     key,
                     owner_userid=msg.from_user,
-                    operation_id=msg.msg_id,
+                    operation_id=operation_id,
                 )
                 media_db.commit()
                 media_id = media.id

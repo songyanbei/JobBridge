@@ -12,6 +12,7 @@
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -20,7 +21,7 @@ from sqlalchemy.orm import Session
 
 from app.core.redis_client import SessionCommitDeadlineExceeded, UserLockUnavailable
 from app.models import WecomOutboundOutbox
-from app.schemas.conversation import ReplyMessage
+from app.schemas.conversation import ReplyMessage, SessionState
 from app.services.worker import (
     MAX_RETRY,
     MAX_SEND_RETRY,
@@ -89,6 +90,117 @@ class TestCoerceLogMsgType:
 
     def test_unknown_maps_to_system(self):
         assert _coerce_log_msg_type("weird") == "system"
+
+
+def _replacement_session(**overrides):
+    values = {
+        "role": "factory",
+        "pending_upload_intent": "upload_job",
+        "pending_upload_mode": "replace",
+        "pending_target_id": 42,
+        "pending_target_version": 7,
+        "pending_operation_id": "o" * 36,
+        "pending_expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        ).isoformat(),
+    }
+    values.update(overrides)
+    return SessionState(**values)
+
+
+class TestImageMediaOperation:
+    @pytest.mark.parametrize(
+        ("session", "expected_operation_id"),
+        [
+            (None, "image-msg-1"),
+            (SessionState(role="factory", pending_upload_mode="create"), "image-msg-1"),
+            (_replacement_session(), "o" * 36),
+        ],
+    )
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.storage.get_storage")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    def test_media_uses_draft_operation_id_for_replacement_only(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_get_storage,
+        mock_record_pending_media,
+        session,
+        expected_operation_id,
+        worker,
+    ):
+        mock_load_session.return_value = session
+        media_db = MagicMock()
+        mock_session_factory.return_value.__enter__.return_value = media_db
+        mock_record_pending_media.return_value.id = 17
+        worker._wecom_client.download_media.return_value = b"image"
+        storage = mock_get_storage.return_value
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="image-msg-1"),
+            "msg_type": "image",
+            "media_id": "wecom-media-1",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        mock_record_pending_media.assert_called_once_with(
+            media_db,
+            "images/u1/image-msg-1.jpg",
+            owner_userid="u1",
+            operation_id=expected_operation_id,
+        )
+        media_db.commit.assert_called_once_with()
+        storage.save.assert_called_once_with(
+            "images/u1/image-msg-1.jpg",
+            b"image",
+            content_type="image/jpeg",
+        )
+        assert msg.media_lifecycle_id == 17
+        assert msg.image_url == "images/u1/image-msg-1.jpg"
+
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    @pytest.mark.parametrize(
+        "session",
+        [
+            _replacement_session(pending_upload_intent=None),
+            _replacement_session(pending_target_id=None),
+            _replacement_session(pending_target_version=None),
+            _replacement_session(pending_expires_at=None),
+            _replacement_session(
+                pending_expires_at=(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ).isoformat(),
+            ),
+            _replacement_session(pending_operation_id=None),
+            _replacement_session(pending_operation_id="o" * 37),
+        ],
+    )
+    def test_invalid_replacement_context_fails_before_media_write(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_record_pending_media,
+        session,
+        worker,
+    ):
+        mock_load_session.return_value = session
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="image-msg-2"),
+            "msg_type": "image",
+            "media_id": "wecom-media-2",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        mock_session_factory.assert_not_called()
+        mock_record_pending_media.assert_not_called()
+        assert msg.image_url == ""
+        assert msg.media_lifecycle_id is None
 
 
 # ---------------------------------------------------------------------------
