@@ -3,12 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.core.exceptions import BusinessException
+from app.core.logging_setup import identifier_hash
 from app.api.admin.jobs import ReplacementCancelRequest
 from app.models import (
     AuditLog,
@@ -29,6 +30,7 @@ from app.services.job_replace_service import (
     retry_activation,
 )
 from app.services import upload_service
+from app.services import job_replace_service
 from app.services.intent_service import _match_command
 from app.services.user_service import UserContext
 
@@ -210,6 +212,187 @@ def test_pending_candidate_is_complete_and_does_not_replace_old_job(db):
     assert relation.old_job_version == old.version
     assert relation.lifecycle_status == "awaiting_review"
     assert relation.active_old_job_id == old.id
+
+
+def test_pending_candidate_creation_emits_one_privacy_safe_event(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event, **fields: events.append((event, fields)),
+    )
+    old = _job(db)
+
+    relation, candidate = _create(db, old, status="pending")
+    assert events == []
+    db.commit()
+    duplicate_relation, duplicate_candidate = _create(
+        db,
+        old,
+        operation_id="op-1",
+        source_msg_id="msg-replayed",
+    )
+    relation_by_message, candidate_by_message = _create(
+        db,
+        old,
+        operation_id="op-replayed",
+        source_msg_id="msg-1",
+    )
+
+    assert duplicate_relation.id == relation.id
+    assert duplicate_candidate.id == candidate.id
+    assert relation_by_message.id == relation.id
+    assert candidate_by_message.id == candidate.id
+    assert events == [
+        (
+            "job_replace_started",
+            {
+                "old_job_id": old.id,
+                "new_job_id": candidate.id,
+                "batch_id": "op-1",
+                "user_hash": identifier_hash("owner-1"),
+            },
+        )
+    ]
+    assert events[0][1]["user_hash"] != "owner-1"
+    assert set(events[0][1]) == {
+        "old_job_id",
+        "new_job_id",
+        "batch_id",
+        "user_hash",
+    }
+
+
+def test_candidate_creation_event_is_discarded_on_rollback(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event_name, **fields: events.append((event_name, fields)),
+    )
+    old = _job(db)
+
+    _create(db, old, status="pending")
+    db.rollback()
+    db.commit()
+
+    assert events == []
+    assert db.query(JobReplacement).count() == 0
+
+
+def test_candidate_creation_event_is_not_emitted_on_commit_failure(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event_name, **fields: events.append((event_name, fields)),
+    )
+    old = _job(db)
+    _create(db, old, status="pending")
+
+    def fail_commit(_db):
+        raise RuntimeError("forced_commit_failure")
+
+    event.listen(db, "before_commit", fail_commit, once=True)
+    with pytest.raises(RuntimeError, match="forced_commit_failure"):
+        db.commit()
+    assert events == []
+    db.rollback()
+    db.commit()
+
+    assert events == []
+    assert db.query(JobReplacement).count() == 0
+
+
+def test_candidate_creation_event_waits_for_outer_commit(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event_name, **fields: events.append((event_name, fields)),
+    )
+    old = _job(db)
+
+    savepoint = db.begin_nested()
+    _create(db, old, status="pending")
+    savepoint.commit()
+    assert events == []
+
+    db.commit()
+    assert len(events) == 1
+    assert events[0][0] == "job_replace_started"
+
+
+def test_savepoint_rollback_discards_only_nested_candidate_event(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event_name, **fields: events.append((event_name, fields)),
+    )
+    outer_old = _job(db)
+    nested_old = _job(db)
+
+    outer_relation, _ = _create(
+        db,
+        outer_old,
+        operation_id="op-outer",
+        source_msg_id="msg-outer",
+    )
+    savepoint = db.begin_nested()
+    _create(
+        db,
+        nested_old,
+        operation_id="op-nested",
+        source_msg_id="msg-nested",
+    )
+    savepoint.rollback()
+    assert events == []
+
+    db.commit()
+
+    assert db.query(JobReplacement).count() == 1
+    assert db.query(JobReplacement).one().id == outer_relation.id
+    assert len(events) == 1
+    assert events[0][1]["batch_id"] == "op-outer"
+
+
+def test_telemetry_failure_does_not_fail_commit_or_leak_event(db, monkeypatch):
+    attempts = []
+
+    def fail_telemetry(event_name, **fields):
+        attempts.append((event_name, fields))
+        raise RuntimeError("telemetry_unavailable")
+
+    monkeypatch.setattr(job_replace_service, "log_event", fail_telemetry)
+    old = _job(db)
+    relation, candidate = _create(db, old, status="pending")
+
+    db.commit()
+
+    assert relation.id is not None and candidate.id is not None
+    assert db.query(JobReplacement).filter_by(id=relation.id).one()
+    assert len(attempts) == 1
+    assert job_replace_service._PENDING_REPLACEMENT_EVENTS not in db.info
+    db.commit()
+    assert len(attempts) == 1
+
+
+def test_candidate_creation_event_is_discarded_when_session_closes(db, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        job_replace_service,
+        "log_event",
+        lambda event_name, **fields: events.append((event_name, fields)),
+    )
+    old = _job(db)
+
+    _create(db, old, status="pending")
+    db.close()
+    db.commit()
+
+    assert events == []
+    assert db.query(JobReplacement).count() == 0
 
 
 def test_replacement_candidate_preserves_explicit_full_update_fields(db):

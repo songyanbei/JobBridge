@@ -1,11 +1,14 @@
 """Create complete replacement candidates and atomically activate approvals."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import event
+from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core.exceptions import BusinessException
+from app.core.logging_setup import identifier_hash
 from app.models import Job, JobReplacement
 from app.services.job_activation_service import activate_job
 from app.services.admin_log_service import write_admin_log
@@ -18,8 +21,83 @@ from app.services.job_replacement_lock_service import (
 )
 from app.services.lifecycle_config_service import get_job_candidate_ttl_days
 from app.services.target_cleanup_service import ensure_job_cleanup_task
+from app.tasks.common import log_event
 
 REPLACEMENT_CANCEL_REASON_MAX_LENGTH = 64
+_PENDING_REPLACEMENT_EVENTS = "job_replace_pending_events"
+
+logger = logging.getLogger(__name__)
+
+
+def _transaction_contains(
+    transaction: SessionTransaction | None,
+    ancestor: SessionTransaction,
+) -> bool:
+    while transaction is not None:
+        if transaction is ancestor:
+            return True
+        transaction = transaction.parent
+    return False
+
+
+@event.listens_for(Session, "after_commit")
+def _emit_committed_replacement_events(db: Session) -> None:
+    # SQLAlchemy also fires after_commit for a released savepoint.
+    if db.in_nested_transaction():
+        return
+    pending = db.info.pop(_PENDING_REPLACEMENT_EVENTS, [])
+    for _, fields in pending:
+        try:
+            log_event("job_replace_started", **fields)
+        except Exception:
+            logger.exception("job_replace_started telemetry failed")
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _discard_rolled_back_replacement_events(
+    db: Session,
+    previous_transaction: SessionTransaction,
+) -> None:
+    pending = db.info.get(_PENDING_REPLACEMENT_EVENTS, [])
+    remaining = [
+        item for item in pending
+        if not _transaction_contains(item[0], previous_transaction)
+    ]
+    if remaining:
+        db.info[_PENDING_REPLACEMENT_EVENTS] = remaining
+    else:
+        db.info.pop(_PENDING_REPLACEMENT_EVENTS, None)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _discard_abandoned_replacement_events(
+    db: Session,
+    transaction: SessionTransaction,
+) -> None:
+    if transaction.parent is None and not db.in_transaction():
+        db.info.pop(_PENDING_REPLACEMENT_EVENTS, None)
+
+
+def _emit_replacement_started_after_commit(
+    db: Session,
+    *,
+    old_job_id: int,
+    new_job_id: int,
+    operation_id: str,
+    owner_userid: str,
+) -> None:
+    transaction = db.get_nested_transaction() or db.get_transaction()
+    if transaction is None:
+        raise RuntimeError("replacement_event_requires_transaction")
+    db.info.setdefault(_PENDING_REPLACEMENT_EVENTS, []).append((
+        transaction,
+        {
+            "old_job_id": old_job_id,
+            "new_job_id": new_job_id,
+            "batch_id": operation_id,
+            "user_hash": identifier_hash(owner_userid),
+        },
+    ))
 
 _COPY_FIELDS = (
     "city", "district", "address", "job_category", "job_sub_category",
@@ -164,6 +242,13 @@ def create_replacement_candidate(
             new_job,
             expected_old_version=replacement_base_version,
         )
+    _emit_replacement_started_after_commit(
+        db,
+        old_job_id=old.id,
+        new_job_id=new_job.id,
+        operation_id=operation_id,
+        owner_userid=owner_userid,
+    )
     return relation, new_job
 
 
