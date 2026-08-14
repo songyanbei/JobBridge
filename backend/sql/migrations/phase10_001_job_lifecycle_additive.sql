@@ -83,6 +83,9 @@ CREATE TABLE `media_asset_lifecycle` (
 CREATE TABLE `phase10_migration_control` (
   `id` TINYINT UNSIGNED NOT NULL,
   `writes_blocked` TINYINT(1) NOT NULL DEFAULT 0,
+  `backup_rows` BIGINT UNSIGNED NULL,
+  `backup_checksum` BIGINT UNSIGNED NULL,
+  `expected_live_checksum` BIGINT UNSIGNED NULL,
   PRIMARY KEY (`id`),
   CONSTRAINT `chk_phase10_writes_blocked` CHECK (`writes_blocked` IN (0, 1))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -167,6 +170,29 @@ SET b.`expected_audit_status` = j.`audit_status`,
 ALTER TABLE `phase10_job_lifecycle_backup`
   MODIFY COLUMN `expected_audit_status` ENUM('pending','passed','rejected') NOT NULL,
   MODIFY COLUMN `expected_version` INT UNSIGNED NOT NULL;
+
+UPDATE `phase10_migration_control`
+SET `backup_rows` = (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`),
+    `backup_checksum` = (
+      SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
+        COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+        COALESCE(`delist_reason`, ''), `version`))), 0)
+      FROM `phase10_job_lifecycle_backup`
+    ),
+    `expected_live_checksum` = (
+      SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
+        COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
+        COALESCE(`expected_delist_reason`, ''), `expected_version`,
+        COALESCE(`expected_activated_at`, ''),
+        COALESCE(`expected_candidate_expires_at`, '')))), 0)
+      FROM `phase10_job_lifecycle_backup`
+    )
+WHERE `id` = 1;
+
+ALTER TABLE `phase10_migration_control`
+  MODIFY COLUMN `backup_rows` BIGINT UNSIGNED NOT NULL,
+  MODIFY COLUMN `backup_checksum` BIGINT UNSIGNED NOT NULL,
+  MODIFY COLUMN `expected_live_checksum` BIGINT UNSIGNED NOT NULL;
 
 -- Deployment gate: this query must return zero rows before writes resume.
 SELECT `id` FROM `job`

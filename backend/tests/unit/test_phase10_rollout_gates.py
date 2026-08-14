@@ -150,10 +150,28 @@ def test_preflight_includes_config_and_backup_coverage_gates():
     assert "invalid_job_ttl_config" in phase10_preflight.CHECKS
     assert "invalid_candidate_ttl_config" in phase10_preflight.CHECKS
     assert "job_backup_coverage_mismatch" in phase10_preflight.CHECKS
+    backup_gate = phase10_preflight.CHECKS["job_backup_coverage_mismatch"]
+    assert "LEFT JOIN job" not in backup_gate
+    assert "phase10_migration_control" in backup_gate
+    for field in ("backup_rows", "backup_checksum", "expected_live_checksum"):
+        assert field in backup_gate
     enum_gate = phase10_preflight.CHECKS["media_state_enum_missing_dead_letter"]
     assert "information_schema.COLUMNS" in enum_gate
     assert "COLUMN_TYPE" in enum_gate
     assert "dead_letter" in enum_gate
+
+
+def test_additive_migration_freezes_backup_integrity_evidence():
+    sql = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_text(
+        encoding="utf-8"
+    )
+    snapshot = sql.index("UPDATE `phase10_job_lifecycle_backup` AS b")
+    evidence = sql.index("UPDATE `phase10_migration_control`", snapshot)
+    final_gate = sql.index("-- Deployment gate", evidence)
+
+    assert snapshot < evidence < final_gate
+    for field in ("backup_rows", "backup_checksum", "expected_live_checksum"):
+        assert f"`{field}` BIGINT UNSIGNED NOT NULL" in sql
 
 
 def test_session_schema_gates_check_exact_types_nullable_and_index_order():

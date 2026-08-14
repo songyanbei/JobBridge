@@ -1,15 +1,86 @@
 """Phase 10 preflight checks that require a real MySQL database."""
 from __future__ import annotations
 
+from pathlib import Path
+from uuid import uuid4
+
+import pymysql
 import pytest
+from pymysql.constants import CLIENT
 from sqlalchemy import text
 
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from scripts.phase10_clock_check import collect_clock_report
 from scripts.phase10_preflight import CHECKS, collect_redis_policy
 
 
 pytestmark = pytest.mark.integration
+
+ROOT = Path(__file__).resolve().parents[2]
+UP_SQL = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_text(
+    encoding="utf-8"
+)
+
+BASE_SCHEMA_SQL = """
+CREATE TABLE system_config (
+  config_key VARCHAR(64) PRIMARY KEY,
+  config_value TEXT NOT NULL
+);
+INSERT INTO system_config VALUES ('ttl.job.candidate.days','7');
+CREATE TABLE job (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  audit_status ENUM('pending','passed','rejected') NOT NULL,
+  created_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL,
+  audited_at DATETIME NULL,
+  expires_at DATETIME NOT NULL,
+  deleted_at DATETIME NULL,
+  delist_reason ENUM('filled','manual_delist','expired') NULL,
+  version INT UNSIGNED NOT NULL DEFAULT 1
+) ENGINE=InnoDB;
+INSERT INTO job (
+  audit_status, created_at, updated_at, audited_at, expires_at,
+  deleted_at, delist_reason, version
+) VALUES
+('passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1);
+"""
+
+
+def _connect(database: str | None = None):
+    url = engine.url
+    return pymysql.connect(
+        host=url.host or "127.0.0.1",
+        port=int(url.port or 3306),
+        user=url.username,
+        password=url.password,
+        database=database,
+        charset="utf8mb4",
+        autocommit=True,
+        client_flag=CLIENT.MULTI_STATEMENTS,
+    )
+
+
+def _execute_script(connection, sql: str) -> None:
+    delimiter = ";"
+    statement_lines: list[str] = []
+    with connection.cursor() as cursor:
+        for line in sql.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.upper().startswith("DELIMITER "):
+                if "".join(statement_lines).strip():
+                    raise AssertionError("DELIMITER changed inside a SQL statement")
+                delimiter = stripped.split(maxsplit=1)[1]
+                continue
+            statement_lines.append(line)
+            if not "".join(statement_lines).rstrip().endswith(delimiter):
+                continue
+            statement = "".join(statement_lines).rstrip()
+            statement = statement[: -len(delimiter)].strip()
+            statement_lines.clear()
+            if statement:
+                cursor.execute(statement)
+        if "".join(statement_lines).strip():
+            raise AssertionError("unterminated SQL statement")
 
 
 def test_mysql_and_redis_clock_skew_is_within_rollout_limit():
@@ -72,3 +143,72 @@ def test_job_ttl_preflight_accepts_full_supported_range():
     finally:
         db.rollback()
         db.close()
+
+
+def test_backup_integrity_gate_ignores_live_job_additions_and_hard_deletes():
+    database = f"phase10_preflight_{uuid4().hex[:16]}"
+    admin = _connect()
+    db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        _execute_script(db, UP_SQL)
+
+        with db.cursor() as cursor:
+            gate = CHECKS["job_backup_coverage_mismatch"]
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
+            cursor.execute(
+                "INSERT INTO job (audit_status, created_at, updated_at, audited_at, "
+                "activated_at, candidate_expires_at, expires_at, deleted_at, "
+                "delist_reason, version) VALUES "
+                "('passed','2026-02-01','2026-02-02','2026-02-03',"
+                "'2026-02-03',NULL,'2026-10-01',NULL,NULL,1)"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
+            cursor.execute("DELETE FROM job WHERE id=1")
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
+            cursor.execute(
+                "UPDATE phase10_job_lifecycle_backup "
+                "SET expected_version=expected_version+1 WHERE job_id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 1
+
+            cursor.execute(
+                "UPDATE phase10_job_lifecycle_backup "
+                "SET expected_version=expected_version-1 WHERE job_id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
+            cursor.execute(
+                "UPDATE phase10_migration_control "
+                "SET expected_live_checksum=expected_live_checksum+1 WHERE id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 1
+
+            cursor.execute(
+                "UPDATE phase10_migration_control "
+                "SET expected_live_checksum=expected_live_checksum-1 WHERE id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
+            cursor.execute("DELETE FROM phase10_migration_control WHERE id=1")
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 1
+    finally:
+        if db is not None:
+            db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()

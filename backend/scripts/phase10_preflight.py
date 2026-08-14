@@ -66,11 +66,19 @@ CHECKS = {
         "THEN 0 ELSE 1 END"
     ),
     "job_backup_coverage_mismatch": (
-        "SELECT COUNT(*) FROM ("
-        "SELECT j.id FROM job j LEFT JOIN phase10_job_lifecycle_backup b ON b.job_id=j.id "
-        "WHERE b.job_id IS NULL UNION ALL "
-        "SELECT b.job_id FROM phase10_job_lifecycle_backup b LEFT JOIN job j ON j.id=b.job_id "
-        "WHERE j.id IS NULL) missing_backup"
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM phase10_migration_control c "
+        "WHERE c.id=1 "
+        "AND c.backup_rows=(SELECT COUNT(*) FROM phase10_job_lifecycle_backup) "
+        "AND c.backup_checksum=(SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', "
+        "job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), "
+        "COALESCE(delist_reason, ''), version))), 0) "
+        "FROM phase10_job_lifecycle_backup) "
+        "AND c.expected_live_checksum=(SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', "
+        "job_id, expected_audit_status, COALESCE(expected_expires_at, ''), "
+        "COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), "
+        "expected_version, COALESCE(expected_activated_at, ''), "
+        "COALESCE(expected_candidate_expires_at, '')))), 0) "
+        "FROM phase10_job_lifecycle_backup)) THEN 0 ELSE 1 END"
     ),
     "passed_without_activation": (
         "SELECT COUNT(*) FROM job WHERE deleted_at IS NULL AND audit_status='passed' "
