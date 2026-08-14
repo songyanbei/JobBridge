@@ -177,6 +177,28 @@ class TestNormalizeStructuredData:
         )
         assert "education_required" not in out
 
+    def test_job_database_enums_normalized_before_persistence(self):
+        out = intent_service._normalize_structured_data(
+            {
+                "employment_type": "工厂直招",
+                "contract_type": "长期",
+            },
+            role="factory", intent="upload_job",
+        )
+        assert out["employment_type"] == "厂家直招"
+        assert out["contract_type"] == "长期合同"
+
+    def test_unknown_job_database_enums_are_dropped(self):
+        out = intent_service._normalize_structured_data(
+            {
+                "employment_type": "平台自营",
+                "contract_type": "正式工",
+            },
+            role="factory", intent="upload_job",
+        )
+        assert "employment_type" not in out
+        assert "contract_type" not in out
+
     def test_unknown_keys_already_filtered_by_sanitize(self):
         # 规整层不丢未知 key（_sanitize_intent_result 已经做了），
         # 这里只是确保 normalize 不抛异常

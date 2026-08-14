@@ -489,6 +489,17 @@ def test_job_upload_education_requirement_matches_database_enum():
     )
 
 
+def test_job_upload_full_update_fields_match_persistence_contract():
+    frame = slot_schema.get_frame("job_upload")
+    assert "address" in frame.slots
+    assert frame.slots["employment_type"].slot_type.enum_values == (
+        "厂家直招", "劳务派遣", "中介代招",
+    )
+    assert frame.slots["contract_type"].slot_type.enum_values == (
+        "长期合同", "短期合同", "劳务关系",
+    )
+
+
 # ---------------------------------------------------------------------------
 # P1：job_title 通过 _normalize_structured_data 不被 silently dropped
 # ---------------------------------------------------------------------------

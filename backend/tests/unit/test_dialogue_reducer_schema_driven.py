@@ -174,6 +174,28 @@ class TestFieldValidation:
         )
         assert "totally_unknown_field" not in d.accepted_slots_delta
 
+    def test_full_job_update_fields_survive_v2_reducer(self):
+        s = _make_session(role="factory")
+        d = reduce(
+            _make_parse(
+                dialogue_act="start_upload",
+                frame_hint="job_upload",
+                slots_delta={
+                    "address": "星湖街88号",
+                    "accept_couple": True,
+                    "employment_type": "厂家直招",
+                    "contract_type": "长期合同",
+                },
+            ),
+            s, "factory",
+        )
+        assert d.accepted_slots_delta == {
+            "address": "星湖街88号",
+            "accept_couple": True,
+            "employment_type": "厂家直招",
+            "contract_type": "长期合同",
+        }
+
 
 # ---------------------------------------------------------------------------
 # soft 字段被接受（阶段三关键行为变更）

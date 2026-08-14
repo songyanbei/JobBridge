@@ -93,6 +93,10 @@ class TestProcessUpload:
             structured_data={
                 "city": "苏州市", "job_category": "电子厂",
                 "salary_floor_monthly": 5500, "pay_type": "月薪", "headcount": 30,
+                "address": "吴中区东吴南路888号",
+                "accept_couple": True,
+                "employment_type": "厂家直招",
+                "contract_type": "长期合同",
             },
             confidence=0.95,
         )
@@ -101,6 +105,15 @@ class TestProcessUpload:
         result = process_upload(user_ctx, intent, "招工文本", [], session, db)
         assert result.success is True
         assert "已入库" in result.reply_text
+        created_job = next(
+            call.args[0]
+            for call in db.add.call_args_list
+            if call.args and call.args[0].__class__.__name__ == "Job"
+        )
+        assert created_job.address == "吴中区东吴南路888号"
+        assert created_job.accept_couple is True
+        assert created_job.employment_type == "厂家直招"
+        assert created_job.contract_type == "长期合同"
 
     @patch("app.services.upload_service.conversation_service")
     def test_missing_fields_followup(self, mock_conv):

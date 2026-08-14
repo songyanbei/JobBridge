@@ -495,6 +495,7 @@ def _create_job(
         candidate_expires_at=now + timedelta(days=get_job_candidate_ttl_days(db)),
         # 可选软匹配字段
         district=data.get("district"),
+        address=data.get("address"),
         salary_ceiling_monthly=data.get("salary_ceiling_monthly"),
         provide_meal=data.get("provide_meal"),
         provide_housing=data.get("provide_housing"),

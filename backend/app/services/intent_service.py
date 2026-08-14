@@ -803,6 +803,24 @@ _EDUCATION_REQUIRED_ALIASES = {
     "大专及以上": "大专及以上",
 }
 
+_EMPLOYMENT_TYPE_ALIASES = {
+    "厂家直招": "厂家直招",
+    "工厂直招": "厂家直招",
+    "直招": "厂家直招",
+    "劳务派遣": "劳务派遣",
+    "派遣": "劳务派遣",
+    "中介代招": "中介代招",
+    "中介招聘": "中介代招",
+}
+
+_CONTRACT_TYPE_ALIASES = {
+    "长期合同": "长期合同",
+    "长期": "长期合同",
+    "短期合同": "短期合同",
+    "短期": "短期合同",
+    "劳务关系": "劳务关系",
+}
+
 
 def _normalize_education_required(value) -> str | None:
     """Map common threshold wording to the Job education enum."""
@@ -812,6 +830,12 @@ def _normalize_education_required(value) -> str | None:
     if text.endswith("学历"):
         text = text[:-2].strip()
     return _EDUCATION_REQUIRED_ALIASES.get(text)
+
+
+def _normalize_job_enum(value, aliases: dict[str, str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return aliases.get(value.strip())
 
 
 def _coerce_field_value(field: str, value, *, force_list: bool):
@@ -861,6 +885,10 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
         return _normalize_int_field(value, lo=_SALARY_MIN, hi=_SALARY_MAX)
     if field == "education_required":
         return _normalize_education_required(value)
+    if field == "employment_type":
+        return _normalize_job_enum(value, _EMPLOYMENT_TYPE_ALIASES)
+    if field == "contract_type":
+        return _normalize_job_enum(value, _CONTRACT_TYPE_ALIASES)
 
     return value
 
@@ -937,13 +965,13 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
                 )
             continue
 
-        if key == "education_required":
+        if key in {"education_required", "employment_type", "contract_type"}:
             coerced = _coerce_field_value(key, raw, force_list=False)
             if coerced is not None:
                 out[key] = coerced
             else:
                 logger.warning(
-                    "intent_service: drop invalid education_required raw=%r", raw,
+                    "intent_service: drop invalid closed enum field=%s raw=%r", key, raw,
                 )
             continue
 

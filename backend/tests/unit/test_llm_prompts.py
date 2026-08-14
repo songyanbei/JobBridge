@@ -17,13 +17,18 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        # 2026-05-02 bump to v2.8：补"抽取忠实度"反幻觉条款 + upload_resume 锚点示例
-        # （示例13），修复"用户没说城市但 LLM 输出 expected_cities=['苏州市']"漂移。
-        assert prompts.PROMPT_VERSION == "v2.8"
-        assert prompts.INTENT_PROMPT_VERSION == "v2.8"
+        assert prompts.PROMPT_VERSION == "v2.9"
+        assert prompts.INTENT_PROMPT_VERSION == "v2.9"
         # PROMPT_VERSION 必须等于 INTENT_PROMPT_VERSION（一次 prompt 修订一组版本号）
         assert prompts.PROMPT_VERSION == prompts.INTENT_PROMPT_VERSION
-        assert prompts.PROMPT_DATE == "2026-05-02"
+        assert prompts.PROMPT_DATE == "2026-08-14"
+
+    def test_full_job_update_fields_are_explicitly_described(self):
+        prompt = prompts.INTENT_SYSTEM_PROMPT
+        for field_name in (
+            "address", "accept_couple", "employment_type", "contract_type",
+        ):
+            assert field_name in prompt
 
     def test_intent_service_version_aliases_prompts(self):
         """intent_service.INTENT_PROMPT_VERSION 必须从 prompts 单一来源取，
@@ -75,7 +80,11 @@ class TestDialoguePrompt:
         assert "宁波找技工工作" in prompt
         assert "给这位师傅找个杭州焊工岗位" in prompt
         assert "找两个能上夜班的操作工" in prompt
-        assert prompts.DIALOGUE_PROMPT_VERSION == "v0.6"
+        assert prompts.DIALOGUE_PROMPT_VERSION == "v0.7"
+        for field_name in (
+            "address", "accept_couple", "employment_type", "contract_type",
+        ):
+            assert field_name in prompt
 
 
 class TestRerankPrompt:

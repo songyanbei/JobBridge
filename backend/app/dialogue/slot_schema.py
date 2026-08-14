@@ -99,7 +99,7 @@ def _ref_normalize_job_category():
 # job_upload frame 合法字段集合（含 hard 必填 + 上传可选字段）
 _JOB_UPLOAD_FIELDS: frozenset[str] = frozenset({
     "city", "job_category", "salary_floor_monthly", "pay_type", "headcount",
-    "gender_required", "is_long_term", "district", "salary_ceiling_monthly",
+    "gender_required", "is_long_term", "district", "address", "salary_ceiling_monthly",
     "provide_meal", "provide_housing", "dorm_condition", "shift_pattern",
     "work_hours", "accept_couple", "accept_student", "accept_minority",
     "height_required", "experience_required", "education_required",
@@ -347,12 +347,17 @@ def _build_job_search() -> FrameDef:
             "height_required", slot_type=_str_type(), display_name="身高要求",
         ),
         "district": _slot("district", slot_type=_str_type(), display_name="区县"),
+        "address": _slot("address", slot_type=_str_type(), display_name="详细工作地址"),
         "rebate": _slot("rebate", slot_type=_str_type(), display_name="返费"),
         "employment_type": _slot(
-            "employment_type", slot_type=_str_type(), display_name="用工类型",
+            "employment_type",
+            slot_type=_enum_str(("厂家直招", "劳务派遣", "中介代招")),
+            display_name="用工类型",
         ),
         "contract_type": _slot(
-            "contract_type", slot_type=_str_type(), display_name="合同类型",
+            "contract_type",
+            slot_type=_enum_str(("长期合同", "短期合同", "劳务关系")),
+            display_name="合同类型",
         ),
         "min_duration": _slot(
             "min_duration", slot_type=_str_type(), display_name="最短入职时长",

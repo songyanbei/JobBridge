@@ -196,6 +196,34 @@ def test_pending_candidate_is_complete_and_does_not_replace_old_job(db):
     assert relation.active_old_job_id == old.id
 
 
+def test_replacement_candidate_preserves_explicit_full_update_fields(db):
+    old = _job(db)
+    relation, candidate = create_replacement_candidate(
+        db,
+        owner_userid="owner-1",
+        target_job_id=old.id,
+        expected_version=old.version,
+        operation_id="op-full-fields",
+        source_msg_id="msg-full-fields",
+        complete_data=_complete_data(
+            address="星湖街88号",
+            accept_couple=True,
+            employment_type="厂家直招",
+            contract_type="长期合同",
+        ),
+        raw_text="完整的新岗位",
+        media_ids=[],
+        audit_result=_audit("pending"),
+    )
+    db.commit()
+
+    assert relation.old_job_id == old.id
+    assert candidate.address == "星湖街88号"
+    assert bool(candidate.accept_couple) is True
+    assert candidate.employment_type == "厂家直招"
+    assert candidate.contract_type == "长期合同"
+
+
 def test_candidate_creation_is_blocked_by_rollout_gate(db, monkeypatch):
     from app.config import settings
 

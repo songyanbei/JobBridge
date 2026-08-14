@@ -92,6 +92,63 @@ def _cleanup_replacement_rows(owner_userid: str) -> None:
         db.close()
 
 
+def test_replacement_persists_explicit_full_update_fields_on_mysql(monkeypatch):
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    owner_userid = f"replace-full-fields-{uuid4().hex}"
+    db = SessionLocal()
+    try:
+        db.add(User(external_userid=owner_userid, role="factory"))
+        db.flush()
+        old_job = _active_job(
+            owner_userid,
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+        )
+        db.add(old_job)
+        db.commit()
+
+        _, candidate = create_replacement_candidate(
+            db,
+            owner_userid=owner_userid,
+            target_job_id=old_job.id,
+            expected_version=old_job.version,
+            operation_id=str(uuid4()),
+            source_msg_id=f"msg-{uuid4()}",
+            complete_data={
+                "city": "苏州市",
+                "job_category": "电子厂",
+                "salary_floor_monthly": 6800,
+                "pay_type": "月薪",
+                "headcount": 55,
+                "address": "星湖街88号",
+                "accept_couple": True,
+                "employment_type": "厂家直招",
+                "contract_type": "长期合同",
+            },
+            raw_text="完整的新岗位",
+            media_ids=[],
+            audit_result=SimpleNamespace(status="pending", reason=""),
+        )
+        candidate_id = candidate.id
+        db.commit()
+        db.close()
+
+        verifier = SessionLocal()
+        try:
+            stored = verifier.get(Job, candidate_id)
+            assert stored is not None
+            assert stored.address == "星湖街88号"
+            assert bool(stored.accept_couple) is True
+            assert stored.employment_type == "厂家直招"
+            assert stored.contract_type == "长期合同"
+        finally:
+            verifier.close()
+    finally:
+        if db.is_active:
+            db.rollback()
+        db.close()
+        _cleanup_replacement_rows(owner_userid)
+
+
 def test_cancel_reason_limit_prevents_mysql_truncation():
     db = SessionLocal()
     prefix = f"replace-limit-{uuid4().hex}"
