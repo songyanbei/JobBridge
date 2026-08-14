@@ -24,6 +24,9 @@ CASE = {
         },
         "pending_upload_intent": "upload_job",
         "awaiting_field": "headcount",
+        "pending_started_at": "2099-01-01T00:00:00+00:00",
+        "pending_updated_at": "2099-01-01T00:00:00+00:00",
+        "pending_expires_at": "2099-01-01T00:10:00+00:00",
     },
     "turns": [
         {

@@ -634,16 +634,25 @@ def test_phase2_dual_read_synthetic_rollout():
 
     legacy_results: list[dict] = []
     dual_results: list[dict] = []
-    for day in _build_dual_read_rollout_days():
-        for idx, case in enumerate(day["cases"]):
-            legacy_case = _clone_case(
-                case, case_id=f"{day['day']}-{idx}-{case['id']}-legacy", mode="off",
-            )
-            dual_case = _clone_case(
-                case, case_id=f"{day['day']}-{idx}-{case['id']}-dual", mode="dual_read",
-            )
-            legacy_results.append(run_dialogue_case(legacy_case))
-            dual_results.append(run_dialogue_case(dual_case))
+    original_city_cache = intent_service._CITY_LOOKUP_CACHE
+    try:
+        intent_service._CITY_LOOKUP_CACHE = dict(intent_service._COMMON_CITY_ALIASES)
+        for day in _build_dual_read_rollout_days():
+            for idx, case in enumerate(day["cases"]):
+                legacy_case = _clone_case(
+                    case,
+                    case_id=f"{day['day']}-{idx}-{case['id']}-legacy",
+                    mode="off",
+                )
+                dual_case = _clone_case(
+                    case,
+                    case_id=f"{day['day']}-{idx}-{case['id']}-dual",
+                    mode="dual_read",
+                )
+                legacy_results.append(run_dialogue_case(legacy_case))
+                dual_results.append(run_dialogue_case(dual_case))
+    finally:
+        intent_service._CITY_LOOKUP_CACHE = original_city_cache
 
     legacy_metrics = _aggregate_rollout_metrics(legacy_results)
     dual_metrics = _aggregate_rollout_metrics(dual_results)
