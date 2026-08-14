@@ -364,6 +364,32 @@ def test_release_manual_orders_target_backfill_before_full_preflight():
     assert dry_run < apply < missing_zero < preflight
 
 
+def test_release_manual_deploys_old_schema_compatibility_before_migration():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+    stage_a_commit = "499eb929b75ad2f208d306b62157d8ded0119f33"
+    release_head = manual.index('git -C "$PHASE10_RELEASE_ROOT" rev-parse HEAD')
+    release_clean = manual.index('git -C "$PHASE10_RELEASE_ROOT" status --porcelain')
+    ancestor = manual.index("merge-base --is-ancestor")
+    stage_a_worktree = manual.index("worktree add --detach")
+    stage_a_deploy = manual.index("部署为 Stage A 同一镜像 digest")
+    stage_a_smoke = manual.index("后台岗位列表第 1/2 页")
+    migration = manual.index("phase10_001_job_lifecycle_additive.sql")
+    final_deploy = manual.index("构建一次最终 schema-aware 制品")
+
+    assert stage_a_commit in manual
+    assert "set -euo pipefail" in manual[:release_head]
+    assert "--confcutdir=" in manual
+    assert "--import-mode=importlib" in manual
+    for surface in ("岗位列表", "岗位详情", "岗位 CSV 导出", "审核工作台队列", "审核详情"):
+        assert surface in manual
+    assert release_head < release_clean < ancestor < stage_a_worktree
+    assert stage_a_worktree < stage_a_deploy < stage_a_smoke < migration < final_deploy
+    assert "禁止用最终 schema-aware 制品替代本阶段制品" in manual
+    assert "最终制品只能在 Phase 10 schema 上启动" in manual
+
+
 def test_release_manual_covers_complete_phase10_sequence_and_module_commands():
     manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
         encoding="utf-8"
@@ -427,7 +453,9 @@ def test_release_manual_restarts_and_verifies_all_phase10_processes():
         encoding="utf-8"
     )
 
-    deployment = manual[manual.index("## 5. 同版本部署"):manual.index("## 6. 开关顺序")]
+    deployment = manual[
+        manual.index("## 6. 最终版本部署"):manual.index("## 7. 开关顺序")
+    ]
     for process in ("API", "消息 Worker", "scheduler", "session recovery Worker"):
         assert process in deployment
     assert "heartbeat" in deployment
@@ -438,7 +466,7 @@ def test_release_manual_stops_candidate_producer_before_consumer():
     manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
         encoding="utf-8"
     )
-    rollback = manual[manual.index("## 8. 回滚"):]
+    rollback = manual[manual.index("## 9. 回滚"):]
     stop_producer = rollback.index("同步关闭 `JOB_REPLACEMENT_ENABLED`")
     keep_consumer = rollback.index("保持 `JOB_CANDIDATE_CLEANUP_ENABLED=true`")
     stop_consumer = rollback.index("才同步关闭 `JOB_CANDIDATE_CLEANUP_ENABLED`")
