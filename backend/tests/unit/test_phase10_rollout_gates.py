@@ -434,6 +434,19 @@ def test_release_manual_restarts_and_verifies_all_phase10_processes():
     assert "镜像 digest" in deployment
 
 
+def test_release_manual_stops_candidate_producer_before_consumer():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+    rollback = manual[manual.index("## 8. 回滚"):]
+    stop_producer = rollback.index("同步关闭 `JOB_REPLACEMENT_ENABLED`")
+    keep_consumer = rollback.index("保持 `JOB_CANDIDATE_CLEANUP_ENABLED=true`")
+    stop_consumer = rollback.index("才同步关闭 `JOB_CANDIDATE_CLEANUP_ENABLED`")
+
+    assert stop_producer < keep_consumer < stop_consumer
+    assert "media/target cleanup backlog 均收敛" in rollback
+
+
 def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():
     job_gate = phase10_preflight.CHECKS["invalid_job_ttl_config"]
     candidate_gate = phase10_preflight.CHECKS["invalid_candidate_ttl_config"]

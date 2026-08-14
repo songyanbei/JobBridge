@@ -71,7 +71,7 @@ python -m scripts.phase10_preflight
 ## 5. 同版本部署
 
 1. 构建一次制品，API、消息 Worker 和 scheduler 必须使用同一镜像 digest。
-2. 保持四个岗位生命周期开关为 `false`，同时启动新版本 API、消息 Worker、scheduler 和 session recovery Worker；不得让旧版本回流。
+2. 保持四个岗位生命周期开关为 `false`，同时启动新版本 API、消息 Worker、scheduler 和 session recovery Worker；不得让旧版本回流。此时 `JOB_REPLACEMENT_ENABLED=false` 同时禁止 replacement 和首次发布流程持久化 pending/rejected 候选，auto-pass 首次发布仍可直接激活，不得出现 `expires_at IS NULL AND candidate_expires_at IS NOT NULL` 的新增 Job。
 3. 检查 `/health`、消息 Worker/scheduler/session recovery Worker heartbeat、各进程版本和镜像 digest、Redis durability policy、推荐正文活动密钥版本及数据库连接；四类进程必须与已记录的同一制品和同一配置版本一致，只核对密钥版本和可解析状态，不输出密钥材料。
 4. 执行一轮不创建 replacement 的基础消息、后台查询和推荐发送 smoke test。
 5. 再次执行 `python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，结果必须通过。
@@ -80,7 +80,7 @@ python -m scripts.phase10_preflight
 
 每一步至少观察一个完整 worker 调度周期；任一门禁或监控异常时停止，不得继续打开后续开关。
 
-1. 先以待启用的相同配置执行 `JOB_REPLACEMENT_ENABLED=true python -m scripts.phase10_preflight`，确认 `recommendation_content_key_unavailable=0` 且 `ready=true`；再在所有 API、消息 Worker、scheduler 和 session recovery Worker 同步开启 `JOB_REPLACEMENT_ENABLED=true`，验证候选创建、审核、取消、激活和推荐消息投递。缺少活动版本密钥或各实例配置版本不一致时禁止开启。
+1. 先以待启用的相同配置执行 `JOB_REPLACEMENT_ENABLED=true python -m scripts.phase10_preflight`，确认 `recommendation_content_key_unavailable=0` 且 `ready=true`；再在所有 API、消息 Worker、scheduler 和 session recovery Worker 同步开启 `JOB_REPLACEMENT_ENABLED=true`，验证首次发布与 replacement 两类候选的创建、审核、取消、激活和推荐消息投递。缺少活动版本密钥或各实例配置版本不一致时禁止开启。
 2. 开启 `JOB_CANDIDATE_CLEANUP_ENABLED=true`，验证过期候选进入 media/target durable cleanup。
 3. 开启 `JOB_EXPIRY_CLEANUP_ENABLED=true`，验证到期岗位软删除、version 增长和 cleanup task 创建。
 4. 确认 coverage blocker 为 0、无 dead-letter 且 hard-delete 延迟窗口满足后，开启 `JOB_HARD_DELETE_ENABLED=true`。硬删任务负责把已超过延迟的历史媒体置为 `delete_pending`，并由逐行 media/target fail-closed 门禁阻止岗位提前物理删除；禁止由回填脚本代替该步骤。
@@ -103,10 +103,11 @@ python -m scripts.phase10_preflight
 
 ## 8. 回滚
 
-1. 按相反顺序关闭 `JOB_HARD_DELETE_ENABLED`、`JOB_EXPIRY_CLEANUP_ENABLED`、`JOB_CANDIDATE_CLEANUP_ENABLED`、`JOB_REPLACEMENT_ENABLED`，并确认所有实例读取到同一配置。
-2. 停止 API、Worker 和 scheduler，保留 MySQL 新增列、durable cleanup task、媒体生命周期记录、Redis AOF 和 revocation fence，优先 forward-fix。
-3. 不得直接启动 003/004 之前的 Worker。需要回滚应用制品时，只能使用明确兼容 003/004 schema 和 session fencing 的版本，并继续禁止新旧版本混跑。
-4. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows、原始 backup checksum 和 expected-live checksum 与当前备份表完全匹配，并取得破坏性回滚审批时执行。先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档三项证据。`phase10-down-backup-evidence.tsv` 必须与 `phase10-001-backup-evidence.tsv` 逐字节一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
+1. 先在所有 API、消息 Worker、scheduler 和 session recovery Worker 同步关闭 `JOB_REPLACEMENT_ENABLED`，确认所有实例读取到同一配置；该开关是 replacement 和首次发布 pending/rejected 候选的生产门禁，必须先于任何候选消费者关闭。
+2. 关闭 `JOB_HARD_DELETE_ENABLED` 和 `JOB_EXPIRY_CLEANUP_ENABLED`，但保持 `JOB_CANDIDATE_CLEANUP_ENABLED=true`，继续运行 candidate、media 和 target cleanup Worker。直到未激活候选 backlog、media/target cleanup backlog 均收敛且无 processing/retry_wait/dead-letter，连续一个完整调度周期没有新增候选后，才同步关闭 `JOB_CANDIDATE_CLEANUP_ENABLED`。
+3. 停止 API、Worker 和 scheduler，保留 MySQL 新增列、durable cleanup task、媒体生命周期记录、Redis AOF 和 revocation fence，优先 forward-fix。
+4. 不得直接启动 003/004 之前的 Worker。需要回滚应用制品时，只能使用明确兼容 003/004 schema 和 session fencing 的版本，并继续禁止新旧版本混跑。
+5. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows、原始 backup checksum 和 expected-live checksum 与当前备份表完全匹配，并取得破坏性回滚审批时执行。先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档三项证据。`phase10-down-backup-evidence.tsv` 必须与 `phase10-001-backup-evidence.tsv` 逐字节一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
 
    ```bash
    set -euo pipefail
@@ -133,7 +134,7 @@ python -m scripts.phase10_preflight
      cat sql/migrations/phase10_down_001_job_lifecycle.sql
    } | "${PHASE10_MYSQL[@]}" | tee phase10-down-001-output.txt
    ```
-5. 已经启用 replacement、产生 cleanup task 或执行媒体回填后，不做破坏性 schema 回滚；关闭开关、保留 durable 状态并发布修复版本。
-6. 回滚后重新执行健康检查、`python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，记录所有非零项和后续处置。
+6. 已经启用 replacement、产生 cleanup task 或执行媒体回填后，不做破坏性 schema 回滚；关闭开关、保留 durable 状态并发布修复版本。
+7. 回滚后重新执行健康检查、`python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，记录所有非零项和后续处置。
 
 回滚不得删除 WIP/发布证据、迁移备份表、AOF 或 cleanup task，也不得用清库方式消除 preflight blocker。

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.llm.base import IntentResult
 from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
@@ -223,6 +224,26 @@ def process_upload(
         text=final_raw_text,
         db=db,
     )
+
+    if (
+        entity_type == "job"
+        and not settings.job_replacement_enabled
+        and (
+            session.pending_upload_mode == "replace"
+            or audit_result.status != "passed"
+        )
+    ):
+        logger.warning(
+            "job_candidate_creation_blocked lifecycle rollout disabled "
+            "owner=%s mode=%s audit_status=%s",
+            identifier_hash(user_ctx.external_userid),
+            session.pending_upload_mode,
+            audit_result.status,
+        )
+        return UploadResult(
+            success=False,
+            reply_text="岗位发布功能暂不可用，请稍后再试。",
+        )
 
     # 入库（带审核结果）
     if entity_type == "job" and session.pending_upload_mode == "replace":

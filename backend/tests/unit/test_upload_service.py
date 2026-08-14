@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.config import settings
 from app.llm.base import IntentResult
 from app.schemas.conversation import SessionState
 from app.services.upload_service import (
@@ -114,6 +115,158 @@ class TestProcessUpload:
         assert created_job.accept_couple is True
         assert created_job.employment_type == "厂家直招"
         assert created_job.contract_type == "长期合同"
+
+    @pytest.mark.parametrize(
+        ("upload_mode", "audit_status", "candidate_cleanup_enabled"),
+        [
+            ("create", "pending", False),
+            ("create", "pending", True),
+            ("create", "rejected", False),
+            ("replace", "passed", False),
+        ],
+    )
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_disabled_rollout_does_not_persist_first_publish_candidate(
+        self, mock_conv, mock_audit, monkeypatch, upload_mode, audit_status,
+        candidate_cleanup_enabled,
+    ):
+        from app.services.audit_service import AuditResult
+
+        for name in (
+            "job_replacement_enabled",
+            "job_expiry_cleanup_enabled",
+            "job_candidate_cleanup_enabled",
+            "job_hard_delete_enabled",
+        ):
+            monkeypatch.setattr(settings, name, False)
+        monkeypatch.setattr(
+            settings, "job_candidate_cleanup_enabled", candidate_cleanup_enabled
+        )
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status=audit_status, reason="manual review", matched_words=[],
+        )
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+        session = _make_session(pending_upload_mode=upload_mode)
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市",
+                    "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "月薪",
+                    "headcount": 30,
+                },
+                confidence=0.95,
+            ),
+            "招工文本",
+            [],
+            session,
+            db,
+        )
+
+        assert result.success is False
+        assert "暂不可用" in result.reply_text
+        assert db.add.call_count == 0
+        assert session.pending_upload_mode == upload_mode
+
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_enabled_rollout_persists_pending_first_publish_candidate(
+        self, mock_conv, mock_audit, monkeypatch,
+    ):
+        from app.services.audit_service import AuditResult
+
+        monkeypatch.setattr(settings, "job_replacement_enabled", True)
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="pending", reason="manual review", matched_words=[],
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市",
+                    "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "月薪",
+                    "headcount": 30,
+                },
+                confidence=0.95,
+            ),
+            "招工文本",
+            [],
+            _make_session(),
+            db,
+        )
+
+        assert result.success is True
+        created_job = next(
+            call.args[0]
+            for call in db.add.call_args_list
+            if call.args and call.args[0].__class__.__name__ == "Job"
+        )
+        assert created_job.audit_status == "pending"
+        assert created_job.activated_at is None
+        assert created_job.expires_at is None
+        assert created_job.candidate_expires_at is not None
+
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_disabled_rollout_still_allows_auto_pass_activation(
+        self, mock_conv, mock_audit, monkeypatch,
+    ):
+        from app.services.audit_service import AuditResult
+
+        monkeypatch.setattr(settings, "job_replacement_enabled", False)
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="passed", reason="", matched_words=[],
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市",
+                    "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "月薪",
+                    "headcount": 30,
+                },
+                confidence=0.95,
+            ),
+            "招工文本",
+            [],
+            _make_session(),
+            db,
+        )
+
+        assert result.success is True
+        created_job = next(
+            call.args[0]
+            for call in db.add.call_args_list
+            if call.args and call.args[0].__class__.__name__ == "Job"
+        )
+        assert created_job.audit_status == "passed"
+        assert created_job.activated_at is not None
+        assert created_job.expires_at is not None
+        assert created_job.candidate_expires_at is None
 
     @patch("app.services.upload_service.conversation_service")
     def test_missing_fields_followup(self, mock_conv):
