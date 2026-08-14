@@ -482,6 +482,13 @@ class TestIntentServiceConstantsFromSchema:
         assert dict(_is._SEARCH_FIELD_REMAP) == slot_schema.search_synonyms()
 
 
+def test_job_upload_education_requirement_matches_database_enum():
+    slot = slot_schema.get_frame("job_upload").slots["education_required"]
+    assert slot.slot_type.enum_values == (
+        "不限", "初中", "高中", "中专", "大专及以上",
+    )
+
+
 # ---------------------------------------------------------------------------
 # P1：job_title 通过 _normalize_structured_data 不被 silently dropped
 # ---------------------------------------------------------------------------

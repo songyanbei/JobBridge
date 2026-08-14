@@ -786,6 +786,34 @@ def _normalize_int_field(value, *, lo: int | None = None, hi: int | None = None)
     return v
 
 
+_EDUCATION_REQUIRED_ALIASES = {
+    "不限": "不限",
+    "学历不限": "不限",
+    "初中": "初中",
+    "初中以上": "初中",
+    "初中及以上": "初中",
+    "高中": "高中",
+    "高中以上": "高中",
+    "高中及以上": "高中",
+    "中专": "中专",
+    "中专以上": "中专",
+    "中专及以上": "中专",
+    "大专": "大专及以上",
+    "大专以上": "大专及以上",
+    "大专及以上": "大专及以上",
+}
+
+
+def _normalize_education_required(value) -> str | None:
+    """Map common threshold wording to the Job education enum."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("学历"):
+        text = text[:-2].strip()
+    return _EDUCATION_REQUIRED_ALIASES.get(text)
+
+
 def _coerce_field_value(field: str, value, *, force_list: bool):
     """按字段语义把单个 value 规整成最终类型。
 
@@ -831,6 +859,8 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
         return _normalize_int_field(value, lo=_AGE_MIN, hi=_AGE_MAX)
     if field in {"salary_floor_monthly", "salary_ceiling_monthly", "salary_expect_floor_monthly"}:
         return _normalize_int_field(value, lo=_SALARY_MIN, hi=_SALARY_MAX)
+    if field == "education_required":
+        return _normalize_education_required(value)
 
     return value
 
@@ -904,6 +934,16 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
             else:
                 logger.warning(
                     "intent_service: drop invalid int field=%s raw=%r", key, raw,
+                )
+            continue
+
+        if key == "education_required":
+            coerced = _coerce_field_value(key, raw, force_list=False)
+            if coerced is not None:
+                out[key] = coerced
+            else:
+                logger.warning(
+                    "intent_service: drop invalid education_required raw=%r", raw,
                 )
             continue
 

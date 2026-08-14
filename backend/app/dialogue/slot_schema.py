@@ -336,7 +336,9 @@ def _build_job_search() -> FrameDef:
             "accept_minority", slot_type=_bool_type(), display_name="可少数民族",
         ),
         "education_required": _slot(
-            "education_required", slot_type=_str_type(), display_name="学历要求",
+            "education_required",
+            slot_type=_enum_str(("不限", "初中", "高中", "中专", "大专及以上")),
+            display_name="学历要求",
         ),
         "experience_required": _slot(
             "experience_required", slot_type=_str_type(), display_name="经验要求",
