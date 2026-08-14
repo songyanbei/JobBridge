@@ -4,9 +4,9 @@
 
 - 分支：`codex/job-expiry-full-update-v05`
 - 修复基线：`060f5fb`
-- 功能与发布手册 HEAD：`29af6d7`
-- 验证日期：2026-08-11（Asia/Shanghai）
-- 结果：23 个问题均使用独立提交完成；V-01 至 V-05 全部通过，未发现未关闭的 P1/P2/P3。
+- 最终代码验证 HEAD：`6198fe7`
+- 验证日期：2026-08-11 至 2026-08-14（Asia/Shanghai）
+- 结果：原 23 个问题及真实页面联调新发现的 3 个阻断问题均使用独立提交完成；V-01 至 V-05 与补充验收全部通过，未发现未关闭的 P1/P2/P3。
 - 边界：未 rebase、未合并 `main`、未推送、未创建 PR。
 
 ## 2. 问题与提交追踪
@@ -36,6 +36,9 @@
 | 21 | N-16 Session schema rollout gate | `0b284c6` | V-01、V-02、V-05 |
 | 22 | N-17 Target cleanup 回填顺序 | `4db63ff` | V-01、V-02、V-05 |
 | 23 | N-18 发布手册 | `29af6d7` | V-01、V-02、V-04、V-05 |
+| 24 | B-01 合法学历表述导致严格 MySQL 写入失败 | `3a67218` | 补充单测、严格 MySQL、真实对话 |
+| 25 | B-02 全量更新显式字段丢失 | `8efed06` | 补充单测、严格 MySQL、真实对话与推荐 |
+| 26 | B-03 岗位替换缺少推荐正文密钥发布门禁 | `6198fe7` | 补充单测、真实 MySQL/Redis preflight |
 
 每项提交前均完成定向测试、受影响模块测试、真实服务测试（适用时）、`py_compile`、`git diff --check` 和独立只读评审。评审发现的问题均在对应问题内修复并重新执行全部门禁后才提交；没有使用空提交表示测试完成。
 
@@ -210,6 +213,23 @@ python -m scripts.phase10_clock_check
 python -m scripts.phase10_preflight
 ```
 
+## 8.1 真实联调阻断项补充验收
+
+2026-08-14 使用最终代码 HEAD `6198fe7` 重建 WSL 审核镜像，API、消息 Worker、管理端和模拟企业微信入口均正常启动，`/health` 返回数据库连接正常。
+
+1. B-01 学历规范化：真实 LLM 将“高中及以上”抽取后，持久化值规范为数据库枚举“高中”；此前“初中以上学历”场景也已验证规范为“初中”，严格 MySQL 未再发生截断或枚举写入错误。
+2. B-02 全量更新：招聘者 `wm_mock_factory_002` 通过 `/更新岗位 124` 提交完整岗位文本。新岗位 `161` 自动审核通过并激活，旧岗位 `124` 变为 `delist_reason=replaced` 且软删除；新岗位的地址、接受夫妻工、学历、用工类型和合同类型分别为“昆山市开发区春旭路666号”、`true`、“高中”、“劳务派遣”、“短期合同”。
+3. 推荐可见性：求职者 `wm_mock_worker_001` 搜索“找昆山服装厂，月薪7000以上”，最新 `recommendation_delivery.recommendation_context` 仅包含 `target_id=161`，不包含旧岗位 `124`，投递状态为 `sent`。
+4. B-03 发布门禁：单密钥、密钥环、缺失密钥、活动版本不匹配均有自动化覆盖；评审额外发现版本 `65536` 无法由正文信封和 MySQL `UNSIGNED SMALLINT` 表示，已在配置层与 preflight 层同时阻断，`65535` 边界通过。
+
+最终提交上的补充自动化结果：
+
+- `python -m pytest -q tests/unit`：`1932 passed`，零失败。
+- `tests/integration/test_job_replace_mysql.py` 与 `tests/integration/test_phase10_preflight_mysql.py`：真实 MySQL 8、Redis 7 环境下 `9 passed`，零失败。
+- B-02 提交前相关模块回归：`241 passed`；独立严格 MySQL 持久化测试：`1 passed`。
+- B-03 提交前相关模块回归：`70 passed`；独立真实 MySQL/Redis preflight：`3 passed`。
+- 所有三项均通过 `py_compile`、`git diff --check` 和独立只读复审；评审提出的普通创建测试缺口及密钥版本上限 P1 均在对应提交前修复并重新执行门禁。
+
 ## 9. 最终静态与仓库状态证据
 
 报告评审前实际执行：
@@ -225,10 +245,10 @@ git stash list
 结果：
 
 - `compileall`：退出码 0。
-- `git diff --check`：退出码 0；当时没有已跟踪文件差异，验证报告是唯一未跟踪文件。
+- `git diff --check`：退出码 0；补充验收前工作区干净，修订后验证报告是唯一已修改文件。
 - 分支：`codex/job-expiry-full-update-v05`。
-- 完整 HEAD：`29af6d7585472a2b61250f31979a5feb43e0eb15`。
-- 状态：仅 `docs/岗位生命周期Phase10最终验证报告.md` 未跟踪，无其他修改。
+- 补充验收代码 HEAD：`6198fe7`。
+- 状态：仅 `docs/岗位生命周期Phase10最终验证报告.md` 已修改，无其他修改。
 - stash：`stash@{0}: wip/post-060f5fb-hardening-audit` 仍存在。
 - 报告通过独立评审后，将使用 `git diff --cached --check` 检查已暂存报告；提交后再验证工作区干净和 stash 保留。
 
@@ -243,5 +263,5 @@ git stash list
 ## 11. 最终状态要求
 
 - 本报告独立只读评审无 P1/P2/P3 后，提交为 `docs(rollout): record phase10 verification evidence`。
-- 提交后工作区必须干净，23 个问题提交和最终证据提交均可独立回溯。
+- 提交后工作区必须干净，26 个问题提交和最终证据提交均可独立回溯。
 - WIP stash 保持存在；不推送、不创建 PR，等待用户下一步指令。
