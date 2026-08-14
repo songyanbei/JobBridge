@@ -68,7 +68,10 @@ PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --data
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_001_job_lifecycle_additive.sql | tee phase10-001-output.txt
 PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-001-backup-evidence.tsv
-# 归档 backup rows/checksum/expected-live checksum，并核对 backup_rows=job_rows
+# 归档 backup rows/checksum/expected-live checksum；同时归档 001 最后一行的
+# 三类 source/live 计数、live/expected checksum 和两个 valid 字段；
+# 核对三类计数逐项相等、backup_rows=job_rows、live_checksum=expected_live_checksum，
+# 且 live_checksum_valid=1、expected_checksum_valid=1。任一不符立即停止。
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_002_media_dead_letter.sql | tee phase10-002-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_003_session_commit_deadline.sql | tee phase10-003-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_004_session_commit_lease_owner.sql | tee phase10-004-output.txt

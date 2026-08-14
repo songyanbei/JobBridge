@@ -1,7 +1,8 @@
 -- v0.5 additive migration. Deploy nullable readers before executing this file.
 CREATE TABLE `phase10_job_lifecycle_backup` AS
 SELECT `id` AS `job_id`, `audit_status`, `expires_at`, `deleted_at`,
-       `delist_reason`, `version`
+       `delist_reason`, `version`, `created_at` AS `source_created_at`,
+       `updated_at` AS `source_updated_at`, `audited_at` AS `source_audited_at`
 FROM `job`;
 ALTER TABLE `phase10_job_lifecycle_backup`
   ADD PRIMARY KEY (`job_id`);
@@ -85,6 +86,9 @@ CREATE TABLE `phase10_migration_control` (
   `writes_blocked` TINYINT(1) NOT NULL DEFAULT 0,
   `backup_rows` BIGINT UNSIGNED NULL,
   `backup_checksum` BIGINT UNSIGNED NULL,
+  `source_soft_deleted_rows` BIGINT UNSIGNED NULL,
+  `source_passed_online_rows` BIGINT UNSIGNED NULL,
+  `source_candidate_rows` BIGINT UNSIGNED NULL,
   `expected_live_checksum` BIGINT UNSIGNED NULL,
   PRIMARY KEY (`id`),
   CONSTRAINT `chk_phase10_writes_blocked` CHECK (`writes_blocked` IN (0, 1))
@@ -158,14 +162,28 @@ ALTER TABLE `phase10_job_lifecycle_backup`
   ADD COLUMN `expected_candidate_expires_at` DATETIME NULL;
 
 UPDATE `phase10_job_lifecycle_backup` AS b
-JOIN `job` AS j ON j.`id` = b.`job_id`
-SET b.`expected_audit_status` = j.`audit_status`,
-    b.`expected_expires_at` = j.`expires_at`,
-    b.`expected_deleted_at` = j.`deleted_at`,
-    b.`expected_delist_reason` = j.`delist_reason`,
-    b.`expected_version` = j.`version`,
-    b.`expected_activated_at` = j.`activated_at`,
-    b.`expected_candidate_expires_at` = j.`candidate_expires_at`;
+SET b.`expected_audit_status` = b.`audit_status`,
+    b.`expected_expires_at` = CASE
+      WHEN b.`deleted_at` IS NOT NULL OR b.`audit_status` = 'passed'
+      THEN b.`expires_at` ELSE NULL END,
+    b.`expected_deleted_at` = b.`deleted_at`,
+    b.`expected_delist_reason` = b.`delist_reason`,
+    b.`expected_version` = b.`version` + 1,
+    b.`expected_activated_at` = CASE
+      WHEN b.`deleted_at` IS NOT NULL
+      THEN COALESCE(b.`source_audited_at`, b.`source_created_at`, b.`source_updated_at`)
+      WHEN b.`audit_status` = 'passed'
+      THEN COALESCE(b.`source_audited_at`, b.`source_created_at`)
+      ELSE NULL END,
+    b.`expected_candidate_expires_at` = CASE
+      WHEN b.`deleted_at` IS NULL AND b.`audit_status` IN ('pending', 'rejected')
+      THEN DATE_ADD(@phase10_migration_time, INTERVAL @phase10_candidate_days DAY)
+      ELSE NULL END;
+
+ALTER TABLE `phase10_job_lifecycle_backup`
+  DROP COLUMN `source_created_at`,
+  DROP COLUMN `source_updated_at`,
+  DROP COLUMN `source_audited_at`;
 
 ALTER TABLE `phase10_job_lifecycle_backup`
   MODIFY COLUMN `expected_audit_status` ENUM('pending','passed','rejected') NOT NULL,
@@ -178,6 +196,18 @@ SET `backup_rows` = (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`),
         COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
         COALESCE(`delist_reason`, ''), `version`))), 0)
       FROM `phase10_job_lifecycle_backup`
+    ),
+    `source_soft_deleted_rows` = (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
+      WHERE `deleted_at` IS NOT NULL
+    ),
+    `source_passed_online_rows` = (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
+      WHERE `deleted_at` IS NULL AND `audit_status` = 'passed'
+    ),
+    `source_candidate_rows` = (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
+      WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')
     ),
     `expected_live_checksum` = (
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
@@ -192,7 +222,80 @@ WHERE `id` = 1;
 ALTER TABLE `phase10_migration_control`
   MODIFY COLUMN `backup_rows` BIGINT UNSIGNED NOT NULL,
   MODIFY COLUMN `backup_checksum` BIGINT UNSIGNED NOT NULL,
+  MODIFY COLUMN `source_soft_deleted_rows` BIGINT UNSIGNED NOT NULL,
+  MODIFY COLUMN `source_passed_online_rows` BIGINT UNSIGNED NOT NULL,
+  MODIFY COLUMN `source_candidate_rows` BIGINT UNSIGNED NOT NULL,
   MODIFY COLUMN `expected_live_checksum` BIGINT UNSIGNED NOT NULL;
+
+DELIMITER $$
+-- Fail inside the migration window if any legal-looking row was reclassified or
+-- if the post-backfill lifecycle projection differs from its frozen expectation.
+CREATE PROCEDURE `phase10_assert_lifecycle_backfill`()
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE migration_mismatch TINYINT DEFAULT 1;
+  SELECT CASE WHEN
+    c.`backup_rows` <> (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`)
+    OR c.`backup_rows` <> (SELECT COUNT(*) FROM `job`)
+    OR c.`backup_rows` <>
+       c.`source_soft_deleted_rows` + c.`source_passed_online_rows` + c.`source_candidate_rows`
+    OR c.`backup_checksum` <> (
+      SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
+        COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+        COALESCE(`delist_reason`, ''), `version`))), 0)
+      FROM `phase10_job_lifecycle_backup`
+    )
+    OR c.`source_soft_deleted_rows` <> (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup` WHERE `deleted_at` IS NOT NULL
+    )
+    OR c.`source_passed_online_rows` <> (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
+      WHERE `deleted_at` IS NULL AND `audit_status` = 'passed'
+    )
+    OR c.`source_candidate_rows` <> (
+      SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
+      WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')
+    )
+    OR c.`expected_live_checksum` <> (
+      SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
+        COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
+        COALESCE(`expected_delist_reason`, ''), `expected_version`,
+        COALESCE(`expected_activated_at`, ''),
+        COALESCE(`expected_candidate_expires_at`, '')))), 0)
+      FROM `phase10_job_lifecycle_backup`
+    )
+    OR c.`source_soft_deleted_rows` <> (
+      SELECT COUNT(*) FROM `job` WHERE `deleted_at` IS NOT NULL
+    )
+    OR c.`source_passed_online_rows` <> (
+      SELECT COUNT(*) FROM `job`
+      WHERE `deleted_at` IS NULL AND `audit_status` = 'passed'
+    )
+    OR c.`source_candidate_rows` <> (
+      SELECT COUNT(*) FROM `job`
+      WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')
+    )
+    OR c.`expected_live_checksum` <> (
+      SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
+        COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+        COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+        COALESCE(`candidate_expires_at`, '')))), 0)
+      FROM `job`
+    )
+    THEN 1 ELSE 0 END
+  INTO migration_mismatch
+  FROM `phase10_migration_control` AS c
+  WHERE c.`id` = 1;
+
+  IF migration_mismatch <> 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'phase10_lifecycle_backfill_evidence_mismatch';
+  END IF;
+END$$
+DELIMITER ;
+
+CALL `phase10_assert_lifecycle_backfill`();
+DROP PROCEDURE `phase10_assert_lifecycle_backfill`;
 
 -- Deployment gate: this query must return zero rows before writes resume.
 SELECT `id` FROM `job`
@@ -212,17 +315,40 @@ LEFT JOIN `job` AS j ON 1=1
 WHERE t.`TABLE_SCHEMA` = DATABASE() AND t.`TABLE_NAME` = 'job'
 GROUP BY t.`AUTO_INCREMENT`;
 
--- Backup coverage/checksum baseline for rollout and controlled rollback records.
+-- Classification and checksum evidence for rollout and controlled rollback records.
 SELECT
-  (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`) AS `backup_rows`,
+  c.`backup_rows`,
   (SELECT COUNT(*) FROM `job`) AS `job_rows`,
-  (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
+  c.`source_soft_deleted_rows`,
+  (SELECT COUNT(*) FROM `job` WHERE `deleted_at` IS NOT NULL) AS `live_soft_deleted_rows`,
+  c.`source_passed_online_rows`,
+  (SELECT COUNT(*) FROM `job`
+   WHERE `deleted_at` IS NULL AND `audit_status` = 'passed') AS `live_passed_online_rows`,
+  c.`source_candidate_rows`,
+  (SELECT COUNT(*) FROM `job`
+   WHERE `deleted_at` IS NULL
+     AND `audit_status` IN ('pending', 'rejected')) AS `live_candidate_rows`,
+  c.`backup_checksum`,
+  c.`expected_live_checksum`,
+  (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
       COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-      COALESCE(`delist_reason`, ''), `version`))), 0)
-   FROM `phase10_job_lifecycle_backup`) AS `backup_checksum`,
-  (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
+      COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+      COALESCE(`candidate_expires_at`, '')))), 0)
+   FROM `job`) AS `live_checksum`,
+  c.`expected_live_checksum` = (
+    SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
+      COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+      COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+      COALESCE(`candidate_expires_at`, '')))), 0)
+    FROM `job`
+  ) AS `live_checksum_valid`,
+  c.`expected_live_checksum` = (
+    SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
       COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
       COALESCE(`expected_delist_reason`, ''), `expected_version`,
       COALESCE(`expected_activated_at`, ''),
       COALESCE(`expected_candidate_expires_at`, '')))), 0)
-   FROM `phase10_job_lifecycle_backup`) AS `expected_live_checksum`;
+    FROM `phase10_job_lifecycle_backup`
+  ) AS `expected_checksum_valid`
+FROM `phase10_migration_control` AS c
+WHERE c.`id` = 1;

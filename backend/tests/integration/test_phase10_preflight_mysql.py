@@ -42,7 +42,10 @@ INSERT INTO job (
   audit_status, created_at, updated_at, audited_at, expires_at,
   deleted_at, delist_reason, version
 ) VALUES
-('passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1);
+('passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1),
+('pending','2026-01-04','2026-01-05',NULL,'2026-09-02',NULL,NULL,1),
+('rejected','2026-01-06','2026-01-07','2026-01-08','2026-09-03',
+ '2026-02-01','expired',1);
 """
 
 
@@ -203,6 +206,20 @@ def test_backup_integrity_gate_ignores_live_job_additions_and_hard_deletes():
             cursor.execute(gate)
             assert int(cursor.fetchone()[0]) == 0
 
+            cursor.execute(
+                "UPDATE phase10_migration_control "
+                "SET source_candidate_rows=source_candidate_rows+1 WHERE id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 1
+
+            cursor.execute(
+                "UPDATE phase10_migration_control "
+                "SET source_candidate_rows=source_candidate_rows-1 WHERE id=1"
+            )
+            cursor.execute(gate)
+            assert int(cursor.fetchone()[0]) == 0
+
             cursor.execute("DELETE FROM phase10_migration_control WHERE id=1")
             cursor.execute(gate)
             assert int(cursor.fetchone()[0]) == 1
@@ -211,4 +228,98 @@ def test_backup_integrity_gate_ignores_live_job_additions_and_hard_deletes():
             db.close()
         with admin.cursor() as cursor:
             cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
+
+
+def test_migration_gates_classification_counts_and_live_checksum():
+    database = f"phase10_evidence_{uuid4().hex[:16]}"
+    drift_database = f"phase10_evidence_drift_{uuid4().hex[:16]}"
+    checksum_database = f"phase10_evidence_checksum_{uuid4().hex[:16]}"
+    admin = _connect()
+    db = None
+    drift_db = None
+    checksum_db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+            cursor.execute(
+                f"CREATE DATABASE `{drift_database}` CHARACTER SET utf8mb4"
+            )
+            cursor.execute(
+                f"CREATE DATABASE `{checksum_database}` CHARACTER SET utf8mb4"
+            )
+
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        _execute_script(db, UP_SQL)
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT c.source_soft_deleted_rows, "
+                "c.source_passed_online_rows, c.source_candidate_rows, "
+                "(SELECT COUNT(*) FROM job WHERE deleted_at IS NOT NULL), "
+                "(SELECT COUNT(*) FROM job WHERE deleted_at IS NULL "
+                " AND audit_status='passed'), "
+                "(SELECT COUNT(*) FROM job WHERE deleted_at IS NULL "
+                " AND audit_status IN ('pending','rejected')), "
+                "c.expected_live_checksum, "
+                "(SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', id, audit_status, "
+                " COALESCE(expires_at, ''), COALESCE(deleted_at, ''), "
+                " COALESCE(delist_reason, ''), version, COALESCE(activated_at, ''), "
+                " COALESCE(candidate_expires_at, '')))), 0) FROM job) "
+                "FROM phase10_migration_control c WHERE c.id=1"
+            )
+            evidence = tuple(int(value) for value in cursor.fetchone())
+        assert evidence[:6] == (1, 1, 1, 1, 1, 1)
+        assert evidence[6] == evidence[7]
+
+        drift_db = _connect(drift_database)
+        _execute_script(drift_db, BASE_SCHEMA_SQL)
+        assertion = "CALL `phase10_assert_lifecycle_backfill`();"
+        assert assertion in UP_SQL
+        drift_sql = UP_SQL.replace(
+            assertion,
+            "UPDATE `job` SET `audit_status`='pending', `activated_at`=NULL, "
+            "`expires_at`=NULL, `candidate_expires_at`=DATE_ADD("
+            "@phase10_migration_time, INTERVAL @phase10_candidate_days DAY) "
+            "WHERE `id`=1;\n" + assertion,
+            1,
+        )
+        with pytest.raises(
+            pymysql.MySQLError,
+            match="phase10_lifecycle_backfill_evidence_mismatch",
+        ):
+            _execute_script(drift_db, drift_sql)
+
+        checksum_db = _connect(checksum_database)
+        _execute_script(checksum_db, BASE_SCHEMA_SQL)
+        passed_backfill = (
+            "SET `activated_at` = COALESCE(`audited_at`, `created_at`),\n"
+            "    `version` = `version` + 1\n"
+            "WHERE `deleted_at` IS NULL AND `audit_status` = 'passed';"
+        )
+        assert passed_backfill in UP_SQL
+        invalid_checksum_sql = UP_SQL.replace(
+            passed_backfill,
+            "SET `activated_at` = DATE_ADD(COALESCE(`audited_at`, `created_at`), "
+            "INTERVAL 1 SECOND),\n"
+            "    `version` = `version` + 1\n"
+            "WHERE `deleted_at` IS NULL AND `audit_status` = 'passed';",
+            1,
+        )
+        with pytest.raises(
+            pymysql.MySQLError,
+            match="phase10_lifecycle_backfill_evidence_mismatch",
+        ):
+            _execute_script(checksum_db, invalid_checksum_sql)
+    finally:
+        if db is not None:
+            db.close()
+        if drift_db is not None:
+            drift_db.close()
+        if checksum_db is not None:
+            checksum_db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+            cursor.execute(f"DROP DATABASE IF EXISTS `{drift_database}`")
+            cursor.execute(f"DROP DATABASE IF EXISTS `{checksum_database}`")
         admin.close()

@@ -37,6 +37,16 @@ def test_additive_migration_contains_rollout_invariants():
     assert "backup_checksum" in sql
     assert "audit_status` = 'passed'" in sql
     assert "candidate_expires_at` IS NULL" in sql
+    for classification in (
+        "source_soft_deleted_rows",
+        "source_passed_online_rows",
+        "source_candidate_rows",
+    ):
+        assert classification in sql
+    assert "phase10_assert_lifecycle_backfill" in sql
+    assert "phase10_lifecycle_backfill_evidence_mismatch" in sql
+    assert "live_checksum_valid" in sql
+    assert "expected_checksum_valid" in sql
 
 
 def test_media_dead_letter_schema_and_upgrade_migration_are_complete():
@@ -109,6 +119,19 @@ def test_additive_migration_freezes_post_migration_state_for_safe_down():
     )
     assert final_backfill_offset < snapshot_offset
     assert "expected_live_checksum" in sql
+    expected_projection = sql[
+        sql.index("UPDATE `phase10_job_lifecycle_backup` AS b"):sql.index(
+            "ALTER TABLE `phase10_job_lifecycle_backup`\n  MODIFY COLUMN"
+        )
+    ]
+    assert "JOIN `job`" not in expected_projection
+    assert "b.`expected_version` = b.`version` + 1" in expected_projection
+    for source_field in (
+        "source_created_at",
+        "source_updated_at",
+        "source_audited_at",
+    ):
+        assert f"DROP COLUMN `{source_field}`" in expected_projection
     assert "phase10_migration_control" in sql
     assert "phase10_assert_writes_allowed" in sql
     for trigger in (
@@ -154,6 +177,12 @@ def test_preflight_includes_config_and_backup_coverage_gates():
     assert "LEFT JOIN job" not in backup_gate
     assert "phase10_migration_control" in backup_gate
     for field in ("backup_rows", "backup_checksum", "expected_live_checksum"):
+        assert field in backup_gate
+    for field in (
+        "source_soft_deleted_rows",
+        "source_passed_online_rows",
+        "source_candidate_rows",
+    ):
         assert field in backup_gate
     enum_gate = phase10_preflight.CHECKS["media_state_enum_missing_dead_letter"]
     assert "information_schema.COLUMNS" in enum_gate
