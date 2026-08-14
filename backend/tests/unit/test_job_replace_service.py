@@ -28,6 +28,7 @@ from app.services.job_replace_service import (
     create_replacement_candidate,
     retry_activation,
 )
+from app.services import upload_service
 from app.services.intent_service import _match_command
 from app.services.user_service import UserContext
 
@@ -145,6 +146,21 @@ def test_update_command_selects_only_job_and_starts_empty_draft(db, monkeypatch)
     assert session.pending_upload == {}
     assert session.pending_upload_mode == "replace"
     assert session.pending_target_id == old.id
+    started_at = datetime.fromisoformat(session.pending_started_at)
+    updated_at = datetime.fromisoformat(session.pending_updated_at)
+    expires_at = datetime.fromisoformat(session.pending_expires_at)
+    assert updated_at == started_at
+    assert expires_at - started_at == timedelta(minutes=10)
+
+    original_deadline = session.pending_expires_at
+    upload_service._save_pending_upload(
+        session,
+        intent="upload_job",
+        structured_data={"city": "无锡"},
+        missing=["job_category"],
+        raw_text="无锡",
+    )
+    assert session.pending_expires_at == original_deadline
 
 
 @pytest.mark.parametrize("text", [

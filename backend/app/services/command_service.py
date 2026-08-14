@@ -169,7 +169,8 @@ def _handle_update_job(
         target_id = int(args.strip()) if args.strip() else None
     except ValueError:
         return [_reply(user_ctx, "岗位 ID 必须是数字。")]
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.replace(tzinfo=None)
     jobs = db.query(Job).filter(
         Job.owner_userid == user_ctx.external_userid,
         Job.audit_status == "passed",
@@ -201,6 +202,7 @@ def _handle_update_job(
     session.pending_upload_mode, session.pending_target_id = "replace", job.id
     session.pending_target_version, session.pending_operation_id = job.version, str(uuid.uuid4())
     session.pending_upload_media_ids, session.pending_upload_intent = [], "upload_job"
+    upload_service.initialize_pending_upload_window(session, now=now_utc)
     session.active_flow = "upload_collecting"
     return [_reply(user_ctx, "请发送完整的新岗位信息；审核通过后才会替换旧岗位。")]
 

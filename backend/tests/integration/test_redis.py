@@ -3,11 +3,14 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from redis.exceptions import ResponseError
 
 from app.services import conversation_service
+from app.services import upload_service
+from app.schemas.conversation import SessionState
 from app.core.redis_client import (
     RedisDurabilityPolicyError,
     SessionCommitDeadlineExceeded,
@@ -37,6 +40,38 @@ from app.core.redis_client import (
     save_undo,
     validate_redis_durability_policy,
 )
+
+
+def test_empty_replacement_draft_deadline_survives_real_redis_round_trip():
+    userid = "integration-empty-replacement-deadline"
+    started_at = datetime(2026, 8, 14, 9, 30, tzinfo=timezone.utc)
+    conversation_service.clear_session(userid)
+    try:
+        session = SessionState(
+            role="factory",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="replace",
+            pending_target_id=42,
+            pending_target_version=7,
+            pending_operation_id="8e36fe0d-84cc-4274-8b10-c36ec62af7ad",
+            active_flow="upload_collecting",
+        )
+        upload_service.initialize_pending_upload_window(session, now=started_at)
+
+        conversation_service.save_session(userid, session)
+        restored = conversation_service.load_session(userid)
+
+        assert restored is not None
+        assert restored.pending_upload == {}
+        assert restored.pending_started_at == started_at.isoformat()
+        assert restored.pending_updated_at == started_at.isoformat()
+        assert datetime.fromisoformat(restored.pending_expires_at) == (
+            started_at + timedelta(minutes=10)
+        )
+        assert restored.pending_target_id == 42
+        assert restored.pending_operation_id == session.pending_operation_id
+    finally:
+        conversation_service.clear_session(userid)
 
 
 def test_real_undo_compare_and_delete_preserves_replacement_snapshot():

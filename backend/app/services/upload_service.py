@@ -44,6 +44,24 @@ MAX_FOLLOW_UP_ROUNDS = 2
 PENDING_UPLOAD_TTL_MINUTES = 10
 
 
+def initialize_pending_upload_window(
+    session: SessionState,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Start the fixed upload deadline once, including for an empty draft."""
+    if session.pending_started_at:
+        return
+    started_at = now or datetime.now(timezone.utc)
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    session.pending_started_at = started_at.isoformat()
+    session.pending_updated_at = started_at.isoformat()
+    session.pending_expires_at = (
+        started_at + timedelta(minutes=PENDING_UPLOAD_TTL_MINUTES)
+    ).isoformat()
+
+
 def _save_pending_upload(
     session: SessionState,
     intent: str,
@@ -59,11 +77,7 @@ def _save_pending_upload(
     now = datetime.now(timezone.utc)
     # 固定窗口：expires_at = created_at + 10 分钟，subsequent 轮次只更新 updated_at。
     # 避免用户用 chitchat 间歇性"续命"陈旧草稿（spec §3.4 / §9.4）。
-    if not session.pending_started_at:
-        session.pending_started_at = now.isoformat()
-        session.pending_expires_at = (
-            now + timedelta(minutes=PENDING_UPLOAD_TTL_MINUTES)
-        ).isoformat()
+    initialize_pending_upload_window(session, now=now)
     session.pending_updated_at = now.isoformat()
 
     # 合并结构化字段（新值覆盖旧值）。
@@ -144,7 +158,7 @@ def is_pending_upload_expired(session: SessionState) -> bool:
        可能产生 naive 字符串，比较前必须归一化。
     """
     if not session.pending_expires_at:
-        return False
+        return bool(session.pending_upload_intent)
     try:
         expires = datetime.fromisoformat(session.pending_expires_at)
         if expires.tzinfo is None:
