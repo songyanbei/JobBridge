@@ -334,8 +334,10 @@ def _load_ttl_config(db) -> dict[str, int]:
     说明：``ttl.job.days`` / ``ttl.resume.days`` 在 upload_service 写 expires_at
     时消费，本任务不再二次读取。
     """
+    from app.services.lifecycle_config_service import get_hard_delete_delay_days
+
     return {
-        "hard_delete_delay_days": _read_int_config(db, "ttl.hard_delete.delay_days", 7),
+        "hard_delete_delay_days": get_hard_delete_delay_days(db),
         "conversation_log_days": _read_int_config(db, "ttl.conversation_log.days", 30),
         "wecom_inbound_event_days": _read_int_config(db, "ttl.wecom_inbound_event.days", 30),
         "audit_log_days": _read_int_config(db, "ttl.audit_log.days", 180),

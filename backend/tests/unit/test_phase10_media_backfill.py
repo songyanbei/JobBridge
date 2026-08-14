@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.schema import CreateTable
 
 from app.config import settings
-from app.models import Job, MediaAssetLifecycle, Resume
+from app.models import Job, MediaAssetLifecycle, Resume, SystemConfig
 from scripts import backfill_media_lifecycle, phase10_preflight
 
 
@@ -29,7 +29,12 @@ def _now():
 def db():
     engine = create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
-        for table in (Job.__table__, Resume.__table__, MediaAssetLifecycle.__table__):
+        for table in (
+            Job.__table__,
+            Resume.__table__,
+            MediaAssetLifecycle.__table__,
+            SystemConfig.__table__,
+        ):
             connection.execute(CreateTable(table))
     session = sessionmaker(bind=engine)()
     try:
@@ -93,7 +98,12 @@ def test_backfill_is_dry_run_by_default_and_apply_is_idempotent(db, monkeypatch)
         "/files/images/job/a.jpg",
         "https://assets.example.com/files/images/job/b.jpg?sig=secret",
     ])
-    _resume(db, 2, images=["images/resume/a.jpg"], deleted_at=_now())
+    _resume(
+        db,
+        2,
+        images=["images/resume/a.jpg"],
+        deleted_at=_now() - timedelta(days=8),
+    )
 
     dry = backfill_media_lifecycle.backfill_media_lifecycle(db)
 
@@ -116,7 +126,7 @@ def test_backfill_is_dry_run_by_default_and_apply_is_idempotent(db, monkeypatch)
     assert states == {
         "images/job/a.jpg": "attached",
         "images/job/b.jpg": "attached",
-        "images/resume/a.jpg": "delete_pending",
+        "images/resume/a.jpg": "attached",
     }
 
     repeated = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
@@ -124,6 +134,143 @@ def test_backfill_is_dry_run_by_default_and_apply_is_idempotent(db, monkeypatch)
     assert repeated["updated_media_lifecycle_count"] == 0
     assert repeated["matched_media_lifecycle_key_count"] == 3
     assert db.query(MediaAssetLifecycle).count() == 3
+
+
+def test_backfill_keeps_recent_soft_deleted_media_until_configured_delay(db):
+    db.add(SystemConfig(
+        config_key="ttl.hard_delete.delay_days",
+        config_value="14",
+        value_type="int",
+    ))
+    _job(
+        db,
+        1,
+        images=["images/job/recent.jpg"],
+        deleted_at=_now() - timedelta(days=8),
+    )
+    _job(
+        db,
+        2,
+        images=["images/job/due.jpg"],
+        deleted_at=_now() - timedelta(days=15),
+    )
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    assert report["hard_delete_delay_days"] == 14
+    assert report["non_deleted_soft_deleted_media_key_count"] == 1
+    rows = {
+        row.object_key: row for row in db.query(MediaAssetLifecycle).all()
+    }
+    assert rows["images/job/recent.jpg"].state == "attached"
+    assert rows["images/job/recent.jpg"].next_attempt_at is None
+    assert rows["images/job/due.jpg"].state == "attached"
+    assert rows["images/job/due.jpg"].next_attempt_at is None
+
+
+def test_backfill_restores_only_unstarted_recent_delete_pending_media(db):
+    _job(db, 1, images=["images/job/restorable.jpg"], deleted_at=_now())
+    _job(db, 2, images=["images/job/started.jpg"], deleted_at=_now())
+    restorable = MediaAssetLifecycle(
+        object_key="images/job/restorable.jpg",
+        owner_userid="owner-1",
+        entity_type="job",
+        entity_id=1,
+        state="delete_pending",
+        next_attempt_at=_now(),
+    )
+    started = MediaAssetLifecycle(
+        object_key="images/job/started.jpg",
+        owner_userid="owner-1",
+        entity_type="job",
+        entity_id=2,
+        state="delete_pending",
+        next_attempt_at=_now(),
+        attempt_count=1,
+    )
+    db.add_all([restorable, started])
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    db.refresh(restorable)
+    db.refresh(started)
+    assert restorable.state == "attached"
+    assert restorable.next_attempt_at is None
+    assert started.state == "delete_pending"
+    assert report["updated_media_lifecycle_count"] == 1
+    assert report["media_reference_conflict_count"] == 1
+
+
+def test_backfill_preserves_immediate_cleanup_for_unactivated_candidates(db):
+    candidate = _job(
+        db,
+        1,
+        images=["images/job/candidate.jpg"],
+        deleted_at=_now(),
+    )
+    candidate.audit_status = "rejected"
+    candidate.activated_at = None
+    candidate.expires_at = None
+    candidate.candidate_expires_at = _now() - timedelta(minutes=1)
+    db.add(MediaAssetLifecycle(
+        object_key="images/job/candidate.jpg",
+        owner_userid="owner-1",
+        entity_type="job",
+        entity_id=1,
+        state="attached",
+    ))
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    media = db.query(MediaAssetLifecycle).one()
+    assert media.state == "delete_pending"
+    assert media.next_attempt_at is not None
+    assert report["updated_media_lifecycle_count"] == 1
+    assert report["non_deleted_soft_deleted_media_key_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("expires_at", "candidate_expires_at"),
+    [(_now(), _now()), (None, None)],
+)
+def test_backfill_does_not_immediately_delete_invalid_candidate_shapes(
+    db, expires_at, candidate_expires_at,
+):
+    job = _job(db, 1, images=["images/job/invalid-shape.jpg"], deleted_at=_now())
+    job.audit_status = "rejected"
+    job.activated_at = None
+    job.expires_at = expires_at
+    job.candidate_expires_at = candidate_expires_at
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    media = db.query(MediaAssetLifecycle).one()
+    assert media.state == "attached"
+    assert media.next_attempt_at is None
+    assert report["non_deleted_soft_deleted_media_key_count"] == 0
+
+
+def test_backfill_uses_database_time_and_strict_cutoff(db, monkeypatch):
+    database_now = datetime(2026, 8, 14, 12, 0, 0)
+    monkeypatch.setattr(
+        backfill_media_lifecycle,
+        "_database_now",
+        lambda _db: database_now,
+    )
+    cutoff = database_now - timedelta(days=7)
+    _job(db, 1, images=["images/job/before.jpg"], deleted_at=cutoff - timedelta(microseconds=1))
+    _job(db, 2, images=["images/job/at.jpg"], deleted_at=cutoff)
+    _job(db, 3, images=["images/job/after.jpg"], deleted_at=cutoff + timedelta(microseconds=1))
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
+
+    assert report["non_deleted_soft_deleted_media_key_count"] == 1
+    assert {
+        row.state for row in db.query(MediaAssetLifecycle).all()
+    } == {"attached"}
 
 
 def test_backfill_reports_unresolved_conflicts_and_invalid_images(
@@ -154,7 +301,12 @@ def test_backfill_reports_unresolved_conflicts_and_invalid_images(
 
 def test_preflight_media_coverage_blocks_until_soft_deleted_media_is_deleted(db):
     _job(db, 1, images=["images/job/a.jpg"])
-    _resume(db, 2, images=["images/resume/a.jpg"], deleted_at=_now())
+    _resume(
+        db,
+        2,
+        images=["images/resume/a.jpg"],
+        deleted_at=_now() - timedelta(days=8),
+    )
 
     missing = phase10_preflight.collect_media_coverage(db)
     assert missing["missing_media_lifecycle_key_count"] == 2
@@ -163,6 +315,7 @@ def test_preflight_media_coverage_blocks_until_soft_deleted_media_is_deleted(db)
     pending = phase10_preflight.collect_media_coverage(db)
     assert pending["missing_media_lifecycle_key_count"] == 0
     assert pending["non_deleted_soft_deleted_media_key_count"] == 1
+    assert all(pending[name] == 0 for name in phase10_preflight.MEDIA_BLOCKING_CHECKS)
 
     media = db.query(MediaAssetLifecycle).filter_by(object_key="images/resume/a.jpg").one()
     media.state = "deleted"
@@ -173,7 +326,7 @@ def test_preflight_media_coverage_blocks_until_soft_deleted_media_is_deleted(db)
 
 
 def test_backfill_reconciles_unreferenced_media_bound_to_soft_deleted_entity(db):
-    _job(db, 1, images=[], deleted_at=_now())
+    _job(db, 1, images=[], deleted_at=_now() - timedelta(days=8))
     media = MediaAssetLifecycle(
         object_key="images/job/orphaned-reference.jpg",
         operation_id="op-1",
@@ -186,19 +339,20 @@ def test_backfill_reconciles_unreferenced_media_bound_to_soft_deleted_entity(db)
     db.commit()
 
     dry = backfill_media_lifecycle.backfill_media_lifecycle(db)
-    assert dry["repair_required_media_lifecycle_key_count"] == 1
+    assert dry["repair_required_media_lifecycle_key_count"] == 0
     assert dry["non_deleted_soft_deleted_media_key_count"] == 1
     assert media.state == "attached"
 
     applied = backfill_media_lifecycle.backfill_media_lifecycle(db, apply=True)
-    assert applied["updated_media_lifecycle_count"] == 1
+    assert applied["updated_media_lifecycle_count"] == 0
     assert applied["non_deleted_soft_deleted_media_key_count"] == 1
-    assert media.state == "delete_pending"
-    assert media.next_attempt_at is not None
+    assert media.state == "attached"
+    assert media.next_attempt_at is None
 
     pending = phase10_preflight.collect_media_coverage(db)
     assert pending["non_deleted_soft_deleted_media_key_count"] == 1
     assert pending["repair_required_media_lifecycle_key_count"] == 0
+    assert all(pending[name] == 0 for name in phase10_preflight.MEDIA_BLOCKING_CHECKS)
 
     media.state = "deleted"
     media.deleted_at = _now()
@@ -208,7 +362,12 @@ def test_backfill_reconciles_unreferenced_media_bound_to_soft_deleted_entity(db)
 
 
 def test_backfill_never_revives_dead_letter_for_soft_deleted_entity(db):
-    _resume(db, 3, images=["images/resume/dead.jpg"], deleted_at=_now())
+    _resume(
+        db,
+        3,
+        images=["images/resume/dead.jpg"],
+        deleted_at=_now() - timedelta(days=8),
+    )
     media = MediaAssetLifecycle(
         object_key="images/resume/dead.jpg",
         owner_userid="owner-1",
@@ -230,6 +389,7 @@ def test_backfill_never_revives_dead_letter_for_soft_deleted_entity(db):
     assert report["updated_media_lifecycle_count"] == 0
     assert report["repair_required_media_lifecycle_key_count"] == 0
     assert report["non_deleted_soft_deleted_media_key_count"] == 1
+    assert report["media_delete_dead_letter_key_count"] == 1
     detail = next(
         item for item in report["details"]
         if item["normalized_object_key"] == media.object_key
@@ -255,11 +415,52 @@ def test_backfill_reports_active_entity_dead_letter_as_conflict(db):
     db.refresh(media)
     assert media.state == "dead_letter"
     assert report["media_reference_conflict_count"] == 1
+    assert report["media_delete_dead_letter_key_count"] == 1
     detail = next(
         item for item in report["details"]
         if item["normalized_object_key"] == media.object_key
     )
     assert detail["error_code"] == "active_entity_media_state_dead_letter"
+
+
+def test_dead_letter_gate_counts_all_lifecycle_rows_globally(db):
+    _job(db, 1, images=["images/job/referenced-dead.jpg"])
+    db.add_all([
+        MediaAssetLifecycle(
+            object_key="images/job/referenced-dead.jpg",
+            owner_userid="owner-1",
+            entity_type="job",
+            entity_id=1,
+            state="dead_letter",
+        ),
+        MediaAssetLifecycle(
+            object_key="images/job/active-unreferenced-dead.jpg",
+            owner_userid="owner-1",
+            entity_type="job",
+            entity_id=1,
+            state="dead_letter",
+        ),
+        MediaAssetLifecycle(
+            object_key="images/job/missing-entity-dead.jpg",
+            owner_userid="owner-1",
+            entity_type="job",
+            entity_id=999,
+            state="dead_letter",
+        ),
+        MediaAssetLifecycle(
+            object_key="images/draft/unbound-dead.jpg",
+            owner_userid="owner-1",
+            state="dead_letter",
+        ),
+    ])
+    db.commit()
+
+    report = backfill_media_lifecycle.backfill_media_lifecycle(db)
+    coverage = phase10_preflight.collect_media_coverage(db)
+
+    assert report["media_delete_dead_letter_key_count"] == 4
+    assert coverage["media_delete_dead_letter_key_count"] == 4
+    assert "media_delete_dead_letter_key_count" in phase10_preflight.MEDIA_BLOCKING_CHECKS
 
 
 def test_backfill_does_not_delete_unreferenced_key_used_by_another_entity(db):

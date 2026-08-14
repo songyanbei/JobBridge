@@ -49,7 +49,7 @@ python -m scripts.backfill_media_lifecycle --apply --output-dir phase10-media-ap
 python -m scripts.backfill_media_lifecycle --output-dir phase10-media-verify
 ```
 
-最终报告中的 missing、repair-required、invalid JSON、unresolved reference 和 conflict 阻断项必须全部为 0。第一次 dry-run 发现缺口时返回非零是预期行为，不能因此跳过 apply 后的复核。
+最终报告中的 missing、repair-required、media delete dead-letter、invalid JSON、unresolved reference 和 conflict 阻断项必须全部为 0。`non_deleted_soft_deleted_media_key_count` 是历史硬删待处理量，不是硬删开关开启前的 blocker；回填只补齐 ownership coverage，不得把激活岗位或简历的媒体置为 `delete_pending`。第一次 dry-run 发现缺口时返回非零是预期行为，不能因此跳过 apply 后的复核。
 
 ## 4. Target cleanup 回填
 
@@ -81,7 +81,8 @@ python -m scripts.phase10_preflight
 1. 先以待启用的相同配置执行 `JOB_REPLACEMENT_ENABLED=true python -m scripts.phase10_preflight`，确认 `recommendation_content_key_unavailable=0` 且 `ready=true`；再在所有 API、消息 Worker、scheduler 和 session recovery Worker 同步开启 `JOB_REPLACEMENT_ENABLED=true`，验证候选创建、审核、取消、激活和推荐消息投递。缺少活动版本密钥或各实例配置版本不一致时禁止开启。
 2. 开启 `JOB_CANDIDATE_CLEANUP_ENABLED=true`，验证过期候选进入 media/target durable cleanup。
 3. 开启 `JOB_EXPIRY_CLEANUP_ENABLED=true`，验证到期岗位软删除、version 增长和 cleanup task 创建。
-4. 仅在 media/target backlog 收敛、无 dead-letter 且 hard-delete 延迟窗口满足后，开启 `JOB_HARD_DELETE_ENABLED=true`。
+4. 确认 coverage blocker 为 0、无 dead-letter 且 hard-delete 延迟窗口满足后，开启 `JOB_HARD_DELETE_ENABLED=true`。硬删任务负责把已超过延迟的历史媒体置为 `delete_pending`，并由逐行 media/target fail-closed 门禁阻止岗位提前物理删除；禁止由回填脚本代替该步骤。
+5. 持续运行 hard-delete、media 和 target worker，直到 `non_deleted_soft_deleted_media_key_count=0`、media/target backlog 收敛且无 dead-letter，再次执行完整 preflight 并归档结果，才可结束发布窗口。
 
 开关变更要求 API、Worker 和 scheduler 使用同一配置版本；禁止只重启部分实例造成行为混合。
 

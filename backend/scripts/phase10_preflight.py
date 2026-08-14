@@ -58,6 +58,13 @@ CHECKS = {
         "WHERE config_key='ttl.job.candidate.days' AND config_value REGEXP '^[0-9]+$' "
         "AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 365) THEN 0 ELSE 1 END"
     ),
+    "invalid_hard_delete_delay_config": (
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM system_config "
+        "WHERE config_key='ttl.hard_delete.delay_days' "
+        "AND config_value REGEXP '^[0-9]+$' "
+        "AND CAST(config_value AS UNSIGNED) BETWEEN 0 AND 3650) "
+        "THEN 0 ELSE 1 END"
+    ),
     "job_backup_coverage_mismatch": (
         "SELECT COUNT(*) FROM ("
         "SELECT j.id FROM job j LEFT JOIN phase10_job_lifecycle_backup b ON b.job_id=j.id "
@@ -92,7 +99,7 @@ CHECKS = {
 MEDIA_BLOCKING_CHECKS = (
     "missing_media_lifecycle_key_count",
     "repair_required_media_lifecycle_key_count",
-    "non_deleted_soft_deleted_media_key_count",
+    "media_delete_dead_letter_key_count",
     "invalid_images_json_count",
     "unresolved_media_reference_count",
     "media_reference_conflict_count",
@@ -107,6 +114,7 @@ MEDIA_REPORT_FIELDS = (
     "missing_media_lifecycle_key_count",
     "repair_required_media_lifecycle_key_count",
     "non_deleted_soft_deleted_media_key_count",
+    "media_delete_dead_letter_key_count",
     "invalid_images_json_count",
     "unresolved_media_reference_count",
     "media_reference_alias_count",

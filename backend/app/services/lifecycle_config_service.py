@@ -9,6 +9,7 @@ from app.models import SystemConfig
 logger = logging.getLogger(__name__)
 JOB_TTL_DEFAULT_DAYS = 30
 JOB_CANDIDATE_TTL_DEFAULT_DAYS = 7
+HARD_DELETE_DELAY_DEFAULT_DAYS = 7
 
 
 def _read(db: Session, key: str, default: int, lower: int, upper: int) -> int:
@@ -31,3 +32,13 @@ def get_job_ttl_days(db: Session) -> int:
 
 def get_job_candidate_ttl_days(db: Session) -> int:
     return _read(db, "ttl.job.candidate.days", JOB_CANDIDATE_TTL_DEFAULT_DAYS, 1, 365)
+
+
+def get_hard_delete_delay_days(db: Session) -> int:
+    return _read(
+        db,
+        "ttl.hard_delete.delay_days",
+        HARD_DELETE_DELAY_DEFAULT_DAYS,
+        0,
+        3650,
+    )

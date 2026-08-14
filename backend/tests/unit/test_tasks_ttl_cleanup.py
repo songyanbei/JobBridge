@@ -196,6 +196,11 @@ def _stub_db_with_config(values: dict[str, str | None]) -> MagicMock:
     values 中没有的 key → first() 返回 None（模拟 row not found）。
     """
     db = MagicMock()
+    hard_delete_value = values.get("ttl.hard_delete.delay_days")
+    db.query.return_value.filter.return_value.first.return_value = (
+        SimpleNamespace(config_value=hard_delete_value)
+        if hard_delete_value is not None else None
+    )
 
     def _execute(_stmt, params=None):
         params = params or {}

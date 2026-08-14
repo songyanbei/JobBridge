@@ -20,6 +20,7 @@ LOCKED_RECOMMENDATION_KEYS = {"match.max_candidates", "match.top_n"}
 _LIFECYCLE_INT_RANGES = {
     "ttl.job.days": (1, 3650),
     "ttl.job.candidate.days": (1, 365),
+    "ttl.hard_delete.delay_days": (0, 3650),
 }
 from app.services.admin_log_service import write_admin_log
 

@@ -1,5 +1,9 @@
 from types import SimpleNamespace
-from app.services.lifecycle_config_service import get_job_ttl_days, get_job_candidate_ttl_days
+from app.services.lifecycle_config_service import (
+    get_hard_delete_delay_days,
+    get_job_candidate_ttl_days,
+    get_job_ttl_days,
+)
 
 
 class Query:
@@ -13,3 +17,11 @@ class DB:
 def test_ttl_ranges_fallback_to_safe_defaults():
     assert get_job_ttl_days(DB("0")) == 30
     assert get_job_candidate_ttl_days(DB("366")) == 7
+
+
+def test_hard_delete_delay_accepts_zero_and_rejects_out_of_range_values():
+    assert get_hard_delete_delay_days(DB("0")) == 0
+    assert get_hard_delete_delay_days(DB("3650")) == 3650
+    assert get_hard_delete_delay_days(DB("-1")) == 7
+    assert get_hard_delete_delay_days(DB("3651")) == 7
+    assert get_hard_delete_delay_days(DB("invalid")) == 7

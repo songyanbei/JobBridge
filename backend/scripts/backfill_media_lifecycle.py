@@ -9,14 +9,17 @@ import argparse
 import csv
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from sqlalchemy import func, text
+
 from app.config import settings
 from app.db import SessionLocal
 from app.models import Job, MediaAssetLifecycle, Resume
+from app.services.lifecycle_config_service import get_hard_delete_delay_days
 from app.services.storage_reference_service import normalize_storage_reference
 
 
@@ -144,8 +147,35 @@ def _new_detail(
     }
 
 
-def _desired_state(entity) -> str:
-    return "delete_pending" if entity.deleted_at is not None else "attached"
+def _database_now(db) -> datetime:
+    dialect = db.get_bind().dialect.name
+    sql = "SELECT CURRENT_TIMESTAMP" if dialect == "sqlite" else "SELECT NOW(6)"
+    value = db.execute(text(sql)).scalar_one()
+    return datetime.fromisoformat(value) if isinstance(value, str) else value
+
+
+def _is_hard_delete_due(entity, cutoff: datetime) -> bool:
+    return entity.deleted_at is not None and entity.deleted_at < cutoff
+
+
+def _requires_immediate_delete(entity_type: str, entity) -> bool:
+    return (
+        entity_type == "job"
+        and entity.deleted_at is not None
+        and entity.activated_at is None
+        and entity.expires_at is None
+        and entity.candidate_expires_at is not None
+        and entity.audit_status in {"pending", "rejected"}
+    )
+
+
+def _delete_pending_can_be_restored(row: MediaAssetLifecycle) -> bool:
+    return (
+        row.state == "delete_pending"
+        and int(row.attempt_count or 0) == 0
+        and row.lease_owner is None
+        and row.deleted_at is None
+    )
 
 
 def _repair_existing(
@@ -153,7 +183,8 @@ def _repair_existing(
     *,
     entity_type: str,
     entity,
-    desired_state: str,
+    hard_delete_due: bool,
+    immediate_delete: bool,
     apply: bool,
     now: datetime,
 ) -> tuple[str, str | None, bool]:
@@ -165,17 +196,41 @@ def _repair_existing(
     if target != expected and not unbound:
         return "conflict", "media_key_bound_to_other_entity", False
 
-    if desired_state == "attached" and row.state in {
-        "delete_pending",
-        "deleted",
-        "dead_letter",
-    }:
+    if immediate_delete:
+        if row.state in {"deleted", "dead_letter"}:
+            return "matched", None, False
+        needs_update = unbound or row.state != "delete_pending" or row.next_attempt_at is None
+        if not needs_update:
+            return "matched", None, False
+        if apply:
+            row.entity_type = entity_type
+            row.entity_id = entity.id
+            row.draft_expires_at = None
+            row.state = "delete_pending"
+            row.next_attempt_at = now
+            return "updated", None, True
+        return "would_update", None, True
+
+    if not hard_delete_due and row.state == "delete_pending":
+        if not _delete_pending_can_be_restored(row):
+            return "conflict", "retained_entity_media_delete_already_started", False
+        if apply:
+            row.entity_type = entity_type
+            row.entity_id = entity.id
+            row.draft_expires_at = None
+            row.state = "attached"
+            row.next_attempt_at = None
+            row.lease_expires_at = None
+            return "updated", None, True
+        return "would_update", None, True
+
+    if not hard_delete_due and row.state in {"deleted", "dead_letter"}:
         return "conflict", f"active_entity_media_state_{row.state}", False
 
     if row.state == "dead_letter":
         return "matched", "media_delete_dead_letter_requires_manual_recovery", False
 
-    if desired_state == "delete_pending" and row.state == "deleted":
+    if hard_delete_due and row.state == "deleted":
         if not unbound:
             return "matched", None, False
         if apply:
@@ -185,6 +240,9 @@ def _repair_existing(
             return "updated", None, True
         return "would_update", None, True
 
+    desired_state = "attached" if row.state == "pending" else row.state
+    if not hard_delete_due:
+        desired_state = "attached"
     needs_update = unbound or row.state != desired_state
     if not needs_update:
         return "matched", None, False
@@ -193,7 +251,8 @@ def _repair_existing(
         row.entity_id = entity.id
         row.draft_expires_at = None
         row.state = desired_state
-        row.next_attempt_at = now if desired_state == "delete_pending" else None
+        if desired_state == "attached":
+            row.next_attempt_at = None
         return "updated", None, True
     return "would_update", None, True
 
@@ -202,11 +261,12 @@ def _repair_unreferenced_soft_deleted_media(
     db,
     *,
     key_targets: dict[str, set[tuple[str, int]]],
-    soft_deleted_targets: set[tuple[str, int]],
+    soft_deleted_targets: dict[tuple[str, int], tuple[bool, bool]],
     apply: bool,
     batch_size: int,
     migration_batch_id: str,
     now: datetime,
+    hard_delete_delay_days: int,
     summary: dict[str, Any],
     details: list[dict[str, Any]],
     blocked_existing_keys: dict[str, str],
@@ -221,16 +281,74 @@ def _repair_unreferenced_soft_deleted_media(
             .limit(batch_size)
             .all()
         )
+        decisions = soft_deleted_targets
+        current_target_keys: dict[tuple[str, int], set[str]] = {}
+        if apply:
+            targets = {
+                (row.entity_type, int(row.entity_id))
+                for row in rows
+                if row.entity_type in {"job", "resume"} and row.entity_id is not None
+            }
+            current_entities: dict[tuple[str, int], Any] = {}
+            for entity_type, model in (("job", Job), ("resume", Resume)):
+                ids = sorted(
+                    entity_id
+                    for target_type, entity_id in targets
+                    if target_type == entity_type
+                )
+                if not ids:
+                    continue
+                locked = (
+                    db.query(model)
+                    .populate_existing()
+                    .filter(model.id.in_(ids))
+                    .order_by(model.id)
+                    .with_for_update()
+                    .all()
+                )
+                current_entities.update({
+                    (entity_type, int(entity.id)): entity for entity in locked
+                })
+            decision_now = _database_now(db)
+            cutoff = decision_now - timedelta(days=hard_delete_delay_days)
+            decisions = {}
+            for target, entity in current_entities.items():
+                if entity.deleted_at is None:
+                    continue
+                decisions[target] = (
+                    _is_hard_delete_due(entity, cutoff),
+                    _requires_immediate_delete(target[0], entity),
+                )
+                values, parse_error = _parse_images(entity.images)
+                if parse_error is None:
+                    current_target_keys[target] = {
+                        key
+                        for value in values
+                        if (key := _classify(value)["normalized_object_key"]) is not None
+                    }
+            media_ids = [int(row.id) for row in rows]
+            rows = (
+                db.query(MediaAssetLifecycle)
+                .populate_existing()
+                .filter(MediaAssetLifecycle.id.in_(media_ids))
+                .order_by(MediaAssetLifecycle.id)
+                .with_for_update()
+                .all()
+            )
         if not rows:
             break
         for row in rows:
             if row.entity_type not in {"job", "resume"} or row.entity_id is None:
                 continue
             target = (row.entity_type, int(row.entity_id))
-            if target not in soft_deleted_targets:
+            if target not in decisions:
                 continue
+            hard_delete_due, immediate_delete = decisions[target]
             references = key_targets.get(row.object_key, set())
-            if target in references:
+            if (
+                row.object_key in current_target_keys.get(target, set())
+                if apply else target in references
+            ):
                 continue
 
             analysis = {
@@ -258,14 +376,56 @@ def _repair_unreferenced_soft_deleted_media(
 
             if row.state == "deleted":
                 continue
-            summary["non_deleted_soft_deleted_media_key_count"] += 1
-            needs_update = row.state in {"pending", "attached"}
+            if immediate_delete:
+                summary["non_deleted_soft_deleted_media_key_count"] += 1
+                needs_update = row.state in {"pending", "attached"}
+                result = "matched"
+                if needs_update:
+                    summary["repair_required_before_backfill_key_count"] += 1
+                    if apply:
+                        row.state = "delete_pending"
+                        row.next_attempt_at = now
+                        summary["updated_media_lifecycle_count"] += 1
+                        result = "updated"
+                    else:
+                        summary["repair_required_media_lifecycle_key_count"] += 1
+                        result = "would_update"
+                details.append(_new_detail(
+                    entity_type=row.entity_type,
+                    entity_id=int(row.entity_id),
+                    array_index=-1,
+                    raw_value=row.object_key,
+                    migration_batch_id=migration_batch_id,
+                    analysis=analysis,
+                    result=result,
+                ))
+                continue
+            if hard_delete_due:
+                summary["non_deleted_soft_deleted_media_key_count"] += 1
+            if not hard_delete_due and row.state == "delete_pending":
+                if not _delete_pending_can_be_restored(row):
+                    summary["media_reference_conflict_count"] += 1
+                    details.append(_new_detail(
+                        entity_type=row.entity_type,
+                        entity_id=int(row.entity_id),
+                        array_index=-1,
+                        raw_value=row.object_key,
+                        migration_batch_id=migration_batch_id,
+                        analysis=analysis,
+                        result="conflict",
+                        error_code="retained_entity_media_delete_already_started",
+                    ))
+                    continue
+                needs_update = True
+            else:
+                needs_update = row.state == "pending"
             result = "matched"
             if needs_update:
                 summary["repair_required_before_backfill_key_count"] += 1
                 if apply:
-                    row.state = "delete_pending"
-                    row.next_attempt_at = now
+                    row.state = "attached"
+                    row.next_attempt_at = None
+                    row.lease_expires_at = None
                     summary["updated_media_lifecycle_count"] += 1
                     result = "updated"
                 else:
@@ -299,7 +459,9 @@ def backfill_media_lifecycle(
     if batch_size < 1:
         raise ValueError("batch_size_must_be_positive")
     batch_id = migration_batch_id or str(uuid.uuid4())
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    now = _database_now(db)
+    hard_delete_delay_days = get_hard_delete_delay_days(db)
+    hard_delete_cutoff = now - timedelta(days=hard_delete_delay_days)
     details: list[dict[str, Any]] = []
     key_targets = _collect_key_targets(db, batch_size)
     ambiguous_keys = {key for key, targets in key_targets.items() if len(targets) > 1}
@@ -308,10 +470,11 @@ def backfill_media_lifecycle(
     seen_targets: dict[str, tuple[str, int]] = {}
     existing_cache: dict[str, MediaAssetLifecycle | None] = {}
     unique_by_type: dict[str, set[str]] = {"job": set(), "resume": set()}
-    soft_deleted_targets: set[tuple[str, int]] = set()
+    soft_deleted_targets: dict[tuple[str, int], tuple[bool, bool]] = {}
     summary: dict[str, Any] = {
         "migration_batch_id": batch_id,
         "apply": apply,
+        "hard_delete_delay_days": hard_delete_delay_days,
         "entity_rows_scanned": 0,
         "raw_reference_count": 0,
         "normalized_reference_count": 0,
@@ -323,6 +486,11 @@ def backfill_media_lifecycle(
         "repair_required_before_backfill_key_count": 0,
         "repair_required_media_lifecycle_key_count": 0,
         "non_deleted_soft_deleted_media_key_count": 0,
+        "media_delete_dead_letter_key_count": int(
+            db.query(func.count(MediaAssetLifecycle.id)).filter(
+                MediaAssetLifecycle.state == "dead_letter"
+            ).scalar() or 0
+        ),
         "invalid_images_json_count": 0,
         "unresolved_media_reference_count": 0,
         "media_reference_alias_count": 0,
@@ -344,9 +512,31 @@ def backfill_media_lifecycle(
             if not rows:
                 break
             for entity in rows:
+                if apply:
+                    entity = (
+                        db.query(model)
+                        .populate_existing()
+                        .filter(model.id == entity.id)
+                        .with_for_update()
+                        .first()
+                    )
+                    if entity is None:
+                        db.commit()
+                        continue
+                    decision_now = _database_now(db)
+                else:
+                    decision_now = now
                 summary["entity_rows_scanned"] += 1
+                hard_delete_cutoff = decision_now - timedelta(
+                    days=hard_delete_delay_days
+                )
+                hard_delete_due = _is_hard_delete_due(entity, hard_delete_cutoff)
+                immediate_delete = _requires_immediate_delete(entity_type, entity)
                 if entity.deleted_at is not None:
-                    soft_deleted_targets.add((entity_type, int(entity.id)))
+                    soft_deleted_targets[(entity_type, int(entity.id))] = (
+                        hard_delete_due,
+                        immediate_delete,
+                    )
                 values, parse_error = _parse_images(entity.images)
                 if parse_error:
                     summary["invalid_images_json_count"] += 1
@@ -364,7 +554,44 @@ def backfill_media_lifecycle(
                         },
                         result="unresolved",
                     ))
+                    if apply:
+                        db.commit()
                     continue
+
+                entity_keys = sorted({
+                    key
+                    for raw_value in values
+                    if (key := _classify(raw_value)["normalized_object_key"]) is not None
+                })
+                if entity_keys:
+                    lifecycle_query = (
+                        db.query(MediaAssetLifecycle)
+                        .populate_existing()
+                        .filter(MediaAssetLifecycle.object_key.in_(entity_keys))
+                        .order_by(MediaAssetLifecycle.id)
+                    )
+                    if apply:
+                        lifecycle_query = lifecycle_query.with_for_update()
+                    locked_lifecycle = lifecycle_query.all()
+                    existing_cache.update({
+                        row.object_key: row for row in locked_lifecycle
+                    })
+                    for key in entity_keys:
+                        existing_cache.setdefault(key, None)
+                    if apply:
+                        decision_now = _database_now(db)
+                        hard_delete_cutoff = decision_now - timedelta(
+                            days=hard_delete_delay_days
+                        )
+                        hard_delete_due = _is_hard_delete_due(
+                            entity,
+                            hard_delete_cutoff,
+                        )
+                        if entity.deleted_at is not None:
+                            soft_deleted_targets[(entity_type, int(entity.id))] = (
+                                hard_delete_due,
+                                immediate_delete,
+                            )
 
                 for index, raw_value in enumerate(values):
                     summary["raw_reference_count"] += 1
@@ -436,25 +663,23 @@ def backfill_media_lifecycle(
                         continue
                     seen_targets[key] = current_target
 
-                    if key not in existing_cache:
-                        existing_cache[key] = db.query(MediaAssetLifecycle).filter(
-                            MediaAssetLifecycle.object_key == key
-                        ).first()
                     lifecycle = existing_cache[key]
-                    desired_state = _desired_state(entity)
                     if lifecycle is None:
                         summary["missing_before_backfill_key_count"] += 1
                         summary["missing_media_lifecycle_key_count"] += 0 if apply else 1
                         if apply:
+                            initial_state = "delete_pending" if immediate_delete else "attached"
                             lifecycle = MediaAssetLifecycle(
                                 object_key=key,
                                 operation_id=batch_id,
                                 owner_userid=entity.owner_userid,
                                 entity_type=entity_type,
                                 entity_id=entity.id,
-                                state=desired_state,
+                                state=initial_state,
                                 draft_expires_at=None,
-                                next_attempt_at=now if desired_state == "delete_pending" else None,
+                                next_attempt_at=(
+                                    decision_now if immediate_delete else None
+                                ),
                             )
                             db.add(lifecycle)
                             db.flush()
@@ -473,7 +698,7 @@ def backfill_media_lifecycle(
                             analysis=analysis,
                             result=result,
                         ))
-                        if desired_state != "deleted" and entity.deleted_at is not None:
+                        if hard_delete_due or immediate_delete:
                             summary["non_deleted_soft_deleted_media_key_count"] += 1
                         continue
 
@@ -481,9 +706,10 @@ def backfill_media_lifecycle(
                         lifecycle,
                         entity_type=entity_type,
                         entity=entity,
-                        desired_state=desired_state,
+                        hard_delete_due=hard_delete_due,
+                        immediate_delete=immediate_delete,
                         apply=apply,
-                        now=now,
+                        now=decision_now,
                     )
                     if result == "conflict":
                         summary["media_reference_conflict_count"] += 1
@@ -496,7 +722,10 @@ def backfill_media_lifecycle(
                         if result == "updated":
                             summary["updated_media_lifecycle_count"] += 1
                     effective_state = lifecycle.state
-                    if entity.deleted_at is not None and effective_state != "deleted":
+                    if (
+                        (hard_delete_due or immediate_delete)
+                        and effective_state != "deleted"
+                    ):
                         summary["non_deleted_soft_deleted_media_key_count"] += 1
                     details.append(_new_detail(
                         entity_type=entity_type,
@@ -509,8 +738,9 @@ def backfill_media_lifecycle(
                         error_code=error,
                     ))
 
-            if apply:
-                db.commit()
+                if apply:
+                    db.commit()
+
             last_id = int(rows[-1].id)
             if len(rows) < batch_size:
                 break
@@ -523,6 +753,7 @@ def backfill_media_lifecycle(
         batch_size=batch_size,
         migration_batch_id=batch_id,
         now=now,
+        hard_delete_delay_days=hard_delete_delay_days,
         summary=summary,
         details=details,
         blocked_existing_keys=blocked_existing_keys,
@@ -565,6 +796,7 @@ def main() -> int:
         summary["invalid_images_json_count"]
         + summary["unresolved_media_reference_count"]
         + summary["media_reference_conflict_count"]
+        + summary["media_delete_dead_letter_key_count"]
         + summary["missing_media_lifecycle_key_count"]
         + summary["repair_required_media_lifecycle_key_count"]
     )
