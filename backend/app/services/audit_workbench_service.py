@@ -14,15 +14,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import and_, exists, or_
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
 from app.core.redis_client import (
     acquire_audit_lock,
+    consume_undo_if_unchanged,
     get_undo,
+    get_undo_snapshot,
     get_audit_lock_holder,
-    pop_undo,
     refresh_audit_lock,
     release_audit_lock,
     save_undo,
@@ -79,6 +80,71 @@ def _load(db: Session, target_type: str, target_id: int):
     if not obj:
         raise BusinessException(40401, "审核对象不存在")
     return obj
+
+
+def _discover_undo_replacement_graph(db: Session, target_id: int) -> list[tuple[int, int, int]]:
+    """Read immutable relation identities from a fresh view before ordered locking."""
+    statement = (
+        select(JobReplacement.id, JobReplacement.old_job_id, JobReplacement.new_job_id)
+        .where(or_(
+            JobReplacement.old_job_id == target_id,
+            JobReplacement.new_job_id == target_id,
+        ))
+        .order_by(JobReplacement.id)
+    )
+    bind = db.get_bind()
+    if bind.dialect.name == "sqlite":
+        rows = db.execute(statement).all()
+    else:
+        engine = getattr(bind, "engine", bind)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            rows = connection.execute(statement).all()
+    return [(int(row.id), int(row.old_job_id), int(row.new_job_id)) for row in rows]
+
+
+def _lock_undo_target(db: Session, target_type: str, target_id: int):
+    """Lock the target and every discovered replacement edge in global order."""
+    if target_type != "job":
+        model, _, _ = _model_for(target_type)
+        obj = (
+            db.query(model)
+            .populate_existing()
+            .filter(model.id == target_id)
+            .with_for_update()
+            .first()
+        )
+        if obj is None:
+            raise BusinessException(40401, "审核对象不存在")
+        return obj, []
+
+    hints = _discover_undo_replacement_graph(db, target_id)
+    job_ids = sorted({target_id, *(job_id for _, old_id, new_id in hints for job_id in (old_id, new_id))})
+    jobs = (
+        db.query(Job)
+        .populate_existing()
+        .filter(Job.id.in_(job_ids))
+        .order_by(Job.id)
+        .with_for_update()
+        .all()
+    )
+    by_id = {int(job.id): job for job in jobs}
+    if target_id not in by_id:
+        raise BusinessException(40401, "审核对象不存在")
+
+    relations = (
+        db.query(JobReplacement)
+        .populate_existing()
+        .filter(or_(
+            JobReplacement.old_job_id == target_id,
+            JobReplacement.new_job_id == target_id,
+        ))
+        .order_by(JobReplacement.id)
+        .with_for_update()
+        .all()
+    )
+    if {int(row.id) for row in relations} != {row_id for row_id, _, _ in hints}:
+        raise BusinessException(40904, "job_lifecycle_transition_not_undoable")
+    return by_id[target_id], relations
 
 
 def _snapshot(obj, target_type: str) -> dict:
@@ -757,13 +823,25 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
     if not payload:
         raise BusinessException(40903, "撤销窗口已过期（30 秒）")
 
-    obj = _load(db, target_type, target_id)
+    obj, relations = _lock_undo_target(db, target_type, target_id)
+    snapshot = get_undo_snapshot(target_type, target_id)
+    if not snapshot:
+        raise BusinessException(40903, "撤销窗口已过期（30 秒）")
+    payload, snapshot_token = snapshot
     if target_type == "job":
-        relation = db.query(JobReplacement).filter(
-            JobReplacement.new_job_id == target_id,
-        ).first()
+        relation = next(
+            (row for row in relations if int(row.new_job_id) == int(target_id)),
+            None,
+        )
+        outgoing_terminal = any(
+            int(row.old_job_id) == int(target_id)
+            and row.lifecycle_status in {"activated", "closed", "conflict"}
+            for row in relations
+        )
         candidate_snapshot = payload.get("before") or {}
         lifecycle_changed = bool(
+            outgoing_terminal
+            or
             (
                 payload.get("action") in {"pass", "reject"}
                 and (
@@ -783,9 +861,19 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
         )
         if lifecycle_changed:
             raise BusinessException(40904, "job_lifecycle_transition_not_undoable")
-    payload = pop_undo(target_type, target_id)
-    if not payload:
+    after_snapshot = payload.get("after") or {}
+    snapshot_version = after_snapshot.get("version")
+    if snapshot_version is not None and int(obj.version or 0) != int(snapshot_version):
+        raise BusinessException(40902, "此条目已被修改，请刷新", {
+            "current_version": int(obj.version or 0),
+        })
+    consume_result = consume_undo_if_unchanged(
+        target_type, target_id, snapshot_token,
+    )
+    if consume_result == "missing":
         raise BusinessException(40903, "撤销窗口已过期（30 秒）")
+    if consume_result != "consumed":
+        raise BusinessException(40902, "撤销快照已变化，请刷新后重试")
     before_snapshot = payload.get("before") or {}
     _, allowed, snap_fields = _model_for(target_type)
 

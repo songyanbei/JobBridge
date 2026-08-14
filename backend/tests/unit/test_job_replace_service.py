@@ -474,14 +474,81 @@ def test_undo_rejects_job_lifecycle_transition_before_consuming_snapshot(db, mon
         "app.services.audit_workbench_service.get_undo",
         lambda *_args: {"action": "pass", "before": {}},
     )
-    pop = SimpleNamespace(called=False)
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: ({"action": "pass", "before": {}}, "snapshot"),
+    )
+    consume = SimpleNamespace(called=False)
 
-    def _pop(*_args):
-        pop.called = True
-        return {"action": "pass", "before": {}}
+    def _consume(*_args):
+        consume.called = True
+        return "consumed"
 
-    monkeypatch.setattr("app.services.audit_workbench_service.pop_undo", _pop)
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged", _consume,
+    )
 
     with pytest.raises(BusinessException, match="job_lifecycle_transition_not_undoable"):
         undo(db, "job", active.id, "reviewer")
-    assert pop.called is False
+    assert consume.called is False
+
+
+def test_undo_rejects_old_job_after_outgoing_replacement_activated(db, monkeypatch):
+    old = _job(db)
+    relation, candidate = _create(db, old, status="pending")
+    relation.review_outcome = "passed"
+    relation.lifecycle_status = "activated"
+    relation.active_old_job_id = None
+    candidate.audit_status = "passed"
+    db.commit()
+    payload = {
+        "action": "edit",
+        "before": {"description": "before", "version": old.version},
+        "after": {"description": "after", "version": old.version},
+    }
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo", lambda *_args: payload,
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: (payload, "snapshot"),
+    )
+    consume = SimpleNamespace(called=False)
+
+    def _consume(*_args):
+        consume.called = True
+        return "consumed"
+
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged", _consume,
+    )
+
+    with pytest.raises(BusinessException, match="job_lifecycle_transition_not_undoable"):
+        undo(db, "job", old.id, "reviewer")
+    assert consume.called is False
+
+
+def test_undo_does_not_restore_when_validated_snapshot_was_replaced(db, monkeypatch):
+    job = _job(db)
+    job.description = "current value"
+    db.commit()
+    payload = {
+        "action": "edit",
+        "before": {"description": "old value", "version": job.version},
+        "after": {"description": "current value", "version": job.version},
+    }
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo", lambda *_args: payload,
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: (payload, "validated-snapshot"),
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged",
+        lambda *_args: "changed",
+    )
+
+    with pytest.raises(BusinessException, match="撤销快照已变化"):
+        undo(db, "job", job.id, "reviewer")
+    assert job.description == "current value"

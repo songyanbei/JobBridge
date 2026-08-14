@@ -1,7 +1,9 @@
 """Job replacement integration checks that require a real MySQL database."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Event as ThreadEvent
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -10,9 +12,12 @@ from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
+from app.core.redis_client import get_redis, get_undo, save_undo
 from app.config import settings
 from app.db import SessionLocal, engine
 from app.models import Job, JobReplacement, TargetCleanupTask, User
+from app.services import audit_workbench_service, job_replace_service
+from app.services.audit_workbench_service import pass_action, undo
 from app.services.job_admin_service import restore
 from app.services.job_replace_service import cancel_candidate, create_replacement_candidate
 
@@ -492,4 +497,223 @@ def test_rr_active_relation_recheck_blocks_second_creation(monkeypatch):
         if setup.is_active:
             setup.rollback()
             setup.close()
+        _cleanup_replacement_rows(owner_userid)
+
+
+def test_undo_and_replacement_activation_are_serialized(monkeypatch):
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    owner_userid = f"undo-race-{uuid4().hex}"
+    setup = SessionLocal()
+    try:
+        setup.add(User(external_userid=owner_userid, role="factory"))
+        setup.flush()
+        old_job = _active_job(
+            owner_userid,
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+        )
+        setup.add(old_job)
+        setup.commit()
+        relation, candidate = _create_candidate(
+            setup,
+            old_job,
+            operation_id=str(uuid4()),
+            source_msg_id=f"msg-{uuid4()}",
+            audit_status="pending",
+        )
+        candidate.description = "edited before activation"
+        candidate.version = int(candidate.version or 0) + 1
+        setup.commit()
+        candidate_id = int(candidate.id)
+        candidate_version = int(candidate.version)
+        relation_id = int(relation.id)
+        payload = {
+            "action": "edit",
+            "before": {
+                "description": None,
+                "audit_status": "pending",
+                "version": candidate_version - 1,
+            },
+            "after": {
+                "description": "edited before activation",
+                "audit_status": "pending",
+                "version": candidate_version,
+            },
+        }
+    finally:
+        setup.close()
+
+    undo_locked = ThreadEvent()
+    release_undo = ThreadEvent()
+    def controlled_snapshot(*_args):
+        undo_locked.set()
+        assert release_undo.wait(timeout=10)
+        return payload, "snapshot"
+
+    monkeypatch.setattr(audit_workbench_service, "get_undo", lambda *_args: payload)
+    monkeypatch.setattr(
+        audit_workbench_service, "get_undo_snapshot", controlled_snapshot,
+    )
+    monkeypatch.setattr(
+        audit_workbench_service,
+        "consume_undo_if_unchanged",
+        lambda *_args: "consumed",
+    )
+
+    def run_undo():
+        db = SessionLocal()
+        try:
+            undo(db, "job", candidate_id, "reviewer")
+            return "undone"
+        finally:
+            db.close()
+
+    activation_started = ThreadEvent()
+
+    def run_activation():
+        db = SessionLocal()
+        try:
+            activation_started.set()
+            pass_action(db, "job", candidate_id, candidate_version, "reviewer")
+            return "activated"
+        except BusinessException as exc:
+            db.rollback()
+            return str(exc)
+        finally:
+            db.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            undo_future = pool.submit(run_undo)
+            assert undo_locked.wait(timeout=10)
+            activation_future = pool.submit(run_activation)
+            assert activation_started.wait(timeout=10)
+            assert activation_future.done() is False
+            release_undo.set()
+            assert undo_future.result(timeout=10) == "undone"
+            assert "已被修改" in activation_future.result(timeout=10)
+
+        verifier = SessionLocal()
+        try:
+            stored_candidate = verifier.get(Job, candidate_id)
+            stored_relation = verifier.get(JobReplacement, relation_id)
+            assert stored_candidate.description is None
+            assert stored_candidate.audit_status == "pending"
+            assert stored_candidate.activated_at is None
+            assert stored_candidate.version == candidate_version + 1
+            assert stored_relation.review_outcome == "pending"
+            assert stored_relation.lifecycle_status == "awaiting_review"
+        finally:
+            verifier.close()
+    finally:
+        release_undo.set()
+        _cleanup_replacement_rows(owner_userid)
+
+
+def test_activation_commits_before_undo_and_preserves_real_redis_snapshot(monkeypatch):
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    owner_userid = f"undo-activation-first-{uuid4().hex}"
+    setup = SessionLocal()
+    candidate_id = None
+    try:
+        setup.add(User(external_userid=owner_userid, role="factory"))
+        setup.flush()
+        old_job = _active_job(
+            owner_userid,
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0),
+        )
+        setup.add(old_job)
+        setup.commit()
+        relation, candidate = _create_candidate(
+            setup,
+            old_job,
+            operation_id=str(uuid4()),
+            source_msg_id=f"msg-{uuid4()}",
+            audit_status="pending",
+        )
+        candidate.description = "must survive rejected undo"
+        candidate.version = int(candidate.version or 0) + 1
+        setup.commit()
+        candidate_id = int(candidate.id)
+        candidate_version = int(candidate.version)
+        relation_id = int(relation.id)
+        payload = {
+            "action": "edit",
+            "before": {
+                "description": None,
+                "audit_status": "pending",
+                "version": candidate_version - 1,
+            },
+            "after": {
+                "description": "must survive rejected undo",
+                "audit_status": "pending",
+                "version": candidate_version,
+            },
+        }
+        save_undo("job", candidate_id, payload)
+    finally:
+        setup.close()
+
+    activation_holds_locks = ThreadEvent()
+    release_activation = ThreadEvent()
+    original_activate = job_replace_service.activate_replacement_locked
+
+    def hold_activation_locks(*args, **kwargs):
+        result = original_activate(*args, **kwargs)
+        activation_holds_locks.set()
+        assert release_activation.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(
+        job_replace_service, "activate_replacement_locked", hold_activation_locks,
+    )
+
+    def run_activation():
+        db = SessionLocal()
+        try:
+            pass_action(db, "job", candidate_id, candidate_version, "reviewer")
+            return "activated"
+        finally:
+            db.close()
+
+    undo_started = ThreadEvent()
+
+    def run_undo():
+        db = SessionLocal()
+        try:
+            undo_started.set()
+            undo(db, "job", candidate_id, "reviewer")
+            return "undone"
+        except BusinessException as exc:
+            db.rollback()
+            return str(exc)
+        finally:
+            db.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            activation_future = pool.submit(run_activation)
+            assert activation_holds_locks.wait(timeout=10)
+            undo_future = pool.submit(run_undo)
+            assert undo_started.wait(timeout=10)
+            assert undo_future.done() is False
+            release_activation.set()
+            assert activation_future.result(timeout=10) == "activated"
+            assert "job_lifecycle_transition_not_undoable" in undo_future.result(timeout=10)
+
+        verifier = SessionLocal()
+        try:
+            stored_candidate = verifier.get(Job, candidate_id)
+            stored_relation = verifier.get(JobReplacement, relation_id)
+            assert stored_candidate.description == "must survive rejected undo"
+            assert stored_candidate.audit_status == "passed"
+            assert stored_candidate.activated_at is not None
+            assert stored_relation.review_outcome == "passed"
+            assert stored_relation.lifecycle_status == "activated"
+            assert get_undo("job", candidate_id) == payload
+        finally:
+            verifier.close()
+    finally:
+        release_activation.set()
+        if candidate_id is not None:
+            get_redis().delete(f"undo_action:job:{candidate_id}")
         _cleanup_replacement_rows(owner_userid)

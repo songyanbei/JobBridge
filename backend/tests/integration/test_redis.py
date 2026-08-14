@@ -29,10 +29,41 @@ from app.core.redis_client import (
     RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX,
     RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
     RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
+    consume_undo_if_unchanged,
     fence_recommendation_session_indexes,
+    get_undo,
+    get_undo_snapshot,
     remove_recommendation_session_index_members,
+    save_undo,
     validate_redis_durability_policy,
 )
+
+
+def test_real_undo_compare_and_delete_preserves_replacement_snapshot():
+    target_id = "integration-undo-cas"
+    key = f"undo_action:job:{target_id}"
+    redis_client = get_redis()
+    redis_client.delete(key)
+    try:
+        first = {"action": "edit", "before": {"version": 1}}
+        replacement = {"action": "edit", "before": {"version": 2}}
+        save_undo("job", target_id, first)
+        snapshot = get_undo_snapshot("job", target_id)
+        assert snapshot is not None
+        _, token = snapshot
+
+        save_undo("job", target_id, replacement)
+
+        assert consume_undo_if_unchanged("job", target_id, token) == "changed"
+        assert get_undo("job", target_id) == replacement
+        replacement_snapshot = get_undo_snapshot("job", target_id)
+        assert replacement_snapshot is not None
+        assert consume_undo_if_unchanged(
+            "job", target_id, replacement_snapshot[1],
+        ) == "consumed"
+        assert get_undo("job", target_id) is None
+    finally:
+        redis_client.delete(key)
 
 
 def test_real_user_lock_lease_renews_beyond_original_ttl(monkeypatch):

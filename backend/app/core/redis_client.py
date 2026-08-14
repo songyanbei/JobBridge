@@ -842,6 +842,46 @@ def get_undo(target_type: str, target_id: int | str) -> dict | None:
         return None
 
 
+def get_undo_snapshot(
+    target_type: str, target_id: int | str,
+) -> tuple[dict, str] | None:
+    """Return the parsed Undo payload together with its exact Redis value."""
+    data = get_redis().get(f"{UNDO_PREFIX}{target_type}:{target_id}")
+    if not data:
+        return None
+    try:
+        return json.loads(data), str(data)
+    except Exception:
+        return None
+
+
+_CONSUME_UNDO_IF_UNCHANGED_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+if current ~= ARGV[1] then
+    return -1
+end
+redis.call('DEL', KEYS[1])
+return 1
+"""
+
+
+def consume_undo_if_unchanged(
+    target_type: str, target_id: int | str, expected_value: str,
+) -> str:
+    """Atomically consume only the exact Undo snapshot already validated."""
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    result = int(get_redis().eval(
+        _CONSUME_UNDO_IF_UNCHANGED_SCRIPT,
+        1,
+        key,
+        expected_value,
+    ))
+    return {1: "consumed", 0: "missing", -1: "changed"}.get(result, "changed")
+
+
 def pop_undo(target_type: str, target_id: int | str) -> dict | None:
     """取出并删除 Undo 快照；超过 TTL 返回 None。"""
     r = get_redis()
