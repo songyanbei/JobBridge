@@ -80,6 +80,40 @@ CREATE TABLE `media_asset_lifecycle` (
   KEY `idx_media_draft_expiry` (`state`,`draft_expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE `phase10_migration_control` (
+  `id` TINYINT UNSIGNED NOT NULL,
+  `writes_blocked` TINYINT(1) NOT NULL DEFAULT 0,
+  PRIMARY KEY (`id`),
+  CONSTRAINT `chk_phase10_writes_blocked` CHECK (`writes_blocked` IN (0, 1))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+INSERT INTO `phase10_migration_control` (`id`, `writes_blocked`) VALUES (1, 0);
+
+DELIMITER $$
+CREATE PROCEDURE `phase10_assert_writes_allowed`()
+SQL SECURITY INVOKER
+BEGIN
+  DECLARE blocked TINYINT DEFAULT 1;
+  SELECT `writes_blocked` INTO blocked
+  FROM `phase10_migration_control` WHERE `id` = 1 FOR SHARE;
+  IF blocked = 1
+     AND COALESCE(@phase10_destructive_down_authorized, 0) <> 1 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'phase10_destructive_down_in_progress';
+  END IF;
+END$$
+CREATE TRIGGER `phase10_job_insert_fence` BEFORE INSERT ON `job`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_job_update_fence` BEFORE UPDATE ON `job`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_job_delete_fence` BEFORE DELETE ON `job`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_replacement_insert_fence` BEFORE INSERT ON `job_replacement`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_cleanup_insert_fence` BEFORE INSERT ON `target_cleanup_task`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_media_insert_fence` BEFORE INSERT ON `media_asset_lifecycle`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+DELIMITER ;
+
 SET @phase10_migration_time = NOW();
 SET @phase10_candidate_days = COALESCE((
   SELECT CASE
@@ -109,6 +143,31 @@ SET `activated_at` = NULL,
     `version` = `version` + 1
 WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected');
 
+-- Freeze the exact post-migration lifecycle state. Destructive down migration
+-- must reject every write that happened after this point instead of overwriting it.
+ALTER TABLE `phase10_job_lifecycle_backup`
+  ADD COLUMN `expected_audit_status` ENUM('pending','passed','rejected') NULL,
+  ADD COLUMN `expected_expires_at` DATETIME NULL,
+  ADD COLUMN `expected_deleted_at` DATETIME NULL,
+  ADD COLUMN `expected_delist_reason` ENUM('filled','manual_delist','expired','replaced') NULL,
+  ADD COLUMN `expected_version` INT UNSIGNED NULL,
+  ADD COLUMN `expected_activated_at` DATETIME NULL,
+  ADD COLUMN `expected_candidate_expires_at` DATETIME NULL;
+
+UPDATE `phase10_job_lifecycle_backup` AS b
+JOIN `job` AS j ON j.`id` = b.`job_id`
+SET b.`expected_audit_status` = j.`audit_status`,
+    b.`expected_expires_at` = j.`expires_at`,
+    b.`expected_deleted_at` = j.`deleted_at`,
+    b.`expected_delist_reason` = j.`delist_reason`,
+    b.`expected_version` = j.`version`,
+    b.`expected_activated_at` = j.`activated_at`,
+    b.`expected_candidate_expires_at` = j.`candidate_expires_at`;
+
+ALTER TABLE `phase10_job_lifecycle_backup`
+  MODIFY COLUMN `expected_audit_status` ENUM('pending','passed','rejected') NOT NULL,
+  MODIFY COLUMN `expected_version` INT UNSIGNED NOT NULL;
+
 -- Deployment gate: this query must return zero rows before writes resume.
 SELECT `id` FROM `job`
 WHERE (`deleted_at` IS NULL AND `audit_status` = 'passed'
@@ -131,7 +190,13 @@ GROUP BY t.`AUTO_INCREMENT`;
 SELECT
   (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`) AS `backup_rows`,
   (SELECT COUNT(*) FROM `job`) AS `job_rows`,
-  (SELECT BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
+  (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
       COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-      COALESCE(`delist_reason`, ''), `version`)))
-   FROM `phase10_job_lifecycle_backup`) AS `backup_checksum`;
+      COALESCE(`delist_reason`, ''), `version`))), 0)
+   FROM `phase10_job_lifecycle_backup`) AS `backup_checksum`,
+  (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
+      COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
+      COALESCE(`expected_delist_reason`, ''), `expected_version`,
+      COALESCE(`expected_activated_at`, ''),
+      COALESCE(`expected_candidate_expires_at`, '')))), 0)
+   FROM `phase10_job_lifecycle_backup`) AS `expected_live_checksum`;

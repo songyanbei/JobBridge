@@ -72,6 +72,56 @@ def test_down_migration_blocks_new_model_data_and_validates_restore_checksum():
     assert "COUNT(*) FROM `phase10_job_lifecycle_backup`" in sql
     assert "phase10_restore_checksum_valid" in sql
     assert "phase10_down_guard_failed_checksum_mismatch" in sql
+    assert "START TRANSACTION" in sql
+    assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" in sql
+    assert "@phase10_destructive_down_authorized = 1" in sql
+    for archived_value in (
+        "phase10_archived_backup_rows",
+        "phase10_archived_backup_checksum",
+        "phase10_archived_expected_live_checksum",
+    ):
+        assert archived_value in sql
+    assert "FROM `job` FOR UPDATE" in sql
+    assert "FROM `phase10_job_lifecycle_backup` FOR SHARE" in sql
+    assert sql.index("COMMIT;") < sql.index("ALTER TABLE `job` DROP INDEX")
+    update_offset = sql.index("UPDATE `job` AS j")
+    drift_guard_offset = sql.index("expected_candidate_expires_at")
+    assert drift_guard_offset < update_offset
+    for field in (
+        "audit_status",
+        "expires_at",
+        "deleted_at",
+        "delist_reason",
+        "version",
+        "activated_at",
+        "candidate_expires_at",
+    ):
+        assert f"j.`{field}` <=> b.`expected_{field}`" in sql
+
+
+def test_additive_migration_freezes_post_migration_state_for_safe_down():
+    sql = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_text(
+        encoding="utf-8"
+    )
+    snapshot_offset = sql.index("expected_audit_status")
+    final_backfill_offset = sql.index(
+        "WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')"
+    )
+    assert final_backfill_offset < snapshot_offset
+    assert "expected_live_checksum" in sql
+    assert "phase10_migration_control" in sql
+    assert "phase10_assert_writes_allowed" in sql
+    for trigger in (
+        "phase10_job_insert_fence",
+        "phase10_job_update_fence",
+        "phase10_job_delete_fence",
+        "phase10_replacement_insert_fence",
+        "phase10_cleanup_insert_fence",
+        "phase10_media_insert_fence",
+    ):
+        assert trigger in sql
+    assert "expected_audit_status` ENUM('pending','passed','rejected') NOT NULL" in sql
+    assert "expected_version` INT UNSIGNED NOT NULL" in sql
 
 
 def test_preflight_reports_all_clean_database_as_ready(monkeypatch):
@@ -339,14 +389,19 @@ def test_release_manual_uses_one_verified_mysql_target_and_orders_backup_evidenc
     assert manual.count("set -euo pipefail") >= 2
     migration = manual.index("phase10_001_job_lifecycle_additive.sql")
     backup_evidence = manual.index("backup rows/checksum")
-    down_evidence = manual.index("phase10-down-backup-evidence.txt")
+    archived_evidence = manual.index("phase10-001-backup-evidence.tsv")
+    down_evidence = manual.index("phase10-down-backup-evidence.tsv")
     down_approval = manual.index("审批完成后才单独执行")
-    down_command = manual.index(
-        "< sql/migrations/phase10_down_001_job_lifecycle.sql"
-    )
+    down_command = manual.index("cat sql/migrations/phase10_down_001_job_lifecycle.sql")
 
     assert migration < backup_evidence
-    assert down_evidence < down_approval < down_command
+    assert archived_evidence < down_evidence < down_approval < down_command
+    assert "cmp --silent phase10-001-backup-evidence.tsv" in manual
+    assert "新证据与 `phase10-001-backup-evidence.tsv` 精确比较" in manual
+    assert "新证据与 `phase10-001-output.txt` 精确比较" not in manual
+    assert "@phase10_archived_expected_live_checksum" in manual
+    for privilege in ("CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE", "TRIGGER"):
+        assert privilege in manual
 
 
 def test_release_manual_restarts_and_verifies_all_phase10_processes():

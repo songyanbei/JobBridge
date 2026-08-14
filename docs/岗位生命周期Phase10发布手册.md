@@ -14,7 +14,7 @@
 
 ## 2. 迁移
 
-为 MySQL 8 客户端准备权限为 `0600` 的配置文件，至少在 `[client]` 中配置待发布环境的 `host`、`port`、`user`、`password` 和 TLS 参数。配置文件不得提交到代码库。所有迁移和回滚必须复用同一个配置文件和数据库名；先输出实际数据库、主机和端口，人工核对后再执行：
+为 MySQL 8 客户端准备权限为 `0600` 的配置文件，至少在 `[client]` 中配置待发布环境的 `host`、`port`、`user`、`password` 和 TLS 参数。迁移账号除常规 DDL/DML 权限外，必须具备 `CREATE ROUTINE`、`ALTER ROUTINE`、`EXECUTE` 和 `TRIGGER` 权限，用于创建、执行及移除破坏性回滚写入围栏。配置文件不得提交到代码库。所有迁移和回滚必须复用同一个配置文件和数据库名；先输出实际数据库、主机和端口，人工核对后再执行：
 
 ```bash
 export PHASE10_MYSQL_DEFAULTS_FILE=/run/secrets/jobbridge-mysql-client.cnf
@@ -31,7 +31,9 @@ test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
 PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_001_job_lifecycle_additive.sql | tee phase10-001-output.txt
-# 归档上一条输出中的 backup rows/checksum，并核对 backup_rows=job_rows
+PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
+"${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-001-backup-evidence.tsv
+# 归档 backup rows/checksum/expected-live checksum，并核对 backup_rows=job_rows
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_002_media_dead_letter.sql | tee phase10-002-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_003_session_commit_deadline.sql | tee phase10-003-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_004_session_commit_lease_owner.sql | tee phase10-004-output.txt
@@ -104,24 +106,32 @@ python -m scripts.phase10_preflight
 1. 按相反顺序关闭 `JOB_HARD_DELETE_ENABLED`、`JOB_EXPIRY_CLEANUP_ENABLED`、`JOB_CANDIDATE_CLEANUP_ENABLED`、`JOB_REPLACEMENT_ENABLED`，并确认所有实例读取到同一配置。
 2. 停止 API、Worker 和 scheduler，保留 MySQL 新增列、durable cleanup task、媒体生命周期记录、Redis AOF 和 revocation fence，优先 forward-fix。
 3. 不得直接启动 003/004 之前的 Worker。需要回滚应用制品时，只能使用明确兼容 003/004 schema 和 session fencing 的版本，并继续禁止新旧版本混跑。
-4. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows/checksum 与当前备份表完全匹配，并取得破坏性回滚审批时执行。先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档当前备份表的行数和 checksum。`phase10-down-backup-evidence.txt` 的两个值必须与 `phase10-001-output.txt` 精确一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
+4. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows、原始 backup checksum 和 expected-live checksum 与当前备份表完全匹配，并取得破坏性回滚审批时执行。先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档三项证据。`phase10-down-backup-evidence.tsv` 必须与 `phase10-001-backup-evidence.tsv` 逐字节一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
 
    ```bash
    set -euo pipefail
    test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
    PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
    "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
-   "${PHASE10_MYSQL[@]}" --batch -e "SELECT COUNT(*) AS backup_rows, BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))) AS backup_checksum FROM phase10_job_lifecycle_backup" | tee phase10-down-backup-evidence.txt
+   PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
+   "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-down-backup-evidence.tsv
+   cmp --silent phase10-001-backup-evidence.tsv phase10-down-backup-evidence.tsv
    ```
 
-   在这里停止。将新证据与 `phase10-001-output.txt` 精确比较并归档审批记录；任何差异都取消破坏性回滚。审批完成后才单独执行：
+   在这里停止。将新证据与 `phase10-001-backup-evidence.tsv` 精确比较并归档审批记录；任何差异都取消破坏性回滚。审批完成后才单独执行：
 
    ```bash
    set -euo pipefail
    test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
    PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
    "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
-   "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_down_001_job_lifecycle.sql | tee phase10-down-001-output.txt
+   test "$(wc -l < phase10-001-backup-evidence.tsv)" -eq 1
+   read -r PHASE10_ARCHIVED_ROWS PHASE10_ARCHIVED_BACKUP_CHECKSUM PHASE10_ARCHIVED_EXPECTED_CHECKSUM < phase10-001-backup-evidence.tsv
+   [[ "$PHASE10_ARCHIVED_ROWS" =~ ^[0-9]+$ && "$PHASE10_ARCHIVED_BACKUP_CHECKSUM" =~ ^[0-9]+$ && "$PHASE10_ARCHIVED_EXPECTED_CHECKSUM" =~ ^[0-9]+$ ]]
+   {
+     printf 'SET @phase10_archived_backup_rows=%s, @phase10_archived_backup_checksum=%s, @phase10_archived_expected_live_checksum=%s;\n' "$PHASE10_ARCHIVED_ROWS" "$PHASE10_ARCHIVED_BACKUP_CHECKSUM" "$PHASE10_ARCHIVED_EXPECTED_CHECKSUM"
+     cat sql/migrations/phase10_down_001_job_lifecycle.sql
+   } | "${PHASE10_MYSQL[@]}" | tee phase10-down-001-output.txt
    ```
 5. 已经启用 replacement、产生 cleanup task 或执行媒体回填后，不做破坏性 schema 回滚；关闭开关、保留 durable 状态并发布修复版本。
 6. 回滚后重新执行健康检查、`python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，记录所有非零项和后续处置。
