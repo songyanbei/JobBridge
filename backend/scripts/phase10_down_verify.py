@@ -107,6 +107,64 @@ INBOUND_INDEX_CONTRACT = (
     ),
 )
 
+JOB_COLUMN_CONTRACT = (
+    # name, type, nullable, default, charset, collation, extra, generation
+    ("id", "bigint unsigned", "NO", None, None, None, "auto_increment", ""),
+    ("owner_userid", "varchar(64)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("city", "varchar(32)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("job_category", "varchar(32)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("salary_floor_monthly", "int", "NO", None, None, None, "", ""),
+    ("pay_type", "enum('月薪','时薪','计件')", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("headcount", "int", "NO", None, None, None, "", ""),
+    ("gender_required", "enum('男','女','不限')", "NO", "不限", "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("age_min", "tinyint unsigned", "YES", None, None, None, "", ""),
+    ("age_max", "tinyint unsigned", "YES", None, None, None, "", ""),
+    ("is_long_term", "tinyint(1)", "NO", "1", None, None, "", ""),
+    ("district", "varchar(32)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("address", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("salary_ceiling_monthly", "int", "YES", None, None, None, "", ""),
+    ("provide_meal", "tinyint(1)", "YES", None, None, None, "", ""),
+    ("provide_housing", "tinyint(1)", "YES", None, None, None, "", ""),
+    ("dorm_condition", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("shift_pattern", "varchar(128)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("work_hours", "varchar(128)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("accept_couple", "tinyint(1)", "YES", None, None, None, "", ""),
+    ("accept_student", "tinyint(1)", "YES", None, None, None, "", ""),
+    ("accept_minority", "tinyint(1)", "YES", None, None, None, "", ""),
+    ("height_required", "varchar(32)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("experience_required", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("education_required", "enum('不限','初中','高中','中专','大专及以上')", "YES", "不限", "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("rebate", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("employment_type", "enum('厂家直招','劳务派遣','中介代招')", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("contract_type", "enum('长期合同','短期合同','劳务关系')", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("min_duration", "varchar(64)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("job_sub_category", "varchar(64)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("raw_text", "text", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("description", "text", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("images", "json", "YES", None, None, None, "", ""),
+    ("miniprogram_url", "varchar(512)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("audit_status", "enum('pending','passed','rejected')", "NO", "pending", "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("audit_reason", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("audited_by", "varchar(64)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("audited_at", "datetime", "YES", None, None, None, "", ""),
+    ("created_at", "datetime", "NO", "CURRENT_TIMESTAMP", None, None, "DEFAULT_GENERATED", ""),
+    ("updated_at", "datetime", "NO", "CURRENT_TIMESTAMP", None, None, "DEFAULT_GENERATED on update CURRENT_TIMESTAMP", ""),
+    ("expires_at", "datetime", "NO", None, None, None, "", ""),
+    ("delist_reason", "enum('filled','manual_delist','expired')", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("deleted_at", "datetime", "YES", None, None, None, "", ""),
+    ("version", "int unsigned", "NO", "1", None, None, "", ""),
+    ("extra", "json", "YES", None, None, None, "", ""),
+)
+
+JOB_INDEX_CONTRACT = (
+    ("PRIMARY", 0, "id"),
+    ("idx_owner", 1, "owner_userid"),
+    ("idx_audit_time", 1, "audit_status,created_at"),
+    ("idx_expires", 1, "expires_at"),
+    ("idx_filter_hot", 1, "city,job_category,is_long_term,audit_status,deleted_at,expires_at"),
+    ("idx_salary", 1, "salary_floor_monthly"),
+)
+
 
 def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
@@ -116,7 +174,7 @@ def _sql_nullable_string(value: str | None) -> str:
     return "NULL" if value is None else _sql_string(value)
 
 
-def _column_contract_sql() -> str:
+def _column_contract_sql(table_name: str, contract) -> str:
     rows = []
     for (
         name,
@@ -127,7 +185,7 @@ def _column_contract_sql() -> str:
         collation,
         extra,
         generation,
-    ) in INBOUND_COLUMN_CONTRACT:
+    ) in contract:
         rows.append(
             "SELECT "
             f"{_sql_string(name)} AS column_name, "
@@ -141,13 +199,13 @@ def _column_contract_sql() -> str:
         )
     expected = " UNION ALL ".join(rows)
     expected_names = ",".join(
-        _sql_string(row[0]) for row in INBOUND_COLUMN_CONTRACT
+        _sql_string(row[0]) for row in contract
     )
     return (
         "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
         "LEFT JOIN information_schema.COLUMNS actual "
         "ON actual.TABLE_SCHEMA=DATABASE() "
-        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        f"AND BINARY actual.TABLE_NAME={_sql_string(table_name)} "
         "AND BINARY actual.COLUMN_NAME=expected.column_name "
         "WHERE actual.COLUMN_NAME IS NULL "
         "OR NOT (BINARY actual.COLUMN_TYPE <=> BINARY expected.column_type) "
@@ -161,14 +219,14 @@ def _column_contract_sql() -> str:
         "<=> BINARY expected.generation_expression)) + "
         "(SELECT COUNT(*) FROM information_schema.COLUMNS actual "
         "WHERE actual.TABLE_SCHEMA=DATABASE() "
-        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        f"AND BINARY actual.TABLE_NAME={_sql_string(table_name)} "
         f"AND BINARY actual.COLUMN_NAME NOT IN ({expected_names}))"
     )
 
 
-def _index_contract_sql() -> str:
+def _index_contract_sql(table_name: str, contract, *, allow_extra_safe: bool) -> str:
     rows = []
-    for name, non_unique, columns in INBOUND_INDEX_CONTRACT:
+    for name, non_unique, columns in contract:
         rows.append(
             "SELECT "
             f"{_sql_string(name)} AS index_name, "
@@ -178,11 +236,11 @@ def _index_contract_sql() -> str:
     expected = " UNION ALL ".join(rows)
     expected_unique_names = ",".join(
         _sql_string(name)
-        for name, non_unique, _ in INBOUND_INDEX_CONTRACT
+        for name, non_unique, _ in contract
         if non_unique == 0
     )
     expected_index_names = ",".join(
-        _sql_string(name) for name, _, _ in INBOUND_INDEX_CONTRACT
+        _sql_string(name) for name, _, _ in contract
     )
     return (
         "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
@@ -194,7 +252,7 @@ def _index_contract_sql() -> str:
         "THEN 1 ELSE 0 END) AS partial_or_expression_columns "
         "FROM information_schema.STATISTICS "
         "WHERE TABLE_SCHEMA=DATABASE() "
-        "AND BINARY TABLE_NAME='wecom_inbound_event' GROUP BY INDEX_NAME"
+        f"AND BINARY TABLE_NAME={_sql_string(table_name)} GROUP BY INDEX_NAME"
         ") actual ON BINARY actual.INDEX_NAME=expected.index_name "
         "WHERE actual.INDEX_NAME IS NULL "
         "OR actual.non_unique<>expected.non_unique "
@@ -204,19 +262,34 @@ def _index_contract_sql() -> str:
         "(SELECT COUNT(DISTINCT actual.INDEX_NAME) "
         "FROM information_schema.STATISTICS actual "
         "WHERE actual.TABLE_SCHEMA=DATABASE() "
-        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        f"AND BINARY actual.TABLE_NAME={_sql_string(table_name)} "
         "AND actual.NON_UNIQUE=0 "
         f"AND BINARY actual.INDEX_NAME NOT IN ({expected_unique_names})) + "
         "(SELECT COUNT(DISTINCT actual.INDEX_NAME) "
         "FROM information_schema.STATISTICS actual "
         "WHERE actual.TABLE_SCHEMA=DATABASE() "
-        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        f"AND BINARY actual.TABLE_NAME={_sql_string(table_name)} "
         "AND actual.NON_UNIQUE=1 "
         f"AND BINARY actual.INDEX_NAME NOT IN ({expected_index_names}) "
         "AND (actual.COLUMN_NAME IS NULL "
         "OR actual.SUB_PART IS NOT NULL "
         "OR actual.EXPRESSION IS NOT NULL "
         "OR BINARY actual.INDEX_TYPE<>'BTREE'))"
+        if allow_extra_safe else
+        "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
+        "LEFT JOIN (SELECT INDEX_NAME, MIN(NON_UNIQUE) AS non_unique, "
+        "MIN(IS_VISIBLE) AS is_visible, "
+        "GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',') AS columns, "
+        "SUM(CASE WHEN SUB_PART IS NOT NULL OR EXPRESSION IS NOT NULL THEN 1 ELSE 0 END) AS partial_or_expression_columns "
+        "FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() "
+        f"AND BINARY TABLE_NAME={_sql_string(table_name)} GROUP BY INDEX_NAME) actual "
+        "ON BINARY actual.INDEX_NAME=expected.index_name WHERE actual.INDEX_NAME IS NULL "
+        "OR actual.non_unique<>expected.non_unique OR BINARY actual.is_visible<>'YES' "
+        "OR actual.columns<>expected.columns OR actual.partial_or_expression_columns<>0) + "
+        "(SELECT COUNT(DISTINCT actual.INDEX_NAME) FROM information_schema.STATISTICS actual "
+        "WHERE actual.TABLE_SCHEMA=DATABASE() "
+        f"AND BINARY actual.TABLE_NAME={_sql_string(table_name)} "
+        f"AND BINARY actual.INDEX_NAME NOT IN ({expected_index_names}))"
     )
 
 
@@ -240,10 +313,14 @@ SCHEMA_CHECKS = {
     ),
     "old_job_table_contract_mismatch": (
         "SELECT CASE WHEN COUNT(*)=1 "
-        "AND MAX(BINARY ENGINE='InnoDB')=1 THEN 0 ELSE 1 END "
-        "FROM information_schema.TABLES "
-        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' "
-        "AND BINARY TABLE_NAME='job'"
+        "AND MAX(BINARY tables.ENGINE='InnoDB')=1 "
+        "AND MAX(BINARY charsets.CHARACTER_SET_NAME='utf8mb4')=1 "
+        "AND MAX(BINARY tables.TABLE_COLLATION='utf8mb4_0900_ai_ci')=1 "
+        "THEN 0 ELSE 1 END FROM information_schema.TABLES tables "
+        "LEFT JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY charsets "
+        "ON BINARY charsets.COLLATION_NAME=tables.TABLE_COLLATION "
+        "WHERE tables.TABLE_SCHEMA=DATABASE() AND tables.TABLE_TYPE='BASE TABLE' "
+        "AND BINARY tables.TABLE_NAME='job'"
     ),
     "old_inbound_table_contract_mismatch": (
         "SELECT CASE WHEN COUNT(*)=1 "
@@ -269,18 +346,50 @@ SCHEMA_CHECKS = {
         "WHERE TRIGGER_SCHEMA=DATABASE() "
         "AND BINARY EVENT_OBJECT_TABLE='wecom_inbound_event'"
     ),
-    "old_inbound_column_contract_mismatch": _column_contract_sql(),
-    "old_inbound_index_contract_mismatch": _index_contract_sql(),
-    "old_job_column_contract_mismatch": (
-        "SELECT CASE WHEN "
-        "(SELECT COUNT(*) FROM information_schema.COLUMNS "
-        " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='job' "
-        " AND COLUMN_NAME='expires_at' AND IS_NULLABLE='NO') = 1 "
-        "AND (SELECT COUNT(*) FROM information_schema.COLUMNS "
-        " WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='job' "
-        " AND COLUMN_NAME='delist_reason' "
-        " AND COLUMN_TYPE=\"enum('filled','manual_delist','expired')\") = 1 "
+    "old_inbound_column_contract_mismatch": _column_contract_sql(
+        "wecom_inbound_event", INBOUND_COLUMN_CONTRACT
+    ),
+    "old_inbound_index_contract_mismatch": _index_contract_sql(
+        "wecom_inbound_event", INBOUND_INDEX_CONTRACT, allow_extra_safe=True
+    ),
+    "old_job_column_contract_mismatch": _column_contract_sql(
+        "job", JOB_COLUMN_CONTRACT
+    ),
+    "old_job_index_contract_mismatch": _index_contract_sql(
+        "job", JOB_INDEX_CONTRACT, allow_extra_safe=False
+    ),
+    "old_job_constraints_mismatch": (
+        "SELECT "
+        "(SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
+        " WHERE CONSTRAINT_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job' "
+        " AND CONSTRAINT_TYPE='CHECK') + "
+        "CASE WHEN "
+        "(SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS rc "
+        " JOIN information_schema.KEY_COLUMN_USAGE kcu "
+        " ON BINARY kcu.CONSTRAINT_SCHEMA=BINARY rc.CONSTRAINT_SCHEMA "
+        " AND BINARY kcu.CONSTRAINT_NAME=BINARY rc.CONSTRAINT_NAME "
+        " AND BINARY kcu.TABLE_NAME=BINARY rc.TABLE_NAME "
+        " WHERE rc.CONSTRAINT_SCHEMA=DATABASE() AND BINARY rc.TABLE_NAME='job' "
+        " AND BINARY rc.CONSTRAINT_NAME='fk_job_owner' "
+        " AND BINARY kcu.COLUMN_NAME='owner_userid' "
+        " AND BINARY kcu.REFERENCED_TABLE_SCHEMA=DATABASE() "
+        " AND BINARY kcu.REFERENCED_TABLE_NAME='user' "
+        " AND BINARY kcu.REFERENCED_COLUMN_NAME='external_userid' "
+        " AND kcu.ORDINAL_POSITION=1 "
+        " AND kcu.POSITION_IN_UNIQUE_CONSTRAINT=1 "
+        " AND BINARY rc.UPDATE_RULE='NO ACTION' "
+        " AND BINARY rc.DELETE_RULE='RESTRICT')=1 "
+        "AND (SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE "
+        " WHERE CONSTRAINT_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job' "
+        " AND BINARY CONSTRAINT_NAME='fk_job_owner' "
+        " AND REFERENCED_TABLE_NAME IS NOT NULL)=1 "
+        "AND (SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS "
+        " WHERE CONSTRAINT_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job')=1 "
         "THEN 0 ELSE 1 END"
+    ),
+    "old_job_triggers_remaining": (
+        "SELECT COUNT(*) FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA=DATABASE() AND BINARY EVENT_OBJECT_TABLE='job'"
     ),
     "phase10_tables_remaining": (
         "SELECT COUNT(*) FROM information_schema.TABLES "

@@ -560,6 +560,8 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     ]
     assert "TABLE_TYPE='BASE TABLE'" in job_table_gate
     assert "ENGINE='InnoDB'" in job_table_gate
+    assert "CHARACTER_SET_NAME='utf8mb4'" in job_table_gate
+    assert "TABLE_COLLATION='utf8mb4_0900_ai_ci'" in job_table_gate
     inbound_table_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_table_contract_mismatch"
     ]
@@ -603,6 +605,32 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "actual.NON_UNIQUE=1" in inbound_index_gate
     assert "actual.COLUMN_NAME IS NULL" in inbound_index_gate
     assert "actual.INDEX_TYPE<>'BTREE'" in inbound_index_gate
+    job_column_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_job_column_contract_mismatch"
+    ]
+    assert "COLUMN_TYPE" in job_column_gate
+    assert "GENERATION_EXPRESSION" in job_column_gate
+    assert "expires_at" in job_column_gate
+    assert "NOT IN" in job_column_gate
+    job_index_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_job_index_contract_mismatch"
+    ]
+    assert "GROUP_CONCAT" in job_index_gate
+    assert "IS_VISIBLE" in job_index_gate
+    assert "NOT IN" in job_index_gate
+    job_constraints_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_job_constraints_mismatch"
+    ]
+    assert "REFERENTIAL_CONSTRAINTS" in job_constraints_gate
+    assert "ORDINAL_POSITION=1" in job_constraints_gate
+    assert "POSITION_IN_UNIQUE_CONSTRAINT=1" in job_constraints_gate
+    assert "REFERENCED_TABLE_NAME IS NOT NULL)=1" in job_constraints_gate
+    assert "fk_job_owner" in job_constraints_gate
+    assert "CONSTRAINT_TYPE='CHECK'" in job_constraints_gate
+    job_trigger_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_job_triggers_remaining"
+    ]
+    assert "EVENT_OBJECT_TABLE='job'" in job_trigger_gate
 
     db = MagicMock()
     results = []

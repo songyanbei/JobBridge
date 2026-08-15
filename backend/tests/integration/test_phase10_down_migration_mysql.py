@@ -34,6 +34,9 @@ LEASE_OWNER_SQL = (
 DOWN_SQL = (ROOT / "sql/migrations/phase10_down_001_job_lifecycle.sql").read_text(
     encoding="utf-8"
 )
+STAGE_A_JOB_SQL = (ROOT / "sql/contracts/phase10_stage_a_job.sql").read_text(
+    encoding="utf-8"
+)
 
 BASE_SCHEMA_SQL = """
 CREATE TABLE system_config (
@@ -41,23 +44,18 @@ CREATE TABLE system_config (
   config_value TEXT NOT NULL
 );
 INSERT INTO system_config VALUES ('ttl.job.candidate.days','7');
-CREATE TABLE job (
-  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  audit_status ENUM('pending','passed','rejected') NOT NULL,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  audited_at DATETIME NULL,
-  expires_at DATETIME NOT NULL,
-  deleted_at DATETIME NULL,
-  delist_reason ENUM('filled','manual_delist','expired') NULL,
-  version INT UNSIGNED NOT NULL DEFAULT 1
-) ENGINE=InnoDB;
+CREATE TABLE `user` (
+  external_userid VARCHAR(64) NOT NULL PRIMARY KEY
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+INSERT INTO `user` VALUES ('stage-a-owner');
+""" + STAGE_A_JOB_SQL + """
 INSERT INTO job (
-  audit_status, created_at, updated_at, audited_at, expires_at,
+  owner_userid, city, job_category, salary_floor_monthly, pay_type, headcount,
+  raw_text, audit_status, created_at, updated_at, audited_at, expires_at,
   deleted_at, delist_reason, version
 ) VALUES
-('passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1),
-('pending','2026-01-01','2026-01-02',NULL,'2026-09-01',NULL,NULL,4);
+('stage-a-owner','上海','普工',8000,'月薪',2,'岗位一','passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1),
+('stage-a-owner','苏州','操作工',7000,'月薪',3,'岗位二','pending','2026-01-01','2026-01-02',NULL,'2026-09-01',NULL,NULL,4);
 CREATE TABLE wecom_inbound_event (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   msg_id VARCHAR(64) NOT NULL,
@@ -263,10 +261,90 @@ def test_down_rejects_post_migration_extension_before_overwrite():
             assert int(cursor.fetchone()[0]) == 0
 
         report = _collect_down_report(database)
-        assert report["ready"] is True
+        assert report["ready"] is True, report
         assert report["restored_job_backup_mismatch"] == 0
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job'"
+            )
+            assert int(cursor.fetchone()[0]) == 45
+
+            cursor.execute("ALTER TABLE job DROP COLUMN description")
+        report = _collect_down_report(database)
+        assert report["old_job_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE job ADD COLUMN description TEXT NULL")
+            cursor.execute("ALTER TABLE job MODIFY COLUMN expires_at DATE NOT NULL")
+        report = _collect_down_report(database)
+        assert report["old_job_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE job MODIFY COLUMN expires_at DATETIME NOT NULL")
+            cursor.execute(
+                "ALTER TABLE job ADD CONSTRAINT chk_job_stage_a "
+                "CHECK (headcount <> 99)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_job_constraints_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE job DROP CHECK chk_job_stage_a")
+            cursor.execute(
+                "ALTER TABLE `user` ADD COLUMN is_long_term TINYINT(1) NOT NULL "
+                "DEFAULT 1, ADD UNIQUE KEY uq_user_owner_long_term "
+                "(external_userid, is_long_term)"
+            )
+            cursor.execute("ALTER TABLE job DROP FOREIGN KEY fk_job_owner")
+            cursor.execute(
+                "ALTER TABLE job ADD KEY idx_job_owner_long_term "
+                "(owner_userid, is_long_term), "
+                "ADD CONSTRAINT fk_job_owner "
+                "FOREIGN KEY (owner_userid, is_long_term) "
+                "REFERENCES `user` (external_userid, is_long_term) "
+                "ON DELETE RESTRICT"
+            )
+        report = _collect_down_report(database)
+        assert report["old_job_constraints_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE job DROP FOREIGN KEY fk_job_owner")
+            cursor.execute("ALTER TABLE job DROP INDEX idx_job_owner_long_term")
+            cursor.execute(
+                "ALTER TABLE job ADD CONSTRAINT fk_job_owner "
+                "FOREIGN KEY (owner_userid) REFERENCES `user` (external_userid) "
+                "ON DELETE RESTRICT"
+            )
+            cursor.execute(
+                "CREATE TRIGGER job_stage_a_block BEFORE INSERT ON job "
+                "FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='blocked'"
+            )
+        report = _collect_down_report(database)
+        assert report["old_job_triggers_remaining"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("DROP TRIGGER job_stage_a_block")
+            cursor.execute("CREATE INDEX idx_job_extra ON job (headcount)")
+        report = _collect_down_report(database)
+        assert report["old_job_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("DROP INDEX idx_job_extra ON job")
+            cursor.execute(
+                "ALTER TABLE job DEFAULT CHARACTER SET utf8mb4 "
+                "COLLATE utf8mb4_general_ci"
+            )
+        report = _collect_down_report(database)
+        assert report["old_job_table_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE job DEFAULT CHARACTER SET utf8mb4 "
+                "COLLATE utf8mb4_0900_ai_ci"
+            )
+            cursor.execute("ALTER TABLE job DROP FOREIGN KEY fk_job_owner")
             cursor.execute("ALTER TABLE job ENGINE=MyISAM")
         report = _collect_down_report(database)
         assert report["old_job_table_contract_mismatch"] == 1
@@ -280,6 +358,11 @@ def test_down_rejects_post_migration_extension_before_overwrite():
             cursor.execute("SELECT version FROM job WHERE id=1")
             assert int(cursor.fetchone()[0]) == version_before + 1
             cursor.execute("ALTER TABLE job ENGINE=InnoDB")
+            cursor.execute(
+                "ALTER TABLE job ADD CONSTRAINT fk_job_owner "
+                "FOREIGN KEY (owner_userid) REFERENCES `user` (external_userid) "
+                "ON DELETE RESTRICT"
+            )
     finally:
         if db is not None:
             db.close()
@@ -470,6 +553,9 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "old_inbound_column_contract_mismatch": 0,
             "old_inbound_index_contract_mismatch": 0,
             "old_job_column_contract_mismatch": 0,
+            "old_job_index_contract_mismatch": 0,
+            "old_job_constraints_mismatch": 0,
+            "old_job_triggers_remaining": 0,
             "phase10_tables_remaining": 0,
             "phase10_fences_remaining": 0,
             "backup_expected_columns_remaining": 0,
