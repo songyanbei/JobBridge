@@ -533,6 +533,7 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "499eb929b75ad2f208d306b62157d8ded0119f33" in destructive
     assert "old_inbound_table_contract_mismatch" in destructive
     assert "old_inbound_constraints_mismatch" in destructive
+    assert "old_inbound_triggers_remaining" in destructive
     assert "old_inbound_column_contract_mismatch" in destructive
     assert "old_inbound_index_contract_mismatch" in destructive
     assert "额外普通非唯一索引允许保留" in destructive
@@ -563,6 +564,11 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     ]
     assert "TABLE_CONSTRAINTS" in inbound_constraints_gate
     assert "'CHECK','FOREIGN KEY'" in inbound_constraints_gate
+    inbound_trigger_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_inbound_triggers_remaining"
+    ]
+    assert "EVENT_OBJECT_TABLE='wecom_inbound_event'" in inbound_trigger_gate
+    assert "TRIGGER_NAME" not in inbound_trigger_gate
     inbound_column_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_column_contract_mismatch"
     ]
@@ -608,6 +614,7 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["old_schema_required_tables_missing"] == 0
     assert report["old_inbound_table_contract_mismatch"] == 0
     assert report["old_inbound_constraints_mismatch"] == 0
+    assert report["old_inbound_triggers_remaining"] == 0
     assert report["old_inbound_column_contract_mismatch"] == 0
     assert report["old_inbound_index_contract_mismatch"] == 0
 

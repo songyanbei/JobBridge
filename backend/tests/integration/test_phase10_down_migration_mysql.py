@@ -450,6 +450,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "phase10_session_columns_remaining": 0,
             "old_inbound_table_contract_mismatch": 0,
             "old_inbound_constraints_mismatch": 0,
+            "old_inbound_triggers_remaining": 0,
             "old_inbound_column_contract_mismatch": 0,
             "old_inbound_index_contract_mismatch": 0,
             "old_job_column_contract_mismatch": 0,
@@ -461,6 +462,23 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         }
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "CREATE TRIGGER reject_stage_a_inbound "
+                "BEFORE INSERT ON wecom_inbound_event FOR EACH ROW "
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='blocked by trigger'"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_triggers_remaining"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.err.OperationalError) as trigger_error:
+                cursor.execute(
+                    "INSERT INTO wecom_inbound_event "
+                    "(msg_id, from_userid, msg_type) "
+                    "VALUES ('trigger-msg', 'trigger-user', 'text')"
+                )
+            assert trigger_error.value.args[0] == 1644
+            cursor.execute("DROP TRIGGER reject_stage_a_inbound")
             cursor.execute(
                 "ALTER TABLE wecom_inbound_event ADD CONSTRAINT chk_block_text "
                 "CHECK (msg_type <> 'text')"

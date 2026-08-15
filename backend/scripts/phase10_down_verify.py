@@ -244,6 +244,11 @@ SCHEMA_CHECKS = {
         "AND BINARY TABLE_NAME='wecom_inbound_event' "
         "AND CONSTRAINT_TYPE IN ('CHECK','FOREIGN KEY')"
     ),
+    "old_inbound_triggers_remaining": (
+        "SELECT COUNT(*) FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA=DATABASE() "
+        "AND BINARY EVENT_OBJECT_TABLE='wecom_inbound_event'"
+    ),
     "old_inbound_column_contract_mismatch": _column_contract_sql(),
     "old_inbound_index_contract_mismatch": _index_contract_sql(),
     "old_job_column_contract_mismatch": (
