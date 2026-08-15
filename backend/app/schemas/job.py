@@ -16,12 +16,16 @@ class JobBase(BaseModel):
     age_max: int | None = None
     is_long_term: bool = True
     raw_text: str
+    hiring_company: str | None = Field(default=None, max_length=128)
+    address: str | None = Field(default=None, max_length=255)
+    contact_person: str | None = Field(default=None, max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
 
 
 class JobCreate(JobBase):
     """创建岗位。"""
     owner_userid: str = Field(..., max_length=64)
-    expires_at: datetime
+    expires_at: datetime | None = None
 
     # 软匹配字段（可选）
     district: str | None = None
@@ -60,6 +64,10 @@ class JobUpdate(BaseModel):
     age_max: int | None = None
     is_long_term: bool | None = None
     district: str | None = None
+    address: str | None = Field(default=None, max_length=255)
+    hiring_company: str | None = Field(default=None, max_length=128)
+    contact_person: str | None = Field(default=None, max_length=64)
+    phone: str | None = Field(default=None, max_length=32)
     provide_meal: bool | None = None
     provide_housing: bool | None = None
     dorm_condition: str | None = None
@@ -88,6 +96,9 @@ class JobRead(BaseModel):
     """岗位完整输出 DTO。"""
     id: int
     owner_userid: str
+    hiring_company: str | None = None
+    contact_person: str | None = None
+    phone: str | None = None
 
     # 硬过滤
     city: str
@@ -138,9 +149,20 @@ class JobRead(BaseModel):
     # 生命周期
     created_at: datetime
     updated_at: datetime
-    expires_at: datetime
+    # 先于数据库 nullable 迁移发布，兼容尚未激活的候选岗位。
+    expires_at: datetime | None = None
+    activated_at: datetime | None = None
+    candidate_expires_at: datetime | None = None
     delist_reason: str | None = None
     deleted_at: datetime | None = None
+
+    # additive DDL 完成后的只读 replacement 投影。
+    replacement_id: int | None = None
+    replacement_review_outcome: str | None = None
+    replacement_lifecycle_status: str | None = None
+    replacement_closed_reason: str | None = None
+    replaces_job_id: int | None = None
+    replaced_by_job_id: int | None = None
 
     version: int
     extra: dict | None = None

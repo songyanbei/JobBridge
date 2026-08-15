@@ -48,7 +48,11 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync always
+      --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -80,11 +84,10 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-      - worker_uploads:/app/uploads
+      - ./backend/uploads:/app/uploads
     restart: unless-stopped
     # Worker 纯后台消费，不对外暴露端口
 
 volumes:
   mysql_data:
   redis_data:
-  worker_uploads:

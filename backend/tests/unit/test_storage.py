@@ -67,7 +67,7 @@ class TestLocalStorageDelete:
         assert not os.path.exists(os.path.join(tmp_dir, "test", "1", "file.txt"))
 
     def test_delete_nonexistent_file(self, storage):
-        assert storage.delete("nonexistent/file.txt") is False
+        assert storage.delete("nonexistent/file.txt") is True
 
 
 class TestLocalStorageExists:

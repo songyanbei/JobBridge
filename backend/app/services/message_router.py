@@ -55,6 +55,11 @@ from app.services.intent_service import (
     classify_intent,
 )
 from app.services.recommendation_experience_gate import userid_hash
+from app.services.search_permission import (
+    ResolvedSearchDirection,
+    check_search_permission,
+    denied_search_response,
+)
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -429,16 +434,36 @@ def _handle_text(
     userid = msg.from_user
     content = (msg.content or "").strip()
 
-    # 空文本兜底（企微理论上不会推空文本）
-    if not content:
-        return [_reply(userid, FALLBACK_REPLY)]
-
     # 加载 / 创建 session
     session = conversation_service.load_session(userid)
     if session is None:
         session = conversation_service.create_session(userid, user_ctx.role)
     # Stage C1：兜底推导 + self-heal，覆盖测试或非 Redis 路径绕过 load_session 的场景
     conversation_service.ensure_active_flow(session)
+
+    # Upload TTL is a routing precondition. It must run before welcome,
+    # action-plan and V2 clarification/conflict short returns so no branch can
+    # preserve an expired draft or its media references.
+    if _abandon_expired_pending_upload(session, db):
+        if _looks_like_upload_patch(content):
+            conversation_service.record_history(session, "user", content)
+            conversation_service.record_history(
+                session, "assistant", PENDING_EXPIRED_REPLY,
+            )
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+
+    # Any subsequent text turn closes the post-upload attachment window before
+    # welcome, clarification, V2 reset, or classifier failure can short-return.
+    # A complete successful upload in this same turn writes a new exact target.
+    if not session.pending_upload_intent:
+        session.attachment_target_type = None
+        session.attachment_target_id = None
+
+    # 空文本也必须关闭附件窗口并持久化；不能绕过上面的 TTL/target 清理。
+    if not content:
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, FALLBACK_REPLY)]
 
     # 首次欢迎优先于意图分类
     if user_ctx.should_welcome:
@@ -674,7 +699,9 @@ def _handle_text(
                 # 渲染对应文案（以及 proceed 路径消费 pending_interruption）。
                 # 否则 cancel/resume 只改回复但 session 状态不动，是真 bug
                 # （codex review 第二轮 P1）。
-                apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                apply_decision(
+                    decision, session, msg=msg, intent_result=intent_result, db=db,
+                )
                 replies = _route_v2_resolve_conflict(
                     decision, msg, user_ctx, session, db,
                 )
@@ -691,7 +718,9 @@ def _handle_text(
             # 接管二次检索 + 清状态。
             if decision.dialogue_act == "respond_relaxation_offer":
                 if decision.state_transition == "clear_pending_relaxation":
-                    apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                    apply_decision(
+                        decision, session, msg=msg, intent_result=intent_result, db=db,
+                    )
                 replies = _route_v2_relaxation_response(
                     decision, msg, user_ctx, session, db,
                 )
@@ -716,7 +745,9 @@ def _handle_text(
                     ),
                     "active_flow": session.active_flow,
                 }
-                apply_decision(decision, session, msg=msg, intent_result=intent_result)
+                apply_decision(
+                    decision, session, msg=msg, intent_result=intent_result, db=db,
+                )
                 replies = _route_v2_cancel_reset(decision, pre_state, msg, session)
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
@@ -725,7 +756,9 @@ def _handle_text(
                 return replies
             # 其它 transition → applier 物化（awaiting_ops 已经 apply 过，applier 内部
             # 重复调用也是幂等的：consume_search_awaiting 对已消费字段是 no-op）。
-            apply_decision(decision, session, msg=msg, intent_result=intent_result)
+            apply_decision(
+                decision, session, msg=msg, intent_result=intent_result, db=db,
+            )
 
     if user_ctx.role == "broker":
         from app.services.dialogue_reducer import broker_explicit_direction
@@ -774,7 +807,7 @@ def _handle_text(
     intent = intent_result.intent
 
     # Stage C1（spec §2.5）：last_intent 仅观测；current_intent 在 upload_collecting
-    # 期间钉在 pending_upload_intent，兼容旧 attach_image 的回落判断。
+    # 期间钉在 pending_upload_intent，供对话语义与观测使用。
     session.last_intent = intent
     if (
         session.active_flow == "upload_collecting"
@@ -947,9 +980,8 @@ def _route_upload_collecting(
     userid = msg.from_user
 
     # 1. 过期
-    if upload_service.is_pending_upload_expired(session):
+    if _abandon_expired_pending_upload(session, db):
         was_patch = _looks_like_upload_patch(content)
-        upload_service.clear_pending_upload(session)
         if was_patch:
             return [_reply(userid, PENDING_EXPIRED_REPLY)]
         # 未补丁就放行到 idle 分发
@@ -957,7 +989,7 @@ def _route_upload_collecting(
 
     # 2. cancel 强规则
     if _is_cancel(content, intent_result):
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
     # 3. 闲聊穿插（spec §9.8）
@@ -997,6 +1029,11 @@ def _route_upload_conflict(
     userid = msg.from_user
     intent = intent_result.intent
 
+    if _abandon_expired_pending_upload(session, db):
+        if _looks_like_upload_patch(content):
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+        return _route_idle(intent_result, msg, user_ctx, session, db)
+
     # Stage C1（spec §2.7）：识别用户三选一回复时，proceed 信号优先级最高 ——
     # "继续看看" / "算了，先找工人" 这类同时含 resume/cancel 词与 proceed 词的句子，
     # 都按 "用户表达了搜索方向" 处理；这样:
@@ -1015,7 +1052,7 @@ def _route_upload_conflict(
         not has_proceed_signal
         and (_is_cancel(content, intent_result) or "取消草稿" in content)
     ):
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         return [_reply(userid, PENDING_CANCELLED_REPLY)]
 
     # 继续发布 —— 仅在不含 proceed 信号时；spec §2.7 要求允许裸 "继续"
@@ -1045,7 +1082,7 @@ def _route_upload_conflict(
         forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
 
         # 清掉 pending 草稿和 interruption 后再分发
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
         return [_reply(userid, CONFLICT_PROCEED_ACK)] + forwarded
 
@@ -1159,7 +1196,7 @@ def _route_v2_resolve_conflict(
         forwarded_msg = dataclasses.replace(msg, content=forwarded_text)
 
         # 消费 pending_interruption + 清草稿（applier 只清了 active_flow）
-        upload_service.clear_pending_upload(session)
+        upload_service.abandon_pending_upload(session, db)
         session.pending_interruption = None
 
         forwarded = _route_idle(new_intent_result, forwarded_msg, user_ctx, session, db)
@@ -1242,6 +1279,16 @@ def _route_v2_relaxation_response(
         original_criteria = dict(pending.get("original_criteria") or {})
         step = pending.get("step") or ""
         direction = pending.get("direction") or "search_job"
+        permission_decision = check_search_permission(
+            user_ctx,
+            direction,
+            entrypoint="message_router.confirmed_relaxation",
+            request_id=msg.msg_id,
+        )
+        if not permission_decision.allowed:
+            session.pending_relaxation = None
+            denied_result, _ = denied_search_response(permission_decision)
+            return [_reply(userid, denied_result.reply_text)]
         persisted_raw_query = pending.get("raw_query") or ""
         persisted_user_msg_id = pending.get("user_msg_id")
         original_visible_count = int(pending.get("original_visible_count") or 0)
@@ -1528,6 +1575,7 @@ def _handle_upload(
         image_keys=[],  # 图片在 _handle_image 单独处理
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
     # Stage C1：upload_service 已自行维护 active_flow（保存草稿→upload_collecting；
     # 清空草稿→idle）。这里仅兜底确保 active_flow 与 pending 状态一致。
@@ -1564,6 +1612,7 @@ def _handle_upload_and_search(
         image_keys=[],
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
 
     replies: list[ReplyMessage] = [_reply(msg.from_user, upload_result.reply_text)]
@@ -1796,11 +1845,16 @@ def _handle_show_more(
     db: Session,
 ) -> list[ReplyMessage]:
     # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
-    direction = (
-        "search_job"
-        if (user_ctx.role == "worker" or session.broker_direction == "search_job")
-        else "search_worker"
+    direction = search_service.resolve_show_more_direction(session, user_ctx)
+    permission_decision = check_search_permission(
+        user_ctx,
+        direction,
+        entrypoint="message_router.show_more",
+        request_id=msg.msg_id,
     )
+    if not permission_decision.allowed:
+        denied_result, _ = denied_search_response(permission_decision)
+        return [_reply(msg.from_user, denied_result.reply_text)]
     experience_flags = _experience_flags_for(
         user_ctx, direction=direction, emit_log=True,
     )
@@ -2065,23 +2119,38 @@ def _handle_image(
     userid = msg.from_user
     image_url = msg.image_url
 
+    session = conversation_service.load_session(userid)
+    if session and _abandon_expired_pending_upload(session, db):
+        upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
+        conversation_service.record_history(
+            session, "assistant", PENDING_EXPIRED_REPLY,
+        )
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, PENDING_EXPIRED_REPLY)]
+    if msg.expired_upload_draft:
+        upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
+        return [_reply(userid, PENDING_EXPIRED_REPLY)]
+
     if not image_url:
         logger.warning("message_router: image msg without image_url, msg_id=%s", msg.msg_id)
         return [_reply(userid, IMAGE_DOWNLOAD_FAILED)]
 
     # 尝试挂载到当前上传流程。
-    # Stage C1（spec §2.10）：优先看 pending_upload_intent — 草稿存活时（含
-    # upload_collecting 与 upload_conflict 两态）都应该挂图，避免 current_intent 在
-    # 上传过程中被 chitchat / command 等中间消息污染后图片被误判为"非上传流程"。
-    # 回落 current_intent 兼容旧 session（C2 删除回落）。
-    session = conversation_service.load_session(userid)
+    # 草稿存活时按 pending intent 挂载；草稿结束后只接受精确实体目标。
+    # 禁止使用 current_intent 猜测“最近记录”，否则过期/取消/候选结束后
+    # 排队图片可能误改旧岗位。
     if session and (
         session.pending_upload_intent
-        or session.current_intent in ("upload_job", "upload_resume", "upload_and_search")
+        or (
+            session.attachment_target_type in {"job", "resume"}
+            and type(session.attachment_target_id) is int
+            and session.attachment_target_id > 0
+        )
     ):
         feedback = upload_service.attach_image(
             external_userid=userid,
             image_key=image_url,
+            media_lifecycle_id=msg.media_lifecycle_id,
             session=session,
             db=db,
         )
@@ -2089,6 +2158,7 @@ def _handle_image(
         return [_reply(userid, feedback)]
 
     # 非上传流程：留存提示
+    upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
     return [_reply(userid, IMAGE_RECEIVED_NON_UPLOAD)]
 
 
@@ -2129,6 +2199,14 @@ def _looks_like_upload_patch(content: str) -> bool:
     if any(k in text for k in _KNOWN_SHORT_PATCH_KEYWORDS):
         return True
     return False
+
+
+def _abandon_expired_pending_upload(session: SessionState, db: Session) -> bool:
+    """Atomically apply the common expired-draft cleanup before routing."""
+    if not upload_service.is_pending_upload_expired(session):
+        return False
+    upload_service.abandon_pending_upload(session, db)
+    return True
 
 
 def _parse_headcount_from_text(text: str) -> int | None:
@@ -2349,6 +2427,7 @@ def _commit_pending_or_followup(
         image_keys=[],
         session=session,
         db=db,
+        source_msg_id=msg.msg_id,
     )
     return [_reply(userid, result.reply_text)]
 
@@ -2492,6 +2571,14 @@ def _run_search(
     Phase 7：user_msg_id 透传到 rerank 日志（``llm_call``），便于按消息串联检索链路。
     """
     direction = _resolve_search_direction(intent, user_ctx, session)
+    permission_decision = check_search_permission(
+        user_ctx,
+        direction,
+        entrypoint="message_router.run_search",
+        request_id=user_msg_id,
+    )
+    if not permission_decision.allowed:
+        return denied_search_response(permission_decision)
     experience_flags = _experience_flags_for(
         user_ctx, direction=direction, emit_log=True,
     )
@@ -2673,6 +2760,12 @@ def _resolve_search_direction(
         return "search_job"
 
     if intent == "search_job":
+        if user_ctx.role == "factory":
+            return ResolvedSearchDirection(
+                "search_job",
+                supported=False,
+                reason_code="role_direction_forbidden",
+            )
         if user_ctx.role == "broker":
             session.broker_direction = "search_job"
         return "search_job"

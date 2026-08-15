@@ -23,16 +23,17 @@ def test_redis_session_cas_passes_expected_version_and_payload():
         ) is True
 
     args = redis.eval.call_args.args
-    assert args[1:7] == (
-        3,
+    assert args[1:8] == (
+        4,
         "session:u-1",
         "__no_user_lock_fence__",
         "recommendation:session:indexes:u-1",
+        "recommendation:session:revoked_indexes",
         3,
         1800,
     )
-    assert '"session_version": 4' in args[7]
-    assert args[9:] == ("0", "u-1", "[]")
+    assert '"session_version": 4' in args[8]
+    assert args[10:] == ("0", "u-1", "[]", "")
 
 
 def test_redis_session_cas_rejects_lost_lock_fence():
@@ -64,7 +65,7 @@ def test_redis_session_cas_can_restore_missing_durable_state():
             allow_missing=True,
         ) is True
 
-    assert redis.eval.call_args.args[9] == "1"
+    assert redis.eval.call_args.args[10] == "1"
 
 
 def test_redis_session_delete_cas_passes_version_and_fence():
@@ -84,6 +85,7 @@ def test_redis_session_delete_cas_passes_version_and_fence():
         7,
         "owner-token",
         "u-1",
+        "",
     )
 
 
@@ -184,6 +186,7 @@ def test_apply_staged_save_allows_restore_after_redis_ttl_expiry():
         operation="save",
         expected_version=7,
         payload={"role": "worker", "session_version": 8},
+        deadline_epoch=123.456789,
     )
     with patch.object(
         conversation_service,
@@ -193,3 +196,69 @@ def test_apply_staged_save_allows_restore_after_redis_ttl_expiry():
         assert conversation_service.apply_staged_session(commit) is True
 
     assert save.call_args.kwargs["allow_missing"] is True
+    assert save.call_args.kwargs["deadline_epoch"] == 123.456789
+
+
+def test_apply_staged_delete_passes_absolute_deadline():
+    commit = conversation_service.StagedSessionCommit(
+        userid="u-1",
+        operation="delete",
+        expected_version=7,
+        payload=None,
+        deadline_epoch=987.654321,
+    )
+    with patch.object(
+        conversation_service,
+        "redis_delete_session_if_version",
+        return_value=True,
+    ) as delete:
+        assert conversation_service.apply_staged_session(commit) is True
+
+    assert delete.call_args.kwargs["deadline_epoch"] == 987.654321
+
+
+def test_applied_check_accepts_valid_delete_and_save_operations():
+    delete_commit = conversation_service.StagedSessionCommit(
+        userid="u-1",
+        operation="delete",
+        expected_version=7,
+        payload=None,
+    )
+    save_commit = conversation_service.StagedSessionCommit(
+        userid="u-1",
+        operation="save",
+        expected_version=7,
+        payload={"role": "worker", "session_version": 8},
+    )
+
+    with patch.object(
+        conversation_service, "redis_get_session", side_effect=[None, save_commit.payload],
+    ):
+        assert conversation_service.is_staged_session_applied(delete_commit) is True
+        assert conversation_service.is_staged_session_applied(save_commit) is True
+
+
+@pytest.mark.parametrize(
+    ("operation", "payload"),
+    [
+        ("", None),
+        ("unknown", None),
+        (None, None),
+        ("save", None),
+        ("save", {}),
+    ],
+)
+def test_applied_check_rejects_invalid_operation_without_reading_redis(
+    operation, payload,
+):
+    commit = conversation_service.StagedSessionCommit(
+        userid="u-1",
+        operation=operation,
+        expected_version=7,
+        payload=payload,
+    )
+
+    with patch.object(conversation_service, "redis_get_session") as get_session:
+        assert conversation_service.is_staged_session_applied(commit) is False
+
+    get_session.assert_not_called()

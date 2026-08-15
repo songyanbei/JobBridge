@@ -295,6 +295,43 @@ class TestCallLlmApi:
 class TestQwenIntentExtractor:
 
     @patch("app.llm.providers.qwen.call_llm_api")
+    def test_dialogue_prompt_recovers_category_ontology_on_next_request(
+        self, mock_call, monkeypatch, request,
+    ):
+        from app.dialogue import slot_schema
+        from app.services import intent_service
+
+        category_snapshots = iter((
+            frozenset({"故障兜底工种"}),
+            frozenset({"恢复后工种"}),
+        ))
+        monkeypatch.setattr(
+            intent_service,
+            "_get_job_category_canonical_values",
+            lambda: next(category_snapshots),
+        )
+        slot_schema._reset_cache_for_tests()
+        request.addfinalizer(slot_schema._reset_cache_for_tests)
+        mock_call.return_value = _make_chat_response(json.dumps({
+            "dialogue_act": "chitchat",
+            "frame_hint": "none",
+            "slots_delta": {},
+            "merge_hint": {},
+            "confidence": 0.9,
+        }))
+
+        ext = QwenIntentExtractor()
+        ext.extract_dialogue("你好", role="worker")
+        ext.extract_dialogue("你好", role="worker")
+
+        first_prompt = mock_call.call_args_list[0].kwargs["payload"]["messages"][0]["content"]
+        second_prompt = mock_call.call_args_list[1].kwargs["payload"]["messages"][0]["content"]
+        assert "故障兜底工种" in first_prompt
+        assert "恢复后工种" not in first_prompt
+        assert "恢复后工种" in second_prompt
+        assert "故障兜底工种" not in second_prompt
+
+    @patch("app.llm.providers.qwen.call_llm_api")
     def test_normal_response(self, mock_call):
         content = json.dumps({
             "intent": "search_job",
@@ -440,6 +477,33 @@ class TestQwenReranker:
 # ---------------------------------------------------------------------------
 
 class TestDoubaoIntentExtractor:
+
+    @patch("app.llm.providers.doubao.get_dialogue_parse_prompt_v2")
+    @patch("app.llm.providers.doubao.call_llm_api")
+    def test_dialogue_prompt_is_loaded_for_each_request(
+        self, mock_call, mock_get_prompt,
+    ):
+        mock_get_prompt.side_effect = (
+            "first {role} {history} {current_criteria} {session_hint}",
+            "second {role} {history} {current_criteria} {session_hint}",
+        )
+        mock_call.return_value = _make_chat_response(json.dumps({
+            "dialogue_act": "chitchat",
+            "frame_hint": "none",
+            "slots_delta": {},
+            "merge_hint": {},
+            "confidence": 0.9,
+        }))
+
+        ext = DoubaoIntentExtractor()
+        ext.extract_dialogue("你好", role="worker")
+        ext.extract_dialogue("你好", role="worker")
+
+        assert mock_get_prompt.call_count == 2
+        first_prompt = mock_call.call_args_list[0].kwargs["payload"]["messages"][0]["content"]
+        second_prompt = mock_call.call_args_list[1].kwargs["payload"]["messages"][0]["content"]
+        assert first_prompt.startswith("first worker")
+        assert second_prompt.startswith("second worker")
 
     @patch("app.llm.providers.doubao.call_llm_api")
     def test_normal_response(self, mock_call):

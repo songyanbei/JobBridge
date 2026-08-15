@@ -109,9 +109,15 @@ class TestKeyColumns:
             "session_payload",
             "session_apply_attempts",
             "session_apply_locked_at",
+            "session_apply_lease_owner",
             "session_next_attempt_at",
+            "session_commit_deadline_epoch",
             "session_applied_at",
         } <= names
+        deadline = WecomInboundEvent.__table__.c.session_commit_deadline_epoch
+        assert deadline.type.precision == 20
+        assert deadline.type.scale == 6
+        assert deadline.nullable is True
 
     def test_wecom_inbound_event_msg_id_unique(self):
         col = self._col(WecomInboundEvent, "msg_id")
@@ -131,7 +137,7 @@ class TestKeyColumns:
 
     def test_job_delist_reason_enum(self):
         col = self._col(Job, "delist_reason")
-        expected = {"filled", "manual_delist", "expired"}
+        expected = {"filled", "manual_delist", "expired", "replaced"}
         assert set(col.type.enums) == expected
 
     def test_system_config_pk(self):

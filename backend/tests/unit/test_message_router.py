@@ -123,6 +123,7 @@ class TestImageHandling:
     ):
         mock_id.return_value = _ctx()
         mock_check.return_value = None
+        mock_load.return_value = None
         replies = process(_msg(msg_type="image", image_url=""), MagicMock())
         assert replies[0].content == IMAGE_DOWNLOAD_FAILED
 
@@ -152,7 +153,12 @@ class TestImageHandling:
     ):
         mock_id.return_value = _ctx()
         mock_check.return_value = None
-        session = SessionState(role="worker", current_intent="upload_resume")
+        session = SessionState(
+            role="worker",
+            current_intent="upload_resume",
+            attachment_target_type="resume",
+            attachment_target_id=100,
+        )
         mock_load.return_value = session
         mock_attach.return_value = "图片已附加"
         replies = process(
@@ -167,6 +173,33 @@ class TestImageHandling:
 # ---------------------------------------------------------------------------
 
 class TestWelcome:
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    def test_blank_text_closes_attachment_window(
+        self, mock_classify, mock_save, mock_load,
+        mock_id, mock_check, mock_active,
+    ):
+        mock_id.return_value = _ctx()
+        mock_check.return_value = None
+        session = SessionState(
+            role="worker",
+            attachment_target_type="resume",
+            attachment_target_id=100,
+        )
+        mock_load.return_value = session
+
+        replies = process(_msg(content="   "), MagicMock())
+
+        assert replies[0].content == FALLBACK_REPLY
+        assert session.attachment_target_type is None
+        assert session.attachment_target_id is None
+        mock_save.assert_called_once_with("u1", session)
+        mock_classify.assert_not_called()
+
     @patch("app.services.message_router.user_service.update_last_active")
     @patch("app.services.message_router.user_service.check_user_status")
     @patch("app.services.message_router.user_service.identify_or_register")

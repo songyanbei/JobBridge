@@ -19,7 +19,7 @@ from sqlalchemy import func, text
 from app.config import settings
 from app.core.redis_client import QUEUE_DEAD_LETTER, QUEUE_INCOMING, get_redis
 from app.db import SessionLocal
-from app.models import WecomInboundEvent, WecomOutboundOutbox
+from app.models import MediaAssetLifecycle, WecomInboundEvent, WecomOutboundOutbox
 from app.tasks.common import log_event, task_lock
 
 
@@ -147,6 +147,28 @@ def check_outbox() -> None:
             )
         except Exception:
             logger.exception("check_outbox failed")
+        finally:
+            db.close()
+
+
+def check_media_cleanup() -> None:
+    """Alert while durable media deletions remain in dead-letter."""
+    with task_lock("worker_monitor.media_cleanup", ttl=45) as acquired:
+        if not acquired:
+            return
+        db = SessionLocal()
+        try:
+            dead = db.query(func.count(MediaAssetLifecycle.id)).filter(
+                MediaAssetLifecycle.state == "dead_letter",
+            ).scalar() or 0
+            if dead:
+                _alert(
+                    "media_cleanup_dead_letter",
+                    f"Media cleanup has {int(dead)} dead-letter records requiring manual action",
+                )
+            log_event("media_cleanup_health", dead_letter_count=int(dead))
+        except Exception:
+            logger.exception("check_media_cleanup failed")
         finally:
             db.close()
 

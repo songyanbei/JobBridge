@@ -153,6 +153,10 @@ class TestClearPendingHelpers:
         s = SessionState(role="factory")
         assert upload_service.is_pending_upload_expired(s) is False
 
+    def test_active_pending_without_deadline_fails_closed(self):
+        s = SessionState(role="factory", pending_upload_intent="upload_job")
+        assert upload_service.is_pending_upload_expired(s) is True
+
     def test_is_pending_expired_true_when_past(self):
         past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
         s = SessionState(role="factory", pending_expires_at=past)

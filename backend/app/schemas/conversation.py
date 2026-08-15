@@ -64,6 +64,21 @@ class SessionState(BaseModel):
     pending_updated_at: str | None = Field(default=None, description="草稿最近更新时间 ISO 8601 UTC")
     pending_expires_at: str | None = Field(default=None, description="草稿过期时间 ISO 8601 UTC，默认创建后 10 分钟")
     pending_raw_text_parts: list[str] = Field(default_factory=list, description="多轮原始用户文本，按时间顺序")
+    pending_upload_mode: str = Field(default="create", description="create / replace")
+    pending_target_id: int | None = Field(default=None)
+    pending_target_version: int | None = Field(default=None)
+    pending_operation_id: str | None = Field(default=None)
+    pending_upload_media_ids: list[int] = Field(default_factory=list)
+    attachment_target_type: str | None = Field(
+        default=None,
+        description="最近一次成功激活的上传实体类型，仅用于后续图片精确挂载",
+    )
+    attachment_target_id: int | None = Field(
+        default=None,
+        strict=True,
+        gt=0,
+        description="与 attachment_target_type 成对的精确实体 ID",
+    )
 
     # ---- Stage C1：兼容式状态机字段（详见 docs/multi-turn-upload-stage-c-implementation.md §2.3） ----
     # 这些字段保留 Stage A/B 扁平字段并存，旧 Redis session 反序列化时全部走默认值。

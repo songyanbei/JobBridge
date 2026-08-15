@@ -77,6 +77,7 @@ DROP TABLE IF EXISTS `job`;
 CREATE TABLE `job` (
     `id`                       BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     `owner_userid`             VARCHAR(64)     NOT NULL                     COMMENT '发布者 external_userid（厂家/中介）',
+    `hiring_company`           VARCHAR(128)    DEFAULT NULL                  COMMENT '实际招聘工厂名（岗位级）',
 
     -- ---- 硬过滤字段（§7.1）----
     `city`                     VARCHAR(32)     NOT NULL                     COMMENT '城市（强制归一到 dict_city）',
@@ -92,6 +93,8 @@ CREATE TABLE `job` (
     -- ---- 软匹配字段（§7.1）----
     `district`                 VARCHAR(32)     DEFAULT NULL                  COMMENT '区县（细粒度）',
     `address`                  VARCHAR(255)    DEFAULT NULL                  COMMENT '岗位详细工作地址（街道+门牌，区县另见 district）',
+    `contact_person`            VARCHAR(64)     DEFAULT NULL                  COMMENT '岗位级联系人（覆盖发布账号）',
+    `phone`                     VARCHAR(32)     DEFAULT NULL                  COMMENT '岗位级联系电话（覆盖发布账号）',
     `salary_ceiling_monthly`   INT             DEFAULT NULL                  COMMENT '月综合收入上限',
     `provide_meal`             TINYINT(1)      DEFAULT NULL                  COMMENT '包吃',
     `provide_housing`          TINYINT(1)      DEFAULT NULL                  COMMENT '包住',
@@ -127,8 +130,10 @@ CREATE TABLE `job` (
     -- ---- 生命周期 ----
     `created_at`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`               DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    `expires_at`               DATETIME        NOT NULL                      COMMENT '过期时间（默认 created_at + 30 天）',
-    `delist_reason`            ENUM('filled','manual_delist','expired') DEFAULT NULL COMMENT '下架原因：filled=已招满 / manual_delist=主动下架 / expired=TTL到期；null=在线',
+    `activated_at`             DATETIME        DEFAULT NULL                  COMMENT '业务激活时间',
+    `candidate_expires_at`     DATETIME        DEFAULT NULL                  COMMENT '候选版本回收时间',
+    `expires_at`               DATETIME        DEFAULT NULL                  COMMENT '激活后的业务过期时间',
+    `delist_reason`            ENUM('filled','manual_delist','expired','replaced') DEFAULT NULL COMMENT '岗位下架原因；null=在线',
     `deleted_at`               DATETIME        DEFAULT NULL                  COMMENT '软删除时间（null 代表有效）',
 
     -- ---- 乐观锁 ----
@@ -141,11 +146,99 @@ CREATE TABLE `job` (
     KEY `idx_owner`       (`owner_userid`),
     KEY `idx_audit_time`  (`audit_status`, `created_at`),
     KEY `idx_expires`     (`expires_at`),
+    KEY `idx_job_candidate_expiry` (`audit_status`, `candidate_expires_at`),
     -- 硬过滤复合索引：覆盖最热检索路径
     KEY `idx_filter_hot`  (`city`, `job_category`, `is_long_term`, `audit_status`, `deleted_at`, `expires_at`),
     KEY `idx_salary`      (`salary_floor_monthly`),
     CONSTRAINT `fk_job_owner` FOREIGN KEY (`owner_userid`) REFERENCES `user`(`external_userid`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位信息表';
+
+DROP TABLE IF EXISTS `job_replacement`;
+CREATE TABLE `job_replacement` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `operation_id` CHAR(36) NOT NULL,
+    `source_msg_id` VARCHAR(128) NOT NULL,
+    `owner_userid` VARCHAR(64) NOT NULL,
+    `old_job_id` BIGINT UNSIGNED NOT NULL,
+    `new_job_id` BIGINT UNSIGNED NOT NULL,
+    `old_job_version` INT UNSIGNED NOT NULL,
+    `old_expires_at` DATETIME DEFAULT NULL,
+    `old_business_digest` CHAR(64) NOT NULL,
+    `old_business_digest_version` TINYINT UNSIGNED NOT NULL DEFAULT 2,
+    `review_outcome` ENUM('pending','passed','rejected') NOT NULL,
+    `reviewed_at` DATETIME DEFAULT NULL,
+    `reviewed_by` VARCHAR(64) DEFAULT NULL,
+    `lifecycle_status` ENUM('awaiting_review','activated','closed','conflict') NOT NULL,
+    `active_old_job_id` BIGINT UNSIGNED DEFAULT NULL,
+    `closed_reason` VARCHAR(64) DEFAULT NULL,
+    `conflict_reason` VARCHAR(255) DEFAULT NULL,
+    `activated_at` DATETIME DEFAULT NULL,
+    `candidate_cleaned_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_replacement_operation` (`operation_id`),
+    UNIQUE KEY `uq_replacement_message` (`source_msg_id`),
+    UNIQUE KEY `uq_replacement_new_job` (`new_job_id`),
+    UNIQUE KEY `uq_replacement_active_old_job` (`active_old_job_id`),
+    KEY `idx_replacement_old_status` (`old_job_id`,`lifecycle_status`),
+    KEY `idx_replacement_owner_created` (`owner_userid`,`created_at`),
+    KEY `idx_replacement_lifecycle_created` (`lifecycle_status`,`created_at`),
+    KEY `idx_replacement_review_created` (`review_outcome`,`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='岗位全量替换关系';
+
+DROP TABLE IF EXISTS `target_cleanup_task`;
+CREATE TABLE `target_cleanup_task` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `operation_id` CHAR(36) NOT NULL,
+    `target_type` VARCHAR(32) NOT NULL,
+    `target_id` BIGINT UNSIGNED NOT NULL,
+    `reason` VARCHAR(32) NOT NULL,
+    `reason_history` JSON DEFAULT NULL,
+    `status` ENUM('pending','processing','retry_wait','succeeded','dead_letter') NOT NULL DEFAULT 'pending',
+    `delivery_ids` JSON DEFAULT NULL,
+    `db_redacted_at` DATETIME DEFAULT NULL,
+    `conversation_redacted_at` DATETIME DEFAULT NULL,
+    `session_invalidated_at` DATETIME DEFAULT NULL,
+    `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at` DATETIME DEFAULT NULL,
+    `last_error` VARCHAR(255) DEFAULT NULL,
+    `lease_owner` VARCHAR(64) DEFAULT NULL,
+    `lease_expires_at` DATETIME DEFAULT NULL,
+    `completed_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cleanup_operation` (`operation_id`),
+    UNIQUE KEY `uq_cleanup_target` (`target_type`,`target_id`),
+    KEY `idx_target_cleanup_ready` (`status`,`next_attempt_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='目标清理任务';
+
+DROP TABLE IF EXISTS `media_asset_lifecycle`;
+CREATE TABLE `media_asset_lifecycle` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    `object_key` VARCHAR(512) NOT NULL,
+    `operation_id` CHAR(36) DEFAULT NULL,
+    `owner_userid` VARCHAR(64) NOT NULL,
+    `entity_type` ENUM('job','resume') DEFAULT NULL,
+    `entity_id` BIGINT UNSIGNED DEFAULT NULL,
+    `state` ENUM('pending','attached','delete_pending','deleted','dead_letter') NOT NULL DEFAULT 'pending',
+    `draft_expires_at` DATETIME DEFAULT NULL,
+    `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
+    `next_attempt_at` DATETIME DEFAULT NULL,
+    `last_error` VARCHAR(255) DEFAULT NULL,
+    `lease_owner` VARCHAR(64) DEFAULT NULL,
+    `lease_expires_at` DATETIME DEFAULT NULL,
+    `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    `deleted_at` DATETIME DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_media_object_key` (`object_key`),
+    KEY `idx_media_operation` (`operation_id`),
+    KEY `idx_media_entity` (`entity_type`,`entity_id`,`state`),
+    KEY `idx_media_cleanup` (`state`,`next_attempt_at`),
+    KEY `idx_media_draft_expiry` (`state`,`draft_expires_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='媒体生命周期';
 
 
 -- ============================================================================
@@ -374,7 +467,9 @@ CREATE TABLE `wecom_inbound_event` (
     `session_payload`    JSON            DEFAULT NULL,
     `session_apply_attempts` INT UNSIGNED NOT NULL DEFAULT 0,
     `session_apply_locked_at` DATETIME(6) DEFAULT NULL,
+    `session_apply_lease_owner` VARCHAR(64) DEFAULT NULL,
     `session_next_attempt_at` DATETIME(6) DEFAULT NULL,
+    `session_commit_deadline_epoch` DECIMAL(20,6) DEFAULT NULL,
     `session_applied_at` DATETIME(6)     DEFAULT NULL,
     `worker_started_at`  DATETIME(6)     DEFAULT NULL                 COMMENT 'Worker 开始处理时间',
     `worker_finished_at` DATETIME(6)     DEFAULT NULL                 COMMENT 'Worker 处理完成时间',

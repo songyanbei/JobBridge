@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -36,15 +37,21 @@ from app.core.redis_client import (
     QUEUE_INCOMING,
     QUEUE_RATE_LIMIT_NOTIFY,
     QUEUE_SEND_RETRY,
+    SESSION_TTL,
+    SessionCommitDeadlineExceeded,
+    UserLockUnavailable,
     enqueue_message,
     get_redis,
     user_lock,
+    validate_redis_durability_policy,
 )
 from app.core.logging_setup import configure_loguru, identifier_hash
 from app.db import SessionLocal
 from app.models import (
     AuditLog,
     ConversationLog,
+    Job,
+    Resume,
     WecomInboundEvent,
     WecomOutboundOutbox,
     RecommendationDelivery,
@@ -55,6 +62,7 @@ from app.services import (
     message_router,
     recommendation_shadow_service,
     search_service,
+    upload_service,
 )
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
@@ -106,6 +114,95 @@ DELIVERY_ACTIVE_STATUSES = (
 # §10.4 的 claim 条件：只有 pending/retry_wait 允许被 dispatcher 领走发送。
 DELIVERY_SENDABLE_STATUSES = (DELIVERY_PENDING, DELIVERY_RETRY_WAIT)
 
+
+def _recommendation_target_references(
+    raw_context: Any,
+) -> tuple[list[tuple[str, int]] | None, str | None, str | None]:
+    """Strictly decode the target set that guards a recommendation claim.
+
+    The persisted JSON is part of the send authorization boundary.  Returning
+    an empty/partial set would let the dispatcher send without locking every
+    target represented in the recommendation body, so every malformed shape
+    is an explicit permanent failure.
+    """
+    context = raw_context
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (TypeError, ValueError):
+            return None, "context_parse_failed", "recommendation context is not valid JSON"
+
+    if not isinstance(context, dict):
+        return None, "context_not_object", "recommendation context must be a JSON object"
+    if "items" not in context:
+        return None, "context_items_missing", "recommendation context items are missing"
+
+    items = context["items"]
+    if not isinstance(items, list):
+        return None, "context_items_invalid", "recommendation context items must be a JSON array"
+    if not items:
+        return None, "context_targets_missing", "recommendation context contains no targets"
+
+    references: list[tuple[str, int]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None, "context_item_invalid", "recommendation context contains a non-object item"
+        target_type = item.get("target_type")
+        target_id = item.get("target_id")
+        if (
+            target_type not in ("job", "resume")
+            or isinstance(target_id, bool)
+            or not isinstance(target_id, int)
+            or target_id <= 0
+        ):
+            return None, "context_item_invalid", "recommendation context contains an invalid target"
+        references.append((target_type, target_id))
+
+    return sorted(set(references)), None, None
+
+
+def _build_outbox_claim_query(
+    db: Session,
+    due,
+    *,
+    inbound_event_id: Any = None,
+    limit: int = OUTBOX_CLAIM_BATCH_SIZE,
+):
+    earlier = aliased(WecomOutboundOutbox)
+    no_earlier_unsent_for_user = ~exists().where(and_(
+        earlier.userid == WecomOutboundOutbox.userid,
+        earlier.id < WecomOutboundOutbox.id,
+        earlier.status.in_(("pending", "sending")),
+    ))
+    current_delivery = aliased(RecommendationDelivery)
+    earlier_delivery = aliased(RecommendationDelivery)
+    no_earlier_active_delivery = ~exists().where(and_(
+        current_delivery.delivery_id
+        == WecomOutboundOutbox.recommendation_delivery_id,
+        earlier_delivery.userid == current_delivery.userid,
+        earlier_delivery.delivery_order < current_delivery.delivery_order,
+        earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
+    ))
+    inbound_done = exists().where(and_(
+        WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
+        WecomInboundEvent.status == "done",
+    ))
+    query = db.query(WecomOutboundOutbox).filter(
+        due,
+        no_earlier_unsent_for_user,
+        no_earlier_active_delivery,
+        inbound_done,
+    )
+    if inbound_event_id:
+        query = query.filter(
+            WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
+        )
+    return (
+        query.order_by(WecomOutboundOutbox.id)
+        .with_for_update(skip_locked=True)
+        .limit(limit)
+    )
+
 # §10.4.1：dispatcher / prepared session reconciler 各自独立 250ms 扫描，
 # 每批最多 100 条；§10.5 的 impression deriver 同样 250ms。
 AUX_LOOP_INTERVAL_SECONDS = 0.25
@@ -148,6 +245,7 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def start(self) -> None:
+        validate_redis_durability_policy(self._redis)
         logger.info("worker: starting pid=%d", self._pid)
         from app.services.recommendation_shadow_service import start_shadow_runner
         from app.services.recommendation_strategy_service import (
@@ -692,21 +790,69 @@ class Worker:
     # 图片下载并附加到消息对象
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _media_operation_id(msg: WeComMessage) -> str | None:
+        session = conversation_service.load_session(msg.from_user)
+        if session is None:
+            return msg.msg_id
+        if (
+            session.pending_upload_intent
+            and upload_service.is_pending_upload_expired(session)
+        ):
+            msg.expired_upload_draft = True
+            return None
+        if session.pending_upload_mode != "replace":
+            return msg.msg_id
+        valid_target = (
+            session.pending_upload_intent == "upload_job"
+            and type(session.pending_target_id) is int
+            and session.pending_target_id > 0
+            and type(session.pending_target_version) is int
+            and session.pending_target_version > 0
+        )
+        if not valid_target or upload_service.is_pending_upload_expired(session):
+            raise RuntimeError("replacement_media_context_invalid")
+        operation_id = session.pending_operation_id
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 36:
+            raise RuntimeError("replacement_media_operation_id_invalid")
+        return operation_id
+
     def _download_and_attach_image(self, msg: WeComMessage) -> None:
+        media_id = None
         try:
             from app.storage import get_storage
+            from app.services.job_media_service import record_pending_media
 
+            operation_id = self._media_operation_id(msg)
+            if operation_id is None:
+                return
             blob = self._wecom_client.download_media(msg.media_id)
             storage = get_storage()
             key = f"images/{msg.from_user}/{msg.msg_id}.jpg"
-            url = storage.save(key, blob, content_type="image/jpeg")
-            msg.image_url = url
+            with SessionLocal() as media_db:
+                media = record_pending_media(
+                    media_db,
+                    key,
+                    owner_userid=msg.from_user,
+                    operation_id=operation_id,
+                )
+                media_db.commit()
+                media_id = media.id
+            storage.save(key, blob, content_type="image/jpeg")
+            msg.image_url = key
+            msg.media_lifecycle_id = media_id
         except Exception:
+            if media_id is not None:
+                from app.services.job_media_service import mark_delete_pending
+                with SessionLocal() as media_db:
+                    mark_delete_pending(media_db, [media_id])
+                    media_db.commit()
             logger.exception(
                 "worker: image download/save failed media_id=%s msg_id=%s",
                 msg.media_id, msg.msg_id,
             )
             msg.image_url = ""
+            msg.media_lifecycle_id = None
 
     # -----------------------------------------------------------------------
     # 回复发送（失败补偿）
@@ -731,7 +877,11 @@ class Worker:
             "session_payload": null() if patched else commit.payload,
             "session_apply_attempts": 0,
             "session_apply_locked_at": None,
+            "session_apply_lease_owner": None,
             "session_next_attempt_at": None,
+            "session_commit_deadline_epoch": (
+                func.unix_timestamp(func.now(6)) + SESSION_TTL
+            ),
             "session_applied_at": None,
             "worker_finished_at": None,
         })
@@ -784,6 +934,35 @@ class Worker:
             .all()
         )
 
+    @staticmethod
+    def _lock_outboxes_for_event(
+        db: Session, inbound_event_id: Any,
+    ) -> list[WecomOutboundOutbox]:
+        if not inbound_event_id:
+            return []
+        return (
+            db.query(WecomOutboundOutbox)
+            .filter(WecomOutboundOutbox.inbound_event_id == int(inbound_event_id))
+            .order_by(WecomOutboundOutbox.id)
+            .with_for_update()
+            .all()
+        )
+
+    @staticmethod
+    def _lock_deliveries_by_id(
+        db: Session, delivery_ids: list[str],
+    ) -> list[RecommendationDelivery]:
+        if not delivery_ids:
+            return []
+        return (
+            db.query(RecommendationDelivery)
+            .populate_existing()
+            .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+            .order_by(RecommendationDelivery.delivery_id)
+            .with_for_update()
+            .all()
+        )
+
     def _claim_session_commits(
         self,
         *,
@@ -796,11 +975,34 @@ class Worker:
             stale_before = func.timestampadd(
                 text("SECOND"), -SESSION_COMMIT_STALE_SECONDS, now,
             )
-            query = db.query(WecomInboundEvent).filter(
+            deadline_epoch_value = func.coalesce(
+                WecomInboundEvent.session_commit_deadline_epoch,
+                func.unix_timestamp(func.coalesce(
+                    WecomInboundEvent.worker_started_at,
+                    WecomInboundEvent.created_at,
+                )) + SESSION_TTL,
+            )
+            deadline_epoch = deadline_epoch_value.label(
+                "session_commit_deadline_epoch",
+            )
+            deadline_reached_value = (
+                deadline_epoch_value <= func.unix_timestamp(now)
+            )
+            deadline_reached = deadline_reached_value.label(
+                "session_commit_deadline_reached",
+            )
+            query = db.query(
+                WecomInboundEvent,
+                deadline_epoch,
+                deadline_reached,
+            ).filter(
                 WecomInboundEvent.status == "session_pending",
                 or_(
-                    WecomInboundEvent.session_next_attempt_at.is_(None),
-                    WecomInboundEvent.session_next_attempt_at <= now,
+                    or_(
+                        WecomInboundEvent.session_next_attempt_at.is_(None),
+                        WecomInboundEvent.session_next_attempt_at <= now,
+                    ),
+                    deadline_reached_value,
                 ),
                 or_(
                     WecomInboundEvent.session_apply_locked_at.is_(None),
@@ -818,14 +1020,29 @@ class Worker:
                 .all()
             )
             claimed: list[dict] = []
-            for row in rows:
+            for row, raw_deadline_epoch, reached in rows:
+                operation = str(row.session_operation or "")
+                payload_available = True
                 try:
                     payload = self._load_session_patch(db, row)
                 except Exception as exc:
                     # §10.6：解密失败 fail-closed，保持 prepared 并告警，绝不走明文旁路。
-                    self._backoff_session_commit(row, exc)
-                    continue
+                    if not reached:
+                        self._backoff_session_commit(row, exc)
+                        continue
+                    payload = None
+                    payload_available = operation == "delete"
+                if operation == "save" and payload is None:
+                    payload_available = False
+                    if not reached:
+                        self._backoff_session_commit(
+                            row,
+                            RuntimeError("durable session save payload is missing"),
+                        )
+                        continue
+                claim_owner = uuid.uuid4().hex
                 row.session_apply_locked_at = now
+                row.session_apply_lease_owner = claim_owner
                 row.session_apply_attempts = int(
                     row.session_apply_attempts or 0,
                 ) + 1
@@ -833,13 +1050,18 @@ class Worker:
                     "event_id": int(row.id),
                     "userid": row.from_userid,
                     "attempts": int(row.session_apply_attempts),
+                    "lease_owner": claim_owner,
+                    "deadline_epoch": raw_deadline_epoch,
+                    "deadline_reached": bool(reached),
+                    "payload_available": payload_available,
                     "commit": conversation_service.StagedSessionCommit(
                         userid=row.from_userid,
-                        operation=str(row.session_operation or ""),
+                        operation=operation,
                         expected_version=int(
                             row.session_expected_version or 0,
                         ),
                         payload=payload,
+                        deadline_epoch=raw_deadline_epoch,
                     ),
                 })
             db.commit()
@@ -877,6 +1099,7 @@ class Worker:
         ]
         row.session_apply_attempts = attempts
         row.session_apply_locked_at = None
+        row.session_apply_lease_owner = None
         row.session_next_attempt_at = func.timestampadd(
             text("SECOND"), backoff, func.now(6),
         )
@@ -889,12 +1112,26 @@ class Worker:
             severity="alert",
         )
 
-    def _mark_session_commit_applied(self, event_id: int) -> bool:
+    @staticmethod
+    def _current_session_claim_filters(event_id: int, lease_owner: str) -> tuple:
+        stale_before = func.timestampadd(
+            text("SECOND"), -SESSION_COMMIT_STALE_SECONDS, func.now(6),
+        )
+        return (
+            WecomInboundEvent.id == event_id,
+            WecomInboundEvent.status == "session_pending",
+            WecomInboundEvent.session_apply_lease_owner == lease_owner,
+            WecomInboundEvent.session_apply_locked_at.is_not(None),
+            WecomInboundEvent.session_apply_locked_at > stale_before,
+        )
+
+    def _mark_session_commit_applied(
+        self, event_id: int, lease_owner: str,
+    ) -> bool:
         db = SessionLocal()
         try:
             updated = db.query(WecomInboundEvent).filter(
-                WecomInboundEvent.id == event_id,
-                WecomInboundEvent.status == "session_pending",
+                *self._current_session_claim_filters(event_id, lease_owner),
             ).update({
                 "status": "done",
                 # The payload can contain transient search/draft PII. It is only
@@ -904,6 +1141,7 @@ class Worker:
                 "session_expected_version": None,
                 "session_payload": null(),
                 "session_apply_locked_at": None,
+                "session_apply_lease_owner": None,
                 "session_next_attempt_at": None,
                 "session_applied_at": func.now(6),
                 "worker_finished_at": func.now(6),
@@ -923,35 +1161,170 @@ class Worker:
         finally:
             db.close()
 
-    def _mark_session_commit_retry(self, item: dict, error: Exception) -> None:
+    def _mark_session_commit_retry(self, item: dict, error: Exception) -> bool:
         db = SessionLocal()
         try:
             attempts = int(item["attempts"])
             backoff = SESSION_COMMIT_RETRY_BACKOFFS[
                 min(attempts - 1, len(SESSION_COMMIT_RETRY_BACKOFFS) - 1)
             ]
-            db.query(WecomInboundEvent).filter(
-                WecomInboundEvent.id == item["event_id"],
-                WecomInboundEvent.status == "session_pending",
+            updated = db.query(WecomInboundEvent).filter(
+                *self._current_session_claim_filters(
+                    item["event_id"], item["lease_owner"],
+                ),
             ).update({
                 "session_apply_locked_at": None,
+                "session_apply_lease_owner": None,
                 "session_next_attempt_at": func.timestampadd(
                     text("SECOND"), backoff, func.now(6),
                 ),
                 "error_message": f"{type(error).__name__}: {error}"[:1000],
             })
             db.commit()
+            return updated == 1
         except Exception:
             db.rollback()
             logger.exception(
                 "worker: persist session commit retry failed event_id=%s",
                 item.get("event_id"),
             )
+            return False
         finally:
             db.close()
 
+    def _terminalize_session_commit_locked(
+        self,
+        db: Session,
+        row: WecomInboundEvent,
+        *,
+        error_code: str,
+        error: Exception,
+    ) -> None:
+        from app.services.recommendation_delivery_service import (
+            purge_delivery_content,
+        )
+
+        outboxes = self._lock_outboxes_for_event(db, row.id)
+        delivery_ids = sorted({
+            str(outbox.recommendation_delivery_id)
+            for outbox in outboxes
+            if outbox.recommendation_delivery_id is not None
+        })
+        for delivery in self._lock_deliveries_by_id(db, delivery_ids):
+            if delivery.status in (
+                DELIVERY_PREPARED,
+                DELIVERY_PENDING,
+                DELIVERY_RETRY_WAIT,
+            ):
+                delivery.status = DELIVERY_PERMANENT_FAILED
+                delivery.last_error_code = error_code[:32]
+                delivery.last_error = str(error)[:500]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+            elif delivery.status == DELIVERY_SENDING:
+                delivery.status = DELIVERY_UNKNOWN
+                delivery.last_error_code = error_code[:32]
+                delivery.last_error = str(error)[:500]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+            purge_delivery_content(delivery)
+
+        db.flush()
+        for outbox in outboxes:
+            if outbox.status not in ("pending", "sending"):
+                continue
+            was_sending = outbox.status == "sending"
+            outbox.status = "dead_letter"
+            outbox.locked_at = None
+            outbox.next_attempt_at = None
+            outbox.last_error = (
+                "ambiguous provider outcome; session commit terminalized"
+                if was_sending
+                else f"session commit terminalized: {error_code}"
+            )[:1000]
+
+        row.status = "dead_letter"
+        row.session_operation = None
+        row.session_expected_version = None
+        row.session_payload = None
+        row.session_apply_locked_at = None
+        row.session_apply_lease_owner = None
+        row.session_next_attempt_at = None
+        row.session_commit_deadline_epoch = None
+        row.worker_finished_at = func.now(6)
+        row.error_message = f"{type(error).__name__}: {error}"[:1000]
+
+    def _mark_session_commit_terminal(
+        self,
+        item: dict,
+        *,
+        error_code: str,
+        error: Exception,
+    ) -> bool:
+        db = SessionLocal()
+        try:
+            row = db.query(WecomInboundEvent).filter(
+                *self._current_session_claim_filters(
+                    item["event_id"], item["lease_owner"],
+                ),
+            ).with_for_update().first()
+            if row is None:
+                db.rollback()
+                return False
+            self._terminalize_session_commit_locked(
+                db,
+                row,
+                error_code=error_code,
+                error=error,
+            )
+            db.commit()
+            log_event(
+                "session_commit_terminal",
+                inbound_event_id=int(row.id),
+                error_code=error_code,
+                severity="alert",
+            )
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "worker: terminalize durable session commit failed event_id=%s",
+                item.get("event_id"),
+            )
+            return False
+        finally:
+            db.close()
+
+    def _finish_expired_session_commit(
+        self,
+        item: dict,
+        error: Exception,
+    ) -> bool:
+        if item.get("payload_available", True):
+            try:
+                if conversation_service.is_staged_session_applied(item["commit"]):
+                    return self._mark_session_commit_applied(
+                        item["event_id"], item["lease_owner"],
+                    )
+            except Exception as check_error:
+                error = RuntimeError(
+                    "durable session commit deadline reached and Redis state "
+                    f"could not be verified: {check_error}"
+                )
+        self._mark_session_commit_terminal(
+            item,
+            error_code="session_commit_deadline",
+            error=error,
+        )
+        return False
+
     def _apply_session_commit_item(self, item: dict) -> bool:
         commit = item["commit"]
+        if item.get("deadline_reached", False):
+            return self._finish_expired_session_commit(
+                item,
+                RuntimeError("durable session commit deadline exceeded"),
+            )
         try:
             applied = conversation_service.apply_staged_session(commit)
             if not applied:
@@ -960,10 +1333,14 @@ class Worker:
                 raise conversation_service.SessionVersionConflict(
                     "durable session CAS rejected",
                 )
+        except SessionCommitDeadlineExceeded as exc:
+            return self._finish_expired_session_commit(item, exc)
         except Exception as exc:
             self._mark_session_commit_retry(item, exc)
             return False
-        return self._mark_session_commit_applied(item["event_id"])
+        return self._mark_session_commit_applied(
+            item["event_id"], item["lease_owner"],
+        )
 
     def _apply_session_commit_for_event(
         self,
@@ -1000,12 +1377,39 @@ class Worker:
             try:
                 with user_lock(item["userid"], timeout=5) as lease:
                     if not lease:
-                        self._mark_session_commit_retry(
-                            item, RuntimeError("user lock busy"),
-                        )
+                        if (
+                            lease.unavailable
+                            and item.get("deadline_reached", False)
+                        ):
+                            self._mark_session_commit_terminal(
+                                item,
+                                error_code="session_commit_deadline",
+                                error=RuntimeError(
+                                    "durable session commit deadline reached while "
+                                    "Redis user lock was unavailable"
+                                ),
+                            )
+                        else:
+                            self._mark_session_commit_retry(
+                                item,
+                                RuntimeError(
+                                    "user lock unavailable"
+                                    if lease.unavailable
+                                    else "user lock busy"
+                                ),
+                            )
                         continue
                     lease.assert_owned()
                     self._apply_session_commit_item(item)
+            except UserLockUnavailable as exc:
+                if item.get("deadline_reached", False):
+                    self._mark_session_commit_terminal(
+                        item,
+                        error_code="session_commit_deadline",
+                        error=exc,
+                    )
+                else:
+                    self._mark_session_commit_retry(item, exc)
             except Exception as exc:
                 self._mark_session_commit_retry(item, exc)
         return len(items)
@@ -1124,50 +1528,14 @@ class Worker:
                     WecomOutboundOutbox.recommendation_delivery_id.is_(None),
                 ),
             )
-            earlier = aliased(WecomOutboundOutbox)
-            no_earlier_unsent_for_user = ~exists().where(and_(
-                earlier.userid == WecomOutboundOutbox.userid,
-                earlier.id < WecomOutboundOutbox.id,
-                earlier.status.in_(("pending", "sending")),
-            ))
-            # §10.4.1：claim 某用户 delivery 前必须确认不存在该用户更小
-            # delivery_order 的 prepared/pending/sending/retry_wait。outbox 的 id 序
-            # 只覆盖有 outbox 行的回复，delivery_order 才是跨进程恢复的稳定序。
-            current_delivery = aliased(RecommendationDelivery)
-            earlier_delivery = aliased(RecommendationDelivery)
-            no_earlier_active_delivery = ~exists().where(and_(
-                earlier_delivery.userid == current_delivery.userid,
-                earlier_delivery.delivery_order < current_delivery.delivery_order,
-                earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
-            ))
-            query = db.query(WecomOutboundOutbox).join(
-                WecomInboundEvent,
-                WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
-            ).outerjoin(
-                current_delivery,
-                current_delivery.delivery_id
-                == WecomOutboundOutbox.recommendation_delivery_id,
-            ).filter(
+            # All readiness gates stay in correlated EXISTS clauses so this
+            # locking SELECT owns only outbox rows.
+            rows = _build_outbox_claim_query(
+                db,
                 due,
-                no_earlier_unsent_for_user,
-                # 非推荐回复没有 delivery 行，outer join 后 delivery_order 为 NULL，
-                # 子查询恒不命中，等价于不受该门禁影响。
-                no_earlier_active_delivery,
-                WecomInboundEvent.status == "done",
-            )
-            if inbound_event_id:
-                query = query.filter(
-                    WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
-                )
-            rows = (
-                query.order_by(
-                    WecomOutboundOutbox.inbound_event_id,
-                    WecomOutboundOutbox.reply_index,
-                )
-                .with_for_update(skip_locked=True, of=WecomOutboundOutbox)
-                .limit(limit)
-                .all()
-            )
+                inbound_event_id=inbound_event_id,
+                limit=limit,
+            ).all()
             claimed: list[dict] = []
             for row in rows:
                 content = row.content
@@ -1204,12 +1572,108 @@ class Worker:
         状态转移全部收敛到 §9.6 行 1921 的枚举，并用条件 UPDATE 防止旧 Worker
         覆盖新状态（§10.4）。
         """
-        delivery = db.get(RecommendationDelivery, row.recommendation_delivery_id)
-        if delivery is None:
-            row.status = "dead_letter"
-            row.locked_at = None
-            row.next_attempt_at = None
-            row.last_error = "recommendation delivery row missing"
+        snapshot = db.get(RecommendationDelivery, row.recommendation_delivery_id)
+        if snapshot is None:
+            self._terminalize_recommendation_claim(
+                row,
+                None,
+                error_code="delivery_missing",
+                reason="recommendation delivery row missing",
+            )
+            return None
+
+        snapshot_context = copy.deepcopy(snapshot.recommendation_context)
+        references, context_error_code, context_error = (
+            _recommendation_target_references(snapshot_context)
+        )
+
+        # A malformed context has no trustworthy target set to lock.  Lock the
+        # delivery itself, verify that the malformed snapshot is still current,
+        # then make both durable rows permanently unsendable in this transaction.
+        if references is None:
+            locked_delivery = (
+                db.query(RecommendationDelivery)
+                .populate_existing()
+                .filter(
+                    RecommendationDelivery.delivery_id
+                    == row.recommendation_delivery_id,
+                )
+                .with_for_update()
+                .first()
+            )
+            delivery = (
+                locked_delivery
+                if isinstance(locked_delivery, RecommendationDelivery)
+                else snapshot
+            )
+            if isinstance(locked_delivery, RecommendationDelivery) and (
+                delivery.recommendation_context != snapshot_context
+            ):
+                self._defer_outbox_row(
+                    row, "recommendation delivery changed during claim",
+                )
+                return None
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code=context_error_code or "context_invalid",
+                reason=context_error or "recommendation context is invalid",
+            )
+            return None
+
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        target_error: tuple[str, str] | None = None
+        for target_type, target_id in references:
+            model = Job if target_type == "job" else Resume if target_type == "resume" else None
+            target = (
+                db.query(model)
+                .populate_existing()
+                .filter(model.id == target_id)
+                .with_for_update()
+                .first()
+            )
+            valid = bool(
+                target
+                and target.audit_status == "passed"
+                and target.deleted_at is None
+                and target.expires_at is not None
+                and target.expires_at > now_utc
+            )
+            if target_type == "job":
+                valid = valid and target.delist_reason is None
+            if not valid and target_error is None:
+                target_error = (
+                    "target_missing" if target is None else "target_inactive",
+                    "recommendation target is missing"
+                    if target is None
+                    else "recommendation target is no longer active",
+                )
+
+        locked_delivery = (
+            db.query(RecommendationDelivery)
+            .populate_existing()
+            .filter(
+                RecommendationDelivery.delivery_id
+                == row.recommendation_delivery_id,
+            )
+            .with_for_update()
+            .first()
+        )
+        delivery = locked_delivery if isinstance(locked_delivery, RecommendationDelivery) else snapshot
+        if delivery is None or (
+            isinstance(locked_delivery, RecommendationDelivery)
+            and delivery.recommendation_context != snapshot_context
+        ):
+            self._defer_outbox_row(row, "recommendation delivery changed during claim")
+            return None
+
+        if target_error is not None:
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code=target_error[0],
+                reason=target_error[1],
+            )
             return None
 
         if delivery.status == DELIVERY_PREPARED:
@@ -1230,13 +1694,12 @@ class Worker:
 
         if not delivery.content_ciphertext:
             # 正文已被 TTL 清理，永远无法再发送。
-            row.status = "dead_letter"
-            row.locked_at = None
-            row.next_attempt_at = None
-            row.last_error = "recommendation delivery body unavailable"
-            delivery.status = DELIVERY_PERMANENT_FAILED
-            delivery.last_error = row.last_error
-            delivery.last_error_code = "content_unavailable"
+            self._terminalize_recommendation_claim(
+                row,
+                delivery,
+                error_code="content_unavailable",
+                reason="recommendation delivery body unavailable",
+            )
             return None
 
         try:
@@ -1290,6 +1753,63 @@ class Worker:
         row.locked_at = now
         row.attempt_count = int(row.attempt_count or 0) + 1
         return content
+
+    @staticmethod
+    def _terminalize_recommendation_claim(
+        row: WecomOutboundOutbox,
+        delivery: RecommendationDelivery | None,
+        *,
+        error_code: str,
+        reason: str,
+    ) -> None:
+        """Persist an unrecoverable claim failure on both sides of the outbox."""
+        outbox_reason = reason[:1000]
+        row.status = "dead_letter"
+        row.locked_at = None
+        row.next_attempt_at = None
+        row.last_error = outbox_reason
+
+        delivery_id = row.recommendation_delivery_id
+        if delivery is not None:
+            delivery_id = delivery.delivery_id
+            # A sending row has crossed the irreversible claim boundary, so its
+            # provider outcome is unknown.  All earlier active states are safe
+            # to stop permanently; existing terminal facts remain untouched.
+            if delivery.status in DELIVERY_ACTIVE_STATUSES:
+                terminal_status = (
+                    DELIVERY_UNKNOWN
+                    if delivery.status == DELIVERY_SENDING
+                    else DELIVERY_PERMANENT_FAILED
+                )
+                delivery.status = terminal_status
+                delivery.last_error = reason[:500]
+                delivery.last_error_code = error_code[:32]
+                delivery.lease_owner = None
+                delivery.lease_expires_at = None
+                delivery.session_patch_ciphertext = None
+
+                from app.core.time_utils import to_naive_utc, utc_now
+                from app.services.recommendation_delivery_service import (
+                    content_expires_at_for_status,
+                )
+                failed_at = utc_now()
+                created_at = getattr(delivery, "created_at", None)
+                if not isinstance(created_at, datetime):
+                    created_at = failed_at
+                delivery.content_expires_at = to_naive_utc(
+                    content_expires_at_for_status(
+                        terminal_status,
+                        created_at=created_at,
+                        terminal_at=failed_at,
+                    ),
+                )
+
+        log_event(
+            "recommendation_delivery_claim_rejected",
+            delivery_id=delivery_id,
+            error_code=error_code,
+            severity="alert",
+        )
 
     @staticmethod
     def _defer_outbox_row(

@@ -17,9 +17,16 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, Job, SystemConfig
+from app.models import AuditLog, Job, JobReplacement
 from app.schemas.conversation import ReplyMessage, SessionState  # noqa: F401
 from app.services import conversation_service
+from app.services.lifecycle_config_service import get_job_ttl_days
+from app.services.job_mutation_service import (
+    close_active_replacement,
+    increment_version,
+    lock_active_job_for_owner,
+    reject_if_replacement_in_progress,
+)
 from app.services.user_service import UserContext, delete_user_data, get_user_status
 
 # audit_log 可用 action（与 schema.sql 枚举一致）
@@ -47,6 +54,7 @@ HELP_TEXT = (
     "  /找岗位        切换到找岗位模式（中介）\n"
     "  /找工人        切换到找工人模式（中介）\n"
     "  /续期 [天数]   延长岗位有效期（默认 15 天）\n"
+    "  /更新岗位 [ID] 提交完整的新岗位信息替换旧岗位\n"
     "  /下架          下架岗位\n"
     "  /招满了        标记岗位为已招满\n"
     "  /我的状态      查询账号和最近提交状态\n"
@@ -142,9 +150,67 @@ def _handle_cancel_pending(
     if session is None or not session.pending_upload_intent:
         return [_reply(user_ctx, CANCEL_PENDING_NO_DRAFT)]
     from app.services import upload_service
-    upload_service.clear_pending_upload(session)
+    upload_service.abandon_pending_upload(session, db)
     conversation_service.save_session(user_ctx.external_userid, session)
     return [_reply(user_ctx, CANCEL_PENDING_OK)]
+
+
+def _handle_update_job(
+    *, args: str, user_ctx: UserContext, session: SessionState | None, db,
+) -> list[ReplyMessage]:
+    from app.config import settings
+    if not settings.job_replacement_enabled:
+        return [_reply(user_ctx, "岗位更新功能暂不可用，请稍后再试。")]
+    if user_ctx.role == "worker":
+        return [_reply(user_ctx, "工人账号不能更新岗位。")]
+    if session is None:
+        return [_reply(user_ctx, "会话不可用，请稍后重试。")]
+    try:
+        target_id = int(args.strip()) if args.strip() else None
+    except ValueError:
+        return [_reply(user_ctx, "岗位 ID 必须是数字。")]
+    now_utc = datetime.now(timezone.utc)
+    now = now_utc.replace(tzinfo=None)
+    jobs = db.query(Job).filter(
+        Job.owner_userid == user_ctx.external_userid,
+        Job.audit_status == "passed",
+        Job.deleted_at.is_(None),
+        Job.delist_reason.is_(None),
+        Job.expires_at > now,
+    ).order_by(Job.id).all()
+    active_replacement_ids = {
+        row[0] for row in db.query(JobReplacement.active_old_job_id).filter(
+            JobReplacement.active_old_job_id.isnot(None),
+        ).all()
+    }
+    jobs = [job for job in jobs if job.id not in active_replacement_ids]
+    if target_id is not None:
+        jobs = [job for job in jobs if job.id == target_id]
+    if not jobs:
+        return [_reply(user_ctx, "未找到可更新的在线岗位，请重新发布。")]
+    if len(jobs) != 1:
+        return [_reply(user_ctx, "请使用 /更新岗位 岗位ID 选择：" + "、".join(str(job.id) for job in jobs))]
+    import uuid
+    from app.services import upload_service
+
+    job = jobs[0]
+    if session.pending_upload_intent or session.pending_upload_media_ids:
+        upload_service.abandon_pending_upload(session, db)
+    else:
+        upload_service.clear_pending_upload(session)
+    # A replacement is a new, complete upload flow. Stale search criteria and
+    # history can otherwise make the next full Job payload look like a search
+    # follow-up and route it into upload_conflict.
+    conversation_service.reset_search(session)
+    session.last_criteria = {}
+    session.pending_relaxation = None
+    session.pending_upload = {}
+    session.pending_upload_mode, session.pending_target_id = "replace", job.id
+    session.pending_target_version, session.pending_operation_id = job.version, str(uuid.uuid4())
+    session.pending_upload_media_ids, session.pending_upload_intent = [], "upload_job"
+    upload_service.initialize_pending_upload_window(session, now=now_utc)
+    session.active_flow = "upload_collecting"
+    return [_reply(user_ctx, "请发送完整的新岗位信息；审核通过后才会替换旧岗位。")]
 
 
 def _handle_reset_search(
@@ -291,7 +357,7 @@ def _handle_renew_job(
             "续期天数仅支持 15 或 30 天，例如 /续期 15 或 /续期 30。",
         )]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     jobs = db.query(Job).filter(
         Job.owner_userid == user_ctx.external_userid,
         Job.deleted_at.is_(None),
@@ -307,11 +373,19 @@ def _handle_renew_job(
         return [_reply(user_ctx, _render_renew_list(jobs))]
 
     # 单岗位 或 多岗位+明确天数 → 对最近一条执行续期
-    target = jobs[0]
+    target = lock_active_job_for_owner(
+        db, jobs[0].id, user_ctx.external_userid, now,
+    )
+    if target is None:
+        return [_reply(user_ctx, NO_RENEWABLE_JOB)]
+    reject_if_replacement_in_progress(db, target.id, lock_relation=True)
     ttl_cap = _renew_ttl_cap_days(db)
 
     # TTL 上限：从 now 起算（避免老岗位续期反而缩短）
-    max_expires = now + timedelta(days=ttl_cap)
+    compare_now = now
+    if target.expires_at.tzinfo is not None:
+        compare_now = now.replace(tzinfo=timezone.utc)
+    max_expires = compare_now + timedelta(days=ttl_cap)
     new_expires = target.expires_at + timedelta(days=days)
     capped = False
     if new_expires > max_expires:
@@ -320,6 +394,7 @@ def _handle_renew_job(
         capped = new_expires < target.expires_at + timedelta(days=days)
 
     target.expires_at = new_expires
+    increment_version(target)
     db.flush()
     _write_audit_log(
         db,
@@ -406,7 +481,7 @@ def _delist_common(
     if user_ctx.role not in ("factory", "broker"):
         return [_reply(user_ctx, ROLE_NOT_ALLOWED)]
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     jobs = db.query(Job).filter(
         Job.owner_userid == user_ctx.external_userid,
         Job.deleted_at.is_(None),
@@ -417,8 +492,17 @@ def _delist_common(
     if not jobs:
         return [_reply(user_ctx, empty_text)]
 
-    target = jobs[0]
+    target = close_active_replacement(
+        db,
+        jobs[0],
+        reason="old_job_delisted" if delist_reason == "manual_delist" else "old_job_filled",
+        owner_userid=user_ctx.external_userid,
+        active_at=now,
+    )
+    if target is None:
+        return [_reply(user_ctx, empty_text)]
     target.delist_reason = delist_reason
+    increment_version(target)
     db.flush()
 
     _write_audit_log(
@@ -473,16 +557,7 @@ def _parse_renew_days(args: str) -> int | None:
 
 def _renew_ttl_cap_days(db: Session) -> int:
     """从 system_config 读取 ttl.job.days，续期上限取 2 倍。"""
-    cfg = db.query(SystemConfig).filter(
-        SystemConfig.config_key == "ttl.job.days",
-    ).first()
-    base = 30
-    if cfg:
-        try:
-            base = int(cfg.config_value)
-        except (ValueError, TypeError):
-            pass
-    return base * 2
+    return get_job_ttl_days(db) * 2
 
 
 def _write_audit_log(
@@ -523,6 +598,7 @@ _HANDLERS = {
     "switch_to_job": _handle_switch_to_job,
     "switch_to_worker": _handle_switch_to_worker,
     "renew_job": _handle_renew_job,
+    "update_job": _handle_update_job,
     "delist_job": _handle_delist_job,
     "filled_job": _handle_filled_job,
     "delete_my_data": _handle_delete_my_data,

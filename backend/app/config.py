@@ -305,13 +305,23 @@ class Settings(BaseSettings):
         "recommendation_shadow_persistence_threads",
         "recommendation_shadow_persistence_queue_capacity",
         "recommendation_shadow_max_output_tokens",
-        "recommendation_content_key_active_version",
         mode="after",
     )
     @classmethod
     def _at_least_one(cls, v: int) -> int:
         """0 / 负数会让 semaphore、队列和密钥版本静默失效，一律夹到 1。"""
         return max(1, int(v))
+
+    @field_validator("recommendation_content_key_active_version", mode="after")
+    @classmethod
+    def _valid_recommendation_content_key_version(cls, v: int) -> int:
+        """Keep key versions representable by the envelope and MySQL SMALLINT."""
+        version = max(1, int(v))
+        if version > 65_535:
+            raise ValueError(
+                "recommendation_content_key_active_version must be between 1 and 65535"
+            )
+        return version
 
     @field_validator("recommendation_shadow_timeout_seconds", mode="after")
     @classmethod
@@ -432,6 +442,7 @@ class Settings(BaseSettings):
     oss_bucket: str = ""
     oss_local_dir: str = "uploads"           # 本地存储目录（oss_provider=local 时生效）
     oss_local_url_prefix: str = "/files"     # 本地文件 URL 前缀
+    oss_trusted_origins: str = ""             # 允许反解为 object key 的历史访问域名，逗号分隔
 
     # ---- 运营后台 JWT ----
     admin_jwt_secret: str = "change-me"
@@ -708,6 +719,10 @@ class Settings(BaseSettings):
 
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"
+    job_replacement_enabled: bool = False
+    job_expiry_cleanup_enabled: bool = False
+    job_candidate_cleanup_enabled: bool = False
+    job_hard_delete_enabled: bool = False
     daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送
     monitor_queue_incoming_threshold: int = 50
     monitor_queue_incoming_max_age_seconds: int = 120

@@ -9,7 +9,10 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from loguru import logger
@@ -24,8 +27,12 @@ def build_scheduler() -> BackgroundScheduler:
     # 延迟 import，避免 app 启动时的循环依赖
     from app.tasks import (
         daily_report,
+        job_candidate_cleanup,
+        job_expiry_cleanup,
+        media_cleanup_worker,
         recommendation_privacy_cleanup,
         send_retry_drain,
+        target_cleanup_worker,
         ttl_cleanup,
         worker_monitor,
     )
@@ -48,6 +55,38 @@ def build_scheduler() -> BackgroundScheduler:
         ttl_cleanup.run,
         CronTrigger.from_crontab("0 3 * * *"),
         id="ttl_cleanup",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        media_cleanup_worker.run,
+        IntervalTrigger(minutes=1),
+        id="media_cleanup_worker",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        target_cleanup_worker.run,
+        IntervalTrigger(minutes=1),
+        id="target_cleanup_worker",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        job_candidate_cleanup.run,
+        IntervalTrigger(minutes=10),
+        id="job_candidate_cleanup",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        job_expiry_cleanup.run,
+        IntervalTrigger(minutes=10),
+        id="job_expiry_cleanup",
         max_instances=1,
         coalesce=True,
     )
@@ -93,6 +132,14 @@ def build_scheduler() -> BackgroundScheduler:
         worker_monitor.check_outbox,
         IntervalTrigger(seconds=60),
         id="outbox_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    sched.add_job(
+        worker_monitor.check_media_cleanup,
+        IntervalTrigger(seconds=60),
+        id="media_cleanup_health",
         max_instances=1,
         coalesce=True,
     )
@@ -145,6 +192,40 @@ def build_scheduler() -> BackgroundScheduler:
     )
 
     return sched
+
+
+def schedule_job_expiry_continuation() -> bool:
+    """Schedule one immediate follow-up without waiting for the next interval tick."""
+    if _scheduler is None:
+        logger.warning("job expiry continuation skipped: scheduler not running")
+        return False
+    from app.tasks import job_expiry_cleanup
+    _scheduler.add_job(
+        job_expiry_cleanup.run,
+        DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=5)),
+        id="job_expiry_cleanup_continuation",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    return True
+
+
+def schedule_job_candidate_continuation() -> bool:
+    """Schedule candidate cleanup follow-up without waiting for the next interval."""
+    if _scheduler is None:
+        logger.warning("job candidate continuation skipped: scheduler not running")
+        return False
+    from app.tasks import job_candidate_cleanup
+    _scheduler.add_job(
+        job_candidate_cleanup.run,
+        DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=5)),
+        id="job_candidate_cleanup_continuation",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    return True
 
 
 def start() -> None:

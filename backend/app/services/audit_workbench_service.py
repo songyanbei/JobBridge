@@ -9,25 +9,33 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
 from app.core.redis_client import (
     acquire_audit_lock,
+    consume_undo_if_unchanged,
+    get_undo,
+    get_undo_snapshot,
     get_audit_lock_holder,
-    pop_undo,
     refresh_audit_lock,
     release_audit_lock,
     save_undo,
+    validate_undo_unchanged,
 )
-from app.models import AuditLog, Job, Resume, User
+from app.models import AuditLog, Job, JobReplacement, Resume, User
 from app.services import audit_service
 from app.services.admin_log_service import _json_safe, write_admin_log
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +43,8 @@ from app.services.admin_log_service import _json_safe, write_admin_log
 # ---------------------------------------------------------------------------
 
 _JOB_EDIT_FIELDS = {
-    "city", "district", "job_category", "job_sub_category",
+    "city", "district", "address", "hiring_company", "contact_person", "phone",
+    "job_category", "job_sub_category",
     "salary_floor_monthly", "salary_ceiling_monthly",
     "pay_type", "headcount", "gender_required",
     "age_min", "age_max", "is_long_term",
@@ -79,6 +88,71 @@ def _load(db: Session, target_type: str, target_id: int):
     return obj
 
 
+def _discover_undo_replacement_graph(db: Session, target_id: int) -> list[tuple[int, int, int]]:
+    """Read immutable relation identities from a fresh view before ordered locking."""
+    statement = (
+        select(JobReplacement.id, JobReplacement.old_job_id, JobReplacement.new_job_id)
+        .where(or_(
+            JobReplacement.old_job_id == target_id,
+            JobReplacement.new_job_id == target_id,
+        ))
+        .order_by(JobReplacement.id)
+    )
+    bind = db.get_bind()
+    if bind.dialect.name == "sqlite":
+        rows = db.execute(statement).all()
+    else:
+        engine = getattr(bind, "engine", bind)
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            rows = connection.execute(statement).all()
+    return [(int(row.id), int(row.old_job_id), int(row.new_job_id)) for row in rows]
+
+
+def _lock_undo_target(db: Session, target_type: str, target_id: int):
+    """Lock the target and every discovered replacement edge in global order."""
+    if target_type != "job":
+        model, _, _ = _model_for(target_type)
+        obj = (
+            db.query(model)
+            .populate_existing()
+            .filter(model.id == target_id)
+            .with_for_update()
+            .first()
+        )
+        if obj is None:
+            raise BusinessException(40401, "审核对象不存在")
+        return obj, []
+
+    hints = _discover_undo_replacement_graph(db, target_id)
+    job_ids = sorted({target_id, *(job_id for _, old_id, new_id in hints for job_id in (old_id, new_id))})
+    jobs = (
+        db.query(Job)
+        .populate_existing()
+        .filter(Job.id.in_(job_ids))
+        .order_by(Job.id)
+        .with_for_update()
+        .all()
+    )
+    by_id = {int(job.id): job for job in jobs}
+    if target_id not in by_id:
+        raise BusinessException(40401, "审核对象不存在")
+
+    relations = (
+        db.query(JobReplacement)
+        .populate_existing()
+        .filter(or_(
+            JobReplacement.old_job_id == target_id,
+            JobReplacement.new_job_id == target_id,
+        ))
+        .order_by(JobReplacement.id)
+        .with_for_update()
+        .all()
+    )
+    if {int(row.id) for row in relations} != {row_id for row_id, _, _ in hints}:
+        raise BusinessException(40904, "job_lifecycle_transition_not_undoable")
+    return by_id[target_id], relations
+
+
 def _snapshot(obj, target_type: str) -> dict:
     _, _, snap_fields = _model_for(target_type)
     result: dict[str, Any] = {}
@@ -103,6 +177,26 @@ class QueueItem:
     obj: Any  # Job / Resume
     risk_level: str
     locked_by: str | None
+    replacement_id: int | None = None
+    replacement_review_outcome: str | None = None
+    replacement_lifecycle_status: str | None = None
+
+
+def _queue_query(db: Session, target_type: str, status: str):
+    model, _, _ = _model_for(target_type)
+    query = db.query(model).filter(model.audit_status == status)
+    if hasattr(model, "deleted_at"):
+        query = query.filter(model.deleted_at.is_(None))
+
+    if target_type == "job" and status == "pending":
+        any_replacement = exists().where(JobReplacement.new_job_id == Job.id)
+        awaiting_review = exists().where(and_(
+            JobReplacement.new_job_id == Job.id,
+            JobReplacement.review_outcome == "pending",
+            JobReplacement.lifecycle_status == "awaiting_review",
+        ))
+        query = query.filter(or_(~any_replacement, awaiting_review))
+    return query
 
 
 def list_queue(
@@ -131,9 +225,7 @@ def list_queue(
     need = offset + size
     for tt in targets:
         model, _, _ = _model_for(tt)
-        base = db.query(model).filter(model.audit_status == status)
-        if hasattr(model, "deleted_at"):
-            base = base.filter(model.deleted_at.is_(None))
+        base = _queue_query(db, tt, status)
         total += base.count()
         rows = (
             base.with_entities(model.id, model.created_at)
@@ -165,6 +257,15 @@ def list_queue(
         for row in rows:
             obj_map[(tt, row.id)] = row
 
+    replacement_map: dict[int, JobReplacement] = {}
+    if by_type["job"]:
+        replacement_map = {
+            int(relation.new_job_id): relation
+            for relation in db.query(JobReplacement).filter(
+                JobReplacement.new_job_id.in_(by_type["job"]),
+            ).all()
+        }
+
     for tt, rid in order_key:
         obj = obj_map.get((tt, rid))
         if obj is None:
@@ -175,14 +276,23 @@ def list_queue(
             holder = get_audit_lock_holder(tt, obj.id)
         except Exception:
             pass
-        items.append(QueueItem(target_type=tt, obj=obj, risk_level=risk, locked_by=holder))
+        relation = replacement_map.get(int(obj.id)) if tt == "job" else None
+        items.append(QueueItem(
+            target_type=tt,
+            obj=obj,
+            risk_level=risk,
+            locked_by=holder,
+            replacement_id=int(relation.id) if relation is not None else None,
+            replacement_review_outcome=relation.review_outcome if relation is not None else None,
+            replacement_lifecycle_status=relation.lifecycle_status if relation is not None else None,
+        ))
 
     return items, total
 
 
 def get_pending_count(db: Session) -> dict:
-    job_count = db.query(Job).filter(Job.audit_status == "pending", Job.deleted_at.is_(None)).count()
-    resume_count = db.query(Resume).filter(Resume.audit_status == "pending", Resume.deleted_at.is_(None)).count()
+    job_count = _queue_query(db, "job", "pending").count()
+    resume_count = _queue_query(db, "resume", "pending").count()
     return {"job": job_count, "resume": resume_count, "total": job_count + resume_count}
 
 
@@ -277,7 +387,14 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
     if isinstance(extra, dict):
         confidence = extra.get("field_confidence") or {}
 
-    images = getattr(obj, "images", None)
+    from app.services.storage_reference_service import storage_urls_for_response
+
+    images = storage_urls_for_response(getattr(obj, "images", None))
+
+    lifecycle = {}
+    if target_type == "job":
+        from app.services.job_admin_service import replacement_projections
+        lifecycle = replacement_projections(db, [obj]).get(obj.id, {})
 
     return {
         "id": obj.id,
@@ -298,7 +415,10 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
         "audited_at": _json_safe(obj.audited_at),
         "created_at": _json_safe(obj.created_at),
         "expires_at": _json_safe(getattr(obj, "expires_at", None)),
+        "activated_at": _json_safe(getattr(obj, "activated_at", None)),
+        "candidate_expires_at": _json_safe(getattr(obj, "candidate_expires_at", None)),
         "images": images,
+        **lifecycle,
     }
 
 
@@ -372,6 +492,10 @@ def _atomic_version_update(
 
 
 def pass_action(db: Session, target_type: str, target_id: int, version: int, operator: str) -> None:
+    if target_type == "job":
+        _pass_job(db, target_id, version, operator)
+        return
+
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)  # 早退快速失败，仍非最终保障
     before = _snapshot(obj, target_type)
@@ -400,6 +524,74 @@ def pass_action(db: Session, target_type: str, target_id: int, version: int, ope
     })
 
 
+def _pass_job(db: Session, target_id: int, version: int, operator: str) -> None:
+    """通过岗位候选；replacement 的审核结论与激活必须在同一事务。"""
+    relation_hint = db.query(JobReplacement).filter(
+        JobReplacement.new_job_id == target_id,
+    ).first()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if relation_hint is not None:
+        from app.services.job_replace_service import activate_replacement_locked
+        from app.services.job_replacement_lock_service import lock_replacement_graph
+
+        relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+        if relation is None or jobs is None or target_id not in jobs:
+            raise BusinessException(40904, "replacement_graph_incomplete")
+        candidate = jobs[target_id]
+        _check_version(candidate, version)
+        if relation.lifecycle_status != "awaiting_review" or relation.review_outcome != "pending":
+            raise BusinessException(40904, "replacement_already_reviewed")
+        if not candidate.candidate_expires_at or candidate.candidate_expires_at <= now:
+            raise BusinessException(40904, "candidate_expired")
+        before = _snapshot(candidate, "job")
+        relation.review_outcome = "passed"
+        relation.reviewed_at = now
+        relation.reviewed_by = operator
+        activated = activate_replacement_locked(
+            db,
+            relation,
+            jobs[relation.old_job_id],
+            candidate,
+            expected_old_version=relation.old_job_version,
+        )
+        write_admin_log(
+            db,
+            target_type="job",
+            target_id=target_id,
+            action="manual_pass",
+            operator=operator,
+            before=before,
+            after=_snapshot(candidate, "job"),
+            reason=None if activated else "activation_conflict",
+        )
+        db.commit()
+        return
+
+    candidate = db.query(Job).filter(Job.id == target_id).with_for_update().first()
+    if candidate is None:
+        raise BusinessException(40401, "审核对象不存在")
+    _check_version(candidate, version)
+    if candidate.audit_status != "pending" or candidate.expires_at is not None:
+        raise BusinessException(40904, "job_not_pending_activation")
+    if not candidate.candidate_expires_at or candidate.candidate_expires_at <= now:
+        raise BusinessException(40904, "candidate_expired")
+    before = _snapshot(candidate, "job")
+    candidate.audited_by = operator
+    candidate.audited_at = now
+    from app.services.job_activation_service import activate_job
+    activate_job(db, candidate, now=now)
+    write_admin_log(
+        db,
+        target_type="job",
+        target_id=target_id,
+        action="manual_pass",
+        operator=operator,
+        before=before,
+        after=_snapshot(candidate, "job"),
+    )
+    db.commit()
+
+
 def reject_action(
     db: Session,
     target_type: str,
@@ -410,6 +602,13 @@ def reject_action(
     notify: bool = False,
     block_user: bool = False,
 ) -> None:
+    if target_type == "job":
+        _reject_job(
+            db, target_id, version, reason, operator,
+            block_user=block_user,
+        )
+        return
+
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)
     before = _snapshot(obj, target_type)
@@ -457,6 +656,70 @@ def reject_action(
     })
 
 
+def _reject_job(
+    db: Session,
+    target_id: int,
+    version: int,
+    reason: str,
+    operator: str,
+    *,
+    block_user: bool,
+) -> None:
+    """关闭岗位候选，旧岗位不受影响；生命周期动作不生成通用 Undo。"""
+    relation_hint = db.query(JobReplacement).filter(
+        JobReplacement.new_job_id == target_id,
+    ).first()
+    if relation_hint is not None:
+        from app.services.job_replacement_lock_service import lock_replacement_graph
+
+        relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+        if relation is None or jobs is None or target_id not in jobs:
+            raise BusinessException(40904, "replacement_graph_incomplete")
+        candidate = jobs[target_id]
+        if relation.lifecycle_status != "awaiting_review" or relation.review_outcome != "pending":
+            raise BusinessException(40904, "replacement_already_reviewed")
+    else:
+        relation = None
+        candidate = db.query(Job).filter(Job.id == target_id).with_for_update().first()
+        if candidate is None:
+            raise BusinessException(40401, "审核对象不存在")
+
+    _check_version(candidate, version)
+    if candidate.audit_status != "pending" or candidate.expires_at is not None:
+        raise BusinessException(40904, "job_not_pending_review")
+    before = _snapshot(candidate, "job")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    candidate.audit_status = "rejected"
+    candidate.audit_reason = reason
+    candidate.audited_by = operator
+    candidate.audited_at = now
+    candidate.version = int(candidate.version or 0) + 1
+    if relation is not None:
+        relation.review_outcome = "rejected"
+        relation.reviewed_at = now
+        relation.reviewed_by = operator
+        relation.lifecycle_status = "closed"
+        relation.active_old_job_id = None
+        relation.closed_reason = "rejected"
+
+    write_admin_log(
+        db,
+        target_type="job",
+        target_id=target_id,
+        action="manual_reject",
+        operator=operator,
+        before=before,
+        after=_snapshot(candidate, "job"),
+        reason=reason,
+    )
+    if block_user:
+        user = db.query(User).filter(User.external_userid == candidate.owner_userid).first()
+        if user and user.status != "blocked":
+            user.status = "blocked"
+            user.blocked_reason = reason
+    db.commit()
+
+
 def edit_action(
     db: Session,
     target_type: str,
@@ -469,6 +732,55 @@ def edit_action(
     unknown = [f for f in fields.keys() if f not in allowed]
     if unknown:
         raise BusinessException(40101, f"不允许编辑的字段: {','.join(unknown)}")
+
+    if target_type == "job":
+        relation_hint = db.query(JobReplacement).filter(
+            JobReplacement.new_job_id == target_id,
+        ).first()
+        if relation_hint is not None:
+            from app.services.job_mutation_service import increment_version
+            from app.services.job_replacement_lock_service import lock_replacement_graph
+
+            relation, _, jobs = lock_replacement_graph(db, relation_hint.id)
+            if relation is None or jobs is None or target_id not in jobs:
+                raise BusinessException(40904, "replacement_graph_incomplete")
+            candidate = jobs[target_id]
+            if (
+                relation.review_outcome != "pending"
+                or relation.lifecycle_status != "awaiting_review"
+            ):
+                raise BusinessException(40904, "replacement_already_reviewed")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if (
+                candidate.audit_status != "pending"
+                or candidate.expires_at is not None
+                or candidate.deleted_at is not None
+                or not candidate.candidate_expires_at
+                or candidate.candidate_expires_at <= now
+            ):
+                raise BusinessException(40904, "job_not_pending_review")
+            _check_version(candidate, version)
+            before = _snapshot(candidate, target_type)
+            for key, value in fields.items():
+                setattr(candidate, key, value)
+            increment_version(candidate)
+            after = _snapshot(candidate, target_type)
+            write_admin_log(
+                db,
+                target_type=target_type,
+                target_id=target_id,
+                action="manual_edit",
+                operator=operator,
+                before=before,
+                after=after,
+            )
+            db.commit()
+            save_undo(target_type, target_id, {
+                "action": "edit", "operator": operator,
+                "before": before, "after": after,
+                "ts": time.time(),
+            })
+            return
 
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)
@@ -513,11 +825,61 @@ def _restore_value(column_name: str, value: Any) -> Any:
 
 
 def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
-    payload = pop_undo(target_type, target_id)
+    payload = get_undo(target_type, target_id)
     if not payload:
         raise BusinessException(40903, "撤销窗口已过期（30 秒）")
 
-    obj = _load(db, target_type, target_id)
+    obj, relations = _lock_undo_target(db, target_type, target_id)
+    snapshot = get_undo_snapshot(target_type, target_id)
+    if not snapshot:
+        raise BusinessException(40903, "撤销窗口已过期（30 秒）")
+    payload, snapshot_token = snapshot
+    if target_type == "job":
+        relation = next(
+            (row for row in relations if int(row.new_job_id) == int(target_id)),
+            None,
+        )
+        outgoing_terminal = any(
+            int(row.old_job_id) == int(target_id)
+            and row.lifecycle_status in {"activated", "closed", "conflict"}
+            for row in relations
+        )
+        candidate_snapshot = payload.get("before") or {}
+        lifecycle_changed = bool(
+            outgoing_terminal
+            or
+            (
+                payload.get("action") in {"pass", "reject"}
+                and (
+                    obj.activated_at is not None
+                    or relation is not None
+                    or (obj.audit_status == "rejected" and obj.expires_at is None)
+                )
+            )
+            or (
+                candidate_snapshot.get("audit_status") == "pending"
+                and (
+                    obj.activated_at is not None
+                    or obj.audit_status == "rejected"
+                    or (relation is not None and relation.lifecycle_status != "awaiting_review")
+                )
+            )
+        )
+        if lifecycle_changed:
+            raise BusinessException(40904, "job_lifecycle_transition_not_undoable")
+    after_snapshot = payload.get("after") or {}
+    snapshot_version = after_snapshot.get("version")
+    if snapshot_version is not None and int(obj.version or 0) != int(snapshot_version):
+        raise BusinessException(40902, "此条目已被修改，请刷新", {
+            "current_version": int(obj.version or 0),
+        })
+    validate_result = validate_undo_unchanged(
+        target_type, target_id, snapshot_token,
+    )
+    if validate_result == "missing":
+        raise BusinessException(40903, "撤销窗口已过期（30 秒）")
+    if validate_result != "unchanged":
+        raise BusinessException(40902, "撤销快照已变化，请刷新后重试")
     before_snapshot = payload.get("before") or {}
     _, allowed, snap_fields = _model_for(target_type)
 
@@ -541,3 +903,22 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
         reason=f"undo previous action: {payload.get('action')}",
     )
     db.commit()
+    try:
+        consume_result = consume_undo_if_unchanged(
+            target_type, target_id, snapshot_token,
+        )
+    except Exception:
+        logger.exception(
+            "undo committed but snapshot cleanup failed target_type=%s target_id=%s",
+            target_type,
+            target_id,
+        )
+        return
+    if consume_result != "consumed":
+        logger.warning(
+            "undo committed without consuming snapshot target_type=%s target_id=%s "
+            "result=%s",
+            target_type,
+            target_id,
+            consume_result,
+        )

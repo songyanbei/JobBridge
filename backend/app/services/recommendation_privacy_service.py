@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.redis_client import (
@@ -41,12 +42,14 @@ from app.models import (
     ConversationLog,
     EventLog,
     Job,
+    MediaAssetLifecycle,
     RecommendationDelivery,
     RecommendationExposureDaily,
     RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
     Resume,
+    TargetCleanupTask,
     WecomOutboundOutbox,
 )
 
@@ -401,6 +404,26 @@ def _fail_pending_outbox(db: Session, delivery_ids: Sequence[str]) -> int:
     return int(total or 0)
 
 
+def _lock_redactable_deliveries(
+    db: Session,
+    external_userid: str,
+    candidate_ids: Sequence[str],
+    pending_filter,
+) -> list[RecommendationDelivery]:
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(
+            RecommendationDelivery.userid == external_userid,
+            RecommendationDelivery.delivery_id.in_(candidate_ids),
+            pending_filter,
+        )
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
 def redact_user_recommendation_content(
     db: Session,
     external_userid: str,
@@ -417,7 +440,6 @@ def redact_user_recommendation_content(
     moment = now or utc_now()
     trace = batch_id or _new_batch_id()
     redacted = 0
-    touched: list[str] = []
     # 过滤条件只挑「本批一定会被改写」的行：还有密文、还有 session patch，或状态
     # 仍可迁移。这样每批必然缩小候选集合，分批扫描不会在幂等重入时空转。
     pending_filter = (
@@ -425,23 +447,59 @@ def redact_user_recommendation_content(
         | RecommendationDelivery.session_patch_ciphertext.isnot(None)
         | RecommendationDelivery.status.in_(tuple(_STATUS_AFTER_REDACTION))
     )
-    while True:
-        rows = db.query(RecommendationDelivery).filter(
+
+    def _candidate_ids_after(last_id: str | None, limit: int | None) -> list[str]:
+        candidate_query = db.query(
+            RecommendationDelivery.delivery_id,
+        ).filter(
             RecommendationDelivery.userid == external_userid,
             pending_filter,
-        ).limit(BATCH_SIZE).all()
-        if not rows:
-            break
+        )
+        if last_id is not None:
+            candidate_query = candidate_query.filter(
+                RecommendationDelivery.delivery_id > last_id,
+            )
+        candidate_query = candidate_query.order_by(
+            RecommendationDelivery.delivery_id,
+        )
+        if limit is not None:
+            candidate_query = candidate_query.limit(limit)
+        return [
+            str(row[0])
+            for row in candidate_query.all()
+        ]
+
+    def _redact_candidate_batch(candidate_ids: list[str]) -> None:
+        nonlocal redacted
+        rows = _lock_redactable_deliveries(
+            db, external_userid, candidate_ids, pending_filter,
+        )
+        batch_touched = []
         for delivery in rows:
             if _redact_delivery_row(delivery, moment):
                 redacted += 1
-                touched.append(delivery.delivery_id)
+                batch_touched.append(delivery.delivery_id)
+        if batch_touched:
+            _fail_pending_outbox(db, batch_touched)
         _settle(db, commit)
-        if len(rows) < BATCH_SIZE:
-            break
-    if touched:
-        _fail_pending_outbox(db, touched)
-        _settle(db, commit)
+
+    if commit:
+        last_candidate_id: str | None = None
+        while True:
+            candidate_ids = _candidate_ids_after(last_candidate_id, BATCH_SIZE)
+            if not candidate_ids:
+                break
+            _lock_outboxes_for_deliveries(db, candidate_ids)
+            _redact_candidate_batch(candidate_ids)
+            last_candidate_id = candidate_ids[-1]
+            if len(candidate_ids) < BATCH_SIZE:
+                break
+    else:
+        all_candidate_ids = _candidate_ids_after(None, None)
+        _lock_outboxes_for_deliveries(db, all_candidate_ids)
+        for candidate_ids in _chunks(all_candidate_ids):
+            _redact_candidate_batch(candidate_ids)
+
     _log_batch(trace, "immediate_redaction", "recommendation_delivery", redacted)
     return redacted
 
@@ -647,6 +705,31 @@ def _scrub_request_facts(
     return changed
 
 
+def _lock_outboxes_for_deliveries(
+    db: Session,
+    delivery_ids: Sequence[str],
+) -> None:
+    if not delivery_ids:
+        return
+    db.query(WecomOutboundOutbox.id).filter(
+        WecomOutboundOutbox.recommendation_delivery_id.in_(delivery_ids),
+    ).order_by(WecomOutboundOutbox.id).with_for_update().all()
+
+
+def _lock_target_deliveries(
+    db: Session,
+    delivery_ids: Sequence[str],
+) -> list[RecommendationDelivery]:
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
 def redact_deliveries_for_targets(
     db: Session,
     targets: Sequence[TargetRef],
@@ -669,12 +752,17 @@ def redact_deliveries_for_targets(
     if not delivery_ids:
         return set()
 
+    ordered_delivery_ids = sorted(delivery_ids)
+    if not commit:
+        _lock_outboxes_for_deliveries(db, ordered_delivery_ids)
+
     touched: set[str] = set()
     request_ids: set[str] = set()
-    for chunk in _chunks(sorted(delivery_ids)):
-        deliveries = db.query(RecommendationDelivery).filter(
-            RecommendationDelivery.delivery_id.in_(chunk),
-        ).all()
+    for chunk in _chunks(ordered_delivery_ids):
+        if commit:
+            _lock_outboxes_for_deliveries(db, chunk)
+        deliveries = _lock_target_deliveries(db, chunk)
+        batch_touched: list[str] = []
         for delivery in deliveries:
             if exclude_userid is not None and delivery.userid == exclude_userid:
                 # 被删用户自己的 delivery 在步骤 2 整行删除，不用逐字段擦。
@@ -688,11 +776,14 @@ def redact_deliveries_for_targets(
             _recount_impressions(db, delivery)
             request_ids.add(delivery.request_id)
             touched.add(delivery.delivery_id)
+            batch_touched.append(delivery.delivery_id)
             if context_changed or body_changed:
                 _log_batch(trace, "target_redaction", "recommendation_delivery", 1)
+        if commit and batch_touched:
+            _fail_pending_outbox(db, batch_touched)
         _settle(db, commit)
 
-    if touched:
+    if touched and not commit:
         _fail_pending_outbox(db, sorted(touched))
     scrubbed = _scrub_request_facts(db, sorted(request_ids), grouped)
     _settle(db, commit)
@@ -870,44 +961,46 @@ def scrub_recommendation_sessions(
     if not index_keys:
         return 0
 
-    r = redis_client.get_redis()
-    userids: set[str] = set()
-    for key in index_keys:
-        try:
-            members = r.smembers(key)
-        except Exception:
-            # 索引键可能被写入侧建成别的类型；单键失败不该拖垮整轮清理。
-            logger.warning("recommendation_privacy: session index unreadable batch=%s", trace)
-            continue
-        for member in members or ():
-            userids.add(member.decode() if isinstance(member, bytes) else str(member))
-    if owner_userid:
-        # 被删用户自己的 session 由 conversation_service.clear_session 处理，
-        # 这里不重复写回，避免把已清空的会话又建出来。
-        userids.discard(owner_userid)
+    index_keys = sorted(set(index_keys))
+    userids = redis_client.fence_recommendation_session_indexes(index_keys)
 
     rewritten = 0
     for userid in sorted(userids):
-        session = redis_client.get_session(userid)
-        if not session:
+        if owner_userid and userid == owner_userid:
+            redis_client.remove_recommendation_session_index_members(
+                userid, index_keys,
+            )
             continue
-        current_version = int(session.get("session_version") or 0)
-        if not _scrub_session_payload(session, delivery_set, grouped):
-            continue
-        # 版本 +1：任何按旧版本算好的 staged mutation 会 CAS 失败，不会把刚擦掉的
-        # 推荐正文再写回来。
-        session["session_version"] = current_version + 1
-        try:
-            if redis_client.save_session_if_version(userid, session, current_version):
-                rewritten += 1
-        except Exception:
-            logger.warning("recommendation_privacy: session rewrite failed batch=%s", trace)
-
-    for key in index_keys:
-        try:
-            r.delete(key)
-        except Exception:
-            logger.warning("recommendation_privacy: session index delete failed batch=%s", trace)
+        cleaned = False
+        for _attempt in range(3):
+            session = redis_client.get_session(userid)
+            if not session:
+                cleaned = True
+                break
+            current_version = int(session.get("session_version") or 0)
+            if not _scrub_session_payload(session, delivery_set, grouped):
+                cleaned = True
+                break
+            session["session_version"] = current_version + 1
+            try:
+                if redis_client.save_session_if_version(
+                    userid, session, current_version,
+                ):
+                    rewritten += 1
+                    cleaned = True
+                    break
+            except Exception:
+                logger.warning(
+                    "recommendation_privacy: session rewrite failed batch=%s",
+                    trace,
+                )
+                raise
+        if cleaned:
+            redis_client.remove_recommendation_session_index_members(
+                userid, index_keys,
+            )
+        else:
+            raise RuntimeError("session_scrub_cas_conflict")
     _log_batch(trace, "session_scrub", "redis_session", rewritten)
     return rewritten
 
@@ -1075,24 +1168,108 @@ def _delete_target_facts(
 
 
 # ---------------------------------------------------------------------------
-# 步骤 6：本人内容与存储对象
+# 步骤 6：本人日志删除与实体清理移交
 # ---------------------------------------------------------------------------
 
-def _image_keys(images: Any) -> list[str]:
-    values = _as_list(images)
-    if values is None:
-        return []
-    return [str(k) for k in values if k]
+def _lock_owned_cleanup_graph(
+    db: Session,
+    external_userid: str,
+    targets: Sequence[TargetRef],
+) -> None:
+    """Pre-lock one-transaction cleanup in the shared global lock order."""
+    grouped = _target_map(targets)
+    job_ids = sorted(int(value) for value in grouped.get("job", set()))
+    resume_ids = sorted(int(value) for value in grouped.get("resume", set()))
+
+    jobs = (
+        db.query(Job)
+        .populate_existing()
+        .filter(Job.owner_userid == external_userid, Job.id.in_(job_ids))
+        .order_by(Job.id)
+        .with_for_update()
+        .all()
+        if job_ids
+        else []
+    )
+    if any(row.deleted_at is None for row in jobs):
+        raise RuntimeError("active_job_requires_lifecycle_cleanup")
+    locked_job_ids = [int(row.id) for row in jobs]
+
+    locked_resume_ids = []
+    if resume_ids:
+        locked_resume_ids = [
+            int(row[0])
+            for row in (
+                db.query(Resume.id)
+                .populate_existing()
+                .filter(
+                    Resume.owner_userid == external_userid,
+                    Resume.id.in_(resume_ids),
+                )
+                .order_by(Resume.id)
+                .with_for_update()
+                .all()
+            )
+        ]
+
+    media_filters = []
+    if locked_job_ids:
+        media_filters.append(
+            (MediaAssetLifecycle.entity_type == "job")
+            & (MediaAssetLifecycle.entity_id.in_(locked_job_ids))
+        )
+    if locked_resume_ids:
+        media_filters.append(
+            (MediaAssetLifecycle.entity_type == "resume")
+            & (MediaAssetLifecycle.entity_id.in_(locked_resume_ids))
+        )
+    if media_filters:
+        (
+            db.query(MediaAssetLifecycle.id)
+            .filter(
+                or_(*media_filters),
+                MediaAssetLifecycle.state == "attached",
+            )
+            .order_by(MediaAssetLifecycle.id)
+            .with_for_update()
+            .all()
+        )
+
+    if locked_job_ids:
+        (
+            db.query(TargetCleanupTask.id)
+            .populate_existing()
+            .filter(
+                TargetCleanupTask.target_type == "job",
+                TargetCleanupTask.target_id.in_(locked_job_ids),
+            )
+            .order_by(TargetCleanupTask.id)
+            .with_for_update()
+            .all()
+        )
 
 
 def _delete_owned_content(
     db: Session,
     external_userid: str,
+    targets: Sequence[TargetRef],
     report: PrivacyReport,
     *,
+    now: datetime,
     commit: bool,
 ) -> None:
-    """§9.11.1 步骤 6：conversation_log、resume/job 与对象存储。"""
+    """Delete logs and hand owned entities to the durable cleanup pipelines."""
+    grouped = _target_map(targets)
+    job_ids = sorted(int(value) for value in grouped.get("job", set()))
+    for job_chunk in _chunks(job_ids):
+        active_job = db.query(Job.id).filter(
+            Job.id.in_(job_chunk),
+            Job.owner_userid == external_userid,
+            Job.deleted_at.is_(None),
+        ).first()
+        if active_job is not None:
+            raise RuntimeError("active_job_requires_lifecycle_cleanup")
+
     count = _delete_by_pk(
         db, ConversationLog, ConversationLog.id,
         [ConversationLog.userid == external_userid], commit=commit,
@@ -1100,45 +1277,34 @@ def _delete_owned_content(
     report.add("conversation_log", count)
     _log_batch(report.batch_id, "owned_content", "conversation_log", count)
 
-    storage = None
-    try:
-        from app.storage import get_storage
+    from app.services.job_media_service import mark_entity_media_delete_pending
+    from app.services.target_cleanup_service import ensure_job_cleanup_task
 
-        storage = get_storage()
-    except Exception as exc:
-        logger.error(
-            "recommendation_privacy: get_storage failed batch=%s error=%s",
-            report.batch_id, type(exc).__name__,
-        )
-
-    for model, table in ((Resume, "resume"), (Job, "job")):
-        removed = 0
-        while True:
-            rows = db.query(model.id, model.images).filter(
+    deleted_at = to_naive_utc(now)
+    for model, table in ((Job, "job"), (Resume, "resume")):
+        target_ids = sorted(int(value) for value in grouped.get(table, set()))
+        transitioned = 0
+        for id_chunk in _chunks(target_ids):
+            rows = db.query(model).populate_existing().filter(
                 model.owner_userid == external_userid,
-            ).limit(BATCH_SIZE).all()
-            if not rows:
-                break
-            if storage is not None:
-                for _row_id, images in rows:
-                    for key in _image_keys(images):
-                        try:
-                            storage.delete(key)
-                        except Exception:
-                            logger.warning(
-                                "recommendation_privacy: storage delete failed batch=%s table=%s",
-                                report.batch_id, table,
-                            )
-            ids = [row[0] for row in rows]
-            deleted = db.query(model).filter(model.id.in_(ids)).delete(
-                synchronize_session=False,
-            )
+                model.id.in_(id_chunk),
+            ).order_by(model.id).with_for_update().limit(BATCH_SIZE).all()
+            for row in rows:
+                changed = False
+                if isinstance(row, Job):
+                    if row.deleted_at is None:
+                        raise RuntimeError("active_job_requires_lifecycle_cleanup")
+                elif row.deleted_at is None:
+                    row.deleted_at = deleted_at
+                    changed = True
+                media_marked = mark_entity_media_delete_pending(db, table, int(row.id))
+                if isinstance(row, Job):
+                    ensure_job_cleanup_task(db, int(row.id), reason="manual_delete")
+                changed = changed or bool(media_marked)
+                transitioned += int(changed)
             _settle(db, commit)
-            removed += int(deleted or 0)
-            if len(rows) < BATCH_SIZE:
-                break
-        report.add(table, removed)
-        _log_batch(report.batch_id, "owned_content", table, removed)
+        report.add(table, transitioned)
+        _log_batch(report.batch_id, "owned_content", table, transitioned)
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1351,14 @@ def delete_recommendation_user_data(
         "collect_targets", lambda: owned_target_refs(db, external_userid),
     ) or []
     report.targets = len(targets)
+
+    # A caller-owned transaction retains every lock until its final commit.
+    # Establish the upstream Job/Resume -> Media -> Target order before any
+    # outbox/delivery work, without changing durable state yet.
+    if delete_owned_content and not commit and report.ok:
+        _step("delete_owned_content", lambda: _lock_owned_cleanup_graph(
+            db, external_userid, targets,
+        ))
 
     # 无论后续哪一步失败，正文都必须先没：§10.1.1 行 2240「不得继续保留可解密正文」。
     _step("redact_own_content", lambda: redact_user_recommendation_content(
@@ -1233,10 +1407,10 @@ def delete_recommendation_user_data(
         db, sorted(touched_deliveries), commit=commit,
     ))
 
-    # 步骤 6：本人 conversation_log、resume/job 与存储对象。
-    if delete_owned_content:
+    # 步骤 6：本人日志删除，并把原始 target 快照移交 durable 清理。
+    if delete_owned_content and report.ok:
         _step("delete_owned_content", lambda: _delete_owned_content(
-            db, external_userid, report, commit=commit,
+            db, external_userid, targets, report, now=moment, commit=commit,
         ))
 
     logger.info(

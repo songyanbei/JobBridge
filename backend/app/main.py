@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.admin import router as admin_router
@@ -21,8 +22,9 @@ from app.api.webhook import router as webhook_router
 from app.config import settings
 from app.core.exceptions import AppError, BusinessException
 from app.core.logging_setup import configure_loguru
+from app.core.redis_client import validate_redis_durability_policy
 from app.core.responses import fail
-from app.db import engine
+from app.db import SessionLocal
 from app.tasks import scheduler as task_scheduler
 
 logger = logging.getLogger(__name__)
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
     - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
     """
     configure_loguru(settings.app_env)
+    validate_redis_durability_policy()
     from app.services.recommendation_shadow_service import start_shadow_runner
     from app.services.recommendation_strategy_service import (
         start_runtime_control_watcher,
@@ -177,24 +180,63 @@ app.include_router(admin_router)
 app.include_router(events_router)
 
 
+def mount_local_storage_files(
+    target_app: FastAPI,
+    *,
+    provider: str | None = None,
+    url_prefix: str | None = None,
+    directory: str | None = None,
+) -> StaticFiles | None:
+    """Mount the configured local object directory at its presentation prefix."""
+    if (provider or settings.oss_provider) != "local":
+        return None
+    prefix = "/" + (url_prefix or settings.oss_local_url_prefix).strip("/")
+    if prefix == "/":
+        raise ValueError("local storage URL prefix cannot be root")
+    static_files = StaticFiles(
+        directory=directory or settings.oss_local_dir,
+        check_dir=False,
+    )
+    target_app.mount(prefix, static_files, name="local-storage-files")
+    return static_files
+
+
+# Local storage persists object keys in business rows.  Production mounts the
+# same directory in app and worker containers.
+mount_local_storage_files(app)
+
+
 @app.get("/health", tags=["system"])
 def health_check():
-    """健康检查，检测应用与数据库状态。"""
-    db_ok = False
-    db_error: str | None = None
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception as exc:
-        db_error = str(exc)
+    """Liveness: the API process is running."""
+    return {"status": "ok", "env": settings.app_env, "version": app.version}
 
-    return {
-        "status": "ok" if db_ok else "degraded",
-        "env": settings.app_env,
-        "version": app.version,
-        "db": {
-            "ok": db_ok,
-            "error": db_error,
-        },
-    }
+
+def _readiness_report() -> dict:
+    from app.services.visibility_policy import visibility_policy_load_metrics
+    db = SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+        from app.services.system_config_service import check_visibility_policy_integrity
+        policy = check_visibility_policy_integrity(db)
+        return {
+            "status": "ready" if policy["ok"] else "not_ready",
+            "db": {"ok": True}, "visibility_policy": policy,
+            "visibility_policy_load_metrics": visibility_policy_load_metrics(),
+        }
+    except Exception as exc:
+        logger.warning("readiness check failed: %s", type(exc).__name__)
+        return {
+            "status": "not_ready", "db": {"ok": False},
+            "visibility_policy": {"ok": False, "error": type(exc).__name__},
+            "visibility_policy_load_metrics": visibility_policy_load_metrics(),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/ready", tags=["system"])
+def readiness_check():
+    """Readiness: DB policy and its successful audit must be complete."""
+    report = _readiness_report()
+    return JSONResponse(status_code=200 if report["status"] == "ready" else 503, content=report)

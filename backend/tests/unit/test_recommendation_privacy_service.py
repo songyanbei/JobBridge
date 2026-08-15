@@ -21,12 +21,14 @@ from app.models import (
     ConversationLog,
     EventLog,
     Job,
+    MediaAssetLifecycle,
     RecommendationDelivery,
     RecommendationExposureDaily,
     RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
     Resume,
+    TargetCleanupTask,
     User,
     WecomOutboundOutbox,
 )
@@ -61,6 +63,8 @@ _TABLES = [
     User.__table__,
     Job.__table__,
     Resume.__table__,
+    MediaAssetLifecycle.__table__,
+    TargetCleanupTask.__table__,
     ConversationLog.__table__,
     AuditLog.__table__,
     EventLog.__table__,
@@ -171,6 +175,42 @@ def _add_resume(db, owner: str, resume_id: int, images=None) -> Resume:
     db.add(resume)
     db.flush()
     return resume
+
+
+def _add_job(db, owner: str, job_id: int, images=None) -> Job:
+    job = Job(
+        id=job_id,
+        owner_userid=owner,
+        city="苏州市",
+        job_category="普工",
+        salary_floor_monthly=5000,
+        pay_type="月薪",
+        headcount=10,
+        gender_required="不限",
+        is_long_term=1,
+        raw_text="招聘",
+        images=images,
+        audit_status="passed",
+        activated_at=datetime(2026, 1, 1),
+        expires_at=datetime(2030, 1, 1),
+        version=1,
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def _add_attached_media(db, owner: str, entity_type: str, entity_id: int, key: str):
+    media = MediaAssetLifecycle(
+        object_key=key,
+        owner_userid=owner,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        state="attached",
+    )
+    db.add(media)
+    db.flush()
+    return media
 
 
 def _add_request(db, request_id: str, viewer: str, served_top_ids) -> RecommendationRequest:
@@ -315,6 +355,161 @@ class TestImmediateRedaction:
         assert privacy.redact_user_recommendation_content(db, OWNER) == 1
         assert privacy.redact_user_recommendation_content(db, OWNER) == 0
 
+    def test_full_candidate_page_continues_when_locked_rows_shrink(
+        self, db, monkeypatch,
+    ):
+        _add_user(db, OWNER)
+        _add_request(db, "req-batch", OWNER, [])
+        for index in range(501):
+            _add_delivery(
+                db,
+                f"batch-{index:04d}",
+                userid=OWNER,
+                request_id="req-batch",
+                target_ids=[],
+            )
+        db.commit()
+
+        original_lock = privacy._lock_redactable_deliveries
+        candidate_page_sizes = []
+
+        def _shrink_first_locked_page(
+            session, external_userid, candidate_ids, pending_filter,
+        ):
+            candidate_page_sizes.append(len(candidate_ids))
+            if len(candidate_page_sizes) == 1:
+                concurrent = session.get(
+                    RecommendationDelivery, candidate_ids[0],
+                )
+                privacy._redact_delivery_row(concurrent, _naive(datetime.now(timezone.utc)))
+                session.flush()
+            return original_lock(
+                session, external_userid, candidate_ids, pending_filter,
+            )
+
+        monkeypatch.setattr(
+            privacy, "_lock_redactable_deliveries", _shrink_first_locked_page,
+        )
+
+        changed = privacy.redact_user_recommendation_content(
+            db, OWNER, commit=False,
+        )
+
+        assert candidate_page_sizes == [500, 1]
+        assert changed == 500
+        assert db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.userid == OWNER,
+            RecommendationDelivery.content_ciphertext.isnot(None),
+        ).count() == 0
+        assert db.get(RecommendationDelivery, "batch-0500").content_ciphertext is None
+
+    @pytest.mark.parametrize(
+        ("commit", "expected_events"),
+        [
+            (False, [("outbox", 501), ("delivery", 500), ("delivery", 1)]),
+            (
+                True,
+                [
+                    ("outbox", 500),
+                    ("delivery", 500),
+                    ("outbox", 1),
+                    ("delivery", 1),
+                ],
+            ),
+        ],
+    )
+    def test_uses_global_or_per_batch_outbox_delivery_lock_order(
+        self, db, monkeypatch, commit, expected_events,
+    ):
+        candidate_ids = [f"own-lock-order-{index:04d}" for index in range(501)]
+        events = []
+
+        class _CandidateQuery:
+            def filter(self, *_args):
+                return self
+
+            def order_by(self, *_args):
+                return self
+
+            def limit(self, size):
+                self.size = size
+                return self
+
+            def all(self):
+                size = getattr(self, "size", len(candidate_ids))
+                start = sum(
+                    count for kind, count in events if kind == "delivery"
+                )
+                return [(value,) for value in candidate_ids[start:start + size]]
+
+        monkeypatch.setattr(db, "query", lambda *_args: _CandidateQuery())
+        monkeypatch.setattr(
+            privacy,
+            "_lock_outboxes_for_deliveries",
+            lambda _db, ids: events.append(("outbox", len(ids))),
+        )
+        monkeypatch.setattr(
+            privacy,
+            "_lock_redactable_deliveries",
+            lambda _db, _userid, ids, _filter: (
+                events.append(("delivery", len(ids))) or []
+            ),
+        )
+        monkeypatch.setattr(privacy, "_settle", lambda *_args: None)
+
+        privacy.redact_user_recommendation_content(db, OWNER, commit=commit)
+
+        assert events == expected_events
+
+
+@pytest.mark.parametrize(
+    ("commit", "expected_events"),
+    [
+        (False, [("outbox", 501), ("delivery", 500), ("delivery", 1)]),
+        (
+            True,
+            [
+                ("outbox", 500),
+                ("delivery", 500),
+                ("outbox", 1),
+                ("delivery", 1),
+            ],
+        ),
+    ],
+)
+def test_target_redaction_uses_global_or_per_batch_lock_order(
+    db, monkeypatch, commit, expected_events,
+):
+    delivery_ids = {f"lock-order-{index:04d}" for index in range(501)}
+    events = []
+    monkeypatch.setattr(
+        privacy,
+        "_delivery_ids_referencing_targets",
+        lambda *_args: delivery_ids,
+    )
+
+    def _lock_outboxes(_db, ids):
+        events.append(("outbox", len(ids)))
+
+    def _lock_deliveries(_db, ids):
+        events.append(("delivery", len(ids)))
+        return []
+
+    monkeypatch.setattr(
+        privacy, "_lock_outboxes_for_deliveries", _lock_outboxes,
+    )
+    monkeypatch.setattr(
+        privacy, "_lock_target_deliveries", _lock_deliveries,
+    )
+
+    privacy.redact_deliveries_for_targets(
+        db,
+        [privacy.TargetRef("resume", 7)],
+        commit=commit,
+    )
+
+    assert events == expected_events
+
 
 # ---------------------------------------------------------------------------
 # §9.11.1 步骤 1~7 闭环
@@ -325,6 +520,7 @@ def _build_full_fixture(db):
     _add_user(db, OWNER)
     _add_user(db, VIEWER)
     _add_resume(db, OWNER, 7, images=["oss/resume-7.jpg"])
+    _add_attached_media(db, OWNER, "resume", 7, "oss/resume-7.jpg")
     _add_resume(db, VIEWER, 9)
 
     # OWNER 自己作为 viewer 的推荐事实
@@ -373,6 +569,38 @@ def _build_full_fixture(db):
 
 
 class TestDeleteRecommendationUserData:
+    def test_user_cleanup_locks_outboxes_before_target_deliveries(
+        self, db, monkeypatch,
+    ):
+        _build_full_fixture(db)
+        events = []
+        original_outbox_lock = privacy._lock_outboxes_for_deliveries
+        original_delivery_lock = privacy._lock_target_deliveries
+
+        def _lock_outboxes(session, delivery_ids):
+            events.append("outbox")
+            return original_outbox_lock(session, delivery_ids)
+
+        def _lock_deliveries(session, delivery_ids):
+            events.append("delivery")
+            return original_delivery_lock(session, delivery_ids)
+
+        monkeypatch.setattr(
+            privacy, "_lock_outboxes_for_deliveries", _lock_outboxes,
+        )
+        monkeypatch.setattr(
+            privacy, "_lock_target_deliveries", _lock_deliveries,
+        )
+
+        report = privacy.delete_recommendation_user_data(
+            db, OWNER, commit=False,
+        )
+
+        assert report.ok, report.failed_steps
+        first_delivery = events.index("delivery")
+        assert first_delivery > 0
+        assert all(event == "outbox" for event in events[:first_delivery])
+
     def test_removes_every_viewer_side_fact(self, db):
         _build_full_fixture(db)
 
@@ -434,16 +662,86 @@ class TestDeleteRecommendationUserData:
         assert log.criteria_snapshot is None
         assert log.redaction_state == "redacted"
 
-    def test_deletes_own_content_and_storage_objects(self, db):
+    def test_hands_owned_content_to_durable_media_cleanup(self, db):
         _build_full_fixture(db)
         _FakeStorage.deleted = []
 
         privacy.delete_recommendation_user_data(db, OWNER, commit=False)
 
         assert db.query(ConversationLog).filter_by(userid=OWNER).count() == 0
-        assert db.query(Resume).filter_by(owner_userid=OWNER).count() == 0
+        owned = db.query(Resume).filter_by(owner_userid=OWNER).one()
+        assert owned.deleted_at is not None
         assert db.query(Resume).filter_by(owner_userid=VIEWER).count() == 1
-        assert "oss/resume-7.jpg" in _FakeStorage.deleted
+        media = db.query(MediaAssetLifecycle).filter_by(
+            object_key="oss/resume-7.jpg"
+        ).one()
+        assert media.state == "delete_pending"
+        assert media.next_attempt_at is not None
+        assert _FakeStorage.deleted == []
+
+    def test_hands_soft_deleted_jobs_to_target_and_media_cleanup(self, db):
+        _add_user(db, OWNER)
+        job = _add_job(db, OWNER, 11, images=["oss/job-11.jpg"])
+        job.deleted_at = datetime(2026, 1, 2)
+        job.delist_reason = "manual_delist"
+        media = _add_attached_media(db, OWNER, "job", 11, "oss/job-11.jpg")
+        db.flush()
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert report.ok, report.failed_steps
+        assert job.deleted_at is not None
+        assert job.delist_reason == "manual_delist"
+        assert job.version == 1
+        db.refresh(media)
+        assert media.state == "delete_pending"
+        task = db.query(TargetCleanupTask).filter_by(
+            target_type="job", target_id=job.id
+        ).one()
+        assert task.reason == "manual_delete"
+        assert task.status == "pending"
+
+    def test_active_job_anomaly_fails_closed_without_deleting_media(self, db):
+        _add_user(db, OWNER)
+        job = _add_job(db, OWNER, 12, images=["oss/job-12.jpg"])
+        media = _add_attached_media(db, OWNER, "job", 12, "oss/job-12.jpg")
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert not report.ok
+        assert "delete_owned_content" in report.failed_steps
+        assert job.deleted_at is None
+        assert job.delist_reason is None
+        assert job.version == 1
+        db.refresh(media)
+        assert media.state == "attached"
+        assert db.query(TargetCleanupTask).count() == 0
+
+    def test_owned_content_handoff_uses_collected_target_snapshot(self, db, monkeypatch):
+        _add_user(db, OWNER)
+        first = _add_resume(db, OWNER, 21, images=["oss/resume-21.jpg"])
+        first_media = _add_attached_media(
+            db, OWNER, "resume", 21, "oss/resume-21.jpg"
+        )
+        later = _add_resume(db, OWNER, 22, images=["oss/resume-22.jpg"])
+        later_media = _add_attached_media(
+            db, OWNER, "resume", 22, "oss/resume-22.jpg"
+        )
+        monkeypatch.setattr(
+            privacy,
+            "owned_target_refs",
+            lambda *_args: [privacy.TargetRef("resume", first.id)],
+        )
+
+        report = privacy.delete_recommendation_user_data(db, OWNER, commit=False)
+
+        assert report.ok, report.failed_steps
+        assert first.deleted_at is not None
+        assert later.deleted_at is None
+        db.refresh(first_media)
+        db.refresh(later_media)
+        assert first_media.state == "delete_pending"
+        assert later_media.state == "attached"
 
     def test_is_idempotent(self, db):
         _build_full_fixture(db)
@@ -455,6 +753,7 @@ class TestDeleteRecommendationUserData:
         assert second.rows.get("viewer_request", 0) == 0
         assert second.rows.get("target_impression", 0) == 0
         assert second.rows.get("resume", 0) == 0
+        assert db.query(Resume).filter_by(owner_userid=OWNER).one().deleted_at is not None
         log = db.query(ConversationLog).filter_by(userid=VIEWER).one()
         assert log.content == privacy.REDACTED_PLACEHOLDER
 
@@ -483,7 +782,7 @@ class TestDeleteRecommendationUserData:
 
         assert report.ok, report.failed_steps
         assert db.query(RecommendationRequest).filter_by(viewer_userid=OWNER).count() == 0
-        assert db.query(Resume).filter_by(owner_userid=OWNER).count() == 0
+        assert db.query(Resume).filter_by(owner_userid=OWNER).one().deleted_at is not None
         assert db.query(RecommendationExposureDaily).filter_by(target_id=7).count() == 0
 
     def test_logs_never_contain_userid_target_or_body(self, db, caplog):
@@ -515,6 +814,10 @@ class TestDeleteRecommendationUserData:
 
         assert not report.ok
         assert "redact_conversation_logs" in report.failed_steps
+        owned = db.query(Resume).filter_by(owner_userid=OWNER).one()
+        media = db.query(MediaAssetLifecycle).filter_by(entity_id=owned.id).one()
+        assert owned.deleted_at is None
+        assert media.state == "attached"
         # 正文清理排在失败步骤之前：§10.1.1 行 2240 不允许留下可解密正文。
         assert db.get(RecommendationDelivery, "d-other").content_ciphertext is None
         blob = "\n".join(
@@ -538,8 +841,7 @@ class _FakeRedis:
         return set(self._index.get(key, set()))
 
     def delete(self, key):
-        self.deleted.append(key)
-        self._index.pop(key, None)
+        raise AssertionError("session scrub must not delete whole index keys")
 
     def keys(self, *args, **kwargs):  # pragma: no cover - 必须永远不被调用
         raise AssertionError("§10.1.1 禁止全库 KEYS 扫描")
@@ -575,13 +877,23 @@ class TestSessionScrub:
             },
         }
         saved: dict = {}
+        removed: list[tuple[str, tuple[str, ...]]] = []
 
         def _save(userid, session, expected_version, *a, **k):
             assert expected_version == 4
             saved[userid] = session
             return True
 
-        monkeypatch.setattr(redis_client, "get_redis", lambda: fake)
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: set().union(*(fake._index.get(key, set()) for key in keys)),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
         monkeypatch.setattr(redis_client, "get_session", lambda uid: stored.get(uid))
         monkeypatch.setattr(redis_client, "save_session_if_version", _save)
 
@@ -603,23 +915,127 @@ class TestSessionScrub:
         }
         # 版本 +1，让按旧版本算好的 staged mutation CAS 失败，不会把正文写回来。
         assert session["session_version"] == 5
-        # 索引用完即删，且全程没有 KEYS 扫描。
-        assert set(fake.deleted) == {
+        assert removed == [(VIEWER, tuple(sorted({
             f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-other",
             f"{privacy.SESSION_TARGET_INDEX_PREFIX}resume:7",
-        }
+        })))]
 
     def test_skips_owner_session(self, monkeypatch):
         from app.core import redis_client
 
         fake = _FakeRedis({f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-own": {OWNER}})
-        monkeypatch.setattr(redis_client, "get_redis", lambda: fake)
+        removed = []
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {OWNER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
         monkeypatch.setattr(
             redis_client, "get_session",
             lambda uid: pytest.fail("被删用户自己的 session 由 clear_session 处理"),
         )
 
         assert _REAL_SCRUB(["d-own"], [], owner_userid=OWNER) == 0
+        assert removed == [(
+            OWNER,
+            (f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-own",),
+        )]
+
+    def test_cas_conflicts_raise_without_removing_indexes_and_can_retry(
+        self,
+        monkeypatch,
+    ):
+        import copy
+        from app.core import redis_client
+
+        index_key = f"{privacy.SESSION_DELIVERY_INDEX_PREFIX}d-conflict"
+        original = {
+            "session_version": 4,
+            "history": [{
+                "role": "assistant",
+                "content": PHONE_IN_BODY,
+                "delivery_id": "d-conflict",
+            }],
+        }
+        removed = []
+        attempts = []
+        should_conflict = {"value": True}
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {VIEWER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "get_session",
+            lambda userid: copy.deepcopy(original),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
+
+        def _save(*args, **kwargs):
+            attempts.append(args[2])
+            return not should_conflict["value"]
+
+        monkeypatch.setattr(redis_client, "save_session_if_version", _save)
+
+        with pytest.raises(RuntimeError, match="session_scrub_cas_conflict"):
+            _REAL_SCRUB(["d-conflict"], [])
+        assert attempts == [4, 4, 4]
+        assert removed == []
+
+        should_conflict["value"] = False
+        assert _REAL_SCRUB(["d-conflict"], []) == 1
+        assert removed == [(VIEWER, (index_key,))]
+
+    def test_redis_rewrite_error_propagates_without_removing_indexes(
+        self,
+        monkeypatch,
+    ):
+        import copy
+        from app.core import redis_client
+
+        original = {
+            "session_version": 2,
+            "history": [{
+                "role": "assistant",
+                "content": PHONE_IN_BODY,
+                "delivery_id": "d-error",
+            }],
+        }
+        removed = []
+        monkeypatch.setattr(
+            redis_client,
+            "fence_recommendation_session_indexes",
+            lambda keys: {VIEWER},
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "get_session",
+            lambda userid: copy.deepcopy(original),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "save_session_if_version",
+            lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("down")),
+        )
+        monkeypatch.setattr(
+            redis_client,
+            "remove_recommendation_session_index_members",
+            lambda userid, keys: removed.append((userid, tuple(keys))),
+        )
+
+        with pytest.raises(ConnectionError, match="down"):
+            _REAL_SCRUB(["d-error"], [])
+        assert removed == []
 
 
 # ---------------------------------------------------------------------------

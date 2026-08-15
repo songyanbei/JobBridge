@@ -304,6 +304,47 @@ def test_job_category_enum_includes_canonical_set():
     assert "其他" in enum
 
 
+def test_job_category_enum_is_loaded_only_when_read(monkeypatch, request):
+    """构建 frame 不读字典，读枚举时仍使用当前运营值。"""
+    from app.services import intent_service
+
+    calls = []
+    monkeypatch.setattr(
+        intent_service,
+        "_get_job_category_canonical_values",
+        lambda: calls.append("loaded") or frozenset({"动态工种"}),
+    )
+    slot_schema._reset_cache_for_tests()
+    request.addfinalizer(slot_schema._reset_cache_for_tests)
+    fd = slot_schema.get_frame("job_search")
+    assert fd is not None
+    assert calls == []
+
+    assert tuple(fd.slots["job_category"].slot_type.enum_values or ()) == ("动态工种",)
+    assert calls == ["loaded"]
+
+    assert tuple(fd.slots["job_category"].slot_type.enum_values or ()) == ("动态工种",)
+    assert calls == ["loaded", "loaded"]
+
+
+def test_prompt_field_spec_reads_category_ontology_once(monkeypatch, request):
+    from app.services import intent_service
+
+    calls = []
+    monkeypatch.setattr(
+        intent_service,
+        "_get_job_category_canonical_values",
+        lambda: calls.append("loaded") or frozenset({"动态工种"}),
+    )
+    slot_schema._reset_cache_for_tests()
+    request.addfinalizer(slot_schema._reset_cache_for_tests)
+
+    spec = slot_schema.render_prompt_field_spec()
+
+    assert "动态工种" in spec
+    assert calls == ["loaded"]
+
+
 # ---------------------------------------------------------------------------
 # filter_mode / job_title 占位
 # ---------------------------------------------------------------------------
@@ -480,6 +521,24 @@ class TestIntentServiceConstantsFromSchema:
     def test_search_field_remap_equals_schema(self):
         from app.services import intent_service as _is
         assert dict(_is._SEARCH_FIELD_REMAP) == slot_schema.search_synonyms()
+
+
+def test_job_upload_education_requirement_matches_database_enum():
+    slot = slot_schema.get_frame("job_upload").slots["education_required"]
+    assert slot.slot_type.enum_values == (
+        "不限", "初中", "高中", "中专", "大专及以上",
+    )
+
+
+def test_job_upload_full_update_fields_match_persistence_contract():
+    frame = slot_schema.get_frame("job_upload")
+    assert "address" in frame.slots
+    assert frame.slots["employment_type"].slot_type.enum_values == (
+        "厂家直招", "劳务派遣", "中介代招",
+    )
+    assert frame.slots["contract_type"].slot_type.enum_values == (
+        "长期合同", "短期合同", "劳务关系",
+    )
 
 
 # ---------------------------------------------------------------------------

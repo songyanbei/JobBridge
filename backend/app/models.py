@@ -55,6 +55,7 @@ class Job(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     owner_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid", ondelete="RESTRICT"), nullable=False, comment="发布者")
+    hiring_company = sa.Column(sa.String(128), nullable=True, comment="实际招聘工厂名（岗位级）")
 
     # ---- 硬过滤字段（§7.1）----
     city = sa.Column(sa.String(32), nullable=False, comment="城市")
@@ -76,6 +77,8 @@ class Job(Base):
     # ---- 软匹配字段（§7.1）----
     district = sa.Column(sa.String(32), nullable=True, comment="区县（细粒度）")
     address = sa.Column(sa.String(255), nullable=True, comment="岗位详细工作地址（街道+门牌）")
+    contact_person = sa.Column(sa.String(64), nullable=True, comment="岗位级联系人（覆盖发布账号）")
+    phone = sa.Column(sa.String(32), nullable=True, comment="岗位级联系电话（覆盖发布账号）")
     salary_ceiling_monthly = sa.Column(sa.Integer, nullable=True, comment="月综合收入上限")
     provide_meal = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包吃")
     provide_housing = sa.Column(mysql.TINYINT(display_width=1), nullable=True, comment="包住")
@@ -123,25 +126,126 @@ class Job(Base):
     # ---- 生命周期 ----
     created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
     updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
-    expires_at = sa.Column(sa.DateTime, nullable=False, comment="过期时间（默认 created_at + 30 天）")
+    expires_at = sa.Column(sa.DateTime, nullable=True, comment="激活后的业务过期时间")
+    activated_at = sa.Column(sa.DateTime, nullable=True, comment="业务激活时间")
+    candidate_expires_at = sa.Column(sa.DateTime, nullable=True, comment="候选版本回收时间")
     delist_reason = sa.Column(
-        sa.Enum("filled", "manual_delist", "expired", name="delist_reason"),
+        sa.Enum("filled", "manual_delist", "expired", "replaced", name="delist_reason"),
         nullable=True, comment="下架原因",
     )
     deleted_at = sa.Column(sa.DateTime, nullable=True, comment="软删除时间")
 
-    # ---- 乐观锁 ----
-    version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"), comment="乐观锁版本号")
-
-    # ---- 扩展 ----
+    version = sa.Column(
+        mysql.INTEGER(unsigned=True), nullable=False,
+        server_default=sa.text("1"), comment="乐观锁版本号",
+    )
     extra = sa.Column(MutableDict.as_mutable(sa.JSON), nullable=True, comment="扩展字段（§7.6）")
 
     __table_args__ = (
         sa.Index("idx_owner", "owner_userid"),
         sa.Index("idx_audit_time", "audit_status", "created_at"),
         sa.Index("idx_expires", "expires_at"),
+        sa.Index("idx_job_candidate_expiry", "audit_status", "candidate_expires_at"),
         sa.Index("idx_filter_hot", "city", "job_category", "is_long_term", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary", "salary_floor_monthly"),
+    )
+
+
+class JobReplacement(Base):
+    __tablename__ = "job_replacement"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
+    source_msg_id = sa.Column(sa.String(128), nullable=False, unique=True)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    old_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    new_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, unique=True)
+    old_job_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    old_expires_at = sa.Column(sa.DateTime, nullable=True)
+    old_business_digest = sa.Column(sa.String(64), nullable=False)
+    old_business_digest_version = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default="2")
+    review_outcome = sa.Column(sa.Enum("pending", "passed", "rejected", name="replacement_review_outcome"), nullable=False)
+    reviewed_at = sa.Column(sa.DateTime, nullable=True)
+    reviewed_by = sa.Column(sa.String(64), nullable=True)
+    lifecycle_status = sa.Column(sa.Enum("awaiting_review", "activated", "closed", "conflict", name="replacement_lifecycle_status"), nullable=False)
+    active_old_job_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True, unique=True)
+    closed_reason = sa.Column(sa.String(64), nullable=True)
+    conflict_reason = sa.Column(sa.String(255), nullable=True)
+    activated_at = sa.Column(sa.DateTime, nullable=True)
+    candidate_cleaned_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+    __table_args__ = (
+        sa.Index("idx_replacement_old_status", "old_job_id", "lifecycle_status"),
+        sa.Index("idx_replacement_owner_created", "owner_userid", "created_at"),
+        sa.Index("idx_replacement_lifecycle_created", "lifecycle_status", "created_at"),
+        sa.Index("idx_replacement_review_created", "review_outcome", "created_at"),
+    )
+
+
+class MediaAssetLifecycle(Base):
+    __tablename__ = "media_asset_lifecycle"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    object_key = sa.Column(sa.String(512), nullable=False, unique=True)
+    operation_id = sa.Column(sa.String(36), nullable=True, index=True)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    entity_type = sa.Column(sa.Enum("job", "resume", name="media_entity_type"), nullable=True)
+    entity_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    state = sa.Column(
+        sa.Enum(
+            "pending",
+            "attached",
+            "delete_pending",
+            "deleted",
+            "dead_letter",
+            name="media_asset_state",
+        ),
+        nullable=False, server_default="pending",
+    )
+    draft_expires_at = sa.Column(sa.DateTime, nullable=True)
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    next_attempt_at = sa.Column(sa.DateTime, nullable=True)
+    last_error = sa.Column(sa.String(255), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_expires_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+    deleted_at = sa.Column(sa.DateTime, nullable=True)
+
+    __table_args__ = (
+        sa.Index("idx_media_entity", "entity_type", "entity_id", "state"),
+        sa.Index("idx_media_cleanup", "state", "next_attempt_at"),
+        sa.Index("idx_media_draft_expiry", "state", "draft_expires_at"),
+    )
+
+
+class TargetCleanupTask(Base):
+    __tablename__ = "target_cleanup_task"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
+    target_type = sa.Column(sa.String(32), nullable=False)
+    target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    reason = sa.Column(sa.String(32), nullable=False)
+    reason_history = sa.Column(sa.JSON, nullable=True)
+    status = sa.Column(
+        sa.Enum("pending", "processing", "retry_wait", "succeeded", "dead_letter", name="target_cleanup_status"),
+        nullable=False, server_default="pending",
+    )
+    delivery_ids = sa.Column(sa.JSON, nullable=True)
+    db_redacted_at = sa.Column(sa.DateTime, nullable=True)
+    conversation_redacted_at = sa.Column(sa.DateTime, nullable=True)
+    session_invalidated_at = sa.Column(sa.DateTime, nullable=True)
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    next_attempt_at = sa.Column(sa.DateTime, nullable=True)
+    last_error = sa.Column(sa.String(255), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_expires_at = sa.Column(sa.DateTime, nullable=True)
+    completed_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
+    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("target_type", "target_id", name="uq_cleanup_target"),
+        sa.Index("idx_target_cleanup_ready", "status", "next_attempt_at"),
     )
 
 
@@ -488,7 +592,9 @@ class WecomInboundEvent(Base):
         mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"),
     )
     session_apply_locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_apply_lease_owner = sa.Column(sa.String(64), nullable=True)
     session_next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    session_commit_deadline_epoch = sa.Column(sa.Numeric(20, 6), nullable=True)
     session_applied_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     worker_started_at = sa.Column(
         mysql.DATETIME(fsp=6), nullable=True, comment="Worker 开始处理时间",

@@ -52,6 +52,7 @@ INSERT INTO `dict_city` (`code`, `name`, `short_name`, `province`, `aliases`, `e
 INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `description`) VALUES
 -- 数据 TTL（天）
 ('ttl.job.days',                  '30',  'int',  '岗位 TTL（天）'),
+('ttl.job.candidate.days',        '7',   'int',  '岗位候选版本保留期（天），适用于首次发布和全量更新候选'),
 ('ttl.resume.days',                '30', 'int',  '简历 TTL（天）'),
 ('ttl.conversation_log.days',      '30', 'int',  '对话日志 TTL（天）'),
 ('ttl.audit_log.days',             '180','int',  '审核日志 TTL（天）— Phase 7 新增'),
@@ -64,6 +65,9 @@ INSERT INTO `system_config` (`config_key`, `config_value`, `value_type`, `descri
 ('match.max_candidates',           '50', 'int',  'SQL 硬过滤后送 rerank 的最大候选数'),
 ('match.auto_relax_on_empty',      'true', 'bool', '0 召回时是否自动放宽条件'),
 ('match.relax_salary_pct',         '0.1', 'string', '放宽时薪资下调比例（10%）'),
+
+-- 推荐权限可见字段策略（schema_version/revision 均由服务端语义校验）
+('visibility.recommendation_fields', '{"schema_version":1,"revision":1,"job_search":{"worker":["hiring_company","job_category","salary"],"factory":[],"broker":["hiring_company","job_category","salary","city","district","address","benefits","shift","contact_person","phone","publisher_company"]},"candidate_search":{"worker":[],"factory":["display_name","gender_age","expected_job_categories","salary_expectation","expected_cities","phone"],"broker":["display_name","gender_age","expected_job_categories","salary_expectation","expected_cities","phone"]}}', 'json', '推荐岗位/求职者推荐可见字段策略'),
 
 -- 敏感字段硬过滤开关（§7.5）
 ('filter.enable_gender',           'true', 'bool', '是否启用性别硬过滤'),

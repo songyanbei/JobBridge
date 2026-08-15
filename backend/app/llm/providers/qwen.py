@@ -18,10 +18,10 @@ from app.llm.base import (
     RerankResult,
 )
 from app.llm.prompts import (
-    DIALOGUE_PARSE_PROMPT_V2,
     DIALOGUE_USER_TEMPLATE,
     INTENT_SYSTEM_PROMPT,
     INTENT_USER_TEMPLATE,
+    get_dialogue_parse_prompt_v2,
 )
 from app.llm.providers._base import (
     build_rerank_payload,
@@ -123,7 +123,7 @@ class QwenIntentExtractor(IntentExtractor):
         prompt / 解析与 extract 解耦，便于 shadow / dual-read 阶段独立观测；
         与 IntentExtractor.extract 共用同一个 chat completion 入口和 token 记账。
         """
-        system_prompt = DIALOGUE_PARSE_PROMPT_V2.format(
+        system_prompt = get_dialogue_parse_prompt_v2().format(
             role=role,
             history=format_history(history),
             current_criteria=format_criteria(current_criteria),

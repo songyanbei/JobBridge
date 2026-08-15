@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
@@ -41,7 +42,7 @@ class SlotType:
     """字段的类型描述（无业务约束）。"""
 
     py_type: PyType
-    enum_values: tuple[str, ...] | None = None  # str/enum 闭集
+    enum_values: Iterable[str] | None = None  # str/enum 闭集
     int_range: tuple[int, int] | None = None   # int 字段 [lo, hi]
     # 单值归一函数；list 字段的 normalizer 作用于元素而非整 list
     normalizer: Callable[[Any], Any] | None = None
@@ -76,6 +77,16 @@ class FrameDef:
     synonyms_in: dict[str, str] = field(default_factory=dict)  # alias -> canonical
 
 
+class _LazyEnumValues(Iterable[str]):
+    """在真正读取枚举时才加载运营字典，避免模块导入触发数据库连接。"""
+
+    def __init__(self, loader: Callable[[], Sequence[str]]) -> None:
+        self._loader = loader
+
+    def __iter__(self):
+        return iter(tuple(self._loader()))
+
+
 # ---------------------------------------------------------------------------
 # 引入既有归一化函数 / 常量（不重复定义，避免与 intent_service drift）
 # ---------------------------------------------------------------------------
@@ -99,12 +110,13 @@ def _ref_normalize_job_category():
 # job_upload frame 合法字段集合（含 hard 必填 + 上传可选字段）
 _JOB_UPLOAD_FIELDS: frozenset[str] = frozenset({
     "city", "job_category", "salary_floor_monthly", "pay_type", "headcount",
-    "gender_required", "is_long_term", "district", "salary_ceiling_monthly",
+    "gender_required", "is_long_term", "district", "address", "salary_ceiling_monthly",
     "provide_meal", "provide_housing", "dorm_condition", "shift_pattern",
     "work_hours", "accept_couple", "accept_student", "accept_minority",
     "height_required", "experience_required", "education_required",
     "rebate", "employment_type", "contract_type", "min_duration",
     "job_sub_category", "age_min", "age_max",
+    "hiring_company", "contact_person", "phone",
 })
 
 # resume_upload frame 合法字段集合
@@ -129,7 +141,6 @@ def _ref_constants() -> dict[str, Any]:
     from app.services import intent_service as _is
     from app.llm import prompts as _p
     return {
-        "JOB_CATEGORY_CANONICAL": _is._get_job_category_canonical_values(),
         "SALARY_MIN": _is._SALARY_MIN,
         "SALARY_MAX": _is._SALARY_MAX,
         "AGE_MIN": _is._AGE_MIN,
@@ -151,10 +162,12 @@ def _city_type() -> SlotType:
 
 
 def _job_category_type() -> SlotType:
-    c = _ref_constants()
+    from app.services import intent_service as _is
     return SlotType(
         py_type="list[str]",
-        enum_values=tuple(sorted(c["JOB_CATEGORY_CANONICAL"])),
+        enum_values=_LazyEnumValues(
+            lambda: tuple(sorted(_is._get_job_category_canonical_values())),
+        ),
         normalizer=_ref_normalize_job_category(),
     )
 
@@ -336,7 +349,9 @@ def _build_job_search() -> FrameDef:
             "accept_minority", slot_type=_bool_type(), display_name="可少数民族",
         ),
         "education_required": _slot(
-            "education_required", slot_type=_str_type(), display_name="学历要求",
+            "education_required",
+            slot_type=_enum_str(("不限", "初中", "高中", "中专", "大专及以上")),
+            display_name="学历要求",
         ),
         "experience_required": _slot(
             "experience_required", slot_type=_str_type(), display_name="经验要求",
@@ -345,12 +360,17 @@ def _build_job_search() -> FrameDef:
             "height_required", slot_type=_str_type(), display_name="身高要求",
         ),
         "district": _slot("district", slot_type=_str_type(), display_name="区县"),
+        "address": _slot("address", slot_type=_str_type(), display_name="详细工作地址"),
         "rebate": _slot("rebate", slot_type=_str_type(), display_name="返费"),
         "employment_type": _slot(
-            "employment_type", slot_type=_str_type(), display_name="用工类型",
+            "employment_type",
+            slot_type=_enum_str(("厂家直招", "劳务派遣", "中介代招")),
+            display_name="用工类型",
         ),
         "contract_type": _slot(
-            "contract_type", slot_type=_str_type(), display_name="合同类型",
+            "contract_type",
+            slot_type=_enum_str(("长期合同", "短期合同", "劳务关系")),
+            display_name="合同类型",
         ),
         "min_duration": _slot(
             "min_duration", slot_type=_str_type(), display_name="最短入职时长",
@@ -432,7 +452,17 @@ def _build_job_upload() -> FrameDef:
         sd = job_search.slots.get(name)
         if sd is None:
             # 未在 job_search 显式定义的字段（如某些 upload 专属字段），用 str fallback
-            sd = _slot(name, slot_type=_str_type(), display_name=name)
+            display_names = {
+                "hiring_company": "招聘工厂",
+                "address": "岗位工作地址",
+                "contact_person": "岗位联系人",
+                "phone": "岗位联系电话",
+            }
+            sd = _slot(
+                name,
+                slot_type=_str_type(),
+                display_name=display_names.get(name, name),
+            )
         # upload 必填字段标 askable=True；filter_mode 对 upload 无意义，统一 hard。
         # 模板 search → upload 切换：保留任何 slot 自定义模板（非 SEARCH 默认）。
         if sd.prompt_template == SEARCH_PROMPT_DEFAULT:
@@ -1102,6 +1132,7 @@ def render_prompt_field_spec() -> str:
     阶段三 prompt 不再硬编码字段清单，启动期一次性渲染常量字符串。
     """
     lines: list[str] = []
+    job_category_enum: tuple[str, ...] | None = None
     for frame_name in ("job_search", "candidate_search", "job_upload", "resume_upload"):
         fd = get_frame(frame_name)
         if fd is None:
@@ -1109,7 +1140,12 @@ def render_prompt_field_spec() -> str:
         lines.append(f"### {frame_name} 可输出字段")
         for slot_name in sorted(fd.slots.keys()):
             sd = fd.slots[slot_name]
-            type_desc = _format_type_desc(sd.slot_type)
+            enum_values = None
+            if slot_name in {"job_category", "expected_job_categories"}:
+                if job_category_enum is None:
+                    job_category_enum = tuple(sd.slot_type.enum_values or ())
+                enum_values = job_category_enum
+            type_desc = _format_type_desc(sd.slot_type, enum_values=enum_values)
             required_marker = ""
             if slot_name in fd.required_all:
                 required_marker = "（必填）"
@@ -1126,12 +1162,21 @@ def render_prompt_field_spec() -> str:
     return "\n".join(lines).rstrip()
 
 
-def _format_type_desc(st: SlotType) -> str:
+def _format_type_desc(
+    st: SlotType,
+    *,
+    enum_values: tuple[str, ...] | None = None,
+) -> str:
     parts: list[str] = [st.py_type]
-    if st.enum_values:
+    resolved_values = (
+        enum_values
+        if enum_values is not None
+        else tuple(st.enum_values) if st.enum_values is not None else ()
+    )
+    if resolved_values:
         # 枚举太长就截断（job_category 10 个值）
-        vs = ",".join(st.enum_values[:12])
-        suffix = "..." if len(st.enum_values) > 12 else ""
+        vs = ",".join(resolved_values[:12])
+        suffix = "..." if len(resolved_values) > 12 else ""
         parts.append(f"enum=[{vs}{suffix}]")
     if st.int_range:
         parts.append(f"{st.int_range[0]}-{st.int_range[1]}")

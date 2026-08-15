@@ -14,6 +14,26 @@
           </el-form-item>
         </el-col>
         <el-col :span="12">
+          <el-form-item label="招聘工厂">
+            <el-input v-model="form.hiring_company" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="12">
+          <el-form-item label="岗位联系人">
+            <el-input v-model="form.contact_person" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="12">
+          <el-form-item label="岗位联系电话">
+            <el-input v-model="form.phone" maxlength="32" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="24">
+          <el-form-item label="岗位工作地址">
+            <el-input v-model="form.address" />
+          </el-form-item>
+        </el-col>
+        <el-col :span="12">
           <el-form-item label="工种">
             <el-input v-model="form.job_category" />
           </el-form-item>

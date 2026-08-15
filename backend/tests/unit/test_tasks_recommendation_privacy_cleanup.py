@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -164,15 +165,19 @@ class TestDrainRetryQueue:
 class TestDelayConfig:
     def test_falls_back_when_config_missing(self):
         db = MagicMock()
-        db.execute.return_value.first.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
         assert task._read_delay_days(db) == task.DEFAULT_DELAY_DAYS
 
     def test_falls_back_when_config_is_not_an_int(self):
         db = MagicMock()
-        db.execute.return_value.first.return_value = ("abc",)
+        db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(config_value="abc")
+        )
         assert task._read_delay_days(db) == task.DEFAULT_DELAY_DAYS
 
     def test_reads_shared_hard_delete_delay(self):
         db = MagicMock()
-        db.execute.return_value.first.return_value = ("14",)
+        db.query.return_value.filter.return_value.first.return_value = (
+            SimpleNamespace(config_value="14")
+        )
         assert task._read_delay_days(db) == 14
