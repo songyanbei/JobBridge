@@ -542,6 +542,12 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
 
 
 def test_down_verify_reports_only_zero_blockers_as_ready():
+    required_table_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_schema_required_tables_missing"
+    ]
+    assert "TABLE_TYPE='BASE TABLE'" in required_table_gate
+    assert "BINARY TABLE_NAME" in required_table_gate
+
     db = MagicMock()
     results = []
     for _ in phase10_down_verify.SCHEMA_CHECKS:
@@ -559,10 +565,12 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["ready"] is True
     assert report["restored_job_backup_mismatch"] == 0
     assert report["phase10_session_columns_remaining"] == 0
+    assert report["old_schema_required_tables_missing"] == 0
 
     results[0].scalar.return_value = 1
     db.execute.side_effect = [*results, required_tables, restore_mismatch]
     report = phase10_down_verify.collect(db)
+    assert report["old_schema_required_tables_missing"] == 1
     assert report["ready"] is False
 
 

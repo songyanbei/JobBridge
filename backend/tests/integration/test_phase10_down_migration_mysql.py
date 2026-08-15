@@ -416,6 +416,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
 
         report = _collect_down_report(database)
         assert report == {
+            "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
             "old_job_column_contract_mismatch": 0,
@@ -425,6 +426,27 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "restored_job_backup_mismatch": 0,
             "ready": True,
         }
+
+        with db.cursor() as cursor:
+            cursor.execute("DROP TABLE wecom_inbound_event")
+        report = _collect_down_report(database)
+        assert report["old_schema_required_tables_missing"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute("CREATE VIEW wecom_inbound_event AS SELECT 1 AS id")
+        report = _collect_down_report(database)
+        assert report["old_schema_required_tables_missing"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute("DROP VIEW wecom_inbound_event")
+            cursor.execute("SELECT @@lower_case_table_names")
+            assert int(cursor.fetchone()[0]) == 0
+            cursor.execute("CREATE TABLE Wecom_Inbound_Event (id BIGINT PRIMARY KEY)")
+        report = _collect_down_report(database)
+        assert report["old_schema_required_tables_missing"] == 1
+        assert report["ready"] is False
     finally:
         if db is not None:
             db.close()

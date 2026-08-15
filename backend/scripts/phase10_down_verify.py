@@ -9,6 +9,12 @@ from app.db import SessionLocal
 
 
 SCHEMA_CHECKS = {
+    "old_schema_required_tables_missing": (
+        "SELECT 3 - COUNT(*) FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' "
+        "AND BINARY TABLE_NAME IN ("
+        "'job','phase10_job_lifecycle_backup','wecom_inbound_event')"
+    ),
     "phase10_job_columns_remaining": (
         "SELECT COUNT(*) FROM information_schema.COLUMNS "
         "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='job' "
