@@ -239,6 +239,7 @@ class TestP1_1_V2CancelResetReply:
             active_flow="upload_collecting",
             pending_upload={"city": "苏州"},
             pending_upload_intent="upload_job",
+            pending_expires_at="2099-01-01T00:00:00+00:00",
             pending_upload_mode="replace",
             pending_target_id=42,
             pending_target_version=7,

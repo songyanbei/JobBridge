@@ -440,6 +440,18 @@ def _handle_text(
     # Stage C1：兜底推导 + self-heal，覆盖测试或非 Redis 路径绕过 load_session 的场景
     conversation_service.ensure_active_flow(session)
 
+    # Upload TTL is a routing precondition. It must run before welcome,
+    # action-plan and V2 clarification/conflict short returns so no branch can
+    # preserve an expired draft or its media references.
+    if _abandon_expired_pending_upload(session, db):
+        if _looks_like_upload_patch(content):
+            conversation_service.record_history(session, "user", content)
+            conversation_service.record_history(
+                session, "assistant", PENDING_EXPIRED_REPLY,
+            )
+            conversation_service.save_session(userid, session)
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+
     # 首次欢迎优先于意图分类
     if user_ctx.should_welcome:
         conversation_service.record_history(session, "user", content)
@@ -955,9 +967,8 @@ def _route_upload_collecting(
     userid = msg.from_user
 
     # 1. 过期
-    if upload_service.is_pending_upload_expired(session):
+    if _abandon_expired_pending_upload(session, db):
         was_patch = _looks_like_upload_patch(content)
-        upload_service.abandon_pending_upload(session, db)
         if was_patch:
             return [_reply(userid, PENDING_EXPIRED_REPLY)]
         # 未补丁就放行到 idle 分发
@@ -1004,6 +1015,11 @@ def _route_upload_conflict(
     content = (msg.content or "").strip()
     userid = msg.from_user
     intent = intent_result.intent
+
+    if _abandon_expired_pending_upload(session, db):
+        if _looks_like_upload_patch(content):
+            return [_reply(userid, PENDING_EXPIRED_REPLY)]
+        return _route_idle(intent_result, msg, user_ctx, session, db)
 
     # Stage C1（spec §2.7）：识别用户三选一回复时，proceed 信号优先级最高 ——
     # "继续看看" / "算了，先找工人" 这类同时含 resume/cancel 词与 proceed 词的句子，
@@ -2140,6 +2156,14 @@ def _looks_like_upload_patch(content: str) -> bool:
     if any(k in text for k in _KNOWN_SHORT_PATCH_KEYWORDS):
         return True
     return False
+
+
+def _abandon_expired_pending_upload(session: SessionState, db: Session) -> bool:
+    """Atomically apply the common expired-draft cleanup before routing."""
+    if not upload_service.is_pending_upload_expired(session):
+        return False
+    upload_service.abandon_pending_upload(session, db)
+    return True
 
 
 def _parse_headcount_from_text(text: str) -> int | None:
