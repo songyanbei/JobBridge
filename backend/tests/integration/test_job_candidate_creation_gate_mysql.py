@@ -4,6 +4,7 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event
 
 from app.config import settings
 from app.db import SessionLocal
@@ -105,4 +106,179 @@ def test_all_disabled_lifecycle_switches_do_not_persist_pending_candidate(
         assert candidate.candidate_expires_at is not None
     finally:
         db.rollback()
+        db.close()
+
+
+@pytest.mark.parametrize("audit_status", ["pending", "rejected"])
+def test_first_publish_candidate_event_emits_only_after_mysql_commit(
+    monkeypatch, audit_status,
+):
+    owner_userid = f"candidate-event-{audit_status}-{uuid4().hex}"
+    events = []
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    monkeypatch.setattr(
+        upload_service.audit_service,
+        "audit_content_only",
+        lambda **_kwargs: AuditResult(
+            status=audit_status, reason="manual review", matched_words=[]
+        ),
+    )
+    monkeypatch.setattr(
+        upload_service,
+        "log_event",
+        lambda event_type, **fields: events.append((event_type, fields)),
+    )
+
+    db = SessionLocal()
+    try:
+        db.add(User(external_userid=owner_userid, role="factory"))
+        db.commit()
+        result = upload_service.process_upload(
+            _user_context(owner_userid),
+            _intent(),
+            "苏州电子厂招聘普工",
+            [],
+            SessionState(role="factory"),
+            db,
+            source_msg_id="first-publish-message",
+        )
+        assert result.success is True
+        assert events == []
+
+        db.commit()
+
+        assert len(events) == 1
+        event_type, fields = events[0]
+        assert event_type == "job_candidate_created"
+        assert fields == {
+            "job_id": result.entity_id,
+            "candidate_kind": "first_publish",
+            "audit_status": audit_status,
+            "source_message_id": "first-publish-message",
+            "user_hash": upload_service.identifier_hash(owner_userid),
+        }
+    finally:
+        db.rollback()
+        db.query(Job).filter(Job.owner_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.external_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+        db.close()
+
+
+def test_first_publish_candidate_event_is_discarded_on_commit_failure(monkeypatch):
+    owner_userid = f"candidate-event-fail-{uuid4().hex}"
+    events = []
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    monkeypatch.setattr(
+        upload_service.audit_service,
+        "audit_content_only",
+        lambda **_kwargs: AuditResult(
+            status="pending", reason="manual review", matched_words=[]
+        ),
+    )
+    monkeypatch.setattr(
+        upload_service,
+        "log_event",
+        lambda event_type, **fields: events.append((event_type, fields)),
+    )
+
+    db = SessionLocal()
+    try:
+        db.add(User(external_userid=owner_userid, role="factory"))
+        db.commit()
+        result = upload_service.process_upload(
+            _user_context(owner_userid),
+            _intent(),
+            "苏州电子厂招聘普工",
+            [],
+            SessionState(role="factory"),
+            db,
+            source_msg_id="failed-first-publish-message",
+        )
+
+        def _fail_commit(_session):
+            raise RuntimeError("forced_candidate_commit_failure")
+
+        event.listen(db, "before_commit", _fail_commit, once=True)
+        with pytest.raises(RuntimeError, match="forced_candidate_commit_failure"):
+            db.commit()
+        db.rollback()
+
+        assert events == []
+        verify = SessionLocal()
+        try:
+            assert verify.get(Job, result.entity_id) is None
+        finally:
+            verify.close()
+    finally:
+        db.rollback()
+        db.query(Job).filter(Job.owner_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.external_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+        db.close()
+
+
+def test_first_publish_event_failure_does_not_invalidate_mysql_commit(monkeypatch):
+    owner_userid = f"candidate-event-log-fail-{uuid4().hex}"
+    replayed_events = []
+    monkeypatch.setattr(settings, "job_replacement_enabled", True)
+    monkeypatch.setattr(
+        upload_service.audit_service,
+        "audit_content_only",
+        lambda **_kwargs: AuditResult(
+            status="pending", reason="manual review", matched_words=[]
+        ),
+    )
+
+    def _fail_event(*_args, **_kwargs):
+        raise RuntimeError("forced_candidate_event_failure")
+
+    monkeypatch.setattr(upload_service, "log_event", _fail_event)
+    db = SessionLocal()
+    try:
+        db.add(User(external_userid=owner_userid, role="factory"))
+        db.commit()
+        result = upload_service.process_upload(
+            _user_context(owner_userid),
+            _intent(),
+            "苏州电子厂招聘普工",
+            [],
+            SessionState(role="factory"),
+            db,
+            source_msg_id="event-failure-message",
+        )
+
+        db.commit()
+
+        verify = SessionLocal()
+        try:
+            assert verify.get(Job, result.entity_id) is not None
+        finally:
+            verify.close()
+        assert upload_service._PENDING_FIRST_PUBLISH_EVENTS not in db.info
+
+        monkeypatch.setattr(
+            upload_service,
+            "log_event",
+            lambda event_type, **fields: replayed_events.append((event_type, fields)),
+        )
+        db.commit()
+        assert replayed_events == []
+    finally:
+        db.rollback()
+        db.query(Job).filter(Job.owner_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.query(User).filter(User.external_userid == owner_userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
         db.close()

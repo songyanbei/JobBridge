@@ -7,7 +7,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import event
+from sqlalchemy.orm import Session, SessionTransaction
 
 from app.config import settings
 from app.llm.base import IntentResult
@@ -18,11 +19,85 @@ from app.services import audit_service, conversation_service
 from app.services.lifecycle_config_service import get_job_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
+from app.tasks.common import log_event
 
 # 单条记录最多挂载图片数（与 system_config.upload.max_images 对齐）
 _MAX_IMAGES_PER_RECORD = 5
 
 logger = logging.getLogger(__name__)
+
+_PENDING_FIRST_PUBLISH_EVENTS = "job_first_publish_pending_events"
+
+
+def _transaction_contains(
+    transaction: SessionTransaction | None,
+    ancestor: SessionTransaction,
+) -> bool:
+    while transaction is not None:
+        if transaction is ancestor:
+            return True
+        transaction = transaction.parent
+    return False
+
+
+@event.listens_for(Session, "after_commit")
+def _emit_committed_first_publish_events(db: Session) -> None:
+    if db.in_nested_transaction():
+        return
+    pending = db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, [])
+    for _, fields in pending:
+        try:
+            log_event("job_candidate_created", **fields)
+        except Exception:
+            logger.exception("job_candidate_created telemetry failed")
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _discard_rolled_back_first_publish_events(
+    db: Session,
+    previous_transaction: SessionTransaction,
+) -> None:
+    pending = db.info.get(_PENDING_FIRST_PUBLISH_EVENTS, [])
+    remaining = [
+        item for item in pending
+        if not _transaction_contains(item[0], previous_transaction)
+    ]
+    if remaining:
+        db.info[_PENDING_FIRST_PUBLISH_EVENTS] = remaining
+    else:
+        db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, None)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _discard_abandoned_first_publish_events(
+    db: Session,
+    transaction: SessionTransaction,
+) -> None:
+    if transaction.parent is None and not db.in_transaction():
+        db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, None)
+
+
+def _emit_first_publish_candidate_after_commit(
+    db: Session,
+    *,
+    job_id: int,
+    audit_status: str,
+    source_msg_id: str | None,
+    owner_userid: str,
+) -> None:
+    transaction = db.get_nested_transaction() or db.get_transaction()
+    if transaction is None:
+        raise RuntimeError("first_publish_event_requires_transaction")
+    db.info.setdefault(_PENDING_FIRST_PUBLISH_EVENTS, []).append((
+        transaction,
+        {
+            "job_id": job_id,
+            "candidate_kind": "first_publish",
+            "audit_status": audit_status,
+            "source_message_id": source_msg_id or "",
+            "user_hash": identifier_hash(owner_userid),
+        },
+    ))
 
 # 必填字段的中文展示名（用于生成追问文案）
 _FIELD_DISPLAY_NAMES = {
@@ -294,6 +369,19 @@ def process_upload(
     audit_service.write_audit_log_for_result(
         entity_type, entity.id, audit_result, db,
     )
+    if (
+        entity_type == "job"
+        and session.pending_upload_mode != "replace"
+        and entity.audit_status in {"pending", "rejected"}
+        and entity.activated_at is None
+    ):
+        _emit_first_publish_candidate_after_commit(
+            db,
+            job_id=entity.id,
+            audit_status=entity.audit_status,
+            source_msg_id=source_msg_id,
+            owner_userid=user_ctx.external_userid,
+        )
 
     # Stage A：入库成功后清 pending（含 follow_up_rounds 重置）
     clear_pending_upload(session)

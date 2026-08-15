@@ -1,4 +1,5 @@
 """upload_service 单元测试。"""
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -184,6 +185,11 @@ class TestProcessUpload:
         from app.services.audit_service import AuditResult
 
         monkeypatch.setattr(settings, "job_replacement_enabled", True)
+        emit_candidate = MagicMock()
+        monkeypatch.setattr(
+            "app.services.upload_service._emit_first_publish_candidate_after_commit",
+            emit_candidate,
+        )
         mock_audit.audit_content_only.return_value = AuditResult(
             status="pending", reason="manual review", matched_words=[],
         )
@@ -221,6 +227,13 @@ class TestProcessUpload:
         assert created_job.activated_at is None
         assert created_job.expires_at is None
         assert created_job.candidate_expires_at is not None
+        emit_candidate.assert_called_once_with(
+            db,
+            job_id=created_job.id,
+            audit_status="pending",
+            source_msg_id=None,
+            owner_userid="u1",
+        )
 
     @patch("app.services.upload_service.audit_service")
     @patch("app.services.upload_service.conversation_service")
@@ -230,6 +243,11 @@ class TestProcessUpload:
         from app.services.audit_service import AuditResult
 
         monkeypatch.setattr(settings, "job_replacement_enabled", False)
+        emit_candidate = MagicMock()
+        monkeypatch.setattr(
+            "app.services.upload_service._emit_first_publish_candidate_after_commit",
+            emit_candidate,
+        )
         mock_audit.audit_content_only.return_value = AuditResult(
             status="passed", reason="", matched_words=[],
         )
@@ -267,6 +285,66 @@ class TestProcessUpload:
         assert created_job.activated_at is not None
         assert created_job.expires_at is not None
         assert created_job.candidate_expires_at is None
+        emit_candidate.assert_not_called()
+
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_replacement_candidate_does_not_emit_first_publish_event(
+        self, mock_conv, mock_audit, monkeypatch,
+    ):
+        from app.services.audit_service import AuditResult
+        from app.services import job_replace_service
+
+        monkeypatch.setattr(settings, "job_replacement_enabled", True)
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="pending", reason="manual review", matched_words=[],
+        )
+        candidate = SimpleNamespace(
+            id=91, audit_status="pending", activated_at=None,
+        )
+        monkeypatch.setattr(
+            job_replace_service,
+            "create_replacement_candidate",
+            lambda *_args, **_kwargs: (SimpleNamespace(id=90), candidate),
+        )
+        emit_candidate = MagicMock()
+        monkeypatch.setattr(
+            "app.services.upload_service._emit_first_publish_candidate_after_commit",
+            emit_candidate,
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+        session = _make_session(
+            pending_upload_mode="replace",
+            pending_target_id=42,
+            pending_target_version=7,
+            pending_operation_id="replacement-operation",
+        )
+
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市",
+                    "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "月薪",
+                    "headcount": 30,
+                },
+                confidence=0.95,
+            ),
+            "更新岗位",
+            [],
+            session,
+            db,
+            source_msg_id="replacement-message",
+        )
+
+        assert result.success is True
+        emit_candidate.assert_not_called()
 
     @patch("app.services.upload_service.conversation_service")
     def test_missing_fields_followup(self, mock_conv):
