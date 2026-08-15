@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from app import db as app_db
 from app.config import settings
 from app.llm.base import DialogueParseResult, IntentResult
 from app.schemas.conversation import SessionState
@@ -30,6 +31,28 @@ from tests.fixtures.dialogue_golden import (
     worker_xian_to_beijing_replace_v2,
 )
 from tests.fixtures.dialogue_golden.runner import run_dialogue_case
+
+
+def _isolate_synthetic_ontologies(monkeypatch) -> None:
+    category_mapping = {
+        name: name for name in intent_service._JOB_CATEGORY_CANONICAL
+    }
+    category_mapping.update(intent_service._JOB_CATEGORY_SYNONYMS)
+    monkeypatch.setattr(
+        intent_service,
+        "_CITY_LOOKUP_CACHE",
+        dict(intent_service._COMMON_CITY_ALIASES),
+    )
+    monkeypatch.setattr(
+        intent_service,
+        "_JOB_CATEGORY_ONTOLOGY_CACHE",
+        (category_mapping, intent_service._JOB_CATEGORY_CANONICAL),
+    )
+
+    def reject_shared_dictionary_access():
+        raise AssertionError("synthetic rollout must not query shared dictionaries")
+
+    monkeypatch.setattr(app_db, "SessionLocal", reject_shared_dictionary_access)
 
 
 def _shadow_sample(
@@ -571,17 +594,11 @@ def _aggregate_rollout_metrics(results: list[dict]) -> dict:
     }
 
 
-def test_phase2_shadow_synthetic_weekly_report():
+def test_phase2_shadow_synthetic_weekly_report(monkeypatch):
     """开发期替代 shadow 一周报表：至少 5% 采样，且能产出日级 diff 摘要。"""
-    original_city_cache = intent_service._CITY_LOOKUP_CACHE
-    try:
-        # 开发期 synthetic 测试不依赖真实 MySQL 字典；直接用内置常见城市映射，
-        # 避免每条样本都因 DB 不可达而重试、拖慢 shadow 周报测试。
-        intent_service._CITY_LOOKUP_CACHE = dict(intent_service._COMMON_CITY_ALIASES)
-        week = _build_shadow_synthetic_week()
-        summaries = [_summarize_shadow_day(day) for day in week]
-    finally:
-        intent_service._CITY_LOOKUP_CACHE = original_city_cache
+    _isolate_synthetic_ontologies(monkeypatch)
+    week = _build_shadow_synthetic_week()
+    summaries = [_summarize_shadow_day(day) for day in week]
 
     assert len(summaries) == 7
     required_keys = {
@@ -613,7 +630,7 @@ def test_phase2_shadow_synthetic_weekly_report():
     }.issubset(anomaly_ids)
 
 
-def test_phase2_dual_read_synthetic_rollout():
+def test_phase2_dual_read_synthetic_rollout(monkeypatch):
     """开发期替代 dual-read 3 天灰度：5 个白名单 + 1% hash 桶 + 指标不回退。"""
     whitelist_users = [f"internal-u{i}" for i in range(1, 6)]
     original_whitelist = settings.dialogue_v2_userid_whitelist
@@ -634,25 +651,21 @@ def test_phase2_dual_read_synthetic_rollout():
 
     legacy_results: list[dict] = []
     dual_results: list[dict] = []
-    original_city_cache = intent_service._CITY_LOOKUP_CACHE
-    try:
-        intent_service._CITY_LOOKUP_CACHE = dict(intent_service._COMMON_CITY_ALIASES)
-        for day in _build_dual_read_rollout_days():
-            for idx, case in enumerate(day["cases"]):
-                legacy_case = _clone_case(
-                    case,
-                    case_id=f"{day['day']}-{idx}-{case['id']}-legacy",
-                    mode="off",
-                )
-                dual_case = _clone_case(
-                    case,
-                    case_id=f"{day['day']}-{idx}-{case['id']}-dual",
-                    mode="dual_read",
-                )
-                legacy_results.append(run_dialogue_case(legacy_case))
-                dual_results.append(run_dialogue_case(dual_case))
-    finally:
-        intent_service._CITY_LOOKUP_CACHE = original_city_cache
+    _isolate_synthetic_ontologies(monkeypatch)
+    for day in _build_dual_read_rollout_days():
+        for idx, case in enumerate(day["cases"]):
+            legacy_case = _clone_case(
+                case,
+                case_id=f"{day['day']}-{idx}-{case['id']}-legacy",
+                mode="off",
+            )
+            dual_case = _clone_case(
+                case,
+                case_id=f"{day['day']}-{idx}-{case['id']}-dual",
+                mode="dual_read",
+            )
+            legacy_results.append(run_dialogue_case(legacy_case))
+            dual_results.append(run_dialogue_case(dual_case))
 
     legacy_metrics = _aggregate_rollout_metrics(legacy_results)
     dual_metrics = _aggregate_rollout_metrics(dual_results)
