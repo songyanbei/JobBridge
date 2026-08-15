@@ -890,6 +890,20 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
     if field == "contract_type":
         return _normalize_job_enum(value, _CONTRACT_TYPE_ALIASES)
 
+    max_lengths = {
+        "hiring_company": 128,
+        "address": 255,
+        "contact_person": 64,
+        "phone": 32,
+    }
+    if field in max_lengths:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized or len(normalized) > max_lengths[field]:
+            return None
+        return normalized
+
     return value
 
 

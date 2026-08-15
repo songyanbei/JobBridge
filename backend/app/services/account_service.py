@@ -127,8 +127,10 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
     # - 厂家默认 can_search_workers=1 / can_search_jobs=0（只能检索工人）
     # - 中介默认双向（两个开关默认 True，可由 payload 覆盖）
     if role == "factory":
+        if payload.get("can_search_jobs"):
+            raise BusinessException(40101, "厂家账号不能开通岗位搜索权限")
         can_search_workers = True if payload.get("can_search_workers") is None else bool(payload.get("can_search_workers"))
-        can_search_jobs = bool(payload.get("can_search_jobs"))
+        can_search_jobs = False
     else:  # broker
         can_search_workers = True if payload.get("can_search_workers") is None else bool(payload.get("can_search_workers"))
         can_search_jobs = True if payload.get("can_search_jobs") is None else bool(payload.get("can_search_jobs"))
@@ -138,6 +140,7 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
         role=role,
         display_name=payload.get("display_name"),
         company=payload.get("company"),
+        address=payload.get("address"),
         contact_person=payload.get("contact_person"),
         phone=payload.get("phone"),
         can_search_jobs=1 if can_search_jobs else 0,
@@ -156,7 +159,14 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
         target_type="user", target_id=external,
         action="reinstate", operator=operator,
         before=None,
-        after={"role": role, "display_name": user.display_name, "company": user.company},
+        after={
+            "role": role,
+            "display_name": user.display_name,
+            "company": user.company,
+            "address": user.address,
+            "contact_person": user.contact_person,
+            "phone": user.phone,
+        },
         reason="pre_register",
     )
     return user
@@ -164,9 +174,12 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
 
 def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
     user = get_user(db, userid)
+    if user.role == "factory" and payload.get("can_search_jobs"):
+        raise BusinessException(40101, "厂家账号不能开通岗位搜索权限")
     before = {
         "display_name": user.display_name,
         "company": user.company,
+        "address": getattr(user, "address", None),
         "contact_person": user.contact_person,
         "phone": user.phone,
         "can_search_jobs": bool(user.can_search_jobs),
@@ -179,10 +192,13 @@ def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
         # MySQL 不允许直接改主键；一期简化：拒绝改动 external_userid
         raise BusinessException(40101, "external_userid 不可修改（如需变更请联系运维）")
 
-    for k in ("display_name", "company", "contact_person", "phone"):
+    for k in ("display_name", "company", "address", "contact_person", "phone"):
         if k in payload and payload[k] is not None:
             setattr(user, k, payload[k])
-    if "can_search_jobs" in payload and payload["can_search_jobs"] is not None:
+    if user.role == "factory":
+        # Also repairs legacy rows that were manually set to true.
+        user.can_search_jobs = 0
+    elif "can_search_jobs" in payload and payload["can_search_jobs"] is not None:
         user.can_search_jobs = 1 if payload["can_search_jobs"] else 0
     if "can_search_workers" in payload and payload["can_search_workers"] is not None:
         user.can_search_workers = 1 if payload["can_search_workers"] else 0
@@ -190,6 +206,7 @@ def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
     after = {
         "display_name": user.display_name,
         "company": user.company,
+        "address": getattr(user, "address", None),
         "contact_person": user.contact_person,
         "phone": user.phone,
         "can_search_jobs": bool(user.can_search_jobs),
@@ -211,7 +228,7 @@ def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:
 # ---------------------------------------------------------------------------
 
 _IMPORT_COLUMNS = [
-    "role", "display_name", "company", "contact_person", "phone",
+    "role", "display_name", "company", "address", "contact_person", "phone",
     "can_search_jobs", "can_search_workers", "external_userid",
 ]
 
@@ -279,6 +296,7 @@ def import_excel(
         payload = {
             "display_name": cell_map.get("display_name"),
             "company": cell_map.get("company"),
+            "address": cell_map.get("address"),
             "contact_person": cell_map.get("contact_person"),
             "phone": cell_map.get("phone"),
             "can_search_jobs": _coerce_bool(cell_map.get("can_search_jobs")) if role == "broker" else False,

@@ -112,6 +112,7 @@ JOB_COLUMN_CONTRACT = (
     # name, type, nullable, default, charset, collation, extra, generation
     ("id", "bigint unsigned", "NO", None, None, None, "auto_increment", ""),
     ("owner_userid", "varchar(64)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("hiring_company", "varchar(128)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
     ("city", "varchar(32)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
     ("job_category", "varchar(32)", "NO", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
     ("salary_floor_monthly", "int", "NO", None, None, None, "", ""),
@@ -123,6 +124,8 @@ JOB_COLUMN_CONTRACT = (
     ("is_long_term", "tinyint(1)", "NO", "1", None, None, "", ""),
     ("district", "varchar(32)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
     ("address", "varchar(255)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("contact_person", "varchar(64)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
+    ("phone", "varchar(32)", "YES", None, "utf8mb4", "utf8mb4_0900_ai_ci", "", ""),
     ("salary_ceiling_monthly", "int", "YES", None, None, None, "", ""),
     ("provide_meal", "tinyint(1)", "YES", None, None, None, "", ""),
     ("provide_housing", "tinyint(1)", "YES", None, None, None, "", ""),

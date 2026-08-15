@@ -180,7 +180,7 @@ def export_jobs(
     projections = job_admin_service.replacement_projections(db, rows)
     headers = [
         "id", "owner_userid", "owner_company", "owner_contact_person", "owner_phone",
-        "city", "district", "address", "job_category",
+        "hiring_company", "city", "district", "address", "contact_person", "phone", "job_category",
         "salary_floor_monthly", "salary_ceiling_monthly", "pay_type",
         "headcount", "gender_required", "age_min", "age_max", "is_long_term",
         "audit_status", "audit_reason", "delist_reason", "activated_at",
@@ -195,7 +195,7 @@ def export_jobs(
         body.append([
             r.id, r.owner_userid,
             ow.get("owner_company"), ow.get("owner_contact_person"), ow.get("owner_phone"),
-            r.city, r.district, r.address, r.job_category,
+            r.hiring_company, r.city, r.district, r.address, r.contact_person, r.phone, r.job_category,
             r.salary_floor_monthly, r.salary_ceiling_monthly, r.pay_type,
             r.headcount, r.gender_required, r.age_min, r.age_max, r.is_long_term,
             r.audit_status, r.audit_reason, r.delist_reason, r.activated_at,

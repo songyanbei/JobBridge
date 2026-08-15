@@ -324,6 +324,22 @@ class TestBatchHardDelete:
         assert db.execute.call_count == 1
 
 
+def test_audit_cleanup_retains_active_visibility_policy_anchor(monkeypatch):
+    captured = {}
+
+    def fake_delete(_db, table, where):
+        captured.update(table=table, where=where)
+        return 4
+
+    monkeypatch.setattr(ttl_cleanup, "_batch_hard_delete", fake_delete)
+    assert ttl_cleanup._hard_delete_expired_audit_logs(MagicMock(), 180) == 4
+    assert captured["table"] == "audit_log"
+    assert "visibility.recommendation_fields" in captured["where"]
+    assert "NOT EXISTS" in captured["where"]
+    assert "$.after.revision" in captured["where"]
+    assert "$.after.config_value" in captured["where"]
+
+
 def test_inbound_cleanup_preserves_recovery_and_unsent_outbox(monkeypatch):
     captured = {}
 

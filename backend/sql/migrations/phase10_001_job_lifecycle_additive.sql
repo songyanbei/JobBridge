@@ -18,7 +18,7 @@ CREATE TABLE `job_replacement` (
   `source_msg_id` VARCHAR(128) NOT NULL, `owner_userid` VARCHAR(64) NOT NULL,
   `old_job_id` BIGINT UNSIGNED NOT NULL, `new_job_id` BIGINT UNSIGNED NOT NULL,
   `old_job_version` INT UNSIGNED NOT NULL, `old_expires_at` DATETIME NULL,
-  `old_business_digest` CHAR(64) NOT NULL, `old_business_digest_version` TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  `old_business_digest` CHAR(64) NOT NULL, `old_business_digest_version` TINYINT UNSIGNED NOT NULL DEFAULT 2,
   `review_outcome` ENUM('pending','passed','rejected') NOT NULL,
   `reviewed_at` DATETIME NULL, `reviewed_by` VARCHAR(64) NULL,
   `lifecycle_status` ENUM('awaiting_review','activated','closed','conflict') NOT NULL,
@@ -130,6 +130,12 @@ DELIMITER ;
 
 -- Application lifecycle timestamps are stored as naive UTC even when the
 -- MySQL server/session runs in Asia/Shanghai.
+INSERT INTO `system_config`
+  (`config_key`, `config_value`, `value_type`, `description`)
+VALUES
+  ('ttl.job.candidate.days', '7', 'int', '岗位候选版本保留期（天）')
+ON DUPLICATE KEY UPDATE `config_key` = VALUES(`config_key`);
+
 SET @phase10_migration_time = UTC_TIMESTAMP();
 SET @phase10_candidate_days = COALESCE((
   SELECT CASE

@@ -1,7 +1,8 @@
--- Frozen Job DDL from the immutable Stage A schema deployed before Phase 10.
+-- Frozen Job DDL after visibility expansion and before lifecycle expansion.
 CREATE TABLE `job` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `owner_userid` VARCHAR(64) NOT NULL,
+  `hiring_company` VARCHAR(128) DEFAULT NULL,
   `city` VARCHAR(32) NOT NULL,
   `job_category` VARCHAR(32) NOT NULL,
   `salary_floor_monthly` INT NOT NULL,
@@ -13,6 +14,8 @@ CREATE TABLE `job` (
   `is_long_term` TINYINT(1) NOT NULL DEFAULT 1,
   `district` VARCHAR(32) DEFAULT NULL,
   `address` VARCHAR(255) DEFAULT NULL,
+  `contact_person` VARCHAR(64) DEFAULT NULL,
+  `phone` VARCHAR(32) DEFAULT NULL,
   `salary_ceiling_monthly` INT DEFAULT NULL,
   `provide_meal` TINYINT(1) DEFAULT NULL,
   `provide_housing` TINYINT(1) DEFAULT NULL,

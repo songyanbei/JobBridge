@@ -15,6 +15,7 @@ class UserAdminRead(BaseModel):
     role: Role = Field(..., description="worker / factory / broker")
     display_name: str | None = None
     company: str | None = Field(default=None, description="公司名（厂家/中介）")
+    address: str | None = Field(default=None, description="公司/经营地址（不是岗位工作地址）")
     contact_person: str | None = None
     phone: str | None = None
     can_search_jobs: bool = Field(default=False, description="是否允许检索岗位（中介双向标记）")
@@ -30,6 +31,7 @@ class UserAdminRead(BaseModel):
 class FactoryCreate(BaseModel):
     display_name: str | None = Field(default=None, max_length=64, description="显示名")
     company: str | None = Field(default=None, max_length=128, description="公司名")
+    address: str | None = Field(default=None, max_length=255, description="公司/经营地址")
     contact_person: str | None = Field(default=None, max_length=64, description="联系人")
     phone: str | None = Field(default=None, max_length=32, description="联系电话")
     external_userid: str | None = Field(
@@ -46,6 +48,7 @@ class BrokerCreate(FactoryCreate):
 class FactoryUpdate(BaseModel):
     display_name: str | None = None
     company: str | None = None
+    address: str | None = Field(default=None, max_length=255)
     contact_person: str | None = None
     phone: str | None = None
     external_userid: str | None = Field(

@@ -17,16 +17,17 @@ class TestIntentPrompt:
         assert "{text}" in prompts.INTENT_USER_TEMPLATE
 
     def test_version_tag(self):
-        assert prompts.PROMPT_VERSION == "v2.9"
-        assert prompts.INTENT_PROMPT_VERSION == "v2.9"
+        assert prompts.PROMPT_VERSION == "v2.10"
+        assert prompts.INTENT_PROMPT_VERSION == "v2.10"
         # PROMPT_VERSION 必须等于 INTENT_PROMPT_VERSION（一次 prompt 修订一组版本号）
         assert prompts.PROMPT_VERSION == prompts.INTENT_PROMPT_VERSION
-        assert prompts.PROMPT_DATE == "2026-08-14"
+        assert prompts.PROMPT_DATE == "2026-08-15"
 
     def test_full_job_update_fields_are_explicitly_described(self):
         prompt = prompts.INTENT_SYSTEM_PROMPT
         for field_name in (
             "address", "accept_couple", "employment_type", "contract_type",
+            "hiring_company", "contact_person", "phone",
         ):
             assert field_name in prompt
 
@@ -80,7 +81,7 @@ class TestDialoguePrompt:
         assert "宁波找技工工作" in prompt
         assert "给这位师傅找个杭州焊工岗位" in prompt
         assert "找两个能上夜班的操作工" in prompt
-        assert prompts.DIALOGUE_PROMPT_VERSION == "v0.7"
+        assert prompts.DIALOGUE_PROMPT_VERSION == "v0.8"
         for field_name in (
             "address", "accept_couple", "employment_type", "contract_type",
         ):

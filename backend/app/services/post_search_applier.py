@@ -232,6 +232,21 @@ def _handle_auto_relax_and_retry(
         )
         return [_reply(ctx.msg.from_user, ctx.search_result.reply_text)]
 
+    from app.services.search_permission import (
+        check_search_permission,
+        denied_search_response,
+    )
+
+    permission_decision = check_search_permission(
+        ctx.user_ctx,
+        ctx.search_outcome.direction,
+        entrypoint="post_search_applier.auto_relaxation",
+        request_id=ctx.msg.msg_id,
+    )
+    if not permission_decision.allowed:
+        denied_result, _ = denied_search_response(permission_decision)
+        return [_reply(ctx.msg.from_user, denied_result.reply_text)]
+
     new_result, new_outcome = execute_relaxed_search(
         ctx.search_outcome.criteria_used,
         step,

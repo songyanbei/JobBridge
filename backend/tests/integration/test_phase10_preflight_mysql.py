@@ -25,9 +25,10 @@ UP_SQL = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_t
 BASE_SCHEMA_SQL = """
 CREATE TABLE system_config (
   config_key VARCHAR(64) PRIMARY KEY,
-  config_value TEXT NOT NULL
+  config_value TEXT NOT NULL,
+  value_type ENUM('string','int','bool','json') NOT NULL DEFAULT 'string',
+  description VARCHAR(255) NULL
 );
-INSERT INTO system_config VALUES ('ttl.job.candidate.days','7');
 CREATE TABLE job (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   audit_status ENUM('pending','passed','rejected') NOT NULL,
@@ -126,6 +127,11 @@ def test_additive_migration_uses_utc_for_candidate_deadlines():
         _execute_script(db, UP_SQL)
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT config_value, value_type FROM system_config "
+                "WHERE config_key='ttl.job.candidate.days'"
+            )
+            assert cursor.fetchone() == ("7", "int")
             cursor.execute("SELECT UTC_TIMESTAMP()")
             utc_after = cursor.fetchone()[0]
             cursor.execute(
@@ -141,6 +147,38 @@ def test_additive_migration_uses_utc_for_candidate_deadlines():
         assert [row[0] for row in candidate_deadlines] == ["pending", "rejected"]
         for _, candidate_deadline in candidate_deadlines:
             assert expected_before <= candidate_deadline <= expected_after
+    finally:
+        if db is not None:
+            db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
+
+
+def test_additive_migration_preserves_existing_candidate_ttl():
+    database = f"phase10_candidate_ttl_{uuid4().hex[:16]}"
+    admin = _connect()
+    db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO system_config "
+                "(config_key, config_value, value_type, description) "
+                "VALUES ('ttl.job.candidate.days', '21', 'int', 'custom value')"
+            )
+
+        _execute_script(db, UP_SQL)
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT config_value, value_type, description FROM system_config "
+                "WHERE config_key='ttl.job.candidate.days'"
+            )
+            assert cursor.fetchone() == ("21", "int", "custom value")
     finally:
         if db is not None:
             db.close()

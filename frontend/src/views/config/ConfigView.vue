@@ -8,6 +8,45 @@
     </div>
 
     <div v-loading="loading" class="config-container">
+      <el-card v-if="policy" class="visibility-card" shadow="never">
+        <template #header>
+          <div class="visibility-header">
+            <span>推荐可见字段（revision {{ policy.revision }}）</span>
+            <div>
+              <el-button size="small" @click="loadPolicy">刷新策略</el-button>
+              <el-button size="small" type="primary" :loading="policySaving" @click="savePolicy">保存策略</el-button>
+            </div>
+          </div>
+        </template>
+        <el-alert title="字段权限由后端注册表和安全上限校验；电话、联系人、地址属于高敏字段。" type="info" :closable="false" />
+        <el-table :data="policyRows" border size="small" style="margin-top: 12px">
+          <el-table-column prop="scene" label="场景" width="150" />
+          <el-table-column prop="role" label="角色" width="100" />
+          <el-table-column label="字段">
+            <template #default="{ row }">
+              <el-checkbox-group v-model="row.fields">
+                <el-checkbox
+                  v-for="field in row.options"
+                  :key="field.key"
+                  :label="field.key"
+                  :disabled="row.fixed"
+                >
+                  {{ field.label }}<el-tag v-if="field.sensitive" type="warning" size="small">高敏</el-tag>
+                </el-checkbox>
+              </el-checkbox-group>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-checkbox v-model="confirmSensitive" style="margin-top: 12px">我确认本次新增高敏字段会立即影响推荐展示</el-checkbox>
+        <div class="history-row">
+          <span>历史版本（审计保留 {{ policy.audit_retention_days }} 天）</span>
+          <el-select v-model="restoreRevision" placeholder="选择版本" size="small" style="width: 180px">
+            <el-option v-for="item in history" :key="item.revision" :label="`revision ${item.revision}（剩余 ${item.remaining_recovery_days} 天）`" :value="item.revision" :disabled="!item.recoverable" />
+          </el-select>
+          <el-button size="small" :disabled="!restoreRevision" @click="viewPolicyHistory">查看详情</el-button>
+          <el-button size="small" :disabled="!restoreRevision" @click="restorePolicy">以此版本恢复</el-button>
+        </div>
+      </el-card>
       <el-collapse v-model="activeGroups">
         <el-collapse-item
           v-for="(items, ns) in grouped"
@@ -96,12 +135,21 @@ import { computed, ref } from 'vue'
 import { ElMessage, ElMessageBox, ElSwitch } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import JsonEditor from '@/components/JsonEditor.vue'
-import { fetchConfig, updateConfig } from '@/api/config'
+import {
+  fetchConfig, updateConfig, fetchVisibilityPolicy, saveVisibilityPolicy,
+  fetchVisibilityPolicyHistory, fetchVisibilityPolicyHistoryDetail, restoreVisibilityPolicy,
+} from '@/api/config'
 import { DANGEROUS_CONFIG_KEYS } from '@/utils/constants'
 
 const loading = ref(false)
 const groups = ref({})
 const activeGroups = ref([])
+const policy = ref(null)
+const policyRows = ref([])
+const history = ref([])
+const restoreRevision = ref(null)
+const confirmSensitive = ref(false)
+const policySaving = ref(false)
 
 const grouped = computed(() => groups.value)
 
@@ -163,9 +211,76 @@ async function load() {
     }
     groups.value = next
     if (!activeGroups.value.length) activeGroups.value = Object.keys(next)
+    await loadPolicy()
   } finally {
     loading.value = false
   }
+}
+
+async function loadPolicy() {
+  const [current, revisions] = await Promise.all([
+    fetchVisibilityPolicy(), fetchVisibilityPolicyHistory(),
+  ])
+  policy.value = current
+  history.value = revisions || []
+  policyRows.value = []
+  for (const [scene, roles] of Object.entries(current.matrix || {})) {
+    if (scene === 'schema_version' || scene === 'revision') continue
+    for (const [role, fields] of Object.entries(roles || {})) {
+      policyRows.value.push({
+        scene, role, fields: [...fields], options: current.fields?.[scene]?.[role] || [],
+        fixed: scene === 'job_search' && role === 'worker',
+      })
+    }
+  }
+}
+
+function policyPayload() {
+  const next = {}
+  for (const row of policyRows.value) {
+    next[row.scene] ||= {}
+    next[row.scene][row.role] = [...row.fields]
+  }
+  return next
+}
+
+async function viewPolicyHistory() {
+  if (!restoreRevision.value) return
+  const detail = await fetchVisibilityPolicyHistoryDetail(restoreRevision.value)
+  await ElMessageBox.alert(
+    JSON.stringify(detail.config_value, null, 2),
+    `revision ${detail.revision} · 剩余 ${detail.remaining_recovery_days} 天`,
+    { confirmButtonText: '关闭' },
+  )
+}
+
+async function savePolicy() {
+  policySaving.value = true
+  try {
+    const result = await saveVisibilityPolicy({
+      policy: policyPayload(), expected_revision: policy.value.revision,
+      confirm_sensitive_expansion: confirmSensitive.value,
+    })
+    ElMessage.success('推荐字段策略保存成功')
+    confirmSensitive.value = false
+    policy.value = { ...policy.value, ...result, matrix: result.matrix }
+    await loadPolicy()
+  } finally {
+    policySaving.value = false
+  }
+}
+
+async function restorePolicy() {
+  if (!restoreRevision.value) return
+  await ElMessageBox.confirm(`确认恢复 revision ${restoreRevision.value}？`, '恢复策略', { type: 'warning' })
+  await restoreVisibilityPolicy(restoreRevision.value, {
+    expected_revision: policy.value.revision,
+    confirm_sensitive_expansion: confirmSensitive.value,
+  })
+  ElMessage.success('策略已恢复')
+  restoreRevision.value = null
+  confirmSensitive.value = false
+  await loadPolicy()
 }
 
 function onReset(row) {
@@ -223,5 +338,23 @@ load()
   color: var(--el-text-color-secondary);
   font-size: 12px;
   line-height: 18px;
+}
+.visibility-card {
+  margin-bottom: 18px;
+}
+.visibility-header,
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+.history-row {
+  justify-content: flex-start;
+  margin-top: 16px;
+  color: var(--el-text-color-secondary);
+}
+.el-checkbox {
+  margin-right: 12px;
 }
 </style>

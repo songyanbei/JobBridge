@@ -9,7 +9,7 @@ from typing import Any
 
 from app.services.storage_reference_service import normalize_storage_reference
 
-DIGEST_VERSION = 1
+DIGEST_VERSION = 2
 DIGEST_FIELDS_V1 = (
     "owner_userid", "city", "job_category", "job_sub_category",
     "salary_floor_monthly", "salary_ceiling_monthly", "pay_type",
@@ -21,6 +21,14 @@ DIGEST_FIELDS_V1 = (
     "employment_type", "contract_type", "min_duration", "raw_text",
     "description", "images", "miniprogram_url", "extra",
 )
+DIGEST_FIELDS_V2 = DIGEST_FIELDS_V1 + (
+    "hiring_company", "contact_person", "phone",
+)
+
+_DIGEST_FIELDS_BY_VERSION = {
+    1: DIGEST_FIELDS_V1,
+    2: DIGEST_FIELDS_V2,
+}
 
 
 def _text(value: str) -> str:
@@ -55,11 +63,12 @@ def _canonical(value: Any, *, field: str | None = None) -> Any:
 
 
 def canonical_business_bytes(job: Any, *, digest_version: int = DIGEST_VERSION) -> bytes:
-    if digest_version != 1:
+    fields = _DIGEST_FIELDS_BY_VERSION.get(digest_version)
+    if fields is None:
         raise ValueError(f"unsupported digest version: {digest_version}")
     body = {
         field: _canonical(getattr(job, field, None), field=field)
-        for field in DIGEST_FIELDS_V1
+        for field in fields
     }
     return json.dumps(
         body,

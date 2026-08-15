@@ -129,6 +129,32 @@ def _create(db, old, status="pending", operation_id="op-1", source_msg_id="msg-1
     )
 
 
+def test_replacement_candidate_preserves_job_visibility_fields(db):
+    old = _job(db)
+    _, candidate = create_replacement_candidate(
+        db,
+        owner_userid="owner-1",
+        target_job_id=old.id,
+        expected_version=old.version,
+        operation_id="op-visibility-fields",
+        source_msg_id="msg-visibility-fields",
+        complete_data=_complete_data(
+            hiring_company="华星电子",
+            address="木渎镇金山路88号",
+            contact_person="张经理",
+            phone="13800138000",
+        ),
+        raw_text="完整的新岗位",
+        media_ids=[],
+        audit_result=_audit("pending"),
+    )
+
+    assert candidate.hiring_company == "华星电子"
+    assert candidate.address == "木渎镇金山路88号"
+    assert candidate.contact_person == "张经理"
+    assert candidate.phone == "13800138000"
+
+
 def test_update_command_selects_only_job_and_starts_empty_draft(db, monkeypatch):
     from app.config import settings
 

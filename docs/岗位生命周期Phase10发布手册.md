@@ -4,7 +4,7 @@
 
 ## 1. 旧 schema 兼容版本验证
 
-Phase 10 必须先独立部署旧 schema 兼容制品，再进入停服迁移。该制品固定为 commit `499eb929b75ad2f208d306b62157d8ded0119f33`（`feat(job): support nullable expiry reads`），只包含 nullable expiry 读取兼容，不读取任何 Phase 10 新表或新列。禁止用最终 schema-aware 制品替代本阶段制品，也禁止在本阶段冒烟通过前执行任何 Phase 10 迁移。
+Phase 10 必须先独立部署旧 schema 兼容制品，再进入停服迁移。该制品固定为 commit `499eb929b75ad2f208d306b62157d8ded0119f33`（`feat(job): support nullable expiry reads`），只包含 nullable expiry 读取兼容，不读取生命周期新表或新列，也不会读取随后加入的岗位可见性字段。禁止用最终 schema-aware 制品替代本阶段制品，也禁止在本阶段冒烟通过前执行任何 Phase 10 迁移。
 
 1. 记录旧 schema 兼容制品、最终制品和回滚制品的 commit 及镜像 digest。验证兼容 commit 是最终 commit 的祖先，并从干净的 detached worktree 构建兼容制品：
 
@@ -22,7 +22,7 @@ Phase 10 必须先独立部署旧 schema 兼容制品，再进入停服迁移。
    test -z "$(git -C "$PHASE10_STAGE_A_ROOT" status --porcelain)"
    ```
 
-2. 在旧 schema 的隔离预发布 MySQL 上运行自动化冒烟。Python 环境必须从 Stage A 的 `backend/requirements.txt` 创建；以下隔离参数防止最终源码的 `conftest.py` 或 `app` 污染 Stage A 导入。测试会验证实际导入路径、旧 schema 不含 Phase 10 新列，并覆盖岗位列表分页、详情、CSV、审核队列和审核详情：
+2. 在隔离预发布 MySQL 上运行自动化冒烟。测试分别覆盖纯旧 schema，以及只执行岗位可见性 001/002、尚未执行生命周期迁移的 48 列 Job schema。Python 环境必须从 Stage A 的 `backend/requirements.txt` 创建；以下隔离参数防止最终源码的 `conftest.py` 或 `app` 污染 Stage A 导入。测试会验证实际导入路径、两种结构均不含生命周期新列，并覆盖岗位列表分页、详情、CSV、审核队列和审核详情：
 
    ```bash
    cd "$PHASE10_STAGE_A_ROOT/backend"
@@ -58,14 +58,19 @@ PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --data
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
 ```
 
-核验输出与变更单中的目标完全一致后，按固定顺序执行。任一命令失败立即停止，不得跳过后继续；每一步输出均归档为发布证据：
+核验输出与变更单中的目标完全一致后，按固定顺序执行。两组迁移文件共享 Phase 10 编号但不是替代关系，禁止使用 `phase10_*.sql` glob；必须先完成岗位可见性 001/002，再执行生命周期 001–004。任一命令失败立即停止，不得跳过后继续；每一步输出均归档为发布证据：
 
 ```bash
 set -euo pipefail
 test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
 PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
+"${PHASE10_MYSQL[@]}" < sql/migrations/phase10_001_job_visibility_fields.sql | tee phase10-visibility-001-output.txt
+"${PHASE10_MYSQL[@]}" < sql/migrations/phase10_002_ensure_visibility_config.sql | tee phase10-visibility-002-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_001_job_lifecycle_additive.sql | tee phase10-001-output.txt
+PHASE10_CANDIDATE_TTL="$("${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT config_value FROM system_config WHERE config_key='ttl.job.candidate.days' AND config_value REGEXP '^[0-9]+$' AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 365")"
+test -n "$PHASE10_CANDIDATE_TTL"
+printf '%s\n' "$PHASE10_CANDIDATE_TTL" | tee phase10-candidate-ttl.txt
 PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version, source_updated_at))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, expected_updated_at, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-001-backup-evidence.tsv
 # 归档 backup rows/checksum/expected-live checksum；同时归档 001 最后一行的
@@ -76,6 +81,8 @@ PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_003_session_commit_deadline.sql | tee phase10-003-output.txt
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_004_session_commit_lease_owner.sql | tee phase10-004-output.txt
 ```
+
+生命周期 001 会在配置缺失时写入 `ttl.job.candidate.days=7`，已有值保持不变；上面的独立查询必须确认最终值是 `1..365` 的整数并归档。配置缺失、越界或格式错误时停止发布。
 
 003、004 必须在所有旧 Worker 停止后执行。迁移后不得启动旧版本进程。
 
@@ -108,7 +115,7 @@ python -m scripts.phase10_preflight
 
 ## 6. 最终版本部署
 
-1. 迁移和全部回填门禁通过后，构建一次最终 schema-aware 制品；API、消息 Worker 和 scheduler 必须使用同一镜像 digest。最终制品只能在 Phase 10 schema 上启动，Stage A 不得在迁移后重新启动。
+1. 迁移和全部回填门禁通过后，构建一次最终 schema-aware 制品；API、消息 Worker 和 scheduler 必须使用同一镜像 digest。最终制品只能在完整 Phase 10 schema 上启动，Stage A 不得在迁移后重新启动。接入流量前 `/ready` 必须确认可见性策略及其 bootstrap 审计锚点完整。
 2. 保持四个岗位生命周期开关为 `false`，同时启动新版本 API、消息 Worker、scheduler 和 session recovery Worker；不得让旧版本回流。此时 `JOB_REPLACEMENT_ENABLED=false` 同时禁止 replacement 和首次发布流程持久化 pending/rejected 候选，auto-pass 首次发布仍可直接激活，不得出现 `expires_at IS NULL AND candidate_expires_at IS NOT NULL` 的新增 Job。
 3. 检查 `/health`、消息 Worker/scheduler/session recovery Worker heartbeat、各进程版本和镜像 digest、Redis durability policy、推荐正文活动密钥版本及数据库连接；四类进程必须与已记录的同一制品和同一配置版本一致，只核对密钥版本和可解析状态，不输出密钥材料。
 4. 执行一轮不创建 replacement 的基础消息、后台查询和推荐发送 smoke test。
@@ -190,6 +197,6 @@ python -m scripts.phase10_preflight
 
    `backup_job_id_key_contract_mismatch`、`backup_duplicate_job_id_rows` 和 `restored_job_backup_row_count_mismatch` 也必须全部为 `0`；备份表必须保留唯一且可见的 `PRIMARY(job_id)`，不得存在重复 `job_id`，并且总行数必须与 Job 精确一致。
 
-   `down_verify_global_select_privilege_missing`、`old_schema_required_tables_missing`、`phase10_job_columns_remaining`、`phase10_session_columns_remaining`、`old_job_table_contract_mismatch`、`old_inbound_table_contract_mismatch`、`old_inbound_constraints_mismatch`、`old_inbound_referencing_foreign_keys_mismatch`、`old_inbound_triggers_remaining`、`old_inbound_column_contract_mismatch`、`old_inbound_index_contract_mismatch`、`old_job_column_contract_mismatch`、`old_job_index_contract_mismatch`、`old_job_constraints_mismatch`、`old_job_triggers_remaining`、`phase10_tables_remaining`、`phase10_fences_remaining`、`backup_expected_columns_remaining` 和 `restored_job_backup_mismatch` 必须全部为 `0`，`ready=true`。`job` 必须保持完整 Stage A 列、索引、约束、零触发器、InnoDB 和默认字符集/排序规则合同。inbound 门禁会精确核对 Stage A 的 InnoDB 引擎与默认字符集/排序规则、完整字段语义、表约束、零触发器，以及主键、唯一键和 Worker/session 索引列序；全局反向外键扫描同时拒绝其他 schema 中指向 inbound 的外键。未声明的 CHECK、FOREIGN KEY、PRIMARY 或 UNIQUE 约束及任意命名的 inbound trigger 都会阻断；所有声明索引必须可见。额外普通非唯一索引仅允许可直接映射完整物理列的 BTREE，prefix、expression、无物理列或其他索引类型都会阻断。同名空表或残缺表不得视为回滚成功。必需的旧 schema 表为 `job`、`phase10_job_lifecycle_backup` 和 `wecom_inbound_event`，缺少任一表都视为破坏性回滚失败。然后将数据库连接切回不可变 Stage A 制品 `499eb929b75ad2f208d306b62157d8ded0119f33`，确认最终制品全部退出，再执行带鉴权健康检查和旧 schema 只读冒烟：后台岗位列表第 1/2 页、岗位详情、岗位 CSV 导出、审核工作台队列和审核详情。全部通过后归档 down 输出、专用校验 JSON、Stage A commit/镜像 digest 和请求响应证据；任何 5xx、结构错误、数据不一致或进程版本混跑都视为回滚失败。
+   `down_verify_global_select_privilege_missing`、`old_schema_required_tables_missing`、`phase10_job_columns_remaining`、`phase10_session_columns_remaining`、`old_job_table_contract_mismatch`、`old_inbound_table_contract_mismatch`、`old_inbound_constraints_mismatch`、`old_inbound_referencing_foreign_keys_mismatch`、`old_inbound_triggers_remaining`、`old_inbound_column_contract_mismatch`、`old_inbound_index_contract_mismatch`、`old_job_column_contract_mismatch`、`old_job_index_contract_mismatch`、`old_job_constraints_mismatch`、`old_job_triggers_remaining`、`phase10_tables_remaining`、`phase10_fences_remaining`、`backup_expected_columns_remaining` 和 `restored_job_backup_mismatch` 必须全部为 `0`，`ready=true`。生命周期 down 不回退岗位可见性迁移；`job` 必须保持包含 `hiring_company/contact_person/phone` 的 48 列 pre-lifecycle Stage A 合同，以及精确索引、约束、零触发器、InnoDB 和默认字符集/排序规则。inbound 门禁会精确核对 Stage A 的 InnoDB 引擎与默认字符集/排序规则、完整字段语义、表约束、零触发器，以及主键、唯一键和 Worker/session 索引列序；全局反向外键扫描同时拒绝其他 schema 中指向 inbound 的外键。未声明的 CHECK、FOREIGN KEY、PRIMARY 或 UNIQUE 约束及任意命名的 inbound trigger 都会阻断；所有声明索引必须可见。额外普通非唯一索引仅允许可直接映射完整物理列的 BTREE，prefix、expression、无物理列或其他索引类型都会阻断。同名空表或残缺表不得视为回滚成功。必需的旧 schema 表为 `job`、`phase10_job_lifecycle_backup` 和 `wecom_inbound_event`，缺少任一表都视为破坏性回滚失败。然后将数据库连接切回不可变 Stage A 制品 `499eb929b75ad2f208d306b62157d8ded0119f33`，确认最终制品全部退出，再执行带鉴权健康检查和 pre-lifecycle schema 只读冒烟：后台岗位列表第 1/2 页、岗位详情、岗位 CSV 导出、审核工作台队列和审核详情。全部通过后归档 down 输出、专用校验 JSON、Stage A commit/镜像 digest 和请求响应证据；任何 5xx、结构错误、数据不一致或进程版本混跑都视为回滚失败。
 
 回滚不得删除 WIP/发布证据、迁移备份表、AOF 或 cleanup task，也不得用清库方式消除 preflight blocker。

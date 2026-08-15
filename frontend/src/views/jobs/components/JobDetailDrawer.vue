@@ -36,6 +36,18 @@
           <el-input v-if="editing" v-model="form.address" @input="markDirty" placeholder="街道+门牌（区县另填）" />
           <span v-else>{{ detail.address || '--' }}</span>
         </el-descriptions-item>
+        <el-descriptions-item label="招聘工厂" :span="2">
+          <el-input v-if="editing" v-model="form.hiring_company" @input="markDirty" placeholder="实际招聘工厂名" />
+          <span v-else>{{ detail.hiring_company || '--' }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="岗位联系人">
+          <el-input v-if="editing" v-model="form.contact_person" @input="markDirty" />
+          <span v-else>{{ detail.contact_person || '--' }}</span>
+        </el-descriptions-item>
+        <el-descriptions-item label="岗位联系电话">
+          <el-input v-if="editing" v-model="form.phone" @input="markDirty" maxlength="32" />
+          <span v-else>{{ detail.phone || '--' }}</span>
+        </el-descriptions-item>
         <el-descriptions-item label="工种">
           <el-input v-if="editing" v-model="form.job_category" @input="markDirty" />
           <span v-else>{{ detail.job_category }}</span>
@@ -234,6 +246,9 @@ function startEdit() {
     city: detail.value.city,
     district: detail.value.district,
     address: detail.value.address,
+    hiring_company: detail.value.hiring_company,
+    contact_person: detail.value.contact_person,
+    phone: detail.value.phone,
     job_category: detail.value.job_category,
     pay_type: detail.value.pay_type,
     salary_floor_monthly: detail.value.salary_floor_monthly,

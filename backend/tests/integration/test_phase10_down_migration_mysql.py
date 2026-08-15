@@ -41,9 +41,10 @@ STAGE_A_JOB_SQL = (ROOT / "sql/contracts/phase10_stage_a_job.sql").read_text(
 BASE_SCHEMA_SQL = """
 CREATE TABLE system_config (
   config_key VARCHAR(64) PRIMARY KEY,
-  config_value TEXT NOT NULL
+  config_value TEXT NOT NULL,
+  value_type ENUM('string','int','bool','json') NOT NULL DEFAULT 'string',
+  description VARCHAR(255) NULL
 );
-INSERT INTO system_config VALUES ('ttl.job.candidate.days','7');
 CREATE TABLE `user` (
   external_userid VARCHAR(64) NOT NULL PRIMARY KEY
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -316,7 +317,7 @@ def test_down_rejects_post_migration_extension_before_overwrite():
                 "SELECT COUNT(*) FROM information_schema.COLUMNS "
                 "WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job'"
             )
-            assert int(cursor.fetchone()[0]) == 45
+            assert int(cursor.fetchone()[0]) == 48
 
             cursor.execute("ALTER TABLE job DROP COLUMN description")
         report = _collect_down_report(database)

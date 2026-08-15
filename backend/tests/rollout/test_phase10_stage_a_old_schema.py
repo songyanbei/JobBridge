@@ -26,6 +26,14 @@ from app.services import audit_workbench_service
 
 STAGE_A_ROOT = Path(os.environ["PHASE10_STAGE_A_ROOT"]).resolve()
 OLD_SCHEMA_SQL = (STAGE_A_ROOT / "backend/sql/schema.sql").read_text(encoding="utf-8")
+RELEASE_ROOT = Path(__file__).resolve().parents[2]
+VISIBILITY_MIGRATIONS = tuple(
+    (RELEASE_ROOT / "sql/migrations" / name).read_text(encoding="utf-8")
+    for name in (
+        "phase10_001_job_visibility_fields.sql",
+        "phase10_002_ensure_visibility_config.sql",
+    )
+)
 
 
 def _connect(database: str | None = None):
@@ -60,7 +68,12 @@ def _job_filters() -> dict:
     }
 
 
-def test_stage_a_reads_old_schema_without_phase10_columns(monkeypatch):
+@pytest.mark.parametrize(
+    "apply_visibility",
+    [False, True],
+    ids=["base-old-schema", "visibility-expanded-schema"],
+)
+def test_stage_a_reads_pre_lifecycle_schemas(monkeypatch, apply_visibility):
     assert Path(app.__file__).resolve().is_relative_to(STAGE_A_ROOT / "backend")
     database = f"phase10_stage_a_{uuid4().hex[:16]}"
     admin = _connect()
@@ -75,6 +88,11 @@ def test_stage_a_reads_old_schema_without_phase10_columns(monkeypatch):
                 cursor.execute(OLD_SCHEMA_SQL)
                 while cursor.nextset():
                     pass
+                if apply_visibility:
+                    for migration in VISIBILITY_MIGRATIONS:
+                        cursor.execute(migration)
+                        while cursor.nextset():
+                            pass
         finally:
             schema_db.close()
 
@@ -151,6 +169,12 @@ def test_stage_a_reads_old_schema_without_phase10_columns(monkeypatch):
                 "AND COLUMN_NAME IN ('activated_at','candidate_expires_at')"
             )
             assert int(cursor.fetchone()[0]) == 0
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='job' "
+                "AND COLUMN_NAME IN ('hiring_company','contact_person','phone')"
+            )
+            assert int(cursor.fetchone()[0]) == (3 if apply_visibility else 0)
     finally:
         if db is not None:
             db.close()

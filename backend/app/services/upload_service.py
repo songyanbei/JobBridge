@@ -629,6 +629,7 @@ def _create_job(
 
     job = Job(
         owner_userid=user_ctx.external_userid,
+        hiring_company=_extract_scalar(data, "hiring_company", "") or None,
         city=_extract_scalar(data, "city", ""),
         job_category=data.get("job_category", ""),
         salary_floor_monthly=data.get("salary_floor_monthly", 0),
@@ -648,7 +649,9 @@ def _create_job(
         candidate_expires_at=now + timedelta(days=get_job_candidate_ttl_days(db)),
         # 可选软匹配字段
         district=data.get("district"),
-        address=data.get("address"),
+        address=_extract_scalar(data, "address", "") or None,
+        contact_person=_extract_scalar(data, "contact_person", "") or None,
+        phone=_extract_scalar(data, "phone", "") or None,
         salary_ceiling_monthly=data.get("salary_ceiling_monthly"),
         provide_meal=data.get("provide_meal"),
         provide_housing=data.get("provide_housing"),

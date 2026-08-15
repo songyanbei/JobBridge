@@ -49,6 +49,8 @@ def test_additive_migration_contains_rollout_invariants():
     assert "expected_checksum_valid" in sql
     assert "SET @phase10_migration_time = UTC_TIMESTAMP();" in sql
     assert "SET @phase10_migration_time = NOW();" not in sql
+    assert "('ttl.job.candidate.days', '7', 'int'" in sql
+    assert "ON DUPLICATE KEY UPDATE `config_key` = VALUES(`config_key`)" in sql
 
 
 def test_media_dead_letter_schema_and_upgrade_migration_are_complete():
@@ -433,7 +435,7 @@ def test_release_manual_deploys_old_schema_compatibility_before_migration():
     assert release_head < release_clean < ancestor < stage_a_worktree
     assert stage_a_worktree < stage_a_deploy < stage_a_smoke < migration < final_deploy
     assert "禁止用最终 schema-aware 制品替代本阶段制品" in manual
-    assert "最终制品只能在 Phase 10 schema 上启动" in manual
+    assert "最终制品只能在完整 Phase 10 schema 上启动" in manual
 
 
 def test_release_manual_covers_complete_phase10_sequence_and_module_commands():
@@ -442,12 +444,19 @@ def test_release_manual_covers_complete_phase10_sequence_and_module_commands():
     )
 
     for migration in (
+        "phase10_001_job_visibility_fields.sql",
+        "phase10_002_ensure_visibility_config.sql",
         "phase10_001_job_lifecycle_additive.sql",
         "phase10_002_media_dead_letter.sql",
         "phase10_003_session_commit_deadline.sql",
         "phase10_004_session_commit_lease_owner.sql",
     ):
         assert migration in manual
+    visibility_fields = manual.index("phase10_001_job_visibility_fields.sql")
+    visibility_config = manual.index("phase10_002_ensure_visibility_config.sql")
+    lifecycle = manual.index("phase10_001_job_lifecycle_additive.sql")
+    assert visibility_fields < visibility_config < lifecycle
+    assert "禁止使用 `phase10_*.sql` glob" in manual
     for module in (
         "scripts.backfill_media_lifecycle",
         "scripts.backfill_target_cleanup_tasks",
