@@ -19,10 +19,10 @@ from app.llm.base import (
     RerankResult,
 )
 from app.llm.prompts import (
-    DIALOGUE_PARSE_PROMPT_V2,
     DIALOGUE_USER_TEMPLATE,
     INTENT_SYSTEM_PROMPT,
     INTENT_USER_TEMPLATE,
+    get_dialogue_parse_prompt_v2,
 )
 from app.llm.providers._base import (
     build_rerank_payload,
@@ -120,7 +120,7 @@ class DoubaoIntentExtractor(IntentExtractor):
         session_hint: dict | None = None,
     ) -> DialogueParseResult:
         """阶段二：解析为 DialogueParseResult（dialogue-intent-extraction-phased-plan §2）。"""
-        system_prompt = DIALOGUE_PARSE_PROMPT_V2.format(
+        system_prompt = get_dialogue_parse_prompt_v2().format(
             role=role,
             history=format_history(history),
             current_criteria=format_criteria(current_criteria),

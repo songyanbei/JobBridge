@@ -304,6 +304,47 @@ def test_job_category_enum_includes_canonical_set():
     assert "其他" in enum
 
 
+def test_job_category_enum_is_loaded_only_when_read(monkeypatch, request):
+    """构建 frame 不读字典，读枚举时仍使用当前运营值。"""
+    from app.services import intent_service
+
+    calls = []
+    monkeypatch.setattr(
+        intent_service,
+        "_get_job_category_canonical_values",
+        lambda: calls.append("loaded") or frozenset({"动态工种"}),
+    )
+    slot_schema._reset_cache_for_tests()
+    request.addfinalizer(slot_schema._reset_cache_for_tests)
+    fd = slot_schema.get_frame("job_search")
+    assert fd is not None
+    assert calls == []
+
+    assert tuple(fd.slots["job_category"].slot_type.enum_values or ()) == ("动态工种",)
+    assert calls == ["loaded"]
+
+    assert tuple(fd.slots["job_category"].slot_type.enum_values or ()) == ("动态工种",)
+    assert calls == ["loaded", "loaded"]
+
+
+def test_prompt_field_spec_reads_category_ontology_once(monkeypatch, request):
+    from app.services import intent_service
+
+    calls = []
+    monkeypatch.setattr(
+        intent_service,
+        "_get_job_category_canonical_values",
+        lambda: calls.append("loaded") or frozenset({"动态工种"}),
+    )
+    slot_schema._reset_cache_for_tests()
+    request.addfinalizer(slot_schema._reset_cache_for_tests)
+
+    spec = slot_schema.render_prompt_field_spec()
+
+    assert "动态工种" in spec
+    assert calls == ["loaded"]
+
+
 # ---------------------------------------------------------------------------
 # filter_mode / job_title 占位
 # ---------------------------------------------------------------------------

@@ -11,6 +11,10 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from app import db as app_db
 from app.config import settings
@@ -31,6 +35,36 @@ from tests.fixtures.dialogue_golden import (
     worker_xian_to_beijing_replace_v2,
 )
 from tests.fixtures.dialogue_golden.runner import run_dialogue_case
+
+
+def test_synthetic_rollout_import_does_not_access_shared_dictionaries():
+    """全新进程的模块导入不得读取真实城市/工种字典。"""
+    backend_dir = Path(__file__).resolve().parents[2]
+    script = """
+from app import db as app_db
+
+calls = []
+def reject_shared_dictionary_access():
+    calls.append("SessionLocal")
+    raise AssertionError("import must not query shared dictionaries")
+
+app_db.SessionLocal = reject_shared_dictionary_access
+import app.services.intent_service  # noqa: F401
+import tests.unit.test_dialogue_phase2_dev_rollout  # noqa: F401
+assert calls == [], calls
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(backend_dir)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=backend_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _isolate_synthetic_ontologies(monkeypatch) -> None:

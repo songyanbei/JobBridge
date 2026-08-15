@@ -444,25 +444,25 @@ def _render_dialogue_parse_prompt_v2() -> str:
     )
 
 
-# 阶段三：DIALOGUE_PARSE_PROMPT_V2 走模块级 __getattr__ 懒加载，避免与
+# 阶段三：保留模块级 __getattr__ 兼容旧调用方，避免与
 # slot_schema → intent_service → prompts 形成 import-time 循环依赖。
-# 首次访问时渲染并缓存；providers 在 request 时拿到的字符串与启动期同（schema
-# 注册表本身只构建一次）。
-_DIALOGUE_PARSE_PROMPT_V2_CACHE: str | None = None
+# Provider 每次请求都重新渲染：正常情况下 ontology 已在内存缓存；首次读库
+# 失败时不固化 fallback，下次请求可自动恢复。
+
+
+def get_dialogue_parse_prompt_v2() -> str:
+    return _render_dialogue_parse_prompt_v2()
 
 
 def __getattr__(name: str):  # pragma: no cover - py3.7+ module __getattr__
-    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
     if name == "DIALOGUE_PARSE_PROMPT_V2":
-        if _DIALOGUE_PARSE_PROMPT_V2_CACHE is None:
-            _DIALOGUE_PARSE_PROMPT_V2_CACHE = _render_dialogue_parse_prompt_v2()
-        return _DIALOGUE_PARSE_PROMPT_V2_CACHE
+        return get_dialogue_parse_prompt_v2()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _reset_dialogue_parse_prompt_v2_cache_for_tests() -> None:
-    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
-    _DIALOGUE_PARSE_PROMPT_V2_CACHE = None
+    # 保留调用契约；prompt 已改为请求时渲染，无独立字符串缓存。
+    return None
 
 
 DIALOGUE_USER_TEMPLATE = """\
