@@ -4,9 +4,9 @@
 
 - 分支：`codex/job-expiry-full-update-v05`
 - 修复基线：`060f5fb`
-- 最终代码验证 HEAD：`26d7089`
+- 最终代码验证 HEAD：`1c81739`
 - 验证日期：2026-08-11 至 2026-08-15（Asia/Shanghai）
-- 结果：52 个已知问题均使用独立提交完成修复；`d13ec5e` 的 V-01 至 V-05 全量证据继续有效，之后两项收口修复在最终代码 HEAD `26d7089` 上通过完整单元测试及对应的真实 MySQL/Redis 集成门禁，独立评审未发现未关闭的 P1/P2/P3。Stage A 旧 schema 兼容冒烟是前次最终验收证据；页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
+- 结果：55 个已知问题均使用独立提交完成修复；`d13ec5e` 的 V-01 至 V-05 全量证据继续有效，之后五项收口修复在最终代码 HEAD `1c81739` 上通过完整单元测试及对应的真实 MySQL/Redis 集成门禁，独立评审未发现未关闭的 P1/P2/P3。Stage A 旧 schema 兼容冒烟是前次最终验收证据；页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
 - 边界：未 rebase、未合并 `main`、未推送、未创建 PR；保留的 WIP stash 未恢复或删除。
 
 ## 2. 问题与提交追踪
@@ -65,6 +65,9 @@
 | 50 | G-04 synthetic rollout 导入期依赖真实字典数据库 | `d13ec5e` | V-01、fresh-process 导入与 provider 刷新回归 |
 | 51 | H-01 草稿过期后排队图片可误改旧岗位/简历 | `71529e5` | 完整单测、真实 MySQL/Redis、独立复审 |
 | 52 | H-02 down 校验接受同名残缺 inbound 表 | `26d7089` | rollout 单测、destructive-down 真实 MySQL、独立复审 |
+| 53 | H-03 down inbound 列合同非精确匹配 | `393398a` | rollout 单测、五类真实 MySQL 结构负例、独立复审 |
+| 54 | H-04 down 未校验 inbound 表引擎与默认字符集 | `0c835ab` | MyISAM/latin1 真实 MySQL 负例、独立复审 |
+| 55 | H-05 down inbound 索引合同单向匹配 | `1c81739` | 额外 UNIQUE/INVISIBLE 真实 MySQL 负例、独立复审 |
 
 每项功能提交前均执行定向测试、受影响模块测试、适用的真实服务测试、Python 编译检查、`git diff --check` 和独立只读评审。评审提出的可执行问题均在对应问题内修复并重新通过门禁后提交；没有使用空提交表示测试完成。
 
@@ -170,7 +173,7 @@ RUN_INTEGRATION=1 python -m pytest -p no:cacheprovider -q \
 
 ## 6. V-04 时钟偏差
 
-最终代码 HEAD 采样：
+`d13ec5e` 全量验收时采样：
 
 ```json
 {"sampling_window_seconds": 0.024636, "clock_skew_seconds": 0.024198, "max_clock_skew_seconds": 2.0, "ready": true}
@@ -276,16 +279,18 @@ PYTHONPATH=. /tmp/jobbridge-phase10-venv/bin/python -m pytest --rootdir=. \
 
 ## 9. 页面联调历史补充证据
 
-以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `26d7089` 的页面重跑证据：
+以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `1c81739` 的页面重跑证据：
 
 - 学历规范化：LLM 产生“高中及以上”“初中以上学历”等表达时，严格 MySQL 持久化为合法枚举值，不再截断或写入失败。
 - 全量更新：招聘者通过 `/更新岗位 124` 提交完整岗位文本，新岗位 `161` 自动审核激活，旧岗位 `124` 以 `delist_reason=replaced` 软删除；地址、夫妻工、学历、用工类型和合同类型均完整保留。
 - 推荐可见性：求职者搜索后推荐上下文只包含新岗位 `161`，不包含旧岗位 `124`，投递状态为 `sent`。
 - 正文密钥：单密钥、密钥环、缺失密钥、活动版本不匹配和版本上限均有自动化门禁。
 
-`6198fe7` 之后的 R-01 至 R-12、T-01、F-01 至 F-07 和 G-01 至 G-04 共 24 个追踪问题，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及 `d13ec5e` 上的 V-01 `1997 passed`、主集成 `103 passed`、停机 `1 passed` 和补充 Redis `5 passed` 覆盖。Stage A `1 passed` 为前次验收证据；由于本轮未在 `26d7089` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
+`6198fe7` 之后的 R-01 至 R-12、T-01、F-01 至 F-07 和 G-01 至 G-04 共 24 个追踪问题，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及 `d13ec5e` 上的 V-01 `1997 passed`、主集成 `103 passed`、停机 `1 passed` 和补充 Redis `5 passed` 覆盖。Stage A `1 passed` 为前次验收证据；由于本轮未在 `1c81739` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
 
 H-01 与 H-02 完成后，在最终代码 HEAD `26d7089` 上重新执行增量收口门禁：完整 `tests/unit` 为 `2003 passed`；完整 `tests/integration/test_redis.py` 在真实 Redis/MySQL 下为 `56 passed`；完整 `tests/integration/test_phase10_down_migration_mysql.py` 在 MySQL 8 隔离数据库下为 `4 passed`。H-01 进一步覆盖草稿过期后的两张排队图片、pending/rejected candidate、已挂载媒体重放、失效或被驳回的精确 Job/Resume 目标，以及媒体删除状态；H-02 进一步覆盖 inbound 同名 `id`-only 表、字段类型/默认值漂移、缺失索引和前缀唯一索引。两项均在修复评审意见后重跑全部本项门禁，并分别获得“无可执行问题，可提交”的独立只读评审结论。
+
+H-03 至 H-05 完成后，在最终代码 HEAD `1c81739` 再次重跑相同收口门禁，结果仍为完整单元 `2003 passed`、完整 Redis/MySQL 集成 `56 passed`、完整 destructive-down MySQL `4 passed`。新增真实 MySQL 负例覆盖额外无默认必填列、ENUM 字面值大小写、latin1 字符列、`created_at ON UPDATE`、生成列、MyISAM、latin1 默认表属性、额外 `UNIQUE(from_userid)` 和 required index `INVISIBLE`；同时确认额外普通非唯一索引按发布策略允许。三项分别完成实现、门禁、独立只读评审和独立提交。
 
 ## 10. 最终静态检查与仓库状态
 
@@ -312,5 +317,5 @@ git stash list
 ## 12. 完成条件
 
 - 本报告经独立只读评审无 P1/P2/P3 后独立提交。
-- 提交后工作区干净，52 个问题提交与验证报告均可独立回溯。
+- 提交后工作区干净，55 个问题提交与验证报告均可独立回溯。
 - 不推送、不创建 PR、不合并 `main`，等待用户下一步指令。
