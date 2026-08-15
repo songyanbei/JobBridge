@@ -744,10 +744,136 @@ def test_undo_does_not_restore_when_validated_snapshot_was_replaced(db, monkeypa
         lambda *_args: (payload, "validated-snapshot"),
     )
     monkeypatch.setattr(
-        "app.services.audit_workbench_service.consume_undo_if_unchanged",
+        "app.services.audit_workbench_service.validate_undo_unchanged",
         lambda *_args: "changed",
     )
 
     with pytest.raises(BusinessException, match="撤销快照已变化"):
         undo(db, "job", job.id, "reviewer")
     assert job.description == "current value"
+
+
+def test_undo_commit_failure_preserves_snapshot(db, monkeypatch):
+    job = _job(db, description="current value")
+    db.commit()
+    payload = {
+        "action": "edit",
+        "before": {"description": "old value", "version": job.version},
+        "after": {"description": "current value", "version": job.version},
+    }
+    consume = SimpleNamespace(called=False)
+
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo", lambda *_args: payload,
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: (payload, "snapshot-token"),
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.validate_undo_unchanged",
+        lambda *_args: "unchanged",
+    )
+
+    def _consume(*_args):
+        consume.called = True
+        return "consumed"
+
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged", _consume,
+    )
+
+    def _fail_commit(_session):
+        raise RuntimeError("forced_undo_commit_failure")
+
+    event.listen(db, "before_commit", _fail_commit, once=True)
+    with pytest.raises(RuntimeError, match="forced_undo_commit_failure"):
+        undo(db, "job", job.id, "reviewer")
+    assert consume.called is False
+
+    db.rollback()
+    db.expire_all()
+    persisted = db.get(Job, job.id)
+    assert persisted.description == "current value"
+    assert persisted.version == payload["after"]["version"]
+
+
+def test_undo_consumes_snapshot_only_after_commit(db, monkeypatch):
+    job = _job(db, description="current value")
+    db.commit()
+    payload = {
+        "action": "edit",
+        "before": {"description": "old value", "version": job.version},
+        "after": {"description": "current value", "version": job.version},
+    }
+    events = []
+    original_commit = db.commit
+
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo", lambda *_args: payload,
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: (payload, "snapshot-token"),
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.validate_undo_unchanged",
+        lambda *_args: "unchanged",
+    )
+
+    def _commit():
+        events.append("commit")
+        original_commit()
+
+    def _consume(*_args):
+        events.append("consume")
+        return "consumed"
+
+    monkeypatch.setattr(db, "commit", _commit)
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged", _consume,
+    )
+
+    undo(db, "job", job.id, "reviewer")
+
+    assert events == ["commit", "consume"]
+    assert job.description == "old value"
+    assert job.version == payload["after"]["version"] + 1
+
+
+def test_undo_commit_success_is_not_reversed_by_snapshot_cleanup_failure(
+    db, monkeypatch,
+):
+    job = _job(db, description="current value")
+    db.commit()
+    payload = {
+        "action": "edit",
+        "before": {"description": "old value", "version": job.version},
+        "after": {"description": "current value", "version": job.version},
+    }
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo", lambda *_args: payload,
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.get_undo_snapshot",
+        lambda *_args: (payload, "snapshot-token"),
+    )
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.validate_undo_unchanged",
+        lambda *_args: "unchanged",
+    )
+
+    def _fail_cleanup(*_args):
+        raise ConnectionError("redis unavailable after commit")
+
+    monkeypatch.setattr(
+        "app.services.audit_workbench_service.consume_undo_if_unchanged",
+        _fail_cleanup,
+    )
+
+    undo(db, "job", job.id, "reviewer")
+
+    db.expire_all()
+    persisted = db.get(Job, job.id)
+    assert persisted.description == "old value"
+    assert persisted.version == payload["after"]["version"] + 1

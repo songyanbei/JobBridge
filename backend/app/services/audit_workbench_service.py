@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -27,10 +28,14 @@ from app.core.redis_client import (
     refresh_audit_lock,
     release_audit_lock,
     save_undo,
+    validate_undo_unchanged,
 )
 from app.models import AuditLog, Job, JobReplacement, Resume, User
 from app.services import audit_service
 from app.services.admin_log_service import _json_safe, write_admin_log
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -867,12 +872,12 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
         raise BusinessException(40902, "此条目已被修改，请刷新", {
             "current_version": int(obj.version or 0),
         })
-    consume_result = consume_undo_if_unchanged(
+    validate_result = validate_undo_unchanged(
         target_type, target_id, snapshot_token,
     )
-    if consume_result == "missing":
+    if validate_result == "missing":
         raise BusinessException(40903, "撤销窗口已过期（30 秒）")
-    if consume_result != "consumed":
+    if validate_result != "unchanged":
         raise BusinessException(40902, "撤销快照已变化，请刷新后重试")
     before_snapshot = payload.get("before") or {}
     _, allowed, snap_fields = _model_for(target_type)
@@ -897,3 +902,22 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
         reason=f"undo previous action: {payload.get('action')}",
     )
     db.commit()
+    try:
+        consume_result = consume_undo_if_unchanged(
+            target_type, target_id, snapshot_token,
+        )
+    except Exception:
+        logger.exception(
+            "undo committed but snapshot cleanup failed target_type=%s target_id=%s",
+            target_type,
+            target_id,
+        )
+        return
+    if consume_result != "consumed":
+        logger.warning(
+            "undo committed without consuming snapshot target_type=%s target_id=%s "
+            "result=%s",
+            target_type,
+            target_id,
+            consume_result,
+        )

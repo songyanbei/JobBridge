@@ -867,6 +867,31 @@ redis.call('DEL', KEYS[1])
 return 1
 """
 
+_VALIDATE_UNDO_UNCHANGED_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+if current ~= ARGV[1] then
+    return -1
+end
+return 1
+"""
+
+
+def validate_undo_unchanged(
+    target_type: str, target_id: int | str, expected_value: str,
+) -> str:
+    """Validate the exact snapshot without consuming it before DB commit."""
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    result = int(get_redis().eval(
+        _VALIDATE_UNDO_UNCHANGED_SCRIPT,
+        1,
+        key,
+        expected_value,
+    ))
+    return {1: "unchanged", 0: "missing", -1: "changed"}.get(result, "changed")
+
 
 def consume_undo_if_unchanged(
     target_type: str, target_id: int | str, expected_value: str,

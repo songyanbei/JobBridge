@@ -97,6 +97,51 @@ def _cleanup_replacement_rows(owner_userid: str) -> None:
         db.close()
 
 
+def test_undo_mysql_commit_failure_preserves_real_redis_snapshot():
+    owner_userid = f"undo-commit-{uuid4().hex[:16]}"
+    redis_target = None
+    db = SessionLocal()
+    try:
+        db.add(User(external_userid=owner_userid, role="factory"))
+        db.commit()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        job = _active_job(owner_userid, now)
+        job.description = "current value"
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        redis_target = job.id
+        payload = {
+            "action": "edit",
+            "before": {"description": "old value", "version": job.version},
+            "after": {"description": "current value", "version": job.version},
+        }
+        save_undo("job", job.id, payload)
+
+        def _fail_commit(_session):
+            raise RuntimeError("forced_mysql_undo_commit_failure")
+
+        event.listen(db, "before_commit", _fail_commit, once=True)
+        with pytest.raises(RuntimeError, match="forced_mysql_undo_commit_failure"):
+            undo(db, "job", job.id, "reviewer")
+        db.rollback()
+
+        assert get_undo("job", job.id) == payload
+        verify = SessionLocal()
+        try:
+            persisted = verify.get(Job, job.id)
+            assert persisted.description == "current value"
+            assert persisted.version == payload["after"]["version"]
+        finally:
+            verify.close()
+    finally:
+        db.rollback()
+        db.close()
+        if redis_target is not None:
+            get_redis().delete(f"undo_action:job:{redis_target}")
+        _cleanup_replacement_rows(owner_userid)
+
+
 def test_replacement_persists_explicit_full_update_fields_on_mysql(monkeypatch):
     monkeypatch.setattr(settings, "job_replacement_enabled", True)
     owner_userid = f"replace-full-fields-{uuid4().hex}"
@@ -552,6 +597,11 @@ def test_undo_and_replacement_activation_are_serialized(monkeypatch):
     monkeypatch.setattr(audit_workbench_service, "get_undo", lambda *_args: payload)
     monkeypatch.setattr(
         audit_workbench_service, "get_undo_snapshot", controlled_snapshot,
+    )
+    monkeypatch.setattr(
+        audit_workbench_service,
+        "validate_undo_unchanged",
+        lambda *_args: "unchanged",
     )
     monkeypatch.setattr(
         audit_workbench_service,
