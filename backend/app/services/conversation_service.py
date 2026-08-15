@@ -371,6 +371,8 @@ def reset_search(session: SessionState) -> None:
     if not has_pending:
         session.follow_up_rounds = 0
         session.current_intent = None
+        session.attachment_target_type = None
+        session.attachment_target_id = None
         # Stage C1：无 pending 时，/重新找 收敛为 idle；有 pending 时保留 upload_collecting
         session.active_flow = "idle"
     # Phase 1（dialogue-intent-extraction-phased-plan §1.1.2）：搜索 awaiting
@@ -539,6 +541,8 @@ def set_broker_direction(
     clear_search_awaiting(session)
     if not session.pending_upload_intent:
         session.follow_up_rounds = 0
+        session.attachment_target_type = None
+        session.attachment_target_id = None
         # Stage C1：无 pending 时，方向切换后回 idle，等待下一次搜索把 active_flow 推进
         session.active_flow = "idle"
     return None

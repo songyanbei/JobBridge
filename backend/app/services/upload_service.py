@@ -149,6 +149,8 @@ def _save_pending_upload(
     raw_text 为当前轮用户原文（非已拼接结果）。函数会去重追加到
     pending_raw_text_parts；与最后一条相同则跳过，避免重复合并。
     """
+    session.attachment_target_type = None
+    session.attachment_target_id = None
     now = datetime.now(timezone.utc)
     # 固定窗口：expires_at = created_at + 10 分钟，subsequent 轮次只更新 updated_at。
     # 避免用户用 chitchat 间歇性"续命"陈旧草稿（spec §3.4 / §9.4）。
@@ -207,6 +209,8 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_target_version = None
     session.pending_operation_id = None
     session.pending_upload_media_ids = []
+    session.attachment_target_type = None
+    session.attachment_target_id = None
     session.follow_up_rounds = 0
     session.failed_patch_rounds = 0
     session.conflict_followup_rounds = 0
@@ -385,6 +389,13 @@ def process_upload(
 
     # Stage A：入库成功后清 pending（含 follow_up_rounds 重置）
     clear_pending_upload(session)
+    if (
+        entity.audit_status == "passed"
+        and entity.expires_at is not None
+        and entity.deleted_at is None
+    ):
+        session.attachment_target_type = entity_type
+        session.attachment_target_id = entity.id
 
     # 根据审核状态生成回复
     reply = _audit_status_reply(audit_result.status, entity_type)
@@ -407,8 +418,8 @@ def attach_image(
     """将已保存的图片 key 附加到用户当前上传流程的实体上。
 
     Phase 4 新增：图片下载由 Worker 完成后，message_router 调用本方法
-    把图片挂到最近一条未过期的岗位/简历上（由 session.current_intent 和用户
-    角色共同决定实体类型）。不做 OCR，不参与字段抽取。
+    草稿存活时挂到 durable 草稿媒体集合；草稿结束后仅挂到会话中
+    记录的精确激活实体 ID。不做 OCR，不参与字段抽取。
 
     Args:
         external_userid: 上传者 external_userid
@@ -420,6 +431,7 @@ def attach_image(
         用户可读的反馈文案（成功 / 找不到实体 / 数量超限）
     """
     if not image_key:
+        discard_unattached_media(db, media_lifecycle_id)
         return "图片保存失败，请稍后重试。"
 
     if (
@@ -431,34 +443,42 @@ def attach_image(
         if media_lifecycle_id in session.pending_upload_media_ids:
             return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
         if len(session.pending_upload_media_ids) >= _MAX_IMAGES_PER_RECORD:
+            discard_unattached_media(db, media_lifecycle_id)
             return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
         session.pending_upload_media_ids.append(media_lifecycle_id)
         return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
 
-    # Stage C1（spec §2.10）：pending_upload_intent 优先 —
-    # 草稿存活时（无论 active_flow 是 upload_collecting 还是 upload_conflict）
-    # 都按 origin intent 决定实体类型；回落 current_intent 兼容旧 session（C2 删除回落）。
-    if session.pending_upload_intent:
-        entity_type = _attach_target_entity_type(session.pending_upload_intent)
-    else:
-        entity_type = _attach_target_entity_type(session.current_intent)
+    entity_type = session.attachment_target_type
+    target_id = session.attachment_target_id
+    if (
+        entity_type not in {"job", "resume"}
+        or type(target_id) is not int
+        or target_id <= 0
+    ):
+        discard_unattached_media(db, media_lifecycle_id)
+        return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"
 
     model_cls = Job if entity_type == "job" else Resume
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     record = db.query(model_cls).filter(
+        model_cls.id == target_id,
         model_cls.owner_userid == external_userid,
+        model_cls.audit_status == "passed",
         model_cls.deleted_at.is_(None),
         model_cls.expires_at > now,
-    ).order_by(model_cls.created_at.desc()).with_for_update().first()
+    ).with_for_update().first()
 
     if record is None:
+        discard_unattached_media(db, media_lifecycle_id)
         return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"
 
     # 追加到 images JSON 数组（去重 + 数量上限）
     images = list(record.images) if record.images else []
     if image_key in images:
+        discard_unattached_media(db, media_lifecycle_id)
         return "该图片已附加，无需重复发送。"
     if len(images) >= _MAX_IMAGES_PER_RECORD:
+        discard_unattached_media(db, media_lifecycle_id)
         return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
 
     if media_lifecycle_id is not None:
@@ -479,6 +499,16 @@ def attach_image(
         identifier_hash(external_userid), entity_type, record.id, len(images),
     )
     return f"图片已附加到您最近一条{kind}信息（第 {len(images)} 张）。"
+
+
+def discard_unattached_media(db: Session, media_lifecycle_id: int | None) -> None:
+    """已下载但未挂载的媒体立即进入 durable 删除队列。"""
+    if media_lifecycle_id is None:
+        return
+    from app.services.job_media_service import discard_pending_media
+
+    discard_pending_media(db, media_lifecycle_id)
+    db.flush()
 
 
 def _attach_target_entity_type(current_intent: str | None) -> str:

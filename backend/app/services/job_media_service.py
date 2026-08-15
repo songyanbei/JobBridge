@@ -84,6 +84,27 @@ def mark_delete_pending(db: Session, media_ids: list[int]) -> None:
         row.next_attempt_at = now
 
 
+def discard_pending_media(db: Session, media_id: int) -> bool:
+    """只回收尚未绑定实体的草稿媒体，重放不得删除 attached 媒体。"""
+    row = (
+        db.query(MediaAssetLifecycle)
+        .populate_existing()
+        .filter(
+            MediaAssetLifecycle.id == media_id,
+            MediaAssetLifecycle.state == "pending",
+            MediaAssetLifecycle.entity_type.is_(None),
+            MediaAssetLifecycle.entity_id.is_(None),
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if row is None:
+        return False
+    row.state = "delete_pending"
+    row.next_attempt_at = datetime.utcnow()
+    return True
+
+
 def mark_entity_media_delete_pending(
     db: Session,
     entity_type: str,

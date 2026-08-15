@@ -190,3 +190,41 @@ def test_image_cannot_extend_expired_first_publish_draft(
     assert session.pending_upload_intent is None
     assert session.pending_upload_media_ids == []
     assert session.active_flow == "idle"
+
+
+def test_queued_image_after_expiry_cannot_fall_back_to_old_job(monkeypatch):
+    session = _expired_session("upload_collecting")
+    session.current_intent = "upload_job"
+    attach_image = MagicMock(return_value="should not attach")
+    save_session = MagicMock()
+    monkeypatch.setattr(
+        message_router.conversation_service, "load_session", lambda _userid: session,
+    )
+    monkeypatch.setattr(
+        message_router.conversation_service, "save_session", save_session,
+    )
+    monkeypatch.setattr(message_router.upload_service, "attach_image", attach_image)
+    monkeypatch.setattr(
+        "app.services.job_media_service.mark_delete_pending", MagicMock(),
+    )
+
+    first = message_router._handle_image(
+        _image_message(), MagicMock(role="factory"), MagicMock(),
+    )
+    second = message_router._handle_image(
+        WeComMessage(
+            msg_id="queued-after-expiry",
+            from_user="factory-expired-upload",
+            msg_type="image",
+            media_id="queued-media",
+            image_url="images/queued-after-expiry.jpg",
+        ),
+        MagicMock(role="factory"),
+        MagicMock(),
+    )
+
+    assert first[0].content == message_router.PENDING_EXPIRED_REPLY
+    assert second[0].content == message_router.IMAGE_RECEIVED_NON_UPLOAD
+    attach_image.assert_not_called()
+    assert session.current_intent == "upload_job"
+    assert session.attachment_target_id is None

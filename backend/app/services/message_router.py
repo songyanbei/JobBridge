@@ -429,10 +429,6 @@ def _handle_text(
     userid = msg.from_user
     content = (msg.content or "").strip()
 
-    # 空文本兜底（企微理论上不会推空文本）
-    if not content:
-        return [_reply(userid, FALLBACK_REPLY)]
-
     # 加载 / 创建 session
     session = conversation_service.load_session(userid)
     if session is None:
@@ -451,6 +447,18 @@ def _handle_text(
             )
             conversation_service.save_session(userid, session)
             return [_reply(userid, PENDING_EXPIRED_REPLY)]
+
+    # Any subsequent text turn closes the post-upload attachment window before
+    # welcome, clarification, V2 reset, or classifier failure can short-return.
+    # A complete successful upload in this same turn writes a new exact target.
+    if not session.pending_upload_intent:
+        session.attachment_target_type = None
+        session.attachment_target_id = None
+
+    # 空文本也必须关闭附件窗口并持久化；不能绕过上面的 TTL/target 清理。
+    if not content:
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, FALLBACK_REPLY)]
 
     # 首次欢迎优先于意图分类
     if user_ctx.should_welcome:
@@ -794,7 +802,7 @@ def _handle_text(
     intent = intent_result.intent
 
     # Stage C1（spec §2.5）：last_intent 仅观测；current_intent 在 upload_collecting
-    # 期间钉在 pending_upload_intent，兼容旧 attach_image 的回落判断。
+    # 期间钉在 pending_upload_intent，供对话语义与观测使用。
     session.last_intent = intent
     if (
         session.active_flow == "upload_collecting"
@@ -2093,16 +2101,14 @@ def _handle_image(
 
     session = conversation_service.load_session(userid)
     if session and _abandon_expired_pending_upload(session, db):
-        if msg.media_lifecycle_id is not None:
-            from app.services.job_media_service import mark_delete_pending
-            mark_delete_pending(db, [msg.media_lifecycle_id])
-            db.flush()
+        upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
         conversation_service.record_history(
             session, "assistant", PENDING_EXPIRED_REPLY,
         )
         conversation_service.save_session(userid, session)
         return [_reply(userid, PENDING_EXPIRED_REPLY)]
     if msg.expired_upload_draft:
+        upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
         return [_reply(userid, PENDING_EXPIRED_REPLY)]
 
     if not image_url:
@@ -2110,13 +2116,16 @@ def _handle_image(
         return [_reply(userid, IMAGE_DOWNLOAD_FAILED)]
 
     # 尝试挂载到当前上传流程。
-    # Stage C1（spec §2.10）：优先看 pending_upload_intent — 草稿存活时（含
-    # upload_collecting 与 upload_conflict 两态）都应该挂图，避免 current_intent 在
-    # 上传过程中被 chitchat / command 等中间消息污染后图片被误判为"非上传流程"。
-    # 回落 current_intent 兼容旧 session（C2 删除回落）。
+    # 草稿存活时按 pending intent 挂载；草稿结束后只接受精确实体目标。
+    # 禁止使用 current_intent 猜测“最近记录”，否则过期/取消/候选结束后
+    # 排队图片可能误改旧岗位。
     if session and (
         session.pending_upload_intent
-        or session.current_intent in ("upload_job", "upload_resume", "upload_and_search")
+        or (
+            session.attachment_target_type in {"job", "resume"}
+            and type(session.attachment_target_id) is int
+            and session.attachment_target_id > 0
+        )
     ):
         feedback = upload_service.attach_image(
             external_userid=userid,
@@ -2129,6 +2138,7 @@ def _handle_image(
         return [_reply(userid, feedback)]
 
     # 非上传流程：留存提示
+    upload_service.discard_unattached_media(db, msg.media_lifecycle_id)
     return [_reply(userid, IMAGE_RECEIVED_NON_UPLOAD)]
 
 

@@ -1,4 +1,5 @@
 """upload_service 单元测试。"""
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -73,6 +74,55 @@ class TestGenerateFollowupText:
 
 
 class TestProcessUpload:
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_passed_upload_records_exact_attachment_target(
+        self, mock_conv, mock_audit, monkeypatch,
+    ):
+        from app.services.audit_service import AuditResult
+
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="passed", reason="", matched_words=[],
+        )
+        entity = SimpleNamespace(
+            id=77,
+            audit_status="passed",
+            expires_at=datetime.now() + timedelta(days=30),
+            deleted_at=None,
+        )
+        monkeypatch.setattr(
+            "app.services.upload_service._create_job",
+            lambda *_args, **_kwargs: entity,
+        )
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+        session = _make_session()
+
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市",
+                    "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "月薪",
+                    "headcount": 30,
+                },
+                confidence=0.95,
+            ),
+            "招工文本",
+            [],
+            session,
+            db,
+        )
+
+        assert result.success is True
+        assert session.attachment_target_type == "job"
+        assert session.attachment_target_id == 77
+
     @patch("app.services.upload_service.audit_service")
     @patch("app.services.upload_service.conversation_service")
     def test_successful_upload(self, mock_conv, mock_audit):
@@ -227,6 +277,7 @@ class TestProcessUpload:
         assert created_job.activated_at is None
         assert created_job.expires_at is None
         assert created_job.candidate_expires_at is not None
+        assert result.success is True
         emit_candidate.assert_called_once_with(
             db,
             job_id=created_job.id,
@@ -285,6 +336,7 @@ class TestProcessUpload:
         assert created_job.activated_at is not None
         assert created_job.expires_at is not None
         assert created_job.candidate_expires_at is None
+        assert result.success is True
         emit_candidate.assert_not_called()
 
     @patch("app.services.upload_service.audit_service")
@@ -345,6 +397,8 @@ class TestProcessUpload:
 
         assert result.success is True
         emit_candidate.assert_not_called()
+        assert session.attachment_target_type is None
+        assert session.attachment_target_id is None
 
     @patch("app.services.upload_service.conversation_service")
     def test_missing_fields_followup(self, mock_conv):

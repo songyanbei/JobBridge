@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 from app.config import settings
 from app.services.job_media_service import (
+    discard_pending_media,
     hard_delete_media_complete,
     mark_entity_media_delete_pending,
     resume_hard_delete_media_complete,
@@ -142,3 +143,34 @@ def test_entity_cleanup_locks_media_in_id_order_before_transitioning():
     assert first.state == second.state == "delete_pending"
     assert first.next_attempt_at is not None
     assert second.next_attempt_at is not None
+
+
+def test_discard_pending_media_only_transitions_unattached_pending_row():
+    row = SimpleNamespace(
+        id=12,
+        state="pending",
+        entity_type=None,
+        entity_id=None,
+        next_attempt_at=None,
+    )
+    db = MagicMock()
+    locked = (
+        db.query.return_value.populate_existing.return_value.filter.return_value
+        .with_for_update.return_value
+    )
+    locked.one_or_none.return_value = row
+
+    assert discard_pending_media(db, 12) is True
+    assert row.state == "delete_pending"
+    assert row.next_attempt_at is not None
+
+
+def test_discard_pending_media_does_not_transition_attached_row():
+    db = MagicMock()
+    locked = (
+        db.query.return_value.populate_existing.return_value.filter.return_value
+        .with_for_update.return_value
+    )
+    locked.one_or_none.return_value = None
+
+    assert discard_pending_media(db, 12) is False

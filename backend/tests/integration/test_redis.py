@@ -16,7 +16,7 @@ from app.services import message_router
 from app.services import upload_service
 from app.services.worker import Worker
 from app.db import SessionLocal
-from app.models import MediaAssetLifecycle
+from app.models import Job, MediaAssetLifecycle, Resume, User
 from app.schemas.conversation import SessionState
 from app.wecom.callback import WeComMessage
 from app.core.redis_client import (
@@ -148,6 +148,269 @@ def test_expired_image_draft_is_rejected_before_media_refresh_and_cleared():
                 MediaAssetLifecycle.id == media_id,
             ).delete(synchronize_session=False)
             db.commit()
+        db.close()
+
+
+def test_queued_image_after_expiry_cannot_mutate_previous_active_job():
+    token = uuid4().hex
+    userid = f"integration-expired-queue-{token}"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    job_id = None
+    queued_media_id = None
+    attached_media_id = None
+    try:
+        db.add(User(external_userid=userid, role="factory"))
+        db.flush()
+        old_key = f"images/{userid}/old.jpg"
+        old_job = Job(
+            owner_userid=userid,
+            city="苏州市",
+            job_category="电子厂",
+            salary_floor_monthly=5500,
+            pay_type="月薪",
+            headcount=10,
+            raw_text="old active job",
+            audit_status="passed",
+            activated_at=datetime.utcnow() - timedelta(days=1),
+            expires_at=datetime.utcnow() + timedelta(days=30),
+            images=[old_key],
+        )
+        db.add(old_job)
+        db.commit()
+        job_id = old_job.id
+        original_version = old_job.version
+
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            current_intent="upload_job",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="replace",
+            pending_target_id=job_id,
+            pending_target_version=original_version,
+            pending_operation_id=f"expired-{token[:20]}",
+            pending_upload={"city": "苏州市"},
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        conversation_service.save_session(userid, session)
+
+        first = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"first-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="expired-first",
+                expired_upload_draft=True,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        queued_media = MediaAssetLifecycle(
+            object_key=f"images/{userid}/queued.jpg",
+            owner_userid=userid,
+            operation_id=f"queued-{token[:20]}",
+            state="pending",
+            draft_expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        db.add(queued_media)
+        db.flush()
+        queued_media_id = queued_media.id
+        second = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"second-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="queued-second",
+                image_url=f"images/{userid}/queued.jpg",
+                media_lifecycle_id=queued_media_id,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        db.commit()
+
+        db.refresh(old_job)
+        assert first[0].content == message_router.PENDING_EXPIRED_REPLY
+        assert second[0].content == message_router.IMAGE_RECEIVED_NON_UPLOAD
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+        db.refresh(queued_media)
+        assert queued_media.state == "delete_pending"
+        restored = conversation_service.load_session(userid)
+        assert restored is not None
+        assert restored.current_intent == "upload_job"
+        assert restored.attachment_target_id is None
+
+        attached_media = MediaAssetLifecycle(
+            object_key=old_key,
+            owner_userid=userid,
+            operation_id=f"attached-{token[:20]}",
+            state="attached",
+            entity_type="job",
+            entity_id=job_id,
+            draft_expires_at=None,
+        )
+        db.add(attached_media)
+        db.flush()
+        attached_media_id = attached_media.id
+        duplicate_feedback = upload_service.attach_image(
+            external_userid=userid,
+            image_key=old_key,
+            session=SessionState(
+                role="factory",
+                attachment_target_type="job",
+                attachment_target_id=job_id,
+            ),
+            db=db,
+            media_lifecycle_id=attached_media_id,
+        )
+        db.commit()
+
+        db.refresh(attached_media)
+        db.refresh(old_job)
+        assert "已附加" in duplicate_feedback
+        assert attached_media.state == "attached"
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+
+        replay_session = conversation_service.load_session(userid)
+        assert replay_session is not None
+        replay_session.active_flow = "upload_collecting"
+        replay_session.pending_upload_intent = "upload_job"
+        replay_session.pending_upload = {"city": "苏州市"}
+        replay_session.pending_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        conversation_service.save_session(userid, replay_session)
+        replay = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"attached-replay-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="attached-replay",
+                image_url=old_key,
+                media_lifecycle_id=attached_media_id,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        db.commit()
+
+        db.refresh(attached_media)
+        db.refresh(old_job)
+        assert replay[0].content == message_router.PENDING_EXPIRED_REPLY
+        assert attached_media.state == "attached"
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+    finally:
+        conversation_service.clear_session(userid)
+        db.rollback()
+        if queued_media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == queued_media_id,
+            ).delete(synchronize_session=False)
+        if attached_media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == attached_media_id,
+            ).delete(synchronize_session=False)
+        if job_id is not None:
+            db.query(Job).filter(Job.id == job_id).delete(synchronize_session=False)
+        db.query(User).filter(User.external_userid == userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+        db.close()
+
+
+def test_rejected_resume_attachment_target_cannot_accept_queued_image():
+    token = uuid4().hex
+    userid = f"integration-rejected-resume-{token}"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    resume_id = None
+    media_id = None
+    try:
+        db.add(User(external_userid=userid, role="worker"))
+        db.flush()
+        resume = Resume(
+            owner_userid=userid,
+            expected_cities=["苏州市"],
+            expected_job_categories=["电子厂"],
+            salary_expect_floor_monthly=5000,
+            gender="男",
+            age=30,
+            accept_long_term=True,
+            accept_short_term=False,
+            raw_text="active resume",
+            audit_status="passed",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+            images=[f"images/{userid}/old.jpg"],
+        )
+        db.add(resume)
+        db.commit()
+        resume_id = resume.id
+        original_images = list(resume.images)
+        original_version = resume.version
+
+        conversation_service.save_session(
+            userid,
+            SessionState(
+                role="worker",
+                attachment_target_type="resume",
+                attachment_target_id=resume_id,
+            ),
+        )
+
+        resume.audit_status = "rejected"
+        resume.audit_reason = "admin rejected"
+        db.commit()
+
+        media = MediaAssetLifecycle(
+            object_key=f"images/{userid}/queued.jpg",
+            owner_userid=userid,
+            operation_id=f"rejected-{token[:20]}",
+            state="pending",
+            draft_expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        db.add(media)
+        db.flush()
+        media_id = media.id
+
+        session = conversation_service.load_session(userid)
+        assert session is not None
+        feedback = upload_service.attach_image(
+            external_userid=userid,
+            image_key=media.object_key,
+            session=session,
+            db=db,
+            media_lifecycle_id=media_id,
+        )
+        db.commit()
+
+        db.refresh(resume)
+        db.refresh(media)
+        assert "未找到正在处理" in feedback
+        assert resume.images == original_images
+        assert resume.version == original_version
+        assert media.state == "delete_pending"
+    finally:
+        conversation_service.clear_session(userid)
+        db.rollback()
+        if media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == media_id,
+            ).delete(synchronize_session=False)
+        if resume_id is not None:
+            db.query(Resume).filter(Resume.id == resume_id).delete(
+                synchronize_session=False,
+            )
+        db.query(User).filter(User.external_userid == userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
         db.close()
 
 

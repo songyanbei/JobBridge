@@ -56,6 +56,8 @@ def test_clear_awaiting_clears():
 def test_reset_search_wipes_criteria_and_awaiting():
     s = _session(
         search_criteria={"city": ["北京市"]},
+        attachment_target_type="job",
+        attachment_target_id=91,
         awaiting_fields=["salary_floor_monthly"],
         awaiting_frame="job_search",
         awaiting_expires_at="2099-01-01T00:00:00+00:00",
@@ -65,6 +67,8 @@ def test_reset_search_wipes_criteria_and_awaiting():
     assert s.awaiting_fields == []
     assert s.candidate_snapshot is None
     assert s.shown_items == []
+    assert s.attachment_target_type is None
+    assert s.attachment_target_id is None
 
 
 def test_clear_pending_upload_resets_active_flow():
