@@ -198,6 +198,12 @@ def _handle_update_job(
         upload_service.abandon_pending_upload(session, db)
     else:
         upload_service.clear_pending_upload(session)
+    # A replacement is a new, complete upload flow. Stale search criteria and
+    # history can otherwise make the next full Job payload look like a search
+    # follow-up and route it into upload_conflict.
+    conversation_service.reset_search(session)
+    session.last_criteria = {}
+    session.pending_relaxation = None
     session.pending_upload = {}
     session.pending_upload_mode, session.pending_target_id = "replace", job.id
     session.pending_target_version, session.pending_operation_id = job.version, str(uuid.uuid4())

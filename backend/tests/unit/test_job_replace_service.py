@@ -160,7 +160,15 @@ def test_update_command_selects_only_job_and_starts_empty_draft(db, monkeypatch)
 
     monkeypatch.setattr(settings, "job_replacement_enabled", True)
     old = _job(db)
-    session = SessionState(role="factory", pending_upload={"city": "旧草稿"})
+    session = SessionState(
+        role="factory",
+        pending_upload={"city": "旧草稿"},
+        search_criteria={"city": ["苏州市"], "job_category": ["电子厂"]},
+        last_criteria={"city": ["苏州市"]},
+        shown_items=["99"],
+        history=[{"role": "user", "content": "帮我找工人"}],
+        pending_relaxation={"direction": "search_worker"},
+    )
     user = UserContext(
         external_userid="owner-1", role="factory", status="active",
         display_name=None, company=None, contact_person=None, phone=None,
@@ -172,6 +180,11 @@ def test_update_command_selects_only_job_and_starts_empty_draft(db, monkeypatch)
 
     assert "完整的新岗位信息" in reply.content
     assert session.pending_upload == {}
+    assert session.search_criteria == {}
+    assert session.last_criteria == {}
+    assert session.shown_items == []
+    assert session.history == []
+    assert session.pending_relaxation is None
     assert session.pending_upload_mode == "replace"
     assert session.pending_target_id == old.id
     started_at = datetime.fromisoformat(session.pending_started_at)
