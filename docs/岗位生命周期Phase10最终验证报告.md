@@ -4,9 +4,9 @@
 
 - 分支：`codex/job-expiry-full-update-v05`
 - 修复基线：`060f5fb`
-- 最终代码验证 HEAD：`bc7e7cf`
+- 最终代码验证 HEAD：`8d31a46`
 - 验证日期：2026-08-11 至 2026-08-15（Asia/Shanghai）
-- 结果：39 个已知问题均使用独立提交完成修复；最终代码 HEAD `bc7e7cf` 的 V-01 至 V-05 与旧 schema 兼容冒烟全部通过，最终自动化验证未发现未关闭的 P1/P2/P3。页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
+- 结果：46 个已知问题均使用独立提交完成修复；最终代码 HEAD `8d31a46` 的 V-01 至 V-05 与旧 schema 兼容冒烟全部通过，最终自动化验证未发现未关闭的 P1/P2/P3。页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
 - 边界：未 rebase、未合并 `main`、未推送、未创建 PR；保留的 WIP stash 未恢复或删除。
 
 ## 2. 问题与提交追踪
@@ -52,6 +52,13 @@
 | 37 | R-11 replacement 图片未复用 pending_operation_id | `7aa3e85` | 普通/替换图片关联与失效会话单测 |
 | 38 | R-12 生命周期配置缺失时静默回退 | `cea68d1` | 缺失、非法、恢复与限流单测 |
 | 39 | T-01 合成 rollout 测试依赖共享城市字典和过期时间 | `bc7e7cf` | V-01 五分片全量回归 |
+| 40 | F-01 历史候选迁移 TTL 使用本地时区导致晚 8 小时 | `2f07625` | V-01、V-02、V-05 |
+| 41 | F-02 V2 clarification/conflict 绕过上传草稿 TTL | `1e30068` | V-01、定向路由回归 |
+| 42 | F-03 Undo 在数据库提交前删除 Redis 快照 | `4350caa` | V-01、V-02、真实 MySQL/Redis 故障注入 |
+| 43 | F-04 首次发布 pending/rejected 候选缺创建事件 | `b5c6a48` | V-01、V-02 |
+| 44 | F-05 destructive down 后错误运行最终 preflight | `70a5240` | V-01、V-02、Stage A 冒烟 |
+| 45 | F-06 合成 rollout 测试依赖共享岗位类别本体 | `24b08b8` | V-01、200 项 dialogue 回归 |
+| 46 | F-07 迁移测试旧 schema 夹具缺 inbound 表 | `8d31a46` | V-02 真实 MySQL |
 
 每项功能提交前均执行定向测试、受影响模块测试、适用的真实服务测试、Python 编译检查、`git diff --check` 和独立只读评审。评审提出的可执行问题均在对应问题内修复并重新通过门禁后提交；没有使用空提交表示测试完成。
 
@@ -79,23 +86,23 @@ export RECOMMENDATION_CONTENT_KEY=phase10-test-key
 
 ## 4. V-01 全量单元测试
 
-固定排序全部 107 个 `tests/unit/test_*.py`，按文件边界分为五片运行：
+固定排序全部 108 个 `tests/unit/test_*.py`，按文件边界分为五片运行：
 
 | 分片 | 文件序号 | 结果 |
 | --- | --- | --- |
 | 1 | 1–22 | 303 passed |
-| 2 | 23–44 | 483 passed |
-| 3 | 45–65 | 401 passed |
-| 4 | 66–86 | 448 passed |
-| 5 | 87–107 | 344 passed |
+| 2 | 23–44 | 486 passed |
+| 3 | 45–66 | 416 passed |
+| 4 | 67–87 | 453 passed |
+| 5 | 88–108 | 331 passed |
 
-V-01 合计：`1979 passed`，零失败。测试仅产生既有 `datetime.utcnow()` 和 `passlib crypt` 弃用警告。
+V-01 合计：`1989 passed`，零失败。测试仅产生既有 `datetime.utcnow()` 和 `passlib crypt` 弃用警告。
 
 实际五分片生成和执行命令（从 `backend` 目录运行）：
 
 ```powershell
 $all = Get-ChildItem tests/unit -Filter 'test_*.py' | Sort-Object Name
-$bounds = @(@(0, 21), @(22, 43), @(44, 64), @(65, 85), @(86, 106))
+$bounds = @(@(0, 21), @(22, 43), @(44, 65), @(66, 86), @(87, 107))
 foreach ($bound in $bounds) {
     $start, $end = $bound
     $files = $all[$start..$end] | ForEach-Object { "tests/unit/$($_.Name)" }
@@ -106,7 +113,7 @@ foreach ($bound in $bounds) {
 
 ## 5. V-02/V-03 真实 MySQL 与 Redis
 
-- Phase 10 CI 主集成清单在 MySQL 8 与隔离 Redis 7 上运行：`95 passed`。
+- Phase 10 CI 主集成清单在重建后的 MySQL 8 测试库与隔离 Redis 7 上运行：`102 passed`。
 - Redis 真实停机、fail-closed terminalization 与恢复：`1 passed`。
 - 补充 Redis 推荐、多 Worker 与策略测试：`5 passed`。
 - Redis 恢复后读取：`maxmemory-policy=noeviction`、`appendonly=yes`、`appendfsync=always`，健康检查 `PONG`。
@@ -160,10 +167,10 @@ RUN_INTEGRATION=1 python -m pytest -p no:cacheprovider -q \
 首次最终采样：
 
 ```json
-{"sampling_window_seconds": 0.0284, "clock_skew_seconds": 0.027921, "max_clock_skew_seconds": 2.0, "ready": true}
+{"sampling_window_seconds": 0.029839, "clock_skew_seconds": 0.029223, "max_clock_skew_seconds": 2.0, "ready": true}
 ```
 
-V-05 完整门禁前再次采样：`clock_skew_seconds=0.027955`，`ready=true`。两次均远低于 2 秒限制。
+V-05 完整门禁前再次采样：`clock_skew_seconds=0.026608`，`ready=true`。两次均远低于 2 秒限制。
 
 两次均使用相同目标环境运行：
 
@@ -209,7 +216,8 @@ PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" \
     (config_key, config_value, value_type, description)
   VALUES
     ('ttl.job.days', '30', 'int', 'Phase10 verification'),
-    ('ttl.job.candidate.days', '7', 'int', 'Phase10 verification');
+    ('ttl.job.candidate.days', '7', 'int', 'Phase10 verification'),
+    ('ttl.hard_delete.delay_days', '7', 'int', 'Phase10 verification');
 "
 
 for migration in \
@@ -262,14 +270,14 @@ PYTHONPATH=. /tmp/jobbridge-phase10-venv/bin/python -m pytest --rootdir=. \
 
 ## 9. 页面联调历史补充证据
 
-以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `bc7e7cf` 的页面重跑证据：
+以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `8d31a46` 的页面重跑证据：
 
 - 学历规范化：LLM 产生“高中及以上”“初中以上学历”等表达时，严格 MySQL 持久化为合法枚举值，不再截断或写入失败。
 - 全量更新：招聘者通过 `/更新岗位 124` 提交完整岗位文本，新岗位 `161` 自动审核激活，旧岗位 `124` 以 `delist_reason=replaced` 软删除；地址、夫妻工、学历、用工类型和合同类型均完整保留。
 - 推荐可见性：求职者搜索后推荐上下文只包含新岗位 `161`，不包含旧岗位 `124`，投递状态为 `sent`。
 - 正文密钥：单密钥、密钥环、缺失密钥、活动版本不匹配和版本上限均有自动化门禁。
 
-`6198fe7` 之后的 R-01 至 R-12 和 T-01 共 13 个提交，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及最终 HEAD 上的 V-01 `1979 passed`、主集成 `95 passed`、停机 `1 passed`、补充 Redis `5 passed` 和 Stage A `1 passed` 覆盖。由于本轮未在 `bc7e7cf` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
+`6198fe7` 之后的 R-01 至 R-12、T-01 和 F-01 至 F-07 共 20 个追踪问题，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及最终代码 HEAD 上的 V-01 `1989 passed`、主集成 `102 passed`、停机 `1 passed`、补充 Redis `5 passed` 和 Stage A `1 passed` 覆盖。由于本轮未在 `8d31a46` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
 
 ## 10. 最终静态检查与仓库状态
 
@@ -296,5 +304,5 @@ git stash list
 ## 12. 完成条件
 
 - 本报告经独立只读评审无 P1/P2/P3 后独立提交。
-- 提交后工作区干净，39 个问题提交与验证报告均可独立回溯。
+- 提交后工作区干净，46 个问题提交与验证报告均可独立回溯。
 - 不推送、不创建 PR、不合并 `main`，等待用户下一步指令。
