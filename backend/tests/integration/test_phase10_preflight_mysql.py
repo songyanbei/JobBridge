@@ -47,6 +47,15 @@ INSERT INTO job (
 ('pending','2026-01-04','2026-01-05',NULL,'2026-09-02',NULL,NULL,1),
 ('rejected','2026-01-06','2026-01-07','2026-01-08','2026-09-03',
  '2026-02-01','expired',1);
+CREATE TABLE wecom_inbound_event (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  status ENUM('received','processing','session_pending','done','failed','dead_letter')
+    NOT NULL DEFAULT 'received',
+  session_apply_locked_at DATETIME(6) NULL,
+  session_next_attempt_at DATETIME(6) NULL,
+  worker_started_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB;
 """
 
 
