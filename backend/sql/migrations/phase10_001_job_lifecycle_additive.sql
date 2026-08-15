@@ -113,6 +113,12 @@ CREATE TRIGGER `phase10_job_update_fence` BEFORE UPDATE ON `job`
 FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
 CREATE TRIGGER `phase10_job_delete_fence` BEFORE DELETE ON `job`
 FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_inbound_insert_fence` BEFORE INSERT ON `wecom_inbound_event`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_inbound_update_fence` BEFORE UPDATE ON `wecom_inbound_event`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
+CREATE TRIGGER `phase10_inbound_delete_fence` BEFORE DELETE ON `wecom_inbound_event`
+FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
 CREATE TRIGGER `phase10_replacement_insert_fence` BEFORE INSERT ON `job_replacement`
 FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
 CREATE TRIGGER `phase10_cleanup_insert_fence` BEFORE INSERT ON `target_cleanup_task`

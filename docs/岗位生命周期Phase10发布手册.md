@@ -145,7 +145,7 @@ python -m scripts.phase10_preflight
 2. 关闭 `JOB_HARD_DELETE_ENABLED` 和 `JOB_EXPIRY_CLEANUP_ENABLED`，但保持 `JOB_CANDIDATE_CLEANUP_ENABLED=true`，继续运行 candidate、media 和 target cleanup Worker。直到未激活候选 backlog、media/target cleanup backlog 均收敛且无 processing/retry_wait/dead-letter，连续一个完整调度周期没有新增候选后，才同步关闭 `JOB_CANDIDATE_CLEANUP_ENABLED`。
 3. 停止 API、Worker 和 scheduler，保留 MySQL 新增列、durable cleanup task、媒体生命周期记录、Redis AOF 和 revocation fence，优先 forward-fix。
 4. 不得直接启动 003/004 之前的 Worker。需要回滚应用制品时，只能使用明确兼容 003/004 schema 和 session fencing 的版本，并继续禁止新旧版本混跑。
-5. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows、原始 backup checksum 和 expected-live checksum 与当前备份表完全匹配，并取得破坏性回滚审批时执行。先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档三项证据。`phase10-down-backup-evidence.tsv` 必须与 `phase10-001-backup-evidence.tsv` 逐字节一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
+5. `phase10_down_001_job_lifecycle.sql` 仅允许在从未创建或回填任何新模型数据、001 归档的 backup rows、原始 backup checksum 和 expected-live checksum 与当前备份表完全匹配，并且不存在 `session_pending`、非空 `session_commit_deadline_epoch` 或非空 `session_apply_lease_owner` 时执行；001 安装的 inbound INSERT/UPDATE/DELETE 数据库围栏会从 guard 开始持续阻止收尾 Worker 写入，直到脚本安全移除 003/004 两列后才撤销。任何 durable session 状态必须先由当前版本正常收敛，不得通过手工清空字段绕过。取得破坏性回滚审批后，先使用迁移阶段的同一 `PHASE10_MYSQL` 再次核验目标，再用与 001 相同的算法重算并独立归档三项证据。`phase10-down-backup-evidence.tsv` 必须与 `phase10-001-backup-evidence.tsv` 逐字节一致，人工复核并记录审批后才能执行 down。Down 输出必须归档，命令必须为零退出，且 `phase10_restore_checksum_valid` 列的值为 `1`；任一保护条件拒绝后不得使用 `--force` 或其他方式绕过。
 
    ```bash
    set -euo pipefail
@@ -173,6 +173,14 @@ python -m scripts.phase10_preflight
    } | "${PHASE10_MYSQL[@]}" | tee phase10-down-001-output.txt
    ```
 6. 已经启用 replacement、产生 cleanup task 或执行媒体回填后，不做破坏性 schema 回滚；关闭开关、保留 durable 状态并发布修复版本。
-7. 回滚后重新执行健康检查、`python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，记录所有非零项和后续处置。
+7. 未执行 destructive schema down 时属于应用/开关回滚：保留 Phase 10 schema，重新执行健康检查、`python -m scripts.phase10_clock_check` 和 `python -m scripts.phase10_preflight`，记录所有非零项和后续处置。
+8. 已经执行 destructive schema down 时，不得再启动最终 schema-aware 制品，也不得运行 `python -m scripts.phase10_preflight`；该 preflight 依赖已删除的新列和新表，报结构不存在不代表有效验收。使用仍指向同一生产目标的最终工具环境运行专用只读校验：
+
+   ```bash
+   python -m scripts.phase10_down_verify | tee phase10-down-verify.json
+   test "$(python -c 'import json; print(str(json.load(open("phase10-down-verify.json"))["ready"]).lower())')" = true
+   ```
+
+   `phase10_job_columns_remaining`、`phase10_session_columns_remaining`、`old_job_column_contract_mismatch`、`phase10_tables_remaining`、`phase10_fences_remaining`、`backup_expected_columns_remaining` 和 `restored_job_backup_mismatch` 必须全部为 `0`，`ready=true`。然后将数据库连接切回不可变 Stage A 制品 `499eb929b75ad2f208d306b62157d8ded0119f33`，确认最终制品全部退出，再执行带鉴权健康检查和旧 schema 只读冒烟：后台岗位列表第 1/2 页、岗位详情、岗位 CSV 导出、审核工作台队列和审核详情。全部通过后归档 down 输出、专用校验 JSON、Stage A commit/镜像 digest 和请求响应证据；任何 5xx、结构错误、数据不一致或进程版本混跑都视为回滚失败。
 
 回滚不得删除 WIP/发布证据、迁移备份表、AOF 或 cleanup task，也不得用清库方式消除 preflight blocker。

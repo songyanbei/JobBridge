@@ -10,6 +10,12 @@ FROM `phase10_job_lifecycle_backup` FOR SHARE;
 SELECT COUNT(*) AS `phase10_locked_replacement_rows` FROM `job_replacement` FOR UPDATE;
 SELECT COUNT(*) AS `phase10_locked_cleanup_rows` FROM `target_cleanup_task` FOR UPDATE;
 SELECT COUNT(*) AS `phase10_locked_media_rows` FROM `media_asset_lifecycle` FOR UPDATE;
+SELECT `id` AS `phase10_locked_session_pending_id`
+FROM `wecom_inbound_event`
+WHERE `status` = 'session_pending'
+   OR `session_commit_deadline_epoch` IS NOT NULL
+   OR `session_apply_lease_owner` IS NOT NULL
+FOR UPDATE;
 
 SET @phase10_current_backup_rows = (
   SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`
@@ -43,6 +49,13 @@ SET @phase10_down_blocked = (
   EXISTS (SELECT 1 FROM `job_replacement` LIMIT 1)
   OR EXISTS (SELECT 1 FROM `target_cleanup_task` LIMIT 1)
   OR EXISTS (SELECT 1 FROM `media_asset_lifecycle` LIMIT 1)
+  OR EXISTS (
+    SELECT 1 FROM `wecom_inbound_event`
+    WHERE `status` = 'session_pending'
+       OR `session_commit_deadline_epoch` IS NOT NULL
+       OR `session_apply_lease_owner` IS NOT NULL
+    LIMIT 1
+  )
   OR EXISTS (
     SELECT 1 FROM `job` j
     LEFT JOIN `phase10_job_lifecycle_backup` b ON b.`job_id` = j.`id`
@@ -104,6 +117,9 @@ EXECUTE phase10_checksum_stmt;
 DEALLOCATE PREPARE phase10_checksum_stmt;
 COMMIT;
 
+ALTER TABLE `wecom_inbound_event`
+  DROP COLUMN `session_apply_lease_owner`,
+  DROP COLUMN `session_commit_deadline_epoch`;
 ALTER TABLE `job` DROP INDEX `idx_job_candidate_expiry`;
 ALTER TABLE `job` DROP COLUMN `candidate_expires_at`, DROP COLUMN `activated_at`;
 ALTER TABLE `job` MODIFY COLUMN `expires_at` DATETIME NOT NULL;
@@ -114,6 +130,9 @@ DROP TABLE `target_cleanup_task`;
 DROP TRIGGER `phase10_job_insert_fence`;
 DROP TRIGGER `phase10_job_update_fence`;
 DROP TRIGGER `phase10_job_delete_fence`;
+DROP TRIGGER `phase10_inbound_insert_fence`;
+DROP TRIGGER `phase10_inbound_update_fence`;
+DROP TRIGGER `phase10_inbound_delete_fence`;
 DROP PROCEDURE `phase10_assert_writes_allowed`;
 DROP TABLE `phase10_migration_control`;
 ALTER TABLE `phase10_job_lifecycle_backup`

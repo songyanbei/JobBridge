@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from scripts import phase10_preflight
+from scripts import phase10_down_verify, phase10_preflight
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -80,6 +80,14 @@ def test_down_migration_blocks_new_model_data_and_validates_restore_checksum():
     )
     for table in ("job_replacement", "target_cleanup_task", "media_asset_lifecycle"):
         assert f"FROM `{table}`" in sql
+    assert "FROM `wecom_inbound_event`" in sql
+    assert "`status` = 'session_pending'" in sql
+    assert "`session_commit_deadline_epoch` IS NOT NULL" in sql
+    assert "`session_apply_lease_owner` IS NOT NULL" in sql
+    assert "DROP COLUMN `session_apply_lease_owner`" in sql
+    assert "DROP COLUMN `session_commit_deadline_epoch`" in sql
+    for action in ("insert", "update", "delete"):
+        assert f"DROP TRIGGER `phase10_inbound_{action}_fence`" in sql
     assert "phase10_down_blocked" in sql
     assert "COUNT(*) FROM `phase10_job_lifecycle_backup`" in sql
     assert "phase10_restore_checksum_valid" in sql
@@ -115,6 +123,8 @@ def test_additive_migration_freezes_post_migration_state_for_safe_down():
     sql = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_text(
         encoding="utf-8"
     )
+    for action in ("INSERT", "UPDATE", "DELETE"):
+        assert f"BEFORE {action} ON `wecom_inbound_event`" in sql
     snapshot_offset = sql.index("expected_audit_status")
     final_backfill_offset = sql.index(
         "WHERE `deleted_at` IS NULL AND `audit_status` IN ('pending', 'rejected')"
@@ -504,6 +514,51 @@ def test_release_manual_stops_candidate_producer_before_consumer():
 
     assert stop_producer < keep_consumer < stop_consumer
     assert "media/target cleanup backlog 均收敛" in rollback
+
+
+def test_release_manual_uses_dedicated_gate_after_destructive_down():
+    manual = (ROOT.parent / "docs/岗位生命周期Phase10发布手册.md").read_text(
+        encoding="utf-8"
+    )
+    rollback = manual[manual.index("## 9. 回滚"):]
+    destructive = rollback[rollback.index("已经执行 destructive schema down"):]
+
+    assert "不得运行 `python -m scripts.phase10_preflight`" in destructive
+    assert "python -m scripts.phase10_down_verify" in destructive
+    assert "499eb929b75ad2f208d306b62157d8ded0119f33" in destructive
+    for surface in (
+        "岗位列表第 1/2 页",
+        "岗位详情",
+        "岗位 CSV 导出",
+        "审核工作台队列",
+        "审核详情",
+    ):
+        assert surface in destructive
+
+
+def test_down_verify_reports_only_zero_blockers_as_ready():
+    db = MagicMock()
+    results = []
+    for _ in phase10_down_verify.SCHEMA_CHECKS:
+        result = MagicMock()
+        result.scalar.return_value = 0
+        results.append(result)
+    required_tables = MagicMock()
+    required_tables.scalar.return_value = 2
+    restore_mismatch = MagicMock()
+    restore_mismatch.scalar.return_value = 0
+    db.execute.side_effect = [*results, required_tables, restore_mismatch]
+
+    report = phase10_down_verify.collect(db)
+
+    assert report["ready"] is True
+    assert report["restored_job_backup_mismatch"] == 0
+    assert report["phase10_session_columns_remaining"] == 0
+
+    results[0].scalar.return_value = 1
+    db.execute.side_effect = [*results, required_tables, restore_mismatch]
+    report = phase10_down_verify.collect(db)
+    assert report["ready"] is False
 
 
 def test_preflight_uses_distinct_job_and_candidate_ttl_ranges():

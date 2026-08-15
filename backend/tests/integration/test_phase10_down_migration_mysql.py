@@ -9,8 +9,11 @@ from uuid import uuid4
 import pymysql
 import pytest
 from pymysql.constants import CLIENT
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.db import engine
+from scripts.phase10_down_verify import collect as collect_down_report
 
 
 pytestmark = pytest.mark.integration
@@ -19,6 +22,15 @@ ROOT = Path(__file__).resolve().parents[2]
 UP_SQL = (ROOT / "sql/migrations/phase10_001_job_lifecycle_additive.sql").read_text(
     encoding="utf-8"
 )
+MEDIA_SQL = (ROOT / "sql/migrations/phase10_002_media_dead_letter.sql").read_text(
+    encoding="utf-8"
+)
+DEADLINE_SQL = (
+    ROOT / "sql/migrations/phase10_003_session_commit_deadline.sql"
+).read_text(encoding="utf-8")
+LEASE_OWNER_SQL = (
+    ROOT / "sql/migrations/phase10_004_session_commit_lease_owner.sql"
+).read_text(encoding="utf-8")
 DOWN_SQL = (ROOT / "sql/migrations/phase10_down_001_job_lifecycle.sql").read_text(
     encoding="utf-8"
 )
@@ -46,6 +58,15 @@ INSERT INTO job (
 ) VALUES
 ('passed','2026-01-01','2026-01-02','2026-01-03','2026-09-01',NULL,NULL,1),
 ('pending','2026-01-01','2026-01-02',NULL,'2026-09-01',NULL,NULL,4);
+CREATE TABLE wecom_inbound_event (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  status ENUM('received','processing','session_pending','done','failed','dead_letter')
+    NOT NULL DEFAULT 'received',
+  session_apply_locked_at DATETIME(6) NULL,
+  session_next_attempt_at DATETIME(6) NULL,
+  worker_started_at DATETIME(6) NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB;
 """
 
 
@@ -86,6 +107,11 @@ def _execute_script(connection, sql: str) -> None:
             raise AssertionError("unterminated SQL statement")
 
 
+def _execute_phase10_up(connection) -> None:
+    for sql in (UP_SQL, MEDIA_SQL, DEADLINE_SQL, LEASE_OWNER_SQL):
+        _execute_script(connection, sql)
+
+
 def _archive_down_evidence(connection) -> tuple[int, int, int]:
     with connection.cursor() as cursor:
         cursor.execute(
@@ -114,6 +140,15 @@ def _set_down_evidence(connection, evidence: tuple[int, int, int]) -> None:
         )
 
 
+def _collect_down_report(database: str) -> dict[str, int | bool]:
+    verify_engine = create_engine(engine.url.set(database=database))
+    try:
+        with sessionmaker(bind=verify_engine)() as verify_session:
+            return collect_down_report(verify_session)
+    finally:
+        verify_engine.dispose()
+
+
 def test_down_rejects_post_migration_extension_before_overwrite():
     database = f"phase10_down_{uuid4().hex[:16]}"
     assert database.startswith("phase10_down_")
@@ -124,7 +159,7 @@ def test_down_rejects_post_migration_extension_before_overwrite():
             cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
         db = _connect(database)
         _execute_script(db, BASE_SCHEMA_SQL)
-        _execute_script(db, UP_SQL)
+        _execute_phase10_up(db)
         evidence = _archive_down_evidence(db)
 
         with db.cursor() as cursor:
@@ -196,6 +231,10 @@ def test_down_rejects_post_migration_extension_before_overwrite():
                 "AND COLUMN_NAME LIKE 'expected_%'"
             )
             assert int(cursor.fetchone()[0]) == 0
+
+        report = _collect_down_report(database)
+        assert report["ready"] is True
+        assert report["restored_job_backup_mismatch"] == 0
     finally:
         if db is not None:
             db.close()
@@ -213,15 +252,18 @@ def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
             cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
         setup = _connect(database)
         _execute_script(setup, BASE_SCHEMA_SQL)
-        _execute_script(setup, UP_SQL)
+        _execute_phase10_up(setup)
         evidence = _archive_down_evidence(setup)
+        with setup.cursor() as cursor:
+            cursor.execute("INSERT INTO wecom_inbound_event (status) VALUES ('received')")
+            inbound_event_id = int(cursor.lastrowid)
 
         down = _connect(database)
         concurrent = _connect(database)
         _set_down_evidence(down, evidence)
         delayed_down_sql = DOWN_SQL.replace(
-            "COMMIT;\n\nALTER TABLE `job` DROP INDEX",
-            "COMMIT;\nSELECT SLEEP(2);\n\nALTER TABLE `job` DROP INDEX",
+            "COMMIT;\n\nALTER TABLE `wecom_inbound_event`",
+            "COMMIT;\nSELECT SLEEP(2);\n\nALTER TABLE `wecom_inbound_event`",
             1,
         )
         assert delayed_down_sql != DOWN_SQL
@@ -252,6 +294,18 @@ def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
                         "VALUES (UUID(), 'job', 1, 'test')"
                     )
                 assert "phase10_destructive_down_in_progress" in str(insert_error.value)
+
+                with pytest.raises(pymysql.err.OperationalError) as inbound_error:
+                    cursor.execute(
+                        "UPDATE wecom_inbound_event "
+                        "SET status='session_pending', "
+                        "session_commit_deadline_epoch=UNIX_TIMESTAMP(NOW(6)) + 1800 "
+                        "WHERE id=%s",
+                        (inbound_event_id,),
+                    )
+                assert "phase10_destructive_down_in_progress" in str(
+                    inbound_error.value
+                )
             future.result(timeout=10)
 
         with setup.cursor() as cursor:
@@ -262,10 +316,63 @@ def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
                 "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='target_cleanup_task'"
             )
             assert int(cursor.fetchone()[0]) == 0
+            cursor.execute(
+                "SELECT status FROM wecom_inbound_event WHERE id=%s",
+                (inbound_event_id,),
+            )
+            assert cursor.fetchone()[0] == "received"
     finally:
         for connection in (setup, down, concurrent):
             if connection is not None:
                 connection.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
+
+
+def test_down_rejects_durable_session_state_before_column_drop():
+    database = f"phase10_down_{uuid4().hex[:16]}"
+    admin = _connect()
+    db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        _execute_phase10_up(db)
+        evidence = _archive_down_evidence(db)
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO wecom_inbound_event "
+                "(status, session_commit_deadline_epoch) "
+                "VALUES ('session_pending', UNIX_TIMESTAMP(NOW(6)) + 1800)"
+            )
+
+        _set_down_evidence(db, evidence)
+        with pytest.raises(pymysql.err.ProgrammingError) as exc_info:
+            _execute_script(db, DOWN_SQL)
+        assert "phase10_down_guard_failed_new_model_data_exists" in str(exc_info.value)
+        db.rollback()
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT status, session_commit_deadline_epoch "
+                "FROM wecom_inbound_event"
+            )
+            status, deadline = cursor.fetchone()
+            assert status == "session_pending"
+            assert deadline is not None
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() "
+                "AND TABLE_NAME='wecom_inbound_event' "
+                "AND COLUMN_NAME IN ("
+                "'session_commit_deadline_epoch','session_apply_lease_owner')"
+            )
+            assert int(cursor.fetchone()[0]) == 2
+    finally:
+        if db is not None:
+            db.close()
         with admin.cursor() as cursor:
             cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
         admin.close()
@@ -283,7 +390,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         with db.cursor() as cursor:
             cursor.execute("DELETE FROM job")
 
-        _execute_script(db, UP_SQL)
+        _execute_phase10_up(db)
         evidence = _archive_down_evidence(db)
         assert evidence == (0, 0, 0)
 
@@ -299,6 +406,18 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
                 "AND COLUMN_NAME IN ('activated_at','candidate_expires_at')"
             )
             assert int(cursor.fetchone()[0]) == 0
+
+        report = _collect_down_report(database)
+        assert report == {
+            "phase10_job_columns_remaining": 0,
+            "phase10_session_columns_remaining": 0,
+            "old_job_column_contract_mismatch": 0,
+            "phase10_tables_remaining": 0,
+            "phase10_fences_remaining": 0,
+            "backup_expected_columns_remaining": 0,
+            "restored_job_backup_mismatch": 0,
+            "ready": True,
+        }
     finally:
         if db is not None:
             db.close()
