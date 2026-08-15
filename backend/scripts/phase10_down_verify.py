@@ -294,6 +294,12 @@ def _index_contract_sql(table_name: str, contract, *, allow_extra_safe: bool) ->
 
 
 SCHEMA_CHECKS = {
+    "down_verify_global_select_privilege_missing": (
+        "SELECT CASE WHEN COUNT(*)>0 THEN 0 ELSE 1 END "
+        "FROM information_schema.USER_PRIVILEGES "
+        "WHERE REPLACE(GRANTEE, '''', '')=CURRENT_USER() "
+        "AND BINARY PRIVILEGE_TYPE='SELECT'"
+    ),
     "old_schema_required_tables_missing": (
         "SELECT 3 - COUNT(*) FROM information_schema.TABLES "
         "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' "
@@ -340,6 +346,11 @@ SCHEMA_CHECKS = {
         "WHERE CONSTRAINT_SCHEMA=DATABASE() "
         "AND BINARY TABLE_NAME='wecom_inbound_event' "
         "AND CONSTRAINT_TYPE IN ('CHECK','FOREIGN KEY')"
+    ),
+    "old_inbound_referencing_foreign_keys_mismatch": (
+        "SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE "
+        "WHERE REFERENCED_TABLE_SCHEMA=DATABASE() "
+        "AND BINARY REFERENCED_TABLE_NAME='wecom_inbound_event'"
     ),
     "old_inbound_triggers_remaining": (
         "SELECT COUNT(*) FROM information_schema.TRIGGERS "

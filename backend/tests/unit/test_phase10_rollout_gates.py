@@ -550,6 +550,12 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
 
 
 def test_down_verify_reports_only_zero_blockers_as_ready():
+    metadata_visibility_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "down_verify_global_select_privilege_missing"
+    ]
+    assert "USER_PRIVILEGES" in metadata_visibility_gate
+    assert "CURRENT_USER()" in metadata_visibility_gate
+    assert "PRIVILEGE_TYPE='SELECT'" in metadata_visibility_gate
     required_table_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_schema_required_tables_missing"
     ]
@@ -573,6 +579,12 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     ]
     assert "TABLE_CONSTRAINTS" in inbound_constraints_gate
     assert "'CHECK','FOREIGN KEY'" in inbound_constraints_gate
+    inbound_referencing_fk_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_inbound_referencing_foreign_keys_mismatch"
+    ]
+    assert "KEY_COLUMN_USAGE" in inbound_referencing_fk_gate
+    assert "REFERENCED_TABLE_SCHEMA=DATABASE()" in inbound_referencing_fk_gate
+    assert "REFERENCED_TABLE_NAME='wecom_inbound_event'" in inbound_referencing_fk_gate
     inbound_trigger_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_triggers_remaining"
     ]
@@ -653,11 +665,15 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["old_job_table_contract_mismatch"] == 0
     assert report["old_inbound_table_contract_mismatch"] == 0
     assert report["old_inbound_constraints_mismatch"] == 0
+    assert report["old_inbound_referencing_foreign_keys_mismatch"] == 0
     assert report["old_inbound_triggers_remaining"] == 0
     assert report["old_inbound_column_contract_mismatch"] == 0
     assert report["old_inbound_index_contract_mismatch"] == 0
 
-    results[0].scalar.return_value = 1
+    required_table_result_index = list(phase10_down_verify.SCHEMA_CHECKS).index(
+        "old_schema_required_tables_missing"
+    )
+    results[required_table_result_index].scalar.return_value = 1
     db.execute.side_effect = [*results, required_tables, restore_mismatch]
     report = phase10_down_verify.collect(db)
     assert report["old_schema_required_tables_missing"] == 1

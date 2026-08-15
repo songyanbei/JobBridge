@@ -171,6 +171,19 @@ def _collect_down_report(database: str) -> dict[str, int | bool]:
         verify_engine.dispose()
 
 
+def _collect_down_report_as(
+    database: str, username: str, password: str
+) -> dict[str, int | bool]:
+    verify_engine = create_engine(
+        engine.url.set(database=database, username=username, password=password)
+    )
+    try:
+        with sessionmaker(bind=verify_engine)() as verify_session:
+            return collect_down_report(verify_session)
+    finally:
+        verify_engine.dispose()
+
+
 def test_down_rejects_post_migration_extension_before_overwrite():
     database = f"phase10_down_{uuid4().hex[:16]}"
     assert database.startswith("phase10_down_")
@@ -371,6 +384,88 @@ def test_down_rejects_post_migration_extension_before_overwrite():
         admin.close()
 
 
+def test_down_verify_fails_closed_without_global_fk_metadata_visibility():
+    database = f"phase10_down_{uuid4().hex[:16]}"
+    referencing_database = f"phase10_ref_{uuid4().hex[:16]}"
+    metadata_user = f"phase10_meta_{uuid4().hex[:12]}"
+    metadata_password = uuid4().hex
+    admin = _connect()
+    db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+            cursor.execute(
+                f"CREATE DATABASE `{referencing_database}` CHARACTER SET utf8mb4"
+            )
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        _execute_phase10_up(db)
+        evidence = _archive_down_evidence(db)
+        _set_down_evidence(db, evidence)
+        _execute_script(db, DOWN_SQL)
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO wecom_inbound_event "
+                "(msg_id, from_userid, msg_type) "
+                "VALUES ('cross-schema-fk', 'cross-schema-user', 'text')"
+            )
+            inbound_id = int(cursor.lastrowid)
+            cursor.execute(
+                f"CREATE TABLE `{referencing_database}`.outbox_ref ("
+                "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+                "inbound_event_id BIGINT UNSIGNED NOT NULL, "
+                "CONSTRAINT fk_cross_schema_inbound "
+                "FOREIGN KEY (inbound_event_id) "
+                f"REFERENCES `{database}`.wecom_inbound_event(id) "
+                "ON DELETE RESTRICT) ENGINE=InnoDB"
+            )
+            cursor.execute(
+                f"INSERT INTO `{referencing_database}`.outbox_ref "
+                "(inbound_event_id) VALUES (%s)",
+                (inbound_id,),
+            )
+
+        privileged_report = _collect_down_report(database)
+        assert privileged_report["down_verify_global_select_privilege_missing"] == 0
+        assert privileged_report[
+            "old_inbound_referencing_foreign_keys_mismatch"
+        ] == 1
+        assert privileged_report["ready"] is False
+
+        with admin.cursor() as cursor:
+            cursor.execute(
+                f"CREATE USER `{metadata_user}`@'%%' IDENTIFIED BY %s",
+                (metadata_password,),
+            )
+            cursor.execute(
+                f"GRANT SELECT ON `{database}`.* TO `{metadata_user}`@'%'"
+            )
+        restricted_report = _collect_down_report_as(
+            database, metadata_user, metadata_password
+        )
+        assert restricted_report[
+            "old_inbound_referencing_foreign_keys_mismatch"
+        ] == 0
+        assert restricted_report["down_verify_global_select_privilege_missing"] == 1
+        assert restricted_report["ready"] is False
+
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.err.IntegrityError) as delete_error:
+                cursor.execute(
+                    "DELETE FROM wecom_inbound_event WHERE id=%s", (inbound_id,)
+                )
+            assert delete_error.value.args[0] == 1451
+    finally:
+        if db is not None:
+            db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{referencing_database}`")
+            cursor.execute(f"DROP USER IF EXISTS `{metadata_user}`@'%'")
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
+
+
 def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
     database = f"phase10_down_{uuid4().hex[:16]}"
     admin = _connect()
@@ -543,12 +638,14 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
 
         report = _collect_down_report(database)
         assert report == {
+            "down_verify_global_select_privilege_missing": 0,
             "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
             "old_job_table_contract_mismatch": 0,
             "old_inbound_table_contract_mismatch": 0,
             "old_inbound_constraints_mismatch": 0,
+            "old_inbound_referencing_foreign_keys_mismatch": 0,
             "old_inbound_triggers_remaining": 0,
             "old_inbound_column_contract_mismatch": 0,
             "old_inbound_index_contract_mismatch": 0,
@@ -562,6 +659,41 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "restored_job_backup_mismatch": 0,
             "ready": True,
         }
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE wecom_outbound_outbox ("
+                "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+                "inbound_event_id BIGINT UNSIGNED NOT NULL, "
+                "CONSTRAINT fk_outbox_inbound FOREIGN KEY (inbound_event_id) "
+                "REFERENCES wecom_inbound_event(id) ON DELETE RESTRICT"
+                ") ENGINE=InnoDB"
+            )
+            cursor.execute(
+                "INSERT INTO wecom_inbound_event "
+                "(msg_id, from_userid, msg_type) "
+                "VALUES ('reverse-fk-msg', 'reverse-fk-user', 'text')"
+            )
+            reverse_fk_inbound_id = int(cursor.lastrowid)
+            cursor.execute(
+                "INSERT INTO wecom_outbound_outbox (inbound_event_id) VALUES (%s)",
+                (reverse_fk_inbound_id,),
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_referencing_foreign_keys_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.err.IntegrityError) as reverse_fk_error:
+                cursor.execute(
+                    "DELETE FROM wecom_inbound_event WHERE id=%s",
+                    (reverse_fk_inbound_id,),
+                )
+            assert reverse_fk_error.value.args[0] == 1451
+            cursor.execute("DROP TABLE wecom_outbound_outbox")
+            cursor.execute(
+                "DELETE FROM wecom_inbound_event WHERE id=%s",
+                (reverse_fk_inbound_id,),
+            )
 
         with db.cursor() as cursor:
             cursor.execute(
