@@ -176,10 +176,16 @@ def _index_contract_sql() -> str:
             f"{_sql_string(columns)} AS columns"
         )
     expected = " UNION ALL ".join(rows)
+    expected_unique_names = ",".join(
+        _sql_string(name)
+        for name, non_unique, _ in INBOUND_INDEX_CONTRACT
+        if non_unique == 0
+    )
     return (
-        "SELECT COUNT(*) FROM (" + expected + ") expected "
+        "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
         "LEFT JOIN ("
         "SELECT INDEX_NAME, MIN(NON_UNIQUE) AS non_unique, "
+        "MIN(IS_VISIBLE) AS is_visible, "
         "GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',') AS columns, "
         "SUM(CASE WHEN SUB_PART IS NOT NULL OR EXPRESSION IS NOT NULL "
         "THEN 1 ELSE 0 END) AS partial_or_expression_columns "
@@ -189,8 +195,15 @@ def _index_contract_sql() -> str:
         ") actual ON BINARY actual.INDEX_NAME=expected.index_name "
         "WHERE actual.INDEX_NAME IS NULL "
         "OR actual.non_unique<>expected.non_unique "
+        "OR BINARY actual.is_visible<>'YES' "
         "OR actual.columns<>expected.columns "
-        "OR actual.partial_or_expression_columns<>0"
+        "OR actual.partial_or_expression_columns<>0) + "
+        "(SELECT COUNT(DISTINCT actual.INDEX_NAME) "
+        "FROM information_schema.STATISTICS actual "
+        "WHERE actual.TABLE_SCHEMA=DATABASE() "
+        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        "AND actual.NON_UNIQUE=0 "
+        f"AND BINARY actual.INDEX_NAME NOT IN ({expected_unique_names}))"
     )
 
 

@@ -534,6 +534,7 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "old_inbound_table_contract_mismatch" in destructive
     assert "old_inbound_column_contract_mismatch" in destructive
     assert "old_inbound_index_contract_mismatch" in destructive
+    assert "额外普通非唯一索引允许保留" in destructive
     for surface in (
         "岗位列表第 1/2 页",
         "岗位详情",
@@ -575,8 +576,11 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "GROUP_CONCAT" in inbound_index_gate
     assert "SEQ_IN_INDEX" in inbound_index_gate
     assert "NON_UNIQUE" in inbound_index_gate
+    assert "IS_VISIBLE" in inbound_index_gate
     assert "SUB_PART" in inbound_index_gate
     assert "EXPRESSION" in inbound_index_gate
+    assert "COUNT(DISTINCT actual.INDEX_NAME)" in inbound_index_gate
+    assert "actual.NON_UNIQUE=0" in inbound_index_gate
 
     db = MagicMock()
     results = []

@@ -460,6 +460,39 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         }
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "ADD INDEX idx_extra_media_id (media_id)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_index_contract_mismatch"] == 0
+        assert report["ready"] is True
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "ADD UNIQUE INDEX uk_extra_from_userid (from_userid)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "DROP INDEX uk_extra_from_userid, "
+                "DROP INDEX idx_extra_media_id, "
+                "ALTER INDEX idx_status_time INVISIBLE"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "ALTER INDEX idx_status_time VISIBLE"
+            )
             cursor.execute("ALTER TABLE wecom_inbound_event ENGINE=MyISAM")
         report = _collect_down_report(database)
         assert report["old_inbound_table_contract_mismatch"] == 1
