@@ -547,6 +547,25 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
                 "ALTER TABLE wecom_inbound_event "
                 "ALTER INDEX idx_status_time VISIBLE"
             )
+            cursor.execute(
+                "CREATE INDEX idx_content_numeric ON wecom_inbound_event "
+                "((CAST(content_brief AS UNSIGNED)))"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.MySQLError) as expression_error:
+                cursor.execute(
+                    "INSERT INTO wecom_inbound_event "
+                    "(msg_id, from_userid, msg_type, content_brief) "
+                    "VALUES ('function-msg', 'function-user', 'text', '中文')"
+                )
+            assert expression_error.value.args[0] == 3751
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "DROP INDEX idx_content_numeric"
+            )
             cursor.execute("ALTER TABLE wecom_inbound_event ENGINE=MyISAM")
         report = _collect_down_report(database)
         assert report["old_inbound_table_contract_mismatch"] == 1

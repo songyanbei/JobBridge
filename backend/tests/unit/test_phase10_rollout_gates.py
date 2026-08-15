@@ -536,7 +536,8 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "old_inbound_triggers_remaining" in destructive
     assert "old_inbound_column_contract_mismatch" in destructive
     assert "old_inbound_index_contract_mismatch" in destructive
-    assert "额外普通非唯一索引允许保留" in destructive
+    assert "额外普通非唯一索引仅允许" in destructive
+    assert "prefix、expression、无物理列或其他索引类型都会阻断" in destructive
     for surface in (
         "岗位列表第 1/2 页",
         "岗位详情",
@@ -593,6 +594,9 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "EXPRESSION" in inbound_index_gate
     assert "COUNT(DISTINCT actual.INDEX_NAME)" in inbound_index_gate
     assert "actual.NON_UNIQUE=0" in inbound_index_gate
+    assert "actual.NON_UNIQUE=1" in inbound_index_gate
+    assert "actual.COLUMN_NAME IS NULL" in inbound_index_gate
+    assert "actual.INDEX_TYPE<>'BTREE'" in inbound_index_gate
 
     db = MagicMock()
     results = []

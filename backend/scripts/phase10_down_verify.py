@@ -181,6 +181,9 @@ def _index_contract_sql() -> str:
         for name, non_unique, _ in INBOUND_INDEX_CONTRACT
         if non_unique == 0
     )
+    expected_index_names = ",".join(
+        _sql_string(name) for name, _, _ in INBOUND_INDEX_CONTRACT
+    )
     return (
         "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
         "LEFT JOIN ("
@@ -203,7 +206,17 @@ def _index_contract_sql() -> str:
         "WHERE actual.TABLE_SCHEMA=DATABASE() "
         "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
         "AND actual.NON_UNIQUE=0 "
-        f"AND BINARY actual.INDEX_NAME NOT IN ({expected_unique_names}))"
+        f"AND BINARY actual.INDEX_NAME NOT IN ({expected_unique_names})) + "
+        "(SELECT COUNT(DISTINCT actual.INDEX_NAME) "
+        "FROM information_schema.STATISTICS actual "
+        "WHERE actual.TABLE_SCHEMA=DATABASE() "
+        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        "AND actual.NON_UNIQUE=1 "
+        f"AND BINARY actual.INDEX_NAME NOT IN ({expected_index_names}) "
+        "AND (actual.COLUMN_NAME IS NULL "
+        "OR actual.SUB_PART IS NOT NULL "
+        "OR actual.EXPRESSION IS NOT NULL "
+        "OR BINARY actual.INDEX_TYPE<>'BTREE'))"
     )
 
 
