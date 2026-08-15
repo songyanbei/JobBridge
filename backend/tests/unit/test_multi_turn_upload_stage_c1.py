@@ -1050,6 +1050,9 @@ class TestImageAttachWithPollutedCurrentIntent:
             active_flow="upload_conflict",
             pending_upload_intent="upload_job",
             pending_upload={"city": "北京市"},
+            pending_expires_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+            ).isoformat(),
             current_intent="chitchat",  # 被污染
             pending_interruption={
                 "intent": "search_worker",

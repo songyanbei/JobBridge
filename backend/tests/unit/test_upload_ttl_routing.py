@@ -24,6 +24,18 @@ def _message(content: str) -> WeComMessage:
     )
 
 
+def _image_message(*, expired_upload_draft: bool = False) -> WeComMessage:
+    return WeComMessage(
+        msg_id="expired-upload-image",
+        from_user="factory-expired-upload",
+        msg_type="image",
+        content="",
+        media_id="wecom-expired-image",
+        create_time=1_700_000_000,
+        expired_upload_draft=expired_upload_draft,
+    )
+
+
 def _expired_session(active_flow: str) -> SessionState:
     return SessionState(
         role="factory",
@@ -142,6 +154,39 @@ def test_conflict_handler_cannot_resume_expired_upload(monkeypatch):
         field_name="需要的字段"
     )
     mark_delete_pending.assert_called_once_with(db, [41, 42])
+    assert session.pending_upload_intent is None
+    assert session.pending_upload_media_ids == []
+    assert session.active_flow == "idle"
+
+
+@pytest.mark.parametrize("expired_upload_draft", [False, True])
+def test_image_cannot_extend_expired_first_publish_draft(
+    monkeypatch, expired_upload_draft,
+):
+    session = _expired_session("upload_collecting")
+    db = MagicMock()
+    mark_delete_pending = MagicMock()
+    save_session = MagicMock()
+    monkeypatch.setattr(
+        message_router.conversation_service, "load_session", lambda _userid: session,
+    )
+    monkeypatch.setattr(
+        message_router.conversation_service, "save_session", save_session,
+    )
+    monkeypatch.setattr(
+        "app.services.job_media_service.mark_delete_pending", mark_delete_pending,
+    )
+
+    replies = message_router._handle_image(
+        _image_message(expired_upload_draft=expired_upload_draft),
+        MagicMock(role="factory"),
+        db,
+    )
+
+    assert replies[0].content == message_router.PENDING_EXPIRED_REPLY
+    mark_delete_pending.assert_called_once_with(db, [41, 42])
+    save_session.assert_called_once_with("factory-expired-upload", session)
+    assert session.pending_upload == {}
     assert session.pending_upload_intent is None
     assert session.pending_upload_media_ids == []
     assert session.active_flow == "idle"

@@ -4,13 +4,21 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 from redis.exceptions import ResponseError
 
 from app.services import conversation_service
+from app.services import message_router
 from app.services import upload_service
+from app.services.worker import Worker
+from app.db import SessionLocal
+from app.models import MediaAssetLifecycle
 from app.schemas.conversation import SessionState
+from app.wecom.callback import WeComMessage
 from app.core.redis_client import (
     RedisDurabilityPolicyError,
     SessionCommitDeadlineExceeded,
@@ -72,6 +80,75 @@ def test_empty_replacement_draft_deadline_survives_real_redis_round_trip():
         assert restored.pending_operation_id == session.pending_operation_id
     finally:
         conversation_service.clear_session(userid)
+
+
+def test_expired_image_draft_is_rejected_before_media_refresh_and_cleared():
+    token = uuid4().hex
+    userid = f"integration-expired-image-{token}"
+    object_key = f"images/{userid}/old.jpg"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    media_id = None
+    try:
+        media = MediaAssetLifecycle(
+            object_key=object_key,
+            owner_userid=userid,
+            operation_id="expired-image-draft",
+            state="pending",
+            draft_expires_at=datetime.utcnow() - timedelta(seconds=1),
+        )
+        db.add(media)
+        db.commit()
+        media_id = media.id
+        before_count = db.query(MediaAssetLifecycle).count()
+
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="create",
+            pending_upload={"city": "苏州市", "job_category": "电子厂"},
+            pending_upload_media_ids=[media_id],
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        conversation_service.save_session(userid, session)
+
+        worker = Worker.__new__(Worker)
+        worker._wecom_client = MagicMock()
+        msg = WeComMessage(
+            msg_id=f"expired-image-{token}",
+            from_user=userid,
+            msg_type="image",
+            media_id="wecom-expired-image",
+        )
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        assert db.query(MediaAssetLifecycle).count() == before_count
+        assert msg.expired_upload_draft is True
+        replies = message_router._handle_image(
+            msg, SimpleNamespace(role="factory"), db,
+        )
+        db.commit()
+
+        assert replies[0].content == message_router.PENDING_EXPIRED_REPLY
+        db.refresh(media)
+        assert media.state == "delete_pending"
+        restored = conversation_service.load_session(userid)
+        assert restored is not None
+        assert restored.pending_upload_intent is None
+        assert restored.pending_upload_media_ids == []
+        assert restored.active_flow == "idle"
+    finally:
+        conversation_service.clear_session(userid)
+        if media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == media_id,
+            ).delete(synchronize_session=False)
+            db.commit()
+        db.close()
 
 
 def test_real_undo_compare_and_delete_preserves_replacement_snapshot():

@@ -202,6 +202,40 @@ class TestImageMediaOperation:
         assert msg.image_url == ""
         assert msg.media_lifecycle_id is None
 
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    def test_expired_create_draft_fails_before_download_or_media_ttl_refresh(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_record_pending_media,
+        worker,
+    ):
+        mock_load_session.return_value = SessionState(
+            role="factory",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="create",
+            pending_upload_media_ids=[41],
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="expired-create-image"),
+            "msg_type": "image",
+            "media_id": "wecom-media-expired",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        mock_session_factory.assert_not_called()
+        mock_record_pending_media.assert_not_called()
+        assert msg.expired_upload_draft is True
+        assert msg.image_url == ""
+        assert msg.media_lifecycle_id is None
+
 
 # ---------------------------------------------------------------------------
 # 消息处理 happy path

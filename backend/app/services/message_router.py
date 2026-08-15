@@ -2091,6 +2091,20 @@ def _handle_image(
     userid = msg.from_user
     image_url = msg.image_url
 
+    session = conversation_service.load_session(userid)
+    if session and _abandon_expired_pending_upload(session, db):
+        if msg.media_lifecycle_id is not None:
+            from app.services.job_media_service import mark_delete_pending
+            mark_delete_pending(db, [msg.media_lifecycle_id])
+            db.flush()
+        conversation_service.record_history(
+            session, "assistant", PENDING_EXPIRED_REPLY,
+        )
+        conversation_service.save_session(userid, session)
+        return [_reply(userid, PENDING_EXPIRED_REPLY)]
+    if msg.expired_upload_draft:
+        return [_reply(userid, PENDING_EXPIRED_REPLY)]
+
     if not image_url:
         logger.warning("message_router: image msg without image_url, msg_id=%s", msg.msg_id)
         return [_reply(userid, IMAGE_DOWNLOAD_FAILED)]
@@ -2100,7 +2114,6 @@ def _handle_image(
     # upload_collecting 与 upload_conflict 两态）都应该挂图，避免 current_intent 在
     # 上传过程中被 chitchat / command 等中间消息污染后图片被误判为"非上传流程"。
     # 回落 current_intent 兼容旧 session（C2 删除回落）。
-    session = conversation_service.load_session(userid)
     if session and (
         session.pending_upload_intent
         or session.current_intent in ("upload_job", "upload_resume", "upload_and_search")

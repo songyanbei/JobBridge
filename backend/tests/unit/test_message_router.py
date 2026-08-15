@@ -123,6 +123,7 @@ class TestImageHandling:
     ):
         mock_id.return_value = _ctx()
         mock_check.return_value = None
+        mock_load.return_value = None
         replies = process(_msg(msg_type="image", image_url=""), MagicMock())
         assert replies[0].content == IMAGE_DOWNLOAD_FAILED
 

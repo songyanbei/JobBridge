@@ -791,9 +791,17 @@ class Worker:
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _media_operation_id(msg: WeComMessage) -> str:
+    def _media_operation_id(msg: WeComMessage) -> str | None:
         session = conversation_service.load_session(msg.from_user)
-        if session is None or session.pending_upload_mode != "replace":
+        if session is None:
+            return msg.msg_id
+        if (
+            session.pending_upload_intent
+            and upload_service.is_pending_upload_expired(session)
+        ):
+            msg.expired_upload_draft = True
+            return None
+        if session.pending_upload_mode != "replace":
             return msg.msg_id
         valid_target = (
             session.pending_upload_intent == "upload_job"
@@ -816,6 +824,8 @@ class Worker:
             from app.services.job_media_service import record_pending_media
 
             operation_id = self._media_operation_id(msg)
+            if operation_id is None:
+                return
             blob = self._wecom_client.download_media(msg.media_id)
             storage = get_storage()
             key = f"images/{msg.from_user}/{msg.msg_id}.jpg"
