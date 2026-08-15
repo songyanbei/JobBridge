@@ -212,6 +212,19 @@ SCHEMA_CHECKS = {
         "AND COLUMN_NAME IN ("
         "'session_commit_deadline_epoch','session_apply_lease_owner')"
     ),
+    "old_inbound_table_contract_mismatch": (
+        "SELECT CASE WHEN COUNT(*)=1 "
+        "AND MAX(BINARY tables.ENGINE='InnoDB')=1 "
+        "AND MAX(BINARY charsets.CHARACTER_SET_NAME='utf8mb4')=1 "
+        "AND MAX(BINARY tables.TABLE_COLLATION='utf8mb4_0900_ai_ci')=1 "
+        "THEN 0 ELSE 1 END "
+        "FROM information_schema.TABLES tables "
+        "LEFT JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY charsets "
+        "ON BINARY charsets.COLLATION_NAME=tables.TABLE_COLLATION "
+        "WHERE tables.TABLE_SCHEMA=DATABASE() "
+        "AND tables.TABLE_TYPE='BASE TABLE' "
+        "AND BINARY tables.TABLE_NAME='wecom_inbound_event'"
+    ),
     "old_inbound_column_contract_mismatch": _column_contract_sql(),
     "old_inbound_index_contract_mismatch": _index_contract_sql(),
     "old_job_column_contract_mismatch": (

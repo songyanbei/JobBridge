@@ -89,7 +89,7 @@ CREATE TABLE wecom_inbound_event (
   KEY idx_session_commit_due (
     status, session_next_attempt_at, session_apply_locked_at, id
   )
-) ENGINE=InnoDB;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 """
 
 
@@ -448,6 +448,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
+            "old_inbound_table_contract_mismatch": 0,
             "old_inbound_column_contract_mismatch": 0,
             "old_inbound_index_contract_mismatch": 0,
             "old_job_column_contract_mismatch": 0,
@@ -459,6 +460,28 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         }
 
         with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE wecom_inbound_event ENGINE=MyISAM")
+        report = _collect_down_report(database)
+        assert report["old_inbound_table_contract_mismatch"] == 1
+        assert report["old_inbound_column_contract_mismatch"] == 0
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE wecom_inbound_event ENGINE=InnoDB")
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "DEFAULT CHARACTER SET latin1 COLLATE latin1_swedish_ci"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_table_contract_mismatch"] == 1
+        assert report["old_inbound_column_contract_mismatch"] == 0
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+            )
             cursor.execute(
                 "ALTER TABLE wecom_inbound_event "
                 "ADD required_extra VARCHAR(8) NOT NULL"
