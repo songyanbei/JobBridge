@@ -265,6 +265,21 @@ def test_down_rejects_post_migration_extension_before_overwrite():
         report = _collect_down_report(database)
         assert report["ready"] is True
         assert report["restored_job_backup_mismatch"] == 0
+
+        with db.cursor() as cursor:
+            cursor.execute("ALTER TABLE job ENGINE=MyISAM")
+        report = _collect_down_report(database)
+        assert report["old_job_table_contract_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute("SELECT version FROM job WHERE id=1")
+            version_before = int(cursor.fetchone()[0])
+            cursor.execute("START TRANSACTION")
+            cursor.execute("UPDATE job SET version=version+1 WHERE id=1")
+            cursor.execute("ROLLBACK")
+            cursor.execute("SELECT version FROM job WHERE id=1")
+            assert int(cursor.fetchone()[0]) == version_before + 1
+            cursor.execute("ALTER TABLE job ENGINE=InnoDB")
     finally:
         if db is not None:
             db.close()
@@ -448,6 +463,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
+            "old_job_table_contract_mismatch": 0,
             "old_inbound_table_contract_mismatch": 0,
             "old_inbound_constraints_mismatch": 0,
             "old_inbound_triggers_remaining": 0,

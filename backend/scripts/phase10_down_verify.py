@@ -238,6 +238,13 @@ SCHEMA_CHECKS = {
         "AND COLUMN_NAME IN ("
         "'session_commit_deadline_epoch','session_apply_lease_owner')"
     ),
+    "old_job_table_contract_mismatch": (
+        "SELECT CASE WHEN COUNT(*)=1 "
+        "AND MAX(BINARY ENGINE='InnoDB')=1 THEN 0 ELSE 1 END "
+        "FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' "
+        "AND BINARY TABLE_NAME='job'"
+    ),
     "old_inbound_table_contract_mismatch": (
         "SELECT CASE WHEN COUNT(*)=1 "
         "AND MAX(BINARY tables.ENGINE='InnoDB')=1 "

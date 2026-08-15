@@ -531,6 +531,7 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "不得运行 `python -m scripts.phase10_preflight`" in destructive
     assert "python -m scripts.phase10_down_verify" in destructive
     assert "499eb929b75ad2f208d306b62157d8ded0119f33" in destructive
+    assert "old_job_table_contract_mismatch" in destructive
     assert "old_inbound_table_contract_mismatch" in destructive
     assert "old_inbound_constraints_mismatch" in destructive
     assert "old_inbound_triggers_remaining" in destructive
@@ -554,6 +555,11 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     ]
     assert "TABLE_TYPE='BASE TABLE'" in required_table_gate
     assert "BINARY TABLE_NAME" in required_table_gate
+    job_table_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_job_table_contract_mismatch"
+    ]
+    assert "TABLE_TYPE='BASE TABLE'" in job_table_gate
+    assert "ENGINE='InnoDB'" in job_table_gate
     inbound_table_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_table_contract_mismatch"
     ]
@@ -616,6 +622,7 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["restored_job_backup_mismatch"] == 0
     assert report["phase10_session_columns_remaining"] == 0
     assert report["old_schema_required_tables_missing"] == 0
+    assert report["old_job_table_contract_mismatch"] == 0
     assert report["old_inbound_table_contract_mismatch"] == 0
     assert report["old_inbound_constraints_mismatch"] == 0
     assert report["old_inbound_triggers_remaining"] == 0
