@@ -45,7 +45,7 @@ CREATE TABLE job (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   audit_status ENUM('pending','passed','rejected') NOT NULL,
   created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   audited_at DATETIME NULL,
   expires_at DATETIME NOT NULL,
   deleted_at DATETIME NULL,
@@ -118,10 +118,11 @@ def _archive_down_evidence(connection) -> tuple[int, int, int]:
             "SELECT COUNT(*), "
             "COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, "
             "COALESCE(expires_at, ''), COALESCE(deleted_at, ''), "
-            "COALESCE(delist_reason, ''), version))), 0), "
+            "COALESCE(delist_reason, ''), version, source_updated_at))), 0), "
             "COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, "
             "COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), "
             "COALESCE(expected_delist_reason, ''), expected_version, "
+            "expected_updated_at, "
             "COALESCE(expected_activated_at, ''), "
             "COALESCE(expected_candidate_expires_at, '')))), 0) "
             "FROM phase10_job_lifecycle_backup"
@@ -211,6 +212,7 @@ def test_down_rejects_post_migration_extension_before_overwrite():
                 "j.deleted_at=b.expected_deleted_at, "
                 "j.delist_reason=b.expected_delist_reason, "
                 "j.version=b.expected_version, "
+                "j.updated_at=b.expected_updated_at, "
                 "j.activated_at=b.expected_activated_at, "
                 "j.candidate_expires_at=b.expected_candidate_expires_at"
             )
@@ -219,10 +221,15 @@ def test_down_rejects_post_migration_extension_before_overwrite():
         _execute_script(db, DOWN_SQL)
 
         with db.cursor() as cursor:
-            cursor.execute("SELECT id, expires_at, version FROM job ORDER BY id")
-            assert [(row[0], str(row[1]), row[2]) for row in cursor.fetchall()] == [
-                (1, "2026-09-01 00:00:00", 1),
-                (2, "2026-09-01 00:00:00", 4),
+            cursor.execute(
+                "SELECT id, expires_at, version, updated_at FROM job ORDER BY id"
+            )
+            assert [
+                (row[0], str(row[1]), row[2], str(row[3]))
+                for row in cursor.fetchall()
+            ] == [
+                (1, "2026-09-01 00:00:00", 1, "2026-01-02 00:00:00"),
+                (2, "2026-09-01 00:00:00", 4, "2026-01-02 00:00:00"),
             ]
             cursor.execute(
                 "SELECT COUNT(*) FROM information_schema.COLUMNS "

@@ -64,7 +64,8 @@ SELECT
       OR NOT (j.expires_at <=> b.expires_at)
       OR NOT (j.deleted_at <=> b.deleted_at)
       OR NOT (j.delist_reason <=> b.delist_reason)
-      OR NOT (j.version <=> b.version))
+      OR NOT (j.version <=> b.version)
+      OR NOT (j.updated_at <=> b.source_updated_at))
   +
   (SELECT COUNT(*)
    FROM job j

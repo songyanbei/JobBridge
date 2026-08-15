@@ -5,7 +5,8 @@ SELECT `id` AS `job_id`, `audit_status`, `expires_at`, `deleted_at`,
        `updated_at` AS `source_updated_at`, `audited_at` AS `source_audited_at`
 FROM `job`;
 ALTER TABLE `phase10_job_lifecycle_backup`
-  ADD PRIMARY KEY (`job_id`);
+  ADD PRIMARY KEY (`job_id`),
+  MODIFY COLUMN `source_updated_at` DATETIME NOT NULL;
 
 ALTER TABLE `job` MODIFY COLUMN `expires_at` DATETIME NULL COMMENT '激活后的业务过期时间';
 ALTER TABLE `job` ADD COLUMN `activated_at` DATETIME NULL AFTER `updated_at`;
@@ -166,10 +167,12 @@ ALTER TABLE `phase10_job_lifecycle_backup`
   ADD COLUMN `expected_deleted_at` DATETIME NULL,
   ADD COLUMN `expected_delist_reason` ENUM('filled','manual_delist','expired','replaced') NULL,
   ADD COLUMN `expected_version` INT UNSIGNED NULL,
+  ADD COLUMN `expected_updated_at` DATETIME NULL,
   ADD COLUMN `expected_activated_at` DATETIME NULL,
   ADD COLUMN `expected_candidate_expires_at` DATETIME NULL;
 
 UPDATE `phase10_job_lifecycle_backup` AS b
+JOIN `job` AS j ON j.`id` = b.`job_id`
 SET b.`expected_audit_status` = b.`audit_status`,
     b.`expected_expires_at` = CASE
       WHEN b.`deleted_at` IS NOT NULL OR b.`audit_status` = 'passed'
@@ -177,6 +180,7 @@ SET b.`expected_audit_status` = b.`audit_status`,
     b.`expected_deleted_at` = b.`deleted_at`,
     b.`expected_delist_reason` = b.`delist_reason`,
     b.`expected_version` = b.`version` + 1,
+    b.`expected_updated_at` = j.`updated_at`,
     b.`expected_activated_at` = CASE
       WHEN b.`deleted_at` IS NOT NULL
       THEN COALESCE(b.`source_audited_at`, b.`source_created_at`, b.`source_updated_at`)
@@ -190,19 +194,19 @@ SET b.`expected_audit_status` = b.`audit_status`,
 
 ALTER TABLE `phase10_job_lifecycle_backup`
   DROP COLUMN `source_created_at`,
-  DROP COLUMN `source_updated_at`,
   DROP COLUMN `source_audited_at`;
 
 ALTER TABLE `phase10_job_lifecycle_backup`
   MODIFY COLUMN `expected_audit_status` ENUM('pending','passed','rejected') NOT NULL,
-  MODIFY COLUMN `expected_version` INT UNSIGNED NOT NULL;
+  MODIFY COLUMN `expected_version` INT UNSIGNED NOT NULL,
+  MODIFY COLUMN `expected_updated_at` DATETIME NOT NULL;
 
 UPDATE `phase10_migration_control`
 SET `backup_rows` = (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`),
     `backup_checksum` = (
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
         COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-        COALESCE(`delist_reason`, ''), `version`))), 0)
+        COALESCE(`delist_reason`, ''), `version`, `source_updated_at`))), 0)
       FROM `phase10_job_lifecycle_backup`
     ),
     `source_soft_deleted_rows` = (
@@ -221,6 +225,7 @@ SET `backup_rows` = (SELECT COUNT(*) FROM `phase10_job_lifecycle_backup`),
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
         COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
         COALESCE(`expected_delist_reason`, ''), `expected_version`,
+        `expected_updated_at`,
         COALESCE(`expected_activated_at`, ''),
         COALESCE(`expected_candidate_expires_at`, '')))), 0)
       FROM `phase10_job_lifecycle_backup`
@@ -250,7 +255,7 @@ BEGIN
     OR c.`backup_checksum` <> (
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
         COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-        COALESCE(`delist_reason`, ''), `version`))), 0)
+        COALESCE(`delist_reason`, ''), `version`, `source_updated_at`))), 0)
       FROM `phase10_job_lifecycle_backup`
     )
     OR c.`source_soft_deleted_rows` <> (
@@ -268,6 +273,7 @@ BEGIN
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
         COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
         COALESCE(`expected_delist_reason`, ''), `expected_version`,
+        `expected_updated_at`,
         COALESCE(`expected_activated_at`, ''),
         COALESCE(`expected_candidate_expires_at`, '')))), 0)
       FROM `phase10_job_lifecycle_backup`
@@ -286,7 +292,8 @@ BEGIN
     OR c.`expected_live_checksum` <> (
       SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
         COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-        COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+        COALESCE(`delist_reason`, ''), `version`, `updated_at`,
+        COALESCE(`activated_at`, ''),
         COALESCE(`candidate_expires_at`, '')))), 0)
       FROM `job`
     )
@@ -340,13 +347,15 @@ SELECT
   c.`expected_live_checksum`,
   (SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
       COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-      COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+      COALESCE(`delist_reason`, ''), `version`, `updated_at`,
+      COALESCE(`activated_at`, ''),
       COALESCE(`candidate_expires_at`, '')))), 0)
    FROM `job`) AS `live_checksum`,
   c.`expected_live_checksum` = (
     SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
       COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-      COALESCE(`delist_reason`, ''), `version`, COALESCE(`activated_at`, ''),
+      COALESCE(`delist_reason`, ''), `version`, `updated_at`,
+      COALESCE(`activated_at`, ''),
       COALESCE(`candidate_expires_at`, '')))), 0)
     FROM `job`
   ) AS `live_checksum_valid`,
@@ -354,6 +363,7 @@ SELECT
     SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
       COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
       COALESCE(`expected_delist_reason`, ''), `expected_version`,
+      `expected_updated_at`,
       COALESCE(`expected_activated_at`, ''),
       COALESCE(`expected_candidate_expires_at`, '')))), 0)
     FROM `phase10_job_lifecycle_backup`

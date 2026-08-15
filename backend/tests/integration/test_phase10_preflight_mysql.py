@@ -32,7 +32,7 @@ CREATE TABLE job (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   audit_status ENUM('pending','passed','rejected') NOT NULL,
   created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   audited_at DATETIME NULL,
   expires_at DATETIME NOT NULL,
   deleted_at DATETIME NULL,
@@ -327,7 +327,8 @@ def test_migration_gates_classification_counts_and_live_checksum():
                 "c.expected_live_checksum, "
                 "(SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', id, audit_status, "
                 " COALESCE(expires_at, ''), COALESCE(deleted_at, ''), "
-                " COALESCE(delist_reason, ''), version, COALESCE(activated_at, ''), "
+                " COALESCE(delist_reason, ''), version, updated_at, "
+                " COALESCE(activated_at, ''), "
                 " COALESCE(candidate_expires_at, '')))), 0) FROM job) "
                 "FROM phase10_migration_control c WHERE c.id=1"
             )

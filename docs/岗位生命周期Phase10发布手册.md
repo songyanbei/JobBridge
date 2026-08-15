@@ -66,7 +66,7 @@ test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
 PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
 "${PHASE10_MYSQL[@]}" < sql/migrations/phase10_001_job_lifecycle_additive.sql | tee phase10-001-output.txt
-PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
+PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version, source_updated_at))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, expected_updated_at, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
 "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-001-backup-evidence.tsv
 # 归档 backup rows/checksum/expected-live checksum；同时归档 001 最后一行的
 # 三类 source/live 计数、live/expected checksum 和两个 valid 字段；
@@ -152,7 +152,7 @@ python -m scripts.phase10_preflight
    test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
    PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
    "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "SELECT DATABASE(), @@hostname, @@port"
-   PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
+   PHASE10_BACKUP_EVIDENCE_SQL="SELECT COUNT(*), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, audit_status, COALESCE(expires_at, ''), COALESCE(deleted_at, ''), COALESCE(delist_reason, ''), version, source_updated_at))), 0), COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', job_id, expected_audit_status, COALESCE(expected_expires_at, ''), COALESCE(expected_deleted_at, ''), COALESCE(expected_delist_reason, ''), expected_version, expected_updated_at, COALESCE(expected_activated_at, ''), COALESCE(expected_candidate_expires_at, '')))), 0) FROM phase10_job_lifecycle_backup"
    "${PHASE10_MYSQL[@]}" --batch --skip-column-names -e "$PHASE10_BACKUP_EVIDENCE_SQL" | tee phase10-down-backup-evidence.tsv
    cmp --silent phase10-001-backup-evidence.tsv phase10-down-backup-evidence.tsv
    ```

@@ -91,6 +91,7 @@ def test_down_migration_blocks_new_model_data_and_validates_restore_checksum():
     assert "phase10_down_blocked" in sql
     assert "COUNT(*) FROM `phase10_job_lifecycle_backup`" in sql
     assert "phase10_restore_checksum_valid" in sql
+    assert "phase10_post_ddl_restore_checksum_valid" in sql
     assert "phase10_down_guard_failed_checksum_mismatch" in sql
     assert "START TRANSACTION" in sql
     assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ" in sql
@@ -113,6 +114,7 @@ def test_down_migration_blocks_new_model_data_and_validates_restore_checksum():
         "deleted_at",
         "delist_reason",
         "version",
+        "updated_at",
         "activated_at",
         "candidate_expires_at",
     ):
@@ -136,14 +138,13 @@ def test_additive_migration_freezes_post_migration_state_for_safe_down():
             "ALTER TABLE `phase10_job_lifecycle_backup`\n  MODIFY COLUMN"
         )
     ]
-    assert "JOIN `job`" not in expected_projection
+    assert "JOIN `job` AS j ON j.`id` = b.`job_id`" in expected_projection
     assert "b.`expected_version` = b.`version` + 1" in expected_projection
-    for source_field in (
-        "source_created_at",
-        "source_updated_at",
-        "source_audited_at",
-    ):
+    assert "b.`expected_updated_at` = j.`updated_at`" in expected_projection
+    assert "MODIFY COLUMN `source_updated_at` DATETIME NOT NULL" in sql
+    for source_field in ("source_created_at", "source_audited_at"):
         assert f"DROP COLUMN `{source_field}`" in expected_projection
+    assert "DROP COLUMN `source_updated_at`" not in expected_projection
     assert "phase10_migration_control" in sql
     assert "phase10_assert_writes_allowed" in sql
     for trigger in (
@@ -157,6 +158,10 @@ def test_additive_migration_freezes_post_migration_state_for_safe_down():
         assert trigger in sql
     assert "expected_audit_status` ENUM('pending','passed','rejected') NOT NULL" in sql
     assert "expected_version` INT UNSIGNED NOT NULL" in sql
+    assert "expected_updated_at` DATETIME NOT NULL" in sql
+    assert "SET j.`updated_at` = b.`source_updated_at`" in (
+        ROOT / "sql/migrations/phase10_down_001_job_lifecycle.sql"
+    ).read_text(encoding="utf-8")
 
 
 def test_preflight_reports_all_clean_database_as_ready(monkeypatch):

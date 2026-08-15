@@ -23,13 +23,14 @@ SET @phase10_current_backup_rows = (
 SET @phase10_current_backup_checksum = (
   SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
     COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-    COALESCE(`delist_reason`, ''), `version`))), 0)
+    COALESCE(`delist_reason`, ''), `version`, `source_updated_at`))), 0)
   FROM `phase10_job_lifecycle_backup`
 );
 SET @phase10_current_expected_live_checksum = (
   SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `expected_audit_status`,
     COALESCE(`expected_expires_at`, ''), COALESCE(`expected_deleted_at`, ''),
     COALESCE(`expected_delist_reason`, ''), `expected_version`,
+    `expected_updated_at`,
     COALESCE(`expected_activated_at`, ''),
     COALESCE(`expected_candidate_expires_at`, '')))), 0)
   FROM `phase10_job_lifecycle_backup`
@@ -72,6 +73,7 @@ SET @phase10_down_blocked = (
       AND j.`deleted_at` <=> b.`expected_deleted_at`
       AND j.`delist_reason` <=> b.`expected_delist_reason`
       AND j.`version` <=> b.`expected_version`
+      AND j.`updated_at` <=> b.`expected_updated_at`
       AND j.`activated_at` <=> b.`expected_activated_at`
       AND j.`candidate_expires_at` <=> b.`expected_candidate_expires_at`
     )
@@ -95,16 +97,22 @@ SET j.`audit_status` = b.`audit_status`,
     j.`delist_reason` = b.`delist_reason`,
     j.`version` = b.`version`;
 
+-- Restore the automatic timestamp separately. In a multi-column UPDATE MySQL may
+-- apply ON UPDATE after the assignments and overwrite the archived value.
+UPDATE `job` AS j
+JOIN `phase10_job_lifecycle_backup` AS b ON b.`job_id` = j.`id`
+SET j.`updated_at` = b.`source_updated_at`;
+
 SET @phase10_backup_checksum = (
   SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `job_id`, `audit_status`,
     COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-    COALESCE(`delist_reason`, ''), `version`))), 0)
+    COALESCE(`delist_reason`, ''), `version`, `source_updated_at`))), 0)
   FROM `phase10_job_lifecycle_backup`
 );
 SET @phase10_restored_checksum = (
   SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
     COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
-    COALESCE(`delist_reason`, ''), `version`))), 0)
+    COALESCE(`delist_reason`, ''), `version`, `updated_at`))), 0)
   FROM `job`
 );
 SET @phase10_checksum_sql = IF(
@@ -124,6 +132,26 @@ ALTER TABLE `job` DROP INDEX `idx_job_candidate_expiry`;
 ALTER TABLE `job` DROP COLUMN `candidate_expires_at`, DROP COLUMN `activated_at`;
 ALTER TABLE `job` MODIFY COLUMN `expires_at` DATETIME NOT NULL;
 ALTER TABLE `job` MODIFY COLUMN `delist_reason` ENUM('filled','manual_delist','expired') NULL;
+
+-- ALTER TABLE may rebuild Job and advance an ON UPDATE timestamp even after the
+-- transactional restore. Restore and verify the archived value after all Job DDL.
+UPDATE `job` AS j
+JOIN `phase10_job_lifecycle_backup` AS b ON b.`job_id` = j.`id`
+SET j.`updated_at` = b.`source_updated_at`;
+SET @phase10_post_ddl_restored_checksum = (
+  SELECT COALESCE(BIT_XOR(CRC32(CONCAT_WS('|', `id`, `audit_status`,
+    COALESCE(`expires_at`, ''), COALESCE(`deleted_at`, ''),
+    COALESCE(`delist_reason`, ''), `version`, `updated_at`))), 0)
+  FROM `job`
+);
+SET @phase10_post_ddl_checksum_sql = IF(
+  @phase10_backup_checksum <=> @phase10_post_ddl_restored_checksum,
+  'SELECT 1 AS phase10_post_ddl_restore_checksum_valid',
+  'SELECT * FROM `phase10_down_guard_failed_post_ddl_checksum_mismatch`'
+);
+PREPARE phase10_post_ddl_checksum_stmt FROM @phase10_post_ddl_checksum_sql;
+EXECUTE phase10_post_ddl_checksum_stmt;
+DEALLOCATE PREPARE phase10_post_ddl_checksum_stmt;
 DROP TABLE `job_replacement`;
 DROP TABLE `media_asset_lifecycle`;
 DROP TABLE `target_cleanup_task`;
@@ -141,5 +169,6 @@ ALTER TABLE `phase10_job_lifecycle_backup`
   DROP COLUMN `expected_deleted_at`,
   DROP COLUMN `expected_delist_reason`,
   DROP COLUMN `expected_version`,
+  DROP COLUMN `expected_updated_at`,
   DROP COLUMN `expected_activated_at`,
   DROP COLUMN `expected_candidate_expires_at`;
