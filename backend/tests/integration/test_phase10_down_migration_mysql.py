@@ -449,6 +449,7 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
             "old_inbound_table_contract_mismatch": 0,
+            "old_inbound_constraints_mismatch": 0,
             "old_inbound_column_contract_mismatch": 0,
             "old_inbound_index_contract_mismatch": 0,
             "old_job_column_contract_mismatch": 0,
@@ -460,6 +461,41 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         }
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event ADD CONSTRAINT chk_block_text "
+                "CHECK (msg_type <> 'text')"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_constraints_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.err.OperationalError) as check_error:
+                cursor.execute(
+                    "INSERT INTO wecom_inbound_event "
+                    "(msg_id, from_userid, msg_type) "
+                    "VALUES ('check-msg', 'check-user', 'text')"
+                )
+            assert check_error.value.args[0] == 3819
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event DROP CHECK chk_block_text, "
+                "ADD CONSTRAINT fk_inbound_config FOREIGN KEY (from_userid) "
+                "REFERENCES system_config(config_key)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_constraints_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            with pytest.raises(pymysql.err.IntegrityError) as foreign_key_error:
+                cursor.execute(
+                    "INSERT INTO wecom_inbound_event "
+                    "(msg_id, from_userid, msg_type) "
+                    "VALUES ('fk-msg', 'missing-user', 'text')"
+                )
+            assert foreign_key_error.value.args[0] == 1452
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "DROP FOREIGN KEY fk_inbound_config"
+            )
             cursor.execute(
                 "ALTER TABLE wecom_inbound_event "
                 "ADD INDEX idx_extra_media_id (media_id)"

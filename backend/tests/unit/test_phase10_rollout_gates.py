@@ -532,6 +532,7 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "python -m scripts.phase10_down_verify" in destructive
     assert "499eb929b75ad2f208d306b62157d8ded0119f33" in destructive
     assert "old_inbound_table_contract_mismatch" in destructive
+    assert "old_inbound_constraints_mismatch" in destructive
     assert "old_inbound_column_contract_mismatch" in destructive
     assert "old_inbound_index_contract_mismatch" in destructive
     assert "额外普通非唯一索引允许保留" in destructive
@@ -557,6 +558,11 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "ENGINE='InnoDB'" in inbound_table_gate
     assert "CHARACTER_SET_NAME='utf8mb4'" in inbound_table_gate
     assert "TABLE_COLLATION='utf8mb4_0900_ai_ci'" in inbound_table_gate
+    inbound_constraints_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_inbound_constraints_mismatch"
+    ]
+    assert "TABLE_CONSTRAINTS" in inbound_constraints_gate
+    assert "'CHECK','FOREIGN KEY'" in inbound_constraints_gate
     inbound_column_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_column_contract_mismatch"
     ]
@@ -601,6 +607,7 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["phase10_session_columns_remaining"] == 0
     assert report["old_schema_required_tables_missing"] == 0
     assert report["old_inbound_table_contract_mismatch"] == 0
+    assert report["old_inbound_constraints_mismatch"] == 0
     assert report["old_inbound_column_contract_mismatch"] == 0
     assert report["old_inbound_index_contract_mismatch"] == 0
 

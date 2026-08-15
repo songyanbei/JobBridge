@@ -238,6 +238,12 @@ SCHEMA_CHECKS = {
         "AND tables.TABLE_TYPE='BASE TABLE' "
         "AND BINARY tables.TABLE_NAME='wecom_inbound_event'"
     ),
+    "old_inbound_constraints_mismatch": (
+        "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS "
+        "WHERE CONSTRAINT_SCHEMA=DATABASE() "
+        "AND BINARY TABLE_NAME='wecom_inbound_event' "
+        "AND CONSTRAINT_TYPE IN ('CHECK','FOREIGN KEY')"
+    ),
     "old_inbound_column_contract_mismatch": _column_contract_sql(),
     "old_inbound_index_contract_mismatch": _index_contract_sql(),
     "old_job_column_contract_mismatch": (
