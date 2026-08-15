@@ -556,6 +556,13 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "USER_PRIVILEGES" in metadata_visibility_gate
     assert "CURRENT_USER()" in metadata_visibility_gate
     assert "PRIVILEGE_TYPE='SELECT'" in metadata_visibility_gate
+    trigger_visibility_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "down_verify_trigger_privilege_missing"
+    ]
+    assert "USER_PRIVILEGES" in trigger_visibility_gate
+    assert "SCHEMA_PRIVILEGES" in trigger_visibility_gate
+    assert "TABLE_SCHEMA=DATABASE()" in trigger_visibility_gate
+    assert "PRIVILEGE_TYPE='TRIGGER'" in trigger_visibility_gate
     required_table_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_schema_required_tables_missing"
     ]
@@ -654,11 +661,16 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     required_tables.scalar.return_value = 2
     restore_mismatch = MagicMock()
     restore_mismatch.scalar.return_value = 0
-    db.execute.side_effect = [*results, required_tables, restore_mismatch]
+    current_account = MagicMock()
+    current_account.scalar.return_value = "root@%"
+    db.execute.side_effect = [
+        current_account, *results, required_tables, restore_mismatch
+    ]
 
-    report = phase10_down_verify.collect(db)
+    report = phase10_down_verify.collect(db, expected_account="root@%")
 
     assert report["ready"] is True
+    assert report["down_verify_database_account_mismatch"] == 0
     assert report["restored_job_backup_mismatch"] == 0
     assert report["phase10_session_columns_remaining"] == 0
     assert report["old_schema_required_tables_missing"] == 0
@@ -674,9 +686,18 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
         "old_schema_required_tables_missing"
     )
     results[required_table_result_index].scalar.return_value = 1
-    db.execute.side_effect = [*results, required_tables, restore_mismatch]
-    report = phase10_down_verify.collect(db)
+    db.execute.side_effect = [
+        current_account, *results, required_tables, restore_mismatch
+    ]
+    report = phase10_down_verify.collect(db, expected_account="root@%")
     assert report["old_schema_required_tables_missing"] == 1
+    assert report["ready"] is False
+
+    db.execute.side_effect = [
+        current_account, *results, required_tables, restore_mismatch
+    ]
+    report = phase10_down_verify.collect(db, expected_account="migration@%")
+    assert report["down_verify_database_account_mismatch"] == 1
     assert report["ready"] is False
 
 

@@ -9,7 +9,7 @@ from uuid import uuid4
 import pymysql
 import pytest
 from pymysql.constants import CLIENT
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.db import engine
@@ -166,7 +166,12 @@ def _collect_down_report(database: str) -> dict[str, int | bool]:
     verify_engine = create_engine(engine.url.set(database=database))
     try:
         with sessionmaker(bind=verify_engine)() as verify_session:
-            return collect_down_report(verify_session)
+            account = str(
+                verify_session.execute(text("SELECT CURRENT_USER()")).scalar()
+            )
+            return collect_down_report(
+                verify_session, expected_account=account
+            )
     finally:
         verify_engine.dispose()
 
@@ -179,7 +184,12 @@ def _collect_down_report_as(
     )
     try:
         with sessionmaker(bind=verify_engine)() as verify_session:
-            return collect_down_report(verify_session)
+            account = str(
+                verify_session.execute(text("SELECT CURRENT_USER()")).scalar()
+            )
+            return collect_down_report(
+                verify_session, expected_account=account
+            )
     finally:
         verify_engine.dispose()
 
@@ -466,6 +476,81 @@ def test_down_verify_fails_closed_without_global_fk_metadata_visibility():
         admin.close()
 
 
+def test_down_verify_fails_closed_without_trigger_metadata_visibility():
+    database = f"phase10_down_{uuid4().hex[:16]}"
+    metadata_user = f"phase10_trigger_{uuid4().hex[:10]}"
+    metadata_password = uuid4().hex
+    admin = _connect()
+    db = restricted = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+        _execute_phase10_up(db)
+        evidence = _archive_down_evidence(db)
+        _set_down_evidence(db, evidence)
+        _execute_script(db, DOWN_SQL)
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "CREATE TRIGGER hidden_stage_a_inbound "
+                "BEFORE INSERT ON wecom_inbound_event FOR EACH ROW "
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='hidden trigger'"
+            )
+        privileged_report = _collect_down_report(database)
+        assert privileged_report["down_verify_trigger_privilege_missing"] == 0
+        assert privileged_report["old_inbound_triggers_remaining"] == 1
+
+        with admin.cursor() as cursor:
+            cursor.execute(
+                f"CREATE USER `{metadata_user}`@'%%' IDENTIFIED BY %s",
+                (metadata_password,),
+            )
+            cursor.execute(f"GRANT SELECT ON *.* TO `{metadata_user}`@'%'")
+            cursor.execute(
+                f"GRANT INSERT ON `{database}`.wecom_inbound_event "
+                f"TO `{metadata_user}`@'%'"
+            )
+
+        restricted_report = _collect_down_report_as(
+            database, metadata_user, metadata_password
+        )
+        assert restricted_report["down_verify_database_account_mismatch"] == 0
+        assert restricted_report["down_verify_global_select_privilege_missing"] == 0
+        assert restricted_report["old_inbound_triggers_remaining"] == 0
+        assert restricted_report["down_verify_trigger_privilege_missing"] == 1
+        assert restricted_report["ready"] is False
+
+        url = engine.url
+        restricted = pymysql.connect(
+            host=url.host or "127.0.0.1",
+            port=int(url.port or 3306),
+            user=metadata_user,
+            password=metadata_password,
+            database=database,
+            charset="utf8mb4",
+            autocommit=True,
+        )
+        with restricted.cursor() as cursor:
+            with pytest.raises(pymysql.err.OperationalError) as trigger_error:
+                cursor.execute(
+                    "INSERT INTO wecom_inbound_event "
+                    "(msg_id, from_userid, msg_type) "
+                    "VALUES ('hidden-trigger-msg', 'hidden-trigger-user', 'text')"
+                )
+            assert trigger_error.value.args[0] == 1644
+    finally:
+        if restricted is not None:
+            restricted.close()
+        if db is not None:
+            db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP USER IF EXISTS `{metadata_user}`@'%'")
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
+
+
 def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
     database = f"phase10_down_{uuid4().hex[:16]}"
     admin = _connect()
@@ -638,7 +723,9 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
 
         report = _collect_down_report(database)
         assert report == {
+            "down_verify_database_account_mismatch": 0,
             "down_verify_global_select_privilege_missing": 0,
+            "down_verify_trigger_privilege_missing": 0,
             "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,

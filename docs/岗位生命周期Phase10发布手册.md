@@ -49,7 +49,7 @@ Phase 10 必须先独立部署旧 schema 兼容制品，再进入停服迁移。
 
 ## 3. 迁移
 
-为 MySQL 8 客户端准备权限为 `0600` 的配置文件，至少在 `[client]` 中配置待发布环境的 `host`、`port`、`user`、`password` 和 TLS 参数。迁移账号除常规 DDL/DML 权限外，必须具备 `CREATE ROUTINE`、`ALTER ROUTINE`、`EXECUTE` 和 `TRIGGER` 权限，用于创建、执行及移除破坏性回滚写入围栏。破坏性 down 后的专用校验还要求同一账号具备全局 `SELECT`，以完整读取所有 schema 中可能反向引用当前库的外键元数据；仅授予当前业务库 `SELECT` 会被 `down_verify_global_select_privilege_missing` fail-closed 阻断。配置文件不得提交到代码库。所有迁移和回滚必须复用同一个配置文件和数据库名；先输出实际数据库、主机和端口，人工核对后再执行：
+为 MySQL 8 客户端准备权限为 `0600` 的配置文件，至少在 `[client]` 中配置待发布环境的 `host`、`port`、`user`、`password` 和 TLS 参数。迁移账号除常规 DDL/DML 权限外，必须直接具备 `CREATE ROUTINE`、`ALTER ROUTINE`、`EXECUTE` 和目标 schema 的 `TRIGGER` 权限，用于创建、执行及移除破坏性回滚写入围栏，并保证专用校验能看到任意命名的 trigger。破坏性 down 后的专用校验还要求同一账号直接具备全局 `SELECT`，以完整读取所有 schema 中可能反向引用当前库的外键元数据；仅授予当前业务库 `SELECT` 会被 `down_verify_global_select_privilege_missing` fail-closed 阻断，缺少直接 TRIGGER 权限会被 `down_verify_trigger_privilege_missing` 阻断。配置文件不得提交到代码库。所有迁移和回滚必须复用同一个配置文件和数据库名；先输出实际数据库、主机和端口，人工核对后再执行：
 
 ```bash
 export PHASE10_MYSQL_DEFAULTS_FILE=/run/secrets/jobbridge-mysql-client.cnf
@@ -177,9 +177,16 @@ python -m scripts.phase10_preflight
 8. 已经执行 destructive schema down 时，不得再启动最终 schema-aware 制品，也不得运行 `python -m scripts.phase10_preflight`；该 preflight 依赖已删除的新列和新表，报结构不存在不代表有效验收。使用仍指向同一生产目标的最终工具环境运行专用只读校验：
 
    ```bash
+   set -euo pipefail
+   test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
+   PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" --database="$DB_NAME" --show-warnings)
+   export PHASE10_DOWN_VERIFY_DB_ACCOUNT="$("${PHASE10_MYSQL[@]}" --batch --skip-column-names -e 'SELECT CURRENT_USER()')"
+   test -n "$PHASE10_DOWN_VERIFY_DB_ACCOUNT"
    python -m scripts.phase10_down_verify | tee phase10-down-verify.json
    test "$(python -c 'import json; print(str(json.load(open("phase10-down-verify.json"))["ready"]).lower())')" = true
    ```
+
+   `down_verify_database_account_mismatch`、`down_verify_global_select_privilege_missing` 和 `down_verify_trigger_privilege_missing` 必须全部为 `0`；期望账号缺失、SessionLocal 实际账号不一致、缺少直接全局 SELECT 或缺少目标 schema 的直接 TRIGGER 权限均禁止继续。
 
    `down_verify_global_select_privilege_missing`、`old_schema_required_tables_missing`、`phase10_job_columns_remaining`、`phase10_session_columns_remaining`、`old_job_table_contract_mismatch`、`old_inbound_table_contract_mismatch`、`old_inbound_constraints_mismatch`、`old_inbound_referencing_foreign_keys_mismatch`、`old_inbound_triggers_remaining`、`old_inbound_column_contract_mismatch`、`old_inbound_index_contract_mismatch`、`old_job_column_contract_mismatch`、`old_job_index_contract_mismatch`、`old_job_constraints_mismatch`、`old_job_triggers_remaining`、`phase10_tables_remaining`、`phase10_fences_remaining`、`backup_expected_columns_remaining` 和 `restored_job_backup_mismatch` 必须全部为 `0`，`ready=true`。`job` 必须保持完整 Stage A 列、索引、约束、零触发器、InnoDB 和默认字符集/排序规则合同。inbound 门禁会精确核对 Stage A 的 InnoDB 引擎与默认字符集/排序规则、完整字段语义、表约束、零触发器，以及主键、唯一键和 Worker/session 索引列序；全局反向外键扫描同时拒绝其他 schema 中指向 inbound 的外键。未声明的 CHECK、FOREIGN KEY、PRIMARY 或 UNIQUE 约束及任意命名的 inbound trigger 都会阻断；所有声明索引必须可见。额外普通非唯一索引仅允许可直接映射完整物理列的 BTREE，prefix、expression、无物理列或其他索引类型都会阻断。同名空表或残缺表不得视为回滚成功。必需的旧 schema 表为 `job`、`phase10_job_lifecycle_backup` 和 `wecom_inbound_event`，缺少任一表都视为破坏性回滚失败。然后将数据库连接切回不可变 Stage A 制品 `499eb929b75ad2f208d306b62157d8ded0119f33`，确认最终制品全部退出，再执行带鉴权健康检查和旧 schema 只读冒烟：后台岗位列表第 1/2 页、岗位详情、岗位 CSV 导出、审核工作台队列和审核详情。全部通过后归档 down 输出、专用校验 JSON、Stage A commit/镜像 digest 和请求响应证据；任何 5xx、结构错误、数据不一致或进程版本混跑都视为回滚失败。
 

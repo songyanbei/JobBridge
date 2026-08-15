@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from sqlalchemy import text
 
@@ -300,6 +301,17 @@ SCHEMA_CHECKS = {
         "WHERE REPLACE(GRANTEE, '''', '')=CURRENT_USER() "
         "AND BINARY PRIVILEGE_TYPE='SELECT'"
     ),
+    "down_verify_trigger_privilege_missing": (
+        "SELECT CASE WHEN "
+        "(SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES "
+        " WHERE REPLACE(GRANTEE, '''', '')=CURRENT_USER() "
+        " AND BINARY PRIVILEGE_TYPE='TRIGGER') + "
+        "(SELECT COUNT(*) FROM information_schema.SCHEMA_PRIVILEGES "
+        " WHERE REPLACE(GRANTEE, '''', '')=CURRENT_USER() "
+        " AND BINARY TABLE_SCHEMA=DATABASE() "
+        " AND BINARY PRIVILEGE_TYPE='TRIGGER') > 0 "
+        "THEN 0 ELSE 1 END"
+    ),
     "old_schema_required_tables_missing": (
         "SELECT 3 - COUNT(*) FROM information_schema.TABLES "
         "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' "
@@ -445,10 +457,20 @@ SELECT
 """
 
 
-def collect(db) -> dict[str, int | bool]:
+def collect(
+    db, *, expected_account: str | None = None
+) -> dict[str, int | bool]:
+    actual_account = str(
+        db.execute(text("SELECT CURRENT_USER()")).scalar() or ""
+    )
     report = {
-        name: int(db.execute(text(sql)).scalar() or 0)
-        for name, sql in SCHEMA_CHECKS.items()
+        "down_verify_database_account_mismatch": int(
+            not expected_account or actual_account != expected_account
+        ),
+        **{
+            name: int(db.execute(text(sql)).scalar() or 0)
+            for name, sql in SCHEMA_CHECKS.items()
+        },
     }
     required_tables = int(db.execute(text(
         "SELECT COUNT(*) FROM information_schema.TABLES "
@@ -467,7 +489,10 @@ def collect(db) -> dict[str, int | bool]:
 
 def main() -> int:
     with SessionLocal() as db:
-        report = collect(db)
+        report = collect(
+            db,
+            expected_account=os.getenv("PHASE10_DOWN_VERIFY_DB_ACCOUNT"),
+        )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["ready"] else 1
 
