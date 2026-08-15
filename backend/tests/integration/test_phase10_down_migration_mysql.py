@@ -60,12 +60,35 @@ INSERT INTO job (
 ('pending','2026-01-01','2026-01-02',NULL,'2026-09-01',NULL,NULL,4);
 CREATE TABLE wecom_inbound_event (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  msg_id VARCHAR(64) NOT NULL,
+  from_userid VARCHAR(64) NOT NULL,
+  msg_type ENUM('text','image','voice','video','file','link','location','event','other')
+    NOT NULL,
+  media_id VARCHAR(128) NULL,
+  content_brief VARCHAR(500) NULL,
   status ENUM('received','processing','session_pending','done','failed','dead_letter')
     NOT NULL DEFAULT 'received',
+  retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  session_operation VARCHAR(8) NULL,
+  session_expected_version INT UNSIGNED NULL,
+  session_payload JSON NULL,
+  session_apply_attempts INT UNSIGNED NOT NULL DEFAULT 0,
   session_apply_locked_at DATETIME(6) NULL,
   session_next_attempt_at DATETIME(6) NULL,
+  session_applied_at DATETIME(6) NULL,
   worker_started_at DATETIME(6) NULL,
-  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+  worker_finished_at DATETIME(6) NULL,
+  error_message TEXT NULL,
+  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  UNIQUE KEY uk_msg_id (msg_id),
+  KEY idx_status_time (status, created_at),
+  KEY idx_status_worker_started (status, worker_started_at),
+  KEY idx_status_worker_finished (status, worker_finished_at),
+  KEY idx_from_user (from_userid, created_at),
+  KEY idx_user_status_id (from_userid, status, id),
+  KEY idx_session_commit_due (
+    status, session_next_attempt_at, session_apply_locked_at, id
+  )
 ) ENGINE=InnoDB;
 """
 
@@ -262,7 +285,11 @@ def test_down_fence_rejects_concurrent_job_and_empty_model_writes():
         _execute_phase10_up(setup)
         evidence = _archive_down_evidence(setup)
         with setup.cursor() as cursor:
-            cursor.execute("INSERT INTO wecom_inbound_event (status) VALUES ('received')")
+            cursor.execute(
+                "INSERT INTO wecom_inbound_event "
+                "(msg_id, from_userid, msg_type, status) "
+                "VALUES ('down-fence-msg', 'down-fence-user', 'text', 'received')"
+            )
             inbound_event_id = int(cursor.lastrowid)
 
         down = _connect(database)
@@ -351,8 +378,10 @@ def test_down_rejects_durable_session_state_before_column_drop():
         with db.cursor() as cursor:
             cursor.execute(
                 "INSERT INTO wecom_inbound_event "
-                "(status, session_commit_deadline_epoch) "
-                "VALUES ('session_pending', UNIX_TIMESTAMP(NOW(6)) + 1800)"
+                "(msg_id, from_userid, msg_type, status, "
+                "session_commit_deadline_epoch) "
+                "VALUES ('durable-msg', 'durable-user', 'text', "
+                "'session_pending', UNIX_TIMESTAMP(NOW(6)) + 1800)"
             )
 
         _set_down_evidence(db, evidence)
@@ -419,6 +448,8 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "old_schema_required_tables_missing": 0,
             "phase10_job_columns_remaining": 0,
             "phase10_session_columns_remaining": 0,
+            "old_inbound_column_contract_mismatch": 0,
+            "old_inbound_index_contract_mismatch": 0,
             "old_job_column_contract_mismatch": 0,
             "phase10_tables_remaining": 0,
             "phase10_fences_remaining": 0,
@@ -428,12 +459,63 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         }
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "MODIFY retry_count INT NULL DEFAULT 7"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "MODIFY retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0"
+            )
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event DROP INDEX idx_session_commit_due"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 0
+        assert report["old_inbound_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event ADD INDEX idx_session_commit_due "
+                "(status, session_next_attempt_at, session_apply_locked_at, id)"
+            )
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event DROP INDEX uk_msg_id, "
+                "ADD UNIQUE INDEX uk_msg_id (msg_id(8))"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 0
+        assert report["old_inbound_index_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event DROP INDEX uk_msg_id, "
+                "ADD UNIQUE INDEX uk_msg_id (msg_id)"
+            )
             cursor.execute("DROP TABLE wecom_inbound_event")
         report = _collect_down_report(database)
         assert report["old_schema_required_tables_missing"] == 1
         assert report["ready"] is False
 
         with db.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE wecom_inbound_event (id BIGINT PRIMARY KEY)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_schema_required_tables_missing"] == 0
+        assert report["old_inbound_column_contract_mismatch"] > 0
+        assert report["old_inbound_index_contract_mismatch"] > 0
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute("DROP TABLE wecom_inbound_event")
             cursor.execute("CREATE VIEW wecom_inbound_event AS SELECT 1 AS id")
         report = _collect_down_report(database)
         assert report["old_schema_required_tables_missing"] == 1

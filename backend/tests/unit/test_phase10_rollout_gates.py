@@ -531,6 +531,8 @@ def test_release_manual_uses_dedicated_gate_after_destructive_down():
     assert "不得运行 `python -m scripts.phase10_preflight`" in destructive
     assert "python -m scripts.phase10_down_verify" in destructive
     assert "499eb929b75ad2f208d306b62157d8ded0119f33" in destructive
+    assert "old_inbound_column_contract_mismatch" in destructive
+    assert "old_inbound_index_contract_mismatch" in destructive
     for surface in (
         "岗位列表第 1/2 页",
         "岗位详情",
@@ -547,6 +549,21 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     ]
     assert "TABLE_TYPE='BASE TABLE'" in required_table_gate
     assert "BINARY TABLE_NAME" in required_table_gate
+    inbound_column_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_inbound_column_contract_mismatch"
+    ]
+    assert "COLUMN_TYPE" in inbound_column_gate
+    assert "IS_NULLABLE" in inbound_column_gate
+    assert "COLUMN_DEFAULT" in inbound_column_gate
+    assert "auto_increment" in inbound_column_gate
+    inbound_index_gate = phase10_down_verify.SCHEMA_CHECKS[
+        "old_inbound_index_contract_mismatch"
+    ]
+    assert "GROUP_CONCAT" in inbound_index_gate
+    assert "SEQ_IN_INDEX" in inbound_index_gate
+    assert "NON_UNIQUE" in inbound_index_gate
+    assert "SUB_PART" in inbound_index_gate
+    assert "EXPRESSION" in inbound_index_gate
 
     db = MagicMock()
     results = []
@@ -566,6 +583,8 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert report["restored_job_backup_mismatch"] == 0
     assert report["phase10_session_columns_remaining"] == 0
     assert report["old_schema_required_tables_missing"] == 0
+    assert report["old_inbound_column_contract_mismatch"] == 0
+    assert report["old_inbound_index_contract_mismatch"] == 0
 
     results[0].scalar.return_value = 1
     db.execute.side_effect = [*results, required_tables, restore_mismatch]

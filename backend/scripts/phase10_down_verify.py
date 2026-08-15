@@ -8,6 +8,120 @@ from sqlalchemy import text
 from app.db import SessionLocal
 
 
+INBOUND_COLUMN_CONTRACT = (
+    # name, column_type, nullable, default (None means SQL NULL), extra
+    ("id", "bigint unsigned", "NO", None, "auto_increment"),
+    ("msg_id", "varchar(64)", "NO", None, None),
+    ("from_userid", "varchar(64)", "NO", None, None),
+    (
+        "msg_type",
+        "enum('text','image','voice','video','file','link','location','event','other')",
+        "NO",
+        None,
+        None,
+    ),
+    ("media_id", "varchar(128)", "YES", None, None),
+    ("content_brief", "varchar(500)", "YES", None, None),
+    (
+        "status",
+        "enum('received','processing','session_pending','done','failed','dead_letter')",
+        "NO",
+        "received",
+        None,
+    ),
+    ("retry_count", "tinyint unsigned", "NO", "0", None),
+    ("session_operation", "varchar(8)", "YES", None, None),
+    ("session_expected_version", "int unsigned", "YES", None, None),
+    ("session_payload", "json", "YES", None, None),
+    ("session_apply_attempts", "int unsigned", "NO", "0", None),
+    ("session_apply_locked_at", "datetime(6)", "YES", None, None),
+    ("session_next_attempt_at", "datetime(6)", "YES", None, None),
+    ("session_applied_at", "datetime(6)", "YES", None, None),
+    ("worker_started_at", "datetime(6)", "YES", None, None),
+    ("worker_finished_at", "datetime(6)", "YES", None, None),
+    ("error_message", "text", "YES", None, None),
+    ("created_at", "datetime(6)", "NO", "current_timestamp(6)", None),
+)
+
+INBOUND_INDEX_CONTRACT = (
+    # name, non_unique, ordered columns
+    ("PRIMARY", 0, "id"),
+    ("uk_msg_id", 0, "msg_id"),
+    ("idx_status_time", 1, "status,created_at"),
+    ("idx_status_worker_started", 1, "status,worker_started_at"),
+    ("idx_status_worker_finished", 1, "status,worker_finished_at"),
+    ("idx_from_user", 1, "from_userid,created_at"),
+    ("idx_user_status_id", 1, "from_userid,status,id"),
+    (
+        "idx_session_commit_due",
+        1,
+        "status,session_next_attempt_at,session_apply_locked_at,id",
+    ),
+)
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _column_contract_sql() -> str:
+    rows = []
+    for name, column_type, nullable, default, extra in INBOUND_COLUMN_CONTRACT:
+        rows.append(
+            "SELECT "
+            f"{_sql_string(name)} AS column_name, "
+            f"{_sql_string(column_type)} AS column_type, "
+            f"{_sql_string(nullable)} AS is_nullable, "
+            f"{1 if default is None else 0} AS default_is_null, "
+            f"{_sql_string(default or '')} AS column_default, "
+            f"{_sql_string(extra or '')} AS required_extra"
+        )
+    expected = " UNION ALL ".join(rows)
+    return (
+        "SELECT COUNT(*) FROM (" + expected + ") expected "
+        "LEFT JOIN information_schema.COLUMNS actual "
+        "ON actual.TABLE_SCHEMA=DATABASE() "
+        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        "AND BINARY actual.COLUMN_NAME=expected.column_name "
+        "WHERE actual.COLUMN_NAME IS NULL "
+        "OR LOWER(actual.COLUMN_TYPE)<>expected.column_type "
+        "OR actual.IS_NULLABLE<>expected.is_nullable "
+        "OR (expected.default_is_null=1 AND actual.COLUMN_DEFAULT IS NOT NULL) "
+        "OR (expected.default_is_null=0 AND (actual.COLUMN_DEFAULT IS NULL "
+        "OR LOWER(CAST(actual.COLUMN_DEFAULT AS CHAR))<>expected.column_default)) "
+        "OR (expected.required_extra<>'' "
+        "AND LOWER(actual.EXTRA)<>expected.required_extra)"
+    )
+
+
+def _index_contract_sql() -> str:
+    rows = []
+    for name, non_unique, columns in INBOUND_INDEX_CONTRACT:
+        rows.append(
+            "SELECT "
+            f"{_sql_string(name)} AS index_name, "
+            f"{non_unique} AS non_unique, "
+            f"{_sql_string(columns)} AS columns"
+        )
+    expected = " UNION ALL ".join(rows)
+    return (
+        "SELECT COUNT(*) FROM (" + expected + ") expected "
+        "LEFT JOIN ("
+        "SELECT INDEX_NAME, MIN(NON_UNIQUE) AS non_unique, "
+        "GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',') AS columns, "
+        "SUM(CASE WHEN SUB_PART IS NOT NULL OR EXPRESSION IS NOT NULL "
+        "THEN 1 ELSE 0 END) AS partial_or_expression_columns "
+        "FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() "
+        "AND BINARY TABLE_NAME='wecom_inbound_event' GROUP BY INDEX_NAME"
+        ") actual ON BINARY actual.INDEX_NAME=expected.index_name "
+        "WHERE actual.INDEX_NAME IS NULL "
+        "OR actual.non_unique<>expected.non_unique "
+        "OR actual.columns<>expected.columns "
+        "OR actual.partial_or_expression_columns<>0"
+    )
+
+
 SCHEMA_CHECKS = {
     "old_schema_required_tables_missing": (
         "SELECT 3 - COUNT(*) FROM information_schema.TABLES "
@@ -26,6 +140,8 @@ SCHEMA_CHECKS = {
         "AND COLUMN_NAME IN ("
         "'session_commit_deadline_epoch','session_apply_lease_owner')"
     ),
+    "old_inbound_column_contract_mismatch": _column_contract_sql(),
+    "old_inbound_index_contract_mismatch": _index_contract_sql(),
     "old_job_column_contract_mismatch": (
         "SELECT CASE WHEN "
         "(SELECT COUNT(*) FROM information_schema.COLUMNS "
