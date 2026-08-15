@@ -435,6 +435,26 @@ SCHEMA_CHECKS = {
         "AND TABLE_NAME='phase10_job_lifecycle_backup' "
         "AND COLUMN_NAME LIKE 'expected\\_%'"
     ),
+    "backup_job_id_key_contract_mismatch": (
+        "SELECT CASE WHEN "
+        "(SELECT COUNT(*) FROM ("
+        " SELECT INDEX_NAME, MIN(NON_UNIQUE) AS non_unique, "
+        " MIN(IS_VISIBLE) AS is_visible, "
+        " GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX SEPARATOR ',') AS columns "
+        " FROM information_schema.STATISTICS "
+        " WHERE TABLE_SCHEMA=DATABASE() "
+        " AND BINARY TABLE_NAME='phase10_job_lifecycle_backup' "
+        " GROUP BY INDEX_NAME"
+        ") indexes WHERE BINARY INDEX_NAME='PRIMARY' "
+        "AND non_unique=0 AND BINARY is_visible='YES' "
+        "AND BINARY columns='job_id')=1 "
+        "AND (SELECT COUNT(DISTINCT INDEX_NAME) "
+        " FROM information_schema.STATISTICS "
+        " WHERE TABLE_SCHEMA=DATABASE() "
+        " AND BINARY TABLE_NAME='phase10_job_lifecycle_backup' "
+        " AND NON_UNIQUE=0)=1 "
+        "THEN 0 ELSE 1 END"
+    ),
 }
 
 RESTORE_MISMATCH_SQL = """
@@ -481,8 +501,19 @@ def collect(
         report["restored_job_backup_mismatch"] = int(
             db.execute(text(RESTORE_MISMATCH_SQL)).scalar() or 0
         )
+        report["backup_duplicate_job_id_rows"] = int(db.execute(text(
+            "SELECT COUNT(*) - COUNT(DISTINCT job_id) "
+            "FROM phase10_job_lifecycle_backup"
+        )).scalar() or 0)
+        report["restored_job_backup_row_count_mismatch"] = int(db.execute(text(
+            "SELECT ABS("
+            "(SELECT COUNT(*) FROM job) - "
+            "(SELECT COUNT(*) FROM phase10_job_lifecycle_backup))"
+        )).scalar() or 0)
     else:
         report["restored_job_backup_mismatch"] = 1
+        report["backup_duplicate_job_id_rows"] = 1
+        report["restored_job_backup_row_count_mismatch"] = 1
     report["ready"] = all(value == 0 for value in report.values())
     return report
 

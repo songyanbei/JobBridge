@@ -289,6 +289,30 @@ def test_down_rejects_post_migration_extension_before_overwrite():
 
         with db.cursor() as cursor:
             cursor.execute(
+                "ALTER TABLE phase10_job_lifecycle_backup DROP PRIMARY KEY"
+            )
+            cursor.execute(
+                "INSERT INTO phase10_job_lifecycle_backup "
+                "SELECT * FROM phase10_job_lifecycle_backup WHERE job_id=1"
+            )
+        report = _collect_down_report(database)
+        assert report["restored_job_backup_mismatch"] == 0
+        assert report["backup_job_id_key_contract_mismatch"] == 1
+        assert report["backup_duplicate_job_id_rows"] == 1
+        assert report["restored_job_backup_row_count_mismatch"] == 1
+        assert report["ready"] is False
+        with db.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM phase10_job_lifecycle_backup "
+                "WHERE job_id=1 LIMIT 1"
+            )
+            cursor.execute(
+                "ALTER TABLE phase10_job_lifecycle_backup "
+                "ADD PRIMARY KEY (job_id)"
+            )
+
+        with db.cursor() as cursor:
+            cursor.execute(
                 "SELECT COUNT(*) FROM information_schema.COLUMNS "
                 "WHERE TABLE_SCHEMA=DATABASE() AND BINARY TABLE_NAME='job'"
             )
@@ -743,7 +767,10 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
             "phase10_tables_remaining": 0,
             "phase10_fences_remaining": 0,
             "backup_expected_columns_remaining": 0,
+            "backup_job_id_key_contract_mismatch": 0,
             "restored_job_backup_mismatch": 0,
+            "backup_duplicate_job_id_rows": 0,
+            "restored_job_backup_row_count_mismatch": 0,
             "ready": True,
         }
 
