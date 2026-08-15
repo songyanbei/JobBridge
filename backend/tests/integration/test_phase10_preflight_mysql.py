@@ -1,6 +1,7 @@
 """Phase 10 preflight checks that require a real MySQL database."""
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -84,6 +85,59 @@ def _execute_script(connection, sql: str) -> None:
                 cursor.execute(statement)
         if "".join(statement_lines).strip():
             raise AssertionError("unterminated SQL statement")
+
+
+def test_additive_migration_uses_utc_for_candidate_deadlines():
+    database = f"phase10_utc_{uuid4().hex[:16]}"
+    admin = _connect()
+    db = None
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{database}` CHARACTER SET utf8mb4")
+        db = _connect(database)
+        _execute_script(db, BASE_SCHEMA_SQL)
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO job ("
+                "audit_status, created_at, updated_at, audited_at, expires_at, "
+                "deleted_at, delist_reason, version"
+                ") VALUES ("
+                "'rejected','2026-01-09','2026-01-10','2026-01-11',"
+                "'2026-09-04',NULL,NULL,1)"
+            )
+            cursor.execute("SET time_zone = '+08:00'")
+            cursor.execute(
+                "SELECT UTC_TIMESTAMP(), "
+                "TIMESTAMPDIFF(HOUR, UTC_TIMESTAMP(), NOW())"
+            )
+            utc_before, timezone_offset_hours = cursor.fetchone()
+        assert int(timezone_offset_hours) == 8
+
+        _execute_script(db, UP_SQL)
+
+        with db.cursor() as cursor:
+            cursor.execute("SELECT UTC_TIMESTAMP()")
+            utc_after = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT audit_status, candidate_expires_at FROM job "
+                "WHERE deleted_at IS NULL "
+                "AND audit_status IN ('pending','rejected') "
+                "ORDER BY audit_status"
+            )
+            candidate_deadlines = cursor.fetchall()
+
+        expected_before = utc_before + timedelta(days=7)
+        expected_after = utc_after + timedelta(days=7)
+        assert [row[0] for row in candidate_deadlines] == ["pending", "rejected"]
+        for _, candidate_deadline in candidate_deadlines:
+            assert expected_before <= candidate_deadline <= expected_after
+    finally:
+        if db is not None:
+            db.close()
+        with admin.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE IF EXISTS `{database}`")
+        admin.close()
 
 
 def test_mysql_and_redis_clock_skew_is_within_rollout_limit():

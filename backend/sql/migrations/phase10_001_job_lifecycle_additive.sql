@@ -121,7 +121,9 @@ CREATE TRIGGER `phase10_media_insert_fence` BEFORE INSERT ON `media_asset_lifecy
 FOR EACH ROW CALL `phase10_assert_writes_allowed`()$$
 DELIMITER ;
 
-SET @phase10_migration_time = NOW();
+-- Application lifecycle timestamps are stored as naive UTC even when the
+-- MySQL server/session runs in Asia/Shanghai.
+SET @phase10_migration_time = UTC_TIMESTAMP();
 SET @phase10_candidate_days = COALESCE((
   SELECT CASE
     WHEN `config_value` REGEXP '^[0-9]+$'

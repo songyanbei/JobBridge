@@ -47,6 +47,8 @@ def test_additive_migration_contains_rollout_invariants():
     assert "phase10_lifecycle_backfill_evidence_mismatch" in sql
     assert "live_checksum_valid" in sql
     assert "expected_checksum_valid" in sql
+    assert "SET @phase10_migration_time = UTC_TIMESTAMP();" in sql
+    assert "SET @phase10_migration_time = NOW();" not in sql
 
 
 def test_media_dead_letter_schema_and_upgrade_migration_are_complete():
