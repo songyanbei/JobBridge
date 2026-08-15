@@ -9,38 +9,86 @@ from app.db import SessionLocal
 
 
 INBOUND_COLUMN_CONTRACT = (
-    # name, column_type, nullable, default (None means SQL NULL), extra
-    ("id", "bigint unsigned", "NO", None, "auto_increment"),
-    ("msg_id", "varchar(64)", "NO", None, None),
-    ("from_userid", "varchar(64)", "NO", None, None),
+    # name, type, nullable, default, charset, collation, extra, generation
+    ("id", "bigint unsigned", "NO", None, None, None, "auto_increment", ""),
+    (
+        "msg_id", "varchar(64)", "NO", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
+    (
+        "from_userid", "varchar(64)", "NO", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
     (
         "msg_type",
         "enum('text','image','voice','video','file','link','location','event','other')",
         "NO",
         None,
-        None,
+        "utf8mb4",
+        "utf8mb4_0900_ai_ci",
+        "",
+        "",
     ),
-    ("media_id", "varchar(128)", "YES", None, None),
-    ("content_brief", "varchar(500)", "YES", None, None),
+    (
+        "media_id", "varchar(128)", "YES", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
+    (
+        "content_brief", "varchar(500)", "YES", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
     (
         "status",
         "enum('received','processing','session_pending','done','failed','dead_letter')",
         "NO",
         "received",
-        None,
+        "utf8mb4",
+        "utf8mb4_0900_ai_ci",
+        "",
+        "",
     ),
-    ("retry_count", "tinyint unsigned", "NO", "0", None),
-    ("session_operation", "varchar(8)", "YES", None, None),
-    ("session_expected_version", "int unsigned", "YES", None, None),
-    ("session_payload", "json", "YES", None, None),
-    ("session_apply_attempts", "int unsigned", "NO", "0", None),
-    ("session_apply_locked_at", "datetime(6)", "YES", None, None),
-    ("session_next_attempt_at", "datetime(6)", "YES", None, None),
-    ("session_applied_at", "datetime(6)", "YES", None, None),
-    ("worker_started_at", "datetime(6)", "YES", None, None),
-    ("worker_finished_at", "datetime(6)", "YES", None, None),
-    ("error_message", "text", "YES", None, None),
-    ("created_at", "datetime(6)", "NO", "current_timestamp(6)", None),
+    ("retry_count", "tinyint unsigned", "NO", "0", None, None, "", ""),
+    (
+        "session_operation", "varchar(8)", "YES", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
+    (
+        "session_expected_version", "int unsigned", "YES", None,
+        None, None, "", "",
+    ),
+    ("session_payload", "json", "YES", None, None, None, "", ""),
+    (
+        "session_apply_attempts", "int unsigned", "NO", "0",
+        None, None, "", "",
+    ),
+    (
+        "session_apply_locked_at", "datetime(6)", "YES", None,
+        None, None, "", "",
+    ),
+    (
+        "session_next_attempt_at", "datetime(6)", "YES", None,
+        None, None, "", "",
+    ),
+    (
+        "session_applied_at", "datetime(6)", "YES", None,
+        None, None, "", "",
+    ),
+    (
+        "worker_started_at", "datetime(6)", "YES", None,
+        None, None, "", "",
+    ),
+    (
+        "worker_finished_at", "datetime(6)", "YES", None,
+        None, None, "", "",
+    ),
+    (
+        "error_message", "text", "YES", None,
+        "utf8mb4", "utf8mb4_0900_ai_ci", "", "",
+    ),
+    (
+        "created_at", "datetime(6)", "NO", "CURRENT_TIMESTAMP(6)",
+        None, None, "DEFAULT_GENERATED", "",
+    ),
 )
 
 INBOUND_INDEX_CONTRACT = (
@@ -64,33 +112,57 @@ def _sql_string(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _sql_nullable_string(value: str | None) -> str:
+    return "NULL" if value is None else _sql_string(value)
+
+
 def _column_contract_sql() -> str:
     rows = []
-    for name, column_type, nullable, default, extra in INBOUND_COLUMN_CONTRACT:
+    for (
+        name,
+        column_type,
+        nullable,
+        default,
+        charset,
+        collation,
+        extra,
+        generation,
+    ) in INBOUND_COLUMN_CONTRACT:
         rows.append(
             "SELECT "
             f"{_sql_string(name)} AS column_name, "
             f"{_sql_string(column_type)} AS column_type, "
             f"{_sql_string(nullable)} AS is_nullable, "
-            f"{1 if default is None else 0} AS default_is_null, "
-            f"{_sql_string(default or '')} AS column_default, "
-            f"{_sql_string(extra or '')} AS required_extra"
+            f"{_sql_nullable_string(default)} AS column_default, "
+            f"{_sql_nullable_string(charset)} AS character_set_name, "
+            f"{_sql_nullable_string(collation)} AS collation_name, "
+            f"{_sql_string(extra)} AS extra, "
+            f"{_sql_string(generation)} AS generation_expression"
         )
     expected = " UNION ALL ".join(rows)
+    expected_names = ",".join(
+        _sql_string(row[0]) for row in INBOUND_COLUMN_CONTRACT
+    )
     return (
-        "SELECT COUNT(*) FROM (" + expected + ") expected "
+        "SELECT (SELECT COUNT(*) FROM (" + expected + ") expected "
         "LEFT JOIN information_schema.COLUMNS actual "
         "ON actual.TABLE_SCHEMA=DATABASE() "
         "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
         "AND BINARY actual.COLUMN_NAME=expected.column_name "
         "WHERE actual.COLUMN_NAME IS NULL "
-        "OR LOWER(actual.COLUMN_TYPE)<>expected.column_type "
-        "OR actual.IS_NULLABLE<>expected.is_nullable "
-        "OR (expected.default_is_null=1 AND actual.COLUMN_DEFAULT IS NOT NULL) "
-        "OR (expected.default_is_null=0 AND (actual.COLUMN_DEFAULT IS NULL "
-        "OR LOWER(CAST(actual.COLUMN_DEFAULT AS CHAR))<>expected.column_default)) "
-        "OR (expected.required_extra<>'' "
-        "AND LOWER(actual.EXTRA)<>expected.required_extra)"
+        "OR NOT (BINARY actual.COLUMN_TYPE <=> BINARY expected.column_type) "
+        "OR NOT (BINARY actual.IS_NULLABLE <=> BINARY expected.is_nullable) "
+        "OR NOT (BINARY actual.COLUMN_DEFAULT <=> BINARY expected.column_default) "
+        "OR NOT (BINARY actual.CHARACTER_SET_NAME "
+        "<=> BINARY expected.character_set_name) "
+        "OR NOT (BINARY actual.COLLATION_NAME <=> BINARY expected.collation_name) "
+        "OR NOT (BINARY actual.EXTRA <=> BINARY expected.extra) "
+        "OR NOT (BINARY actual.GENERATION_EXPRESSION "
+        "<=> BINARY expected.generation_expression)) + "
+        "(SELECT COUNT(*) FROM information_schema.COLUMNS actual "
+        "WHERE actual.TABLE_SCHEMA=DATABASE() "
+        "AND BINARY actual.TABLE_NAME='wecom_inbound_event' "
+        f"AND BINARY actual.COLUMN_NAME NOT IN ({expected_names}))"
     )
 
 

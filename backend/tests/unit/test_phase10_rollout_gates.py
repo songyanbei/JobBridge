@@ -555,7 +555,13 @@ def test_down_verify_reports_only_zero_blockers_as_ready():
     assert "COLUMN_TYPE" in inbound_column_gate
     assert "IS_NULLABLE" in inbound_column_gate
     assert "COLUMN_DEFAULT" in inbound_column_gate
+    assert "CHARACTER_SET_NAME" in inbound_column_gate
+    assert "COLLATION_NAME" in inbound_column_gate
+    assert "GENERATION_EXPRESSION" in inbound_column_gate
     assert "auto_increment" in inbound_column_gate
+    assert "DEFAULT_GENERATED" in inbound_column_gate
+    assert "NOT IN" in inbound_column_gate
+    assert "LOWER(actual.COLUMN_TYPE)" not in inbound_column_gate
     inbound_index_gate = phase10_down_verify.SCHEMA_CHECKS[
         "old_inbound_index_contract_mismatch"
     ]

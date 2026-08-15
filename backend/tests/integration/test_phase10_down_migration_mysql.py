@@ -461,6 +461,66 @@ def test_empty_job_table_round_trip_uses_zero_checksums():
         with db.cursor() as cursor:
             cursor.execute(
                 "ALTER TABLE wecom_inbound_event "
+                "ADD required_extra VARCHAR(8) NOT NULL"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event DROP COLUMN required_extra, "
+                "MODIFY msg_type "
+                "ENUM('text','IMAGE','voice','video','file','link','location',"
+                "'event','other') NOT NULL"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event MODIFY msg_type "
+                "ENUM('text','image','voice','video','file','link','location',"
+                "'event','other') NOT NULL, "
+                "MODIFY content_brief VARCHAR(500) "
+                "CHARACTER SET latin1 COLLATE latin1_swedish_ci NULL"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "MODIFY content_brief VARCHAR(500) "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL, "
+                "MODIFY created_at DATETIME(6) NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "MODIFY created_at DATETIME(6) NOT NULL "
+                "DEFAULT CURRENT_TIMESTAMP(6), "
+                "MODIFY content_brief VARCHAR(500) "
+                "GENERATED ALWAYS AS (LEFT(msg_id, 500)) STORED"
+            )
+        report = _collect_down_report(database)
+        assert report["old_inbound_column_contract_mismatch"] == 1
+        assert report["ready"] is False
+
+        with db.cursor() as cursor:
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
+                "MODIFY content_brief VARCHAR(500) NULL"
+            )
+            cursor.execute(
+                "ALTER TABLE wecom_inbound_event "
                 "MODIFY retry_count INT NULL DEFAULT 7"
             )
         report = _collect_down_report(database)
