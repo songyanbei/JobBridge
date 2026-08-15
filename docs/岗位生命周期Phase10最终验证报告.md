@@ -4,9 +4,9 @@
 
 - 分支：`codex/job-expiry-full-update-v05`
 - 修复基线：`060f5fb`
-- 最终代码验证 HEAD：`8d31a46`
+- 最终代码验证 HEAD：`d13ec5e`
 - 验证日期：2026-08-11 至 2026-08-15（Asia/Shanghai）
-- 结果：46 个已知问题均使用独立提交完成修复；最终代码 HEAD `8d31a46` 的 V-01 至 V-05 与旧 schema 兼容冒烟全部通过，最终自动化验证未发现未关闭的 P1/P2/P3。页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
+- 结果：50 个已知问题均使用独立提交完成修复；最终代码 HEAD `d13ec5e` 的 V-01 至 V-05 全部通过，最终自动化验证未发现未关闭的 P1/P2/P3。Stage A 旧 schema 兼容冒烟是前次最终验收证据，本轮新增变更不修改 Stage A 制品；页面联调是 `6198fe7` 上的历史补充证据，不声明已在最终 HEAD 重跑。
 - 边界：未 rebase、未合并 `main`、未推送、未创建 PR；保留的 WIP stash 未恢复或删除。
 
 ## 2. 问题与提交追踪
@@ -59,6 +59,10 @@
 | 44 | F-05 destructive down 后错误运行最终 preflight | `70a5240` | V-01、V-02、Stage A 冒烟 |
 | 45 | F-06 合成 rollout 测试依赖共享岗位类别本体 | `24b08b8` | V-01、200 项 dialogue 回归 |
 | 46 | F-07 迁移测试旧 schema 夹具缺 inbound 表 | `8d31a46` | V-02 真实 MySQL |
+| 47 | G-01 destructive down 改写历史 Job `updated_at` | `0761921` | V-01、V-02、V-05 |
+| 48 | G-02 down 专用校验器接受缺失 inbound 表 | `a3576c1` | V-01、V-02 |
+| 49 | G-03 图片消息可续用过期首发草稿 | `b27562b` | V-01、V-02、V-03 |
+| 50 | G-04 synthetic rollout 导入期依赖真实字典数据库 | `d13ec5e` | V-01、fresh-process 导入与 provider 刷新回归 |
 
 每项功能提交前均执行定向测试、受影响模块测试、适用的真实服务测试、Python 编译检查、`git diff --check` 和独立只读评审。评审提出的可执行问题均在对应问题内修复并重新通过门禁后提交；没有使用空提交表示测试完成。
 
@@ -70,7 +74,7 @@
 - Redis 策略：`maxmemory-policy=noeviction`、`appendonly=yes`、`appendfsync=always`
 - 最终队列测试 Redis：容器 `jobbridge-phase10-final-redis`，宿主端口 `36380`
 - 原演示服务使用 `36379` 且有 Worker 消费队列，因此最终队列集成测试使用 `36380` 隔离运行，避免测试消息被演示 Worker 抢占。
-- 最终干净验收数据库：`jobbridge_phase10_final_verify`，与日常开发数据隔离。
+- 最终干净验收数据库：`jobbridge_phase10_final_verify_d13ec5e`，与日常开发数据隔离。
 
 除 V-01 的 PowerShell 分片驱动和 Stage A 独立命令外，V-02 至 V-04 的 shell 命令均在同一个 WSL shell 中先执行以下上下文；密码由测试环境注入，不写入报告：
 
@@ -90,19 +94,19 @@ export RECOMMENDATION_CONTENT_KEY=phase10-test-key
 
 | 分片 | 文件序号 | 结果 |
 | --- | --- | --- |
-| 1 | 1–22 | 303 passed |
-| 2 | 23–44 | 486 passed |
+| 1 | 1–22 | 304 passed |
+| 2 | 23–44 | 488 passed |
 | 3 | 45–66 | 416 passed |
-| 4 | 67–87 | 453 passed |
-| 5 | 88–108 | 331 passed |
+| 4 | 67–88 | 461 passed |
+| 5 | 89–108 | 328 passed |
 
-V-01 合计：`1989 passed`，零失败。测试仅产生既有 `datetime.utcnow()` 和 `passlib crypt` 弃用警告。
+V-01 合计：`1997 passed`，零失败。测试仅产生既有 `datetime.utcnow()` 和 `passlib crypt` 弃用警告。
 
 实际五分片生成和执行命令（从 `backend` 目录运行）：
 
 ```powershell
 $all = Get-ChildItem tests/unit -Filter 'test_*.py' | Sort-Object Name
-$bounds = @(@(0, 21), @(22, 43), @(44, 65), @(66, 86), @(87, 107))
+$bounds = @(@(0, 21), @(22, 43), @(44, 65), @(66, 87), @(88, 107))
 foreach ($bound in $bounds) {
     $start, $end = $bound
     $files = $all[$start..$end] | ForEach-Object { "tests/unit/$($_.Name)" }
@@ -113,7 +117,7 @@ foreach ($bound in $bounds) {
 
 ## 5. V-02/V-03 真实 MySQL 与 Redis
 
-- Phase 10 CI 主集成清单在重建后的 MySQL 8 测试库与隔离 Redis 7 上运行：`102 passed`。
+- Phase 10 CI 主集成清单在 MySQL 8 测试库与隔离 Redis 7 上运行：`103 passed`。新增用例覆盖过期图片草稿在下载和媒体写入前被拒绝，旧媒体与 Redis 草稿同步收敛。
 - Redis 真实停机、fail-closed terminalization 与恢复：`1 passed`。
 - 补充 Redis 推荐、多 Worker 与策略测试：`5 passed`。
 - Redis 恢复后读取：`maxmemory-policy=noeviction`、`appendonly=yes`、`appendfsync=always`，健康检查 `PONG`。
@@ -164,13 +168,13 @@ RUN_INTEGRATION=1 python -m pytest -p no:cacheprovider -q \
 
 ## 6. V-04 时钟偏差
 
-首次最终采样：
+最终代码 HEAD 采样：
 
 ```json
-{"sampling_window_seconds": 0.029839, "clock_skew_seconds": 0.029223, "max_clock_skew_seconds": 2.0, "ready": true}
+{"sampling_window_seconds": 0.024636, "clock_skew_seconds": 0.024198, "max_clock_skew_seconds": 2.0, "ready": true}
 ```
 
-V-05 完整门禁前再次采样：`clock_skew_seconds=0.026608`，`ready=true`。两次均远低于 2 秒限制。
+V-05 完整门禁前再次采样：`sampling_window_seconds=0.030694`、`clock_skew_seconds=0.03032`、`ready=true`。两次均远低于 2 秒限制。
 
 两次均使用相同目标环境运行：
 
@@ -182,7 +186,7 @@ python -m scripts.phase10_clock_check
 
 ## 7. V-05 干净数据库发布门禁
 
-在独立数据库 `jobbridge_phase10_final_verify` 完成：
+在新建的独立数据库 `jobbridge_phase10_final_verify_d13ec5e` 完成：
 
 1. 从不可变 Stage A 提交 `499eb929b75ad2f208d306b62157d8ded0119f33` 加载旧 schema。
 2. 依次执行 001、002、003、004，再重复执行 003、004，全部成功。
@@ -198,7 +202,7 @@ python -m scripts.phase10_clock_check
 set -euo pipefail
 cd /mnt/d/work/JobBridge/_worktrees/job-expiry-full-update-v05/backend
 source /tmp/jobbridge-phase10-venv/bin/activate
-export PHASE10_VERIFY_DB=jobbridge_phase10_final_verify
+export PHASE10_VERIFY_DB=jobbridge_phase10_final_verify_d13ec5e
 export PHASE10_MYSQL_DEFAULTS_FILE=/run/secrets/jobbridge-phase10-verify.cnf
 test -r "$PHASE10_MYSQL_DEFAULTS_FILE"
 PHASE10_MYSQL=(mysql --defaults-extra-file="$PHASE10_MYSQL_DEFAULTS_FILE" \
@@ -237,7 +241,7 @@ done
 
 ```bash
 export APP_ENV=test DB_HOST=127.0.0.1 DB_PORT=33306
-export DB_NAME=jobbridge_phase10_final_verify DB_USER=root
+export DB_NAME=jobbridge_phase10_final_verify_d13ec5e DB_USER=root
 test -n "${DB_PASSWORD:?DB_PASSWORD must be injected}"
 export REDIS_HOST=127.0.0.1 REDIS_PORT=36380
 export RECOMMENDATION_CONTENT_KEY=phase10-test-key
@@ -270,14 +274,14 @@ PYTHONPATH=. /tmp/jobbridge-phase10-venv/bin/python -m pytest --rootdir=. \
 
 ## 9. 页面联调历史补充证据
 
-以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `8d31a46` 的页面重跑证据：
+以下页面联调执行于 2026-08-14、代码 HEAD `6198fe7`，用于确认 B-01 至 B-03 的端到端体验；它不是最终 HEAD `d13ec5e` 的页面重跑证据：
 
 - 学历规范化：LLM 产生“高中及以上”“初中以上学历”等表达时，严格 MySQL 持久化为合法枚举值，不再截断或写入失败。
 - 全量更新：招聘者通过 `/更新岗位 124` 提交完整岗位文本，新岗位 `161` 自动审核激活，旧岗位 `124` 以 `delist_reason=replaced` 软删除；地址、夫妻工、学历、用工类型和合同类型均完整保留。
 - 推荐可见性：求职者搜索后推荐上下文只包含新岗位 `161`，不包含旧岗位 `124`，投递状态为 `sent`。
 - 正文密钥：单密钥、密钥环、缺失密钥、活动版本不匹配和版本上限均有自动化门禁。
 
-`6198fe7` 之后的 R-01 至 R-12、T-01 和 F-01 至 F-07 共 20 个追踪问题，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及最终代码 HEAD 上的 V-01 `1989 passed`、主集成 `102 passed`、停机 `1 passed`、补充 Redis `5 passed` 和 Stage A `1 passed` 覆盖。由于本轮未在 `8d31a46` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
+`6198fe7` 之后的 R-01 至 R-12、T-01、F-01 至 F-07 和 G-01 至 G-04 共 24 个追踪问题，分别由对应提交的定向测试、真实 MySQL/Redis 门禁，以及最终代码 HEAD 上的 V-01 `1997 passed`、主集成 `103 passed`、停机 `1 passed` 和补充 Redis `5 passed` 覆盖。Stage A `1 passed` 为前次验收证据；由于本轮未在 `d13ec5e` 重跑完整页面流程，本报告不将历史页面联调作为最终 HEAD 的合并门禁依据。
 
 ## 10. 最终静态检查与仓库状态
 
@@ -304,5 +308,5 @@ git stash list
 ## 12. 完成条件
 
 - 本报告经独立只读评审无 P1/P2/P3 后独立提交。
-- 提交后工作区干净，46 个问题提交与验证报告均可独立回溯。
+- 提交后工作区干净，50 个问题提交与验证报告均可独立回溯。
 - 不推送、不创建 PR、不合并 `main`，等待用户下一步指令。
