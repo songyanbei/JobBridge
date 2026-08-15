@@ -4,6 +4,7 @@
 结构，都会在这里炸出来。断言使用 `==` 而非 `>=` / `issubset`，以精确
 锁定契约。
 """
+from pathlib import Path
 import re
 
 
@@ -102,6 +103,18 @@ def _assert_key_not_in(obj, banned_key: str):
     elif isinstance(obj, list):
         for x in obj:
             _assert_key_not_in(x, banned_key)
+
+
+def test_mock_user_seed_sets_utf8mb4_before_insert():
+    """Direct mysql imports must not depend on the client's default charset."""
+    seed_path = Path(__file__).resolve().parents[2] / "sql" / "seed_mock_users.sql"
+    sql = seed_path.read_text(encoding="utf-8")
+
+    set_names_position = sql.upper().find("SET NAMES UTF8MB4")
+    insert_position = sql.upper().find("INSERT INTO USER")
+
+    assert set_names_position >= 0
+    assert insert_position > set_names_position
 
 
 # ============================================================================

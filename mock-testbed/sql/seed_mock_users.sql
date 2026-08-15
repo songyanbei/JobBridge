@@ -14,6 +14,9 @@
 --   DELETE FROM user WHERE external_userid LIKE 'wm_mock_%';
 -- ===========================================================================
 
+-- Keep direct/manual imports safe even when the mysql client defaults to latin1.
+SET NAMES utf8mb4;
+
 INSERT INTO user (
   external_userid,
   role,
