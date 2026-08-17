@@ -225,13 +225,18 @@ def test_five_fail_closed_resume_switches_are_independently_addressable():
     assert all(getattr(settings, name) is False for name in expected)
 
 
-def test_manifest_pins_checksums_and_unready_minimum_build_anchor():
+def test_manifest_pins_checksums_and_ready_minimum_build_anchor():
     document = json.loads(MANIFEST.read_text(encoding="utf-8"))
     anchor = document["minimum_build"]
-    assert anchor["ready"] is False
-    assert isinstance(anchor["build_number"], int)
-    assert re.fullmatch(r"[0-9a-f]{40}", anchor["build_sha"])
-    assert set(anchor["capabilities"])
+    assert anchor == {
+        "ready": True,
+        "build_number": 249,
+        "build_sha": "083be7e8fa37045a94f5247ea4fb9cb8d1a35652",
+        "capabilities": [
+            "resume_nullable_dto",
+            "resume_lifecycle_double_write",
+        ],
+    }
     for entry in document["steps"]:
         assert re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
         assert entry["stage"] in {"pre_cutover", "post_cutover", "verify", "down"}

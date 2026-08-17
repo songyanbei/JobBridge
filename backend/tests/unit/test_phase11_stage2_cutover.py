@@ -113,10 +113,15 @@ def test_stop_write_barrier_is_enforced_at_each_resume_writer(monkeypatch, write
     db.commit.assert_not_called()
 
 
-def test_manifest_anchor_stays_unready_until_stage2_metadata_commit():
+def test_manifest_anchor_pins_the_pre_anchor_compatibility_commit():
     manifest = Path(__file__).parents[2] / "sql" / "migrations" / "phase11_manifest.json"
     minimum_build = json.loads(manifest.read_text(encoding="utf-8"))["minimum_build"]
-    assert minimum_build["ready"] is False
+    assert minimum_build == {
+        "ready": True,
+        "build_number": 249,
+        "build_sha": "083be7e8fa37045a94f5247ea4fb9cb8d1a35652",
+        "capabilities": list(PHASE11_CAPABILITIES),
+    }
 
 
 def test_incremental_invariant_check_is_scoped_after_watermark():

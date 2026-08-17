@@ -2,9 +2,9 @@
   "schema_version": 1,
   "mysql": {"vendor": "mysql", "min_version": "8.0"},
   "minimum_build": {
-    "ready": false,
-    "build_number": 0,
-    "build_sha": "0000000000000000000000000000000000000000",
+    "ready": true,
+    "build_number": 249,
+    "build_sha": "083be7e8fa37045a94f5247ea4fb9cb8d1a35652",
     "capabilities": ["resume_nullable_dto", "resume_lifecycle_double_write"]
   },
   "steps": [
