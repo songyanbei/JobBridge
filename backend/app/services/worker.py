@@ -282,11 +282,18 @@ class Worker:
     # -----------------------------------------------------------------------
 
     def _start_heartbeat(self) -> None:
+        from app.services.phase11_build_info import build_probe_payload
+
+        heartbeat_payload = json.dumps(
+            build_probe_payload(), separators=(",", ":"), sort_keys=True,
+        )
+
         def _hb() -> None:
             while self._running:
                 try:
                     self._redis.set(
-                        f"worker:heartbeat:{self._pid}", "1", ex=HEARTBEAT_TTL,
+                        f"worker:heartbeat:{self._pid}", heartbeat_payload,
+                        ex=HEARTBEAT_TTL,
                     )
                 except Exception:
                     logger.warning("worker: heartbeat write failed", exc_info=True)

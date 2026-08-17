@@ -316,8 +316,24 @@ def _handle_my_status(
             f"审核状态 {_audit_display(latest_job['audit_status'])}"
         )
 
+    resume_labels = {
+        "online": "在线简历",
+        "candidate": "候选简历",
+        "history": "历史简历",
+    }
+    shown_resume_ids: set[int] = set()
+    for lifecycle in ("online", "candidate", "history"):
+        latest_resume = info.get(f"latest_{lifecycle}_resume")
+        if not latest_resume:
+            continue
+        shown_resume_ids.add(latest_resume["id"])
+        lines.append(
+            f"📄 {resume_labels[lifecycle]}：#{latest_resume['id']} "
+            f"审核状态 {_audit_display(latest_resume['audit_status'])}"
+        )
+
     latest_resume = info.get("latest_resume")
-    if latest_resume:
+    if latest_resume and latest_resume["id"] not in shown_resume_ids:
         lines.append(
             f"📄 最近简历：#{latest_resume['id']} "
             f"审核状态 {_audit_display(latest_resume['audit_status'])}"

@@ -184,6 +184,9 @@ class Settings(BaseSettings):
     resume_hard_delete_enabled: bool = False
     ttl_resume_days: int = 30
     ttl_resume_candidate_days: int = 7
+    phase11_build_number: int = 0
+    phase11_build_sha: str = "0000000000000000000000000000000000000000"
+    phase11_resume_writes_paused: bool = False
 
     @field_validator("ttl_resume_days", mode="after")
     @classmethod
@@ -199,6 +202,22 @@ class Settings(BaseSettings):
         value = int(value)
         if not 1 <= value <= 365:
             raise ValueError("ttl_resume_candidate_days must be between 1 and 365")
+        return value
+
+    @field_validator("phase11_build_number", mode="after")
+    @classmethod
+    def _valid_phase11_build_number(cls, value: int) -> int:
+        value = int(value)
+        if value < 0:
+            raise ValueError("phase11_build_number must be non-negative")
+        return value
+
+    @field_validator("phase11_build_sha", mode="after")
+    @classmethod
+    def _valid_phase11_build_sha(cls, value: str) -> str:
+        value = str(value).strip().lower()
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("phase11_build_sha must be a 40-character lowercase git SHA")
         return value
 
     # ---- 应用 ----

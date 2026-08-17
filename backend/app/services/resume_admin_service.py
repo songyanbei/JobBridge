@@ -128,6 +128,9 @@ def _snapshot(resume: Resume) -> dict:
 
 
 def update_resume(db: Session, resume_id: int, version: int, payload: dict, operator: str) -> Resume:
+    from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+    assert_resume_writes_allowed()
     resume = get_resume(db, resume_id)
     if int(resume.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
@@ -189,6 +192,9 @@ def _atomic_resume_update(db: Session, resume_id: int, expected_version: int, pa
 
 def delist(db: Session, resume_id: int, version: int, reason: str, operator: str) -> None:
     """简历软下架：置 deleted_at（简历没有 delist_reason 字段）。"""
+    from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+    assert_resume_writes_allowed()
     resume = get_resume(db, resume_id)
     if int(resume.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
@@ -210,6 +216,9 @@ def delist(db: Session, resume_id: int, version: int, reason: str, operator: str
 
 
 def extend(db: Session, resume_id: int, version: int, days: int, operator: str) -> Resume:
+    from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+    assert_resume_writes_allowed()
     if days not in (15, 30):
         raise BusinessException(40101, "延期天数仅支持 15 或 30")
     resume = get_resume(db, resume_id)

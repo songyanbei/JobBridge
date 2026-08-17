@@ -155,15 +155,67 @@ def get_user_status(external_userid: str, db: Session) -> dict:
             "created_at": str(latest_job.created_at),
         }
 
-    # 最近一次简历提交
-    latest_resume = db.query(Resume).filter(
-        Resume.owner_userid == external_userid,
-        Resume.deleted_at.is_(None),
-    ).order_by(Resume.created_at.desc()).first()
-    if latest_resume:
+    # 最近简历按生命周期分组。使用流式 keyset-friendly 排序读取，找到三类
+    # 首条后立即停止；不会因固定窗口把较旧但仍在线的简历遮住，也不把全量
+    # 历史一次性载入内存。
+    from app.config import settings
+    from app.services.resume_mutation_service import (
+        resume_is_online,
+        to_utc_naive,
+        utc_now_naive,
+    )
+
+    now = utc_now_naive()
+    resumes = (
+        db.query(Resume)
+        .filter(Resume.owner_userid == external_userid)
+        .order_by(Resume.created_at.desc(), Resume.id.desc())
+        .yield_per(100)
+    )
+    grouped: dict[str, dict] = {}
+    latest_resume = None
+    for resume in resumes:
+        if latest_resume is None:
+            latest_resume = resume
+        if resume_is_online(
+            resume,
+            now=now,
+            strict=settings.resume_lifecycle_v2_enabled,
+        ):
+            lifecycle = "online"
+        elif (
+            resume.deleted_at is None
+            and resume.delist_reason is None
+            and resume.activated_at is None
+            and resume.expires_at is None
+            and resume.candidate_expires_at is not None
+            and to_utc_naive(resume.candidate_expires_at) > now
+        ):
+            lifecycle = "candidate"
+        else:
+            lifecycle = "history"
+        grouped.setdefault(lifecycle, {
+            "id": resume.id,
+            "audit_status": resume.audit_status,
+            "lifecycle_status": lifecycle,
+            "created_at": str(resume.created_at),
+        })
+        if len(grouped) == 3:
+            break
+
+    for lifecycle, item in grouped.items():
+        result[f"latest_{lifecycle}_resume"] = item
+    if latest_resume is not None:
         result["latest_resume"] = {
             "id": latest_resume.id,
             "audit_status": latest_resume.audit_status,
+            "lifecycle_status": next(
+                (
+                    name for name, item in grouped.items()
+                    if item["id"] == latest_resume.id
+                ),
+                "history",
+            ),
             "created_at": str(latest_resume.created_at),
         }
 

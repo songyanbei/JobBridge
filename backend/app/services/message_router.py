@@ -2711,12 +2711,12 @@ def _load_worker_resume_defaults(external_userid: str, db: Session) -> dict:
     2. 只取最新一份简历，避免历史多份带来的歧义。
     """
     try:
-        now = datetime.now(timezone.utc)
+        from app.services.resume_mutation_service import online_resume_filters, utc_now_naive
+
+        now = utc_now_naive()
         resume = db.query(Resume).filter(
             Resume.owner_userid == external_userid,
-            Resume.audit_status == "passed",
-            Resume.deleted_at.is_(None),
-            Resume.expires_at > now,
+            *online_resume_filters(now=now),
         ).order_by(Resume.created_at.desc()).first()
     except Exception:
         logger.exception(

@@ -14,9 +14,9 @@ from app.config import settings
 from app.llm.base import IntentResult
 from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
-from app.models import Job, Resume, SystemConfig
+from app.models import Job, Resume
 from app.services import audit_service, conversation_service
-from app.services.lifecycle_config_service import get_job_ttl_days
+from app.services.lifecycle_config_service import get_job_ttl_days, get_resume_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
 from app.tasks.common import log_event
@@ -277,6 +277,11 @@ def process_upload(
             reply_text="无法确定您要发布的内容类型，请重新描述。",
         )
 
+    if entity_type == "resume":
+        from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+        assert_resume_writes_allowed()
+
     required = JOB_REQUIRED_FIELDS if entity_type == "job" else RESUME_REQUIRED_FIELDS
     data = intent_result.structured_data
 
@@ -460,13 +465,27 @@ def attach_image(
 
     model_cls = Job if entity_type == "job" else Resume
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    record = db.query(model_cls).filter(
+    target_filters = [
         model_cls.id == target_id,
         model_cls.owner_userid == external_userid,
-        model_cls.audit_status == "passed",
-        model_cls.deleted_at.is_(None),
-        model_cls.expires_at > now,
-    ).with_for_update().first()
+    ]
+    if entity_type == "resume":
+        from app.services.resume_mutation_service import online_resume_filters
+
+        target_filters.extend(online_resume_filters(now=now))
+    else:
+        target_filters.extend((
+            model_cls.audit_status == "passed",
+            model_cls.deleted_at.is_(None),
+            model_cls.delist_reason.is_(None),
+            model_cls.expires_at > now,
+        ))
+    record = (
+        db.query(model_cls)
+        .filter(*target_filters)
+        .with_for_update()
+        .first()
+    )
 
     if record is None:
         discard_unattached_media(db, media_lifecycle_id)
@@ -592,16 +611,7 @@ def _read_ttl_days(entity_type: str, db: Session) -> int:
     """从 system_config 读取 TTL 天数。"""
     if entity_type == "job":
         return get_job_ttl_days(db)
-    key = f"ttl.{entity_type}.days"
-    config = db.query(SystemConfig).filter(
-        SystemConfig.config_key == key,
-    ).first()
-    if config:
-        try:
-            return int(config.config_value)
-        except (ValueError, TypeError):
-            pass
-    return 30  # 默认 30 天
+    return get_resume_ttl_days(db)
 
 
 def _extract_scalar(data: dict, key: str, default: str = "") -> str:
@@ -695,7 +705,11 @@ def _create_resume(
     db: Session,
 ) -> Resume:
     """创建简历记录。"""
-    now = datetime.now(timezone.utc)
+    from app.services.lifecycle_config_service import get_resume_candidate_ttl_days
+    from app.services.resume_activation_service import activate_resume
+    from app.services.resume_mutation_service import utc_now_naive
+
+    now = utc_now_naive()
     resume = Resume(
         owner_userid=user_ctx.external_userid,
         expected_cities=data.get("expected_cities", []),
@@ -708,11 +722,13 @@ def _create_resume(
         raw_text=raw_text,
         description=data.get("description") or raw_text,
         images=image_keys or None,
-        audit_status=audit_result.status,
+        audit_status="pending" if audit_result.status == "passed" else audit_result.status,
         audit_reason=audit_result.reason or None,
         audited_by="system",
         audited_at=now,
-        expires_at=now + timedelta(days=ttl_days),
+        activated_at=None,
+        expires_at=None,
+        candidate_expires_at=now + timedelta(days=get_resume_candidate_ttl_days(db)),
         # 可选软匹配字段
         expected_districts=data.get("expected_districts"),
         height=data.get("height"),
@@ -732,6 +748,8 @@ def _create_resume(
     )
     db.add(resume)
     db.flush()
+    if audit_result.status == "passed":
+        activate_resume(db, resume, now=now)
     return resume
 
 

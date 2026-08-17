@@ -69,7 +69,10 @@ _RESUME_EDIT_FIELDS = {
 }
 
 _JOB_SNAPSHOT_FIELDS = _JOB_EDIT_FIELDS | {"audit_status", "delist_reason", "expires_at", "version"}
-_RESUME_SNAPSHOT_FIELDS = _RESUME_EDIT_FIELDS | {"audit_status", "expires_at", "version"}
+_RESUME_SNAPSHOT_FIELDS = _RESUME_EDIT_FIELDS | {
+    "audit_status", "activated_at", "candidate_expires_at", "expires_at",
+    "delist_reason", "version",
+}
 
 
 def _model_for(target_type: str):
@@ -495,6 +498,9 @@ def pass_action(db: Session, target_type: str, target_id: int, version: int, ope
     if target_type == "job":
         _pass_job(db, target_id, version, operator)
         return
+    if target_type == "resume":
+        _pass_resume(db, target_id, version, operator)
+        return
 
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)  # 早退快速失败，仍非最终保障
@@ -522,6 +528,37 @@ def pass_action(db: Session, target_type: str, target_id: int, version: int, ope
         "before": before, "after": after,
         "ts": time.time(),
     })
+
+
+def _pass_resume(db: Session, target_id: int, version: int, operator: str) -> None:
+    """Lock and activate a first-publish candidate; lifecycle pass has no Undo."""
+    from app.services.resume_cutover_service import assert_resume_writes_allowed
+    from app.services.resume_activation_service import activate_resume
+    from app.services.resume_mutation_service import (
+        assert_resume_activatable,
+        lock_resume,
+        utc_now_naive,
+    )
+
+    assert_resume_writes_allowed()
+    candidate = lock_resume(db, target_id)
+    _check_version(candidate, version)
+    now = utc_now_naive()
+    assert_resume_activatable(candidate, now=now)
+    before = _snapshot(candidate, "resume")
+    candidate.audited_by = operator
+    candidate.audited_at = now
+    activate_resume(db, candidate, now=now)
+    write_admin_log(
+        db,
+        target_type="resume",
+        target_id=target_id,
+        action="manual_pass",
+        operator=operator,
+        before=before,
+        after=_snapshot(candidate, "resume"),
+    )
+    db.commit()
 
 
 def _pass_job(db: Session, target_id: int, version: int, operator: str) -> None:
@@ -604,6 +641,12 @@ def reject_action(
 ) -> None:
     if target_type == "job":
         _reject_job(
+            db, target_id, version, reason, operator,
+            block_user=block_user,
+        )
+        return
+    if target_type == "resume":
+        _reject_resume(
             db, target_id, version, reason, operator,
             block_user=block_user,
         )
@@ -720,6 +763,60 @@ def _reject_job(
     db.commit()
 
 
+def _reject_resume(
+    db: Session,
+    target_id: int,
+    version: int,
+    reason: str,
+    operator: str,
+    *,
+    block_user: bool,
+) -> None:
+    """Reject a locked candidate without creating a generic lifecycle Undo."""
+    from app.services.resume_cutover_service import assert_resume_writes_allowed
+    from app.services.resume_mutation_service import (
+        increment_resume_version,
+        lock_resume,
+        utc_now_naive,
+    )
+    from app.services.lifecycle_config_service import get_resume_candidate_ttl_days
+
+    assert_resume_writes_allowed()
+    candidate = lock_resume(db, target_id)
+    _check_version(candidate, version)
+    if candidate.audit_status != "pending":
+        raise BusinessException(40904, "resume_not_pending_review")
+    before = _snapshot(candidate, "resume")
+    now = utc_now_naive()
+    candidate.audit_status = "rejected"
+    candidate.activated_at = None
+    candidate.expires_at = None
+    if candidate.candidate_expires_at is None:
+        candidate.candidate_expires_at = now + timedelta(
+            days=get_resume_candidate_ttl_days(db),
+        )
+    candidate.audit_reason = reason
+    candidate.audited_by = operator
+    candidate.audited_at = now
+    increment_resume_version(candidate)
+    write_admin_log(
+        db,
+        target_type="resume",
+        target_id=target_id,
+        action="manual_reject",
+        operator=operator,
+        before=before,
+        after=_snapshot(candidate, "resume"),
+        reason=reason,
+    )
+    if block_user:
+        user = db.query(User).filter(User.external_userid == candidate.owner_userid).first()
+        if user and user.status != "blocked":
+            user.status = "blocked"
+            user.blocked_reason = reason
+    db.commit()
+
+
 def edit_action(
     db: Session,
     target_type: str,
@@ -729,6 +826,10 @@ def edit_action(
     operator: str,
 ) -> None:
     _, allowed, _ = _model_for(target_type)
+    if target_type == "resume":
+        from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+        assert_resume_writes_allowed()
     unknown = [f for f in fields.keys() if f not in allowed]
     if unknown:
         raise BusinessException(40101, f"不允许编辑的字段: {','.join(unknown)}")
@@ -834,6 +935,8 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
     if not snapshot:
         raise BusinessException(40903, "撤销窗口已过期（30 秒）")
     payload, snapshot_token = snapshot
+    if target_type == "resume" and payload.get("action") in {"pass", "reject"}:
+        raise BusinessException(40904, "resume_lifecycle_transition_not_undoable")
     if target_type == "job":
         relation = next(
             (row for row in relations if int(row.new_job_id) == int(target_id)),

@@ -209,7 +209,14 @@ mount_local_storage_files(app)
 @app.get("/health", tags=["system"])
 def health_check():
     """Liveness: the API process is running."""
-    return {"status": "ok", "env": settings.app_env, "version": app.version}
+    from app.services.phase11_build_info import build_probe_payload
+
+    return {
+        "status": "ok",
+        "env": settings.app_env,
+        "version": app.version,
+        **build_probe_payload(),
+    }
 
 
 def _readiness_report() -> dict:
