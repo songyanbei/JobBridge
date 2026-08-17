@@ -19,6 +19,8 @@ class ResumeBase(BaseModel):
 class ResumeCreate(ResumeBase):
     """创建简历。"""
     owner_userid: str = Field(..., max_length=64)
+    # Stage 1 only makes read/compatibility DTOs nullable.  Legacy creation
+    # remains fail-closed until the stage-2 activation service owns TTL.
     expires_at: datetime
 
     # 软匹配字段（可选）
@@ -121,7 +123,10 @@ class ResumeRead(BaseModel):
     # 生命周期
     created_at: datetime
     updated_at: datetime
-    expires_at: datetime
+    activated_at: datetime | None = None
+    candidate_expires_at: datetime | None = None
+    expires_at: datetime | None = None
+    delist_reason: str | None = None
     deleted_at: datetime | None = None
 
     version: int

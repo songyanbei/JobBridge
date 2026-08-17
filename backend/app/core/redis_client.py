@@ -427,14 +427,19 @@ return 1
 """
 
 
-def fence_recommendation_session_indexes(index_keys: list[str]) -> set[str]:
+def fence_recommendation_session_indexes(
+    index_keys: list[str],
+    *,
+    client: redis.Redis | None = None,
+    fence_key: str = RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+) -> set[str]:
     """Fence revoked reverse indexes and return their current session owners."""
     if not index_keys:
         return set()
-    members = get_redis().eval(
+    members = (client or get_redis()).eval(
         _FENCE_SESSION_INDEXES_SCRIPT,
         1,
-        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+        fence_key,
         *sorted(set(index_keys)),
     )
     return {

@@ -290,10 +290,13 @@ CREATE TABLE `resume` (
     `audited_at`                  DATETIME        DEFAULT NULL,
 
     -- ---- 生命周期 ----
-    `created_at`                  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    `updated_at`                  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    `expires_at`                  DATETIME        NOT NULL                  COMMENT '过期时间（默认 created_at + 30 天）',
-    `deleted_at`                  DATETIME        DEFAULT NULL,
+    `created_at`                  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `updated_at`                  DATETIME(6)     NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    `activated_at`                DATETIME(6)     DEFAULT NULL              COMMENT '业务激活时间',
+    `candidate_expires_at`        DATETIME(6)     DEFAULT NULL              COMMENT '候选版本回收时间',
+    `expires_at`                  DATETIME(6)     DEFAULT NULL              COMMENT '激活后的业务过期时间',
+    `delist_reason`               VARCHAR(32)     DEFAULT NULL              COMMENT '下架原因',
+    `deleted_at`                  DATETIME(6)     DEFAULT NULL,
 
     -- ---- 乐观锁 ----
     `version`                     INT UNSIGNED    NOT NULL DEFAULT 1        COMMENT '乐观锁版本号，每次更新 +1（审核工作台用）',
@@ -305,10 +308,85 @@ CREATE TABLE `resume` (
     KEY `idx_owner`        (`owner_userid`),
     KEY `idx_audit_time`   (`audit_status`, `created_at`),
     KEY `idx_expires`      (`expires_at`),
+    KEY `idx_resume_candidate_expiry` (`audit_status`,`candidate_expires_at`),
+    KEY `idx_resume_hard_delete` (`deleted_at`,`id`),
     KEY `idx_filter_hot`   (`gender`, `age`, `audit_status`, `deleted_at`, `expires_at`),
     KEY `idx_salary_exp`   (`salary_expect_floor_monthly`),
     CONSTRAINT `fk_resume_owner` FOREIGN KEY (`owner_userid`) REFERENCES `user`(`external_userid`) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='简历信息表';
+
+CREATE TABLE `resume_replacement` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, `operation_id` CHAR(36) NOT NULL,
+    `source_msg_id` VARCHAR(128) NOT NULL, `owner_userid` VARCHAR(64) NOT NULL,
+    `old_resume_id` BIGINT UNSIGNED NOT NULL, `new_resume_id` BIGINT UNSIGNED NOT NULL,
+    `old_resume_version` INT UNSIGNED NOT NULL, `old_expires_at` DATETIME(6) DEFAULT NULL,
+    `old_business_digest` CHAR(64) NOT NULL, `old_business_digest_version` TINYINT UNSIGNED NOT NULL DEFAULT 2,
+    `review_outcome` ENUM('pending','passed','rejected') NOT NULL DEFAULT 'pending',
+    `reviewed_at` DATETIME(6) DEFAULT NULL, `reviewed_by` VARCHAR(64) DEFAULT NULL,
+    `lifecycle_status` ENUM('awaiting_review','activated','closed','conflict') NOT NULL DEFAULT 'awaiting_review',
+    `active_old_resume_id` BIGINT UNSIGNED DEFAULT NULL, `closed_reason` VARCHAR(64) DEFAULT NULL,
+    `conflict_reason` VARCHAR(255) DEFAULT NULL, `activated_at` DATETIME(6) DEFAULT NULL,
+    `candidate_cleaned_at` DATETIME(6) DEFAULT NULL, `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`id`), UNIQUE KEY `uq_resume_replacement_operation` (`operation_id`),
+    UNIQUE KEY `uq_resume_replacement_message` (`source_msg_id`), UNIQUE KEY `uq_resume_replacement_new` (`new_resume_id`),
+    UNIQUE KEY `uq_resume_replacement_active_old` (`active_old_resume_id`),
+    KEY `idx_resume_replacement_old_status` (`old_resume_id`,`lifecycle_status`),
+    KEY `idx_resume_replacement_owner_created` (`owner_userid`,`created_at`),
+    KEY `idx_resume_replacement_lifecycle_created` (`lifecycle_status`,`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='简历全量替换关系';
+
+CREATE TABLE `resume_replacement_rollout_assignment` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, `operation_id` CHAR(36) NOT NULL,
+    `owner_userid` VARCHAR(64) NOT NULL, `cohort` ENUM('enabled','control') NOT NULL,
+    `allowlist_revision` BIGINT UNSIGNED NOT NULL, `source_msg_id` VARCHAR(128) NOT NULL,
+    `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_resume_rollout_operation` (`operation_id`),
+    UNIQUE KEY `uq_resume_rollout_message` (`source_msg_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `phase11_migration_ledger` (
+    `migration_key` VARCHAR(128) NOT NULL, `script_sha256` CHAR(64) NOT NULL,
+    `stage` ENUM('pre_cutover','post_cutover','verify','down') NOT NULL,
+    `kind` ENUM('sql','python','verify_sql') NOT NULL,
+    `status` ENUM('running','succeeded','failed','verified') NOT NULL,
+    `attempt` INT UNSIGNED NOT NULL DEFAULT 0, `last_statement_ordinal` INT UNSIGNED NOT NULL DEFAULT 0,
+    `resume_cursor_json` JSON DEFAULT NULL, `started_at` DATETIME(6) DEFAULT NULL,
+    `completed_at` DATETIME(6) DEFAULT NULL, `cutover_resume_id` BIGINT UNSIGNED DEFAULT NULL,
+    `build_probe_digest` CHAR(64) DEFAULT NULL, `executed_by` VARCHAR(128) NOT NULL,
+    `error_code` VARCHAR(64) DEFAULT NULL, `verification_digest` CHAR(64) DEFAULT NULL,
+    `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`migration_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `resume_media_isolation_issue` (
+    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, `resume_id` BIGINT UNSIGNED DEFAULT NULL,
+    `key_hash` CHAR(64) NOT NULL, `issue_type` VARCHAR(64) NOT NULL,
+    `status` ENUM('open','approved','resolved','blocked') NOT NULL DEFAULT 'open',
+    `disposition` ENUM('assign_owner','detach_reference','delete_object') DEFAULT NULL,
+    `approval_reason` VARCHAR(255) DEFAULT NULL, `approved_by` VARCHAR(64) DEFAULT NULL,
+    `approved_at` DATETIME(6) DEFAULT NULL, `executed_by` VARCHAR(64) DEFAULT NULL,
+    `executed_at` DATETIME(6) DEFAULT NULL, `resolved_at` DATETIME(6) DEFAULT NULL,
+    `created_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    `updated_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`id`), UNIQUE KEY `uq_resume_media_isolation_issue` (`resume_id`,`key_hash`,`issue_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `phase11_resume_media_key_scan` (
+    `resume_id` BIGINT UNSIGNED NOT NULL, `key_hash` CHAR(64) NOT NULL,
+    `reference_kind` ENUM('valid','invalid') NOT NULL, `reference_count` INT UNSIGNED NOT NULL,
+    `first_seen_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`resume_id`,`key_hash`,`reference_kind`),
+    KEY `idx_phase11_media_scan_key` (`key_hash`,`reference_kind`,`resume_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `phase11_resume_lifecycle_backup` (
+    `resume_id` BIGINT UNSIGNED NOT NULL, `expires_at` DATETIME(6) DEFAULT NULL,
+    `activated_at` DATETIME(6) DEFAULT NULL, `candidate_expires_at` DATETIME(6) DEFAULT NULL,
+    `deleted_at` DATETIME(6) DEFAULT NULL, `version` INT UNSIGNED NOT NULL,
+    `updated_at` DATETIME(6) NOT NULL, `captured_at` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (`resume_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 
 -- ============================================================================

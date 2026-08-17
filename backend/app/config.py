@@ -174,6 +174,33 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    # Phase 11 rollout gates.  All remain fail-closed until a later cutover
+    # stage explicitly enables them; keeping them in the contract now lets
+    # mixed-version app/worker fleets parse the same environment.
+    resume_lifecycle_v2_enabled: bool = False
+    resume_replacement_enabled: bool = False
+    resume_expiry_cleanup_enabled: bool = False
+    resume_candidate_cleanup_enabled: bool = False
+    resume_hard_delete_enabled: bool = False
+    ttl_resume_days: int = 30
+    ttl_resume_candidate_days: int = 7
+
+    @field_validator("ttl_resume_days", mode="after")
+    @classmethod
+    def _valid_resume_ttl(cls, value: int) -> int:
+        value = int(value)
+        if not 1 <= value <= 3650:
+            raise ValueError("ttl_resume_days must be between 1 and 3650")
+        return value
+
+    @field_validator("ttl_resume_candidate_days", mode="after")
+    @classmethod
+    def _valid_resume_candidate_ttl(cls, value: int) -> int:
+        value = int(value)
+        if not 1 <= value <= 365:
+            raise ValueError("ttl_resume_candidate_days must be between 1 and 365")
+        return value
+
     # ---- 应用 ----
     app_env: str = "development"
     app_host: str = "0.0.0.0"

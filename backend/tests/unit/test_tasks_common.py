@@ -46,6 +46,7 @@ class TestEnsureTtlConfigDefaults:
             "ttl.job.days",
             "ttl.job.candidate.days",
             "ttl.resume.days",
+            "ttl.resume.candidate.days",
             "ttl.conversation_log.days",
             "ttl.audit_log.days",
             "ttl.wecom_inbound_event.days",

@@ -7,9 +7,42 @@
 """
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.mutable import MutableDict
 
 from app.db import Base
+
+
+class _CurrentTimestamp6(sa.sql.expression.FunctionElement):
+    """Portable ORM default; MySQL keeps the frozen microsecond contract."""
+    type = sa.DateTime()
+    inherit_cache = True
+
+
+@compiles(_CurrentTimestamp6)
+def _compile_current_timestamp(element, compiler, **kw):  # noqa: ARG001
+    return "CURRENT_TIMESTAMP"
+
+
+@compiles(_CurrentTimestamp6, "mysql")
+def _compile_mysql_current_timestamp(element, compiler, **kw):  # noqa: ARG001
+    return "CURRENT_TIMESTAMP(6)"
+
+
+class _CurrentTimestamp6OnUpdate(sa.sql.expression.FunctionElement):
+    """Portable server default with MySQL's ON UPDATE clause."""
+    type = sa.DateTime()
+    inherit_cache = True
+
+
+@compiles(_CurrentTimestamp6OnUpdate)
+def _compile_current_timestamp_on_update(element, compiler, **kw):  # noqa: ARG001
+    return "CURRENT_TIMESTAMP"
+
+
+@compiles(_CurrentTimestamp6OnUpdate, "mysql")
+def _compile_mysql_current_timestamp_on_update(element, compiler, **kw):  # noqa: ARG001
+    return "CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"
 
 
 # ============================================================================
@@ -309,10 +342,17 @@ class Resume(Base):
     audited_at = sa.Column(sa.DateTime, nullable=True)
 
     # ---- 生命周期 ----
-    created_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now())
-    updated_at = sa.Column(sa.DateTime, nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
-    expires_at = sa.Column(sa.DateTime, nullable=False, comment="过期时间")
-    deleted_at = sa.Column(sa.DateTime, nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    updated_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=False,
+        server_default=_CurrentTimestamp6OnUpdate(),
+        server_onupdate=_CurrentTimestamp6(),
+    )
+    activated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True, comment="业务激活时间")
+    candidate_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True, comment="候选版本回收时间")
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True, comment="激活后的业务过期时间")
+    delist_reason = sa.Column(sa.String(32), nullable=True, comment="下架原因")
+    deleted_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
 
     # ---- 乐观锁 ----
     version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"), comment="乐观锁版本号")
@@ -324,9 +364,145 @@ class Resume(Base):
         sa.Index("idx_owner", "owner_userid"),
         sa.Index("idx_audit_time", "audit_status", "created_at"),
         sa.Index("idx_expires", "expires_at"),
+        sa.Index("idx_resume_candidate_expiry", "audit_status", "candidate_expires_at"),
+        sa.Index("idx_resume_hard_delete", "deleted_at", "id"),
         sa.Index("idx_filter_hot", "gender", "age", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary_exp", "salary_expect_floor_monthly"),
     )
+
+
+class ResumeReplacement(Base):
+    """Durable relation between an old active resume and its replacement candidate."""
+    __tablename__ = "resume_replacement"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(mysql.CHAR(36), nullable=False)
+    source_msg_id = sa.Column(sa.String(128), nullable=False)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    old_resume_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    new_resume_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    old_resume_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    old_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    old_business_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    old_business_digest_version = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default=sa.text("2"))
+    review_outcome = sa.Column(sa.Enum("pending", "passed", "rejected", name="resume_replacement_review_outcome"), nullable=False, server_default="pending")
+    reviewed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    reviewed_by = sa.Column(sa.String(64), nullable=True)
+    lifecycle_status = sa.Column(sa.Enum("awaiting_review", "activated", "closed", "conflict", name="resume_replacement_lifecycle_status"), nullable=False, server_default="awaiting_review")
+    active_old_resume_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    closed_reason = sa.Column(sa.String(64), nullable=True)
+    conflict_reason = sa.Column(sa.String(255), nullable=True)
+    activated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    candidate_cleaned_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    updated_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=False,
+        server_default=_CurrentTimestamp6OnUpdate(),
+        server_onupdate=_CurrentTimestamp6(),
+    )
+    __table_args__ = (
+        sa.UniqueConstraint("operation_id", name="uq_resume_replacement_operation"),
+        sa.UniqueConstraint("source_msg_id", name="uq_resume_replacement_message"),
+        sa.UniqueConstraint("new_resume_id", name="uq_resume_replacement_new"),
+        sa.UniqueConstraint("active_old_resume_id", name="uq_resume_replacement_active_old"),
+        sa.Index("idx_resume_replacement_old_status", "old_resume_id", "lifecycle_status"),
+        sa.Index("idx_resume_replacement_owner_created", "owner_userid", "created_at"),
+        sa.Index("idx_resume_replacement_lifecycle_created", "lifecycle_status", "created_at"),
+    )
+
+
+class ResumeReplacementRolloutAssignment(Base):
+    __tablename__ = "resume_replacement_rollout_assignment"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    operation_id = sa.Column(mysql.CHAR(36), nullable=False)
+    owner_userid = sa.Column(sa.String(64), nullable=False)
+    cohort = sa.Column(sa.Enum("enabled", "control", name="resume_rollout_cohort"), nullable=False)
+    allowlist_revision = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    source_msg_id = sa.Column(sa.String(128), nullable=False)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    __table_args__ = (
+        sa.UniqueConstraint("operation_id", name="uq_resume_rollout_operation"),
+        sa.UniqueConstraint("source_msg_id", name="uq_resume_rollout_message"),
+    )
+
+
+class Phase11MigrationLedger(Base):
+    __tablename__ = "phase11_migration_ledger"
+    migration_key = sa.Column(sa.String(128), primary_key=True)
+    script_sha256 = sa.Column(mysql.CHAR(64), nullable=False)
+    stage = sa.Column(sa.Enum("pre_cutover", "post_cutover", "verify", "down", name="phase11_migration_stage"), nullable=False)
+    kind = sa.Column(sa.Enum("sql", "python", "verify_sql", name="phase11_migration_kind"), nullable=False)
+    status = sa.Column(sa.Enum("running", "succeeded", "failed", "verified", name="phase11_migration_status"), nullable=False)
+    attempt = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    last_statement_ordinal = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default="0")
+    resume_cursor_json = sa.Column(sa.JSON, nullable=True)
+    started_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    completed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    cutover_resume_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    build_probe_digest = sa.Column(mysql.CHAR(64), nullable=True)
+    executed_by = sa.Column(sa.String(128), nullable=False)
+    error_code = sa.Column(sa.String(64), nullable=True)
+    verification_digest = sa.Column(mysql.CHAR(64), nullable=True)
+    updated_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=False,
+        server_default=_CurrentTimestamp6OnUpdate(),
+        server_onupdate=_CurrentTimestamp6(),
+    )
+
+
+class ResumeMediaIsolationIssue(Base):
+    __tablename__ = "resume_media_isolation_issue"
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    resume_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    key_hash = sa.Column(mysql.CHAR(64), nullable=False)
+    issue_type = sa.Column(sa.String(64), nullable=False)
+    status = sa.Column(sa.Enum("open", "approved", "resolved", "blocked", name="resume_media_issue_status"), nullable=False, server_default="open")
+    disposition = sa.Column(sa.Enum("assign_owner", "detach_reference", "delete_object", name="resume_media_disposition"), nullable=True)
+    approval_reason = sa.Column(sa.String(255), nullable=True)
+    approved_by = sa.Column(sa.String(64), nullable=True)
+    approved_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    executed_by = sa.Column(sa.String(64), nullable=True)
+    executed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    resolved_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    updated_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=False,
+        server_default=_CurrentTimestamp6OnUpdate(),
+        server_onupdate=_CurrentTimestamp6(),
+    )
+    __table_args__ = (sa.UniqueConstraint("resume_id", "key_hash", "issue_type", name="uq_resume_media_isolation_issue"),)
+
+
+class Phase11ResumeMediaKeyScan(Base):
+    """Hash-only migration registry used to detect shared media on resume."""
+    __tablename__ = "phase11_resume_media_key_scan"
+    resume_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=False)
+    key_hash = sa.Column(mysql.CHAR(64), primary_key=True)
+    reference_kind = sa.Column(
+        sa.Enum("valid", "invalid", name="phase11_resume_media_reference_kind"),
+        primary_key=True,
+    )
+    reference_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    first_seen_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    __table_args__ = (
+        sa.Index(
+            "idx_phase11_media_scan_key",
+            "key_hash",
+            "reference_kind",
+            "resume_id",
+        ),
+    )
+
+
+class Phase11ResumeLifecycleBackup(Base):
+    __tablename__ = "phase11_resume_lifecycle_backup"
+    resume_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=False)
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    activated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    candidate_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    deleted_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False)
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    captured_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
 
 
 # ============================================================================
