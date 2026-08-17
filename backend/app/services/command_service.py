@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from app.models import AuditLog, Job, JobReplacement
+from app.models import AuditLog, Job, JobReplacement, Resume, ResumeReplacement
 from app.schemas.conversation import ReplyMessage, SessionState  # noqa: F401
 from app.services import conversation_service
 from app.services.lifecycle_config_service import get_job_ttl_days
@@ -55,6 +55,7 @@ HELP_TEXT = (
     "  /找工人        切换到找工人模式（中介）\n"
     "  /续期 [天数]   延长岗位有效期（默认 15 天）\n"
     "  /更新岗位 [ID] 提交完整的新岗位信息替换旧岗位\n"
+    "  /更新简历 [ID] 提交完整的新简历信息替换旧简历\n"
     "  /下架          下架岗位\n"
     "  /招满了        标记岗位为已招满\n"
     "  /我的状态      查询账号和最近提交状态\n"
@@ -103,6 +104,7 @@ def execute(
     user_ctx: UserContext,
     session: SessionState | None,
     db: Session,
+    source_msg_id: str | None = None,
 ) -> list[ReplyMessage]:
     """执行归并后的命令 key。
 
@@ -123,6 +125,11 @@ def execute(
     if handler is None:
         logger.warning("command_service: unknown command key=%s", command)
         return [_reply(user_ctx, UNKNOWN_COMMAND)]
+    if command == "update_resume":
+        return handler(
+            args=args, user_ctx=user_ctx, session=session, db=db,
+            source_msg_id=source_msg_id,
+        )
     return handler(args=args, user_ctx=user_ctx, session=session, db=db)
 
 
@@ -211,6 +218,95 @@ def _handle_update_job(
     upload_service.initialize_pending_upload_window(session, now=now_utc)
     session.active_flow = "upload_collecting"
     return [_reply(user_ctx, "请发送完整的新岗位信息；审核通过后才会替换旧岗位。")]
+
+
+def _handle_update_resume(
+    *, args: str, user_ctx: UserContext, session: SessionState | None, db,
+    source_msg_id: str | None = None,
+) -> list[ReplyMessage]:
+    """Start a blank, complete resume replacement draft."""
+    import uuid
+    from app.config import settings
+    from app.services import upload_service
+    from app.services.resume_rollout_service import assign_operation
+
+    if not settings.resume_replacement_enabled:
+        return [_reply(user_ctx, "简历更新功能暂不可用，请稍后再试。")]
+    if user_ctx.role != "worker":
+        return [_reply(user_ctx, ROLE_NOT_ALLOWED)]
+    if session is None:
+        return [_reply(user_ctx, "会话不可用，请稍后重试。")]
+    try:
+        target_id = int(args.strip()) if args.strip() else None
+        if target_id is not None and target_id <= 0:
+            raise ValueError
+    except ValueError:
+        return [_reply(user_ctx, "简历 ID 必须是正整数。")]
+
+    operation_id = str(uuid.uuid4())
+    message_id = source_msg_id or operation_id
+    assignment = assign_operation(
+        db, operation_id=operation_id, source_msg_id=message_id,
+        owner_userid=user_ctx.external_userid,
+    )
+    if assignment.cohort != "enabled":
+        return [_reply(user_ctx, "简历更新功能正在灰度开放，暂未对您的账号开放。")]
+    if (
+        session.pending_upload_mode == "replace"
+        and session.pending_upload_intent == "upload_resume"
+        and session.pending_operation_id == assignment.operation_id
+    ):
+        return [_reply(user_ctx, "您的新简历草稿仍在收集中，请继续补充完整信息或发送 /取消 放弃。")]
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    online = db.query(Resume).filter(
+        Resume.owner_userid == user_ctx.external_userid,
+        Resume.audit_status == "passed",
+        Resume.activated_at.isnot(None),
+        Resume.deleted_at.is_(None),
+        Resume.delist_reason.is_(None),
+        Resume.expires_at > now,
+    ).order_by(Resume.id).all()
+    active_ids = {row[0] for row in db.query(ResumeReplacement.active_old_resume_id).filter(
+        ResumeReplacement.active_old_resume_id.isnot(None),
+    ).all()}
+    if target_id is not None:
+        selected = [row for row in online if row.id == target_id]
+        if selected and target_id in active_ids:
+            return [_reply(user_ctx, "该简历已有更新正在处理中，请等待审核或联系客服取消。")]
+        selected = [row for row in selected if row.id not in active_ids]
+    else:
+        selected = [row for row in online if row.id not in active_ids]
+    if not selected:
+        return [_reply(user_ctx, "未找到可更新简历，请重新上传完整简历。")]
+    if len(selected) != 1:
+        lines = []
+        for row in selected:
+            cities = "、".join(row.expected_cities or []) or "未填写城市"
+            categories = "、".join(row.expected_job_categories or []) or "未填写工种"
+            lines.append(f"{row.id}（{cities} / {categories} / 到期 {row.expires_at:%Y-%m-%d}）")
+        return [_reply(user_ctx, "您有多份在线简历，请使用 /更新简历 ID 明确选择：\n" + "\n".join(lines))]
+
+    old = selected[0]
+    if session.pending_upload_intent or session.pending_upload_media_ids:
+        upload_service.abandon_pending_upload(session, db)
+    else:
+        upload_service.clear_pending_upload(session)
+    conversation_service.reset_search(session)
+    session.last_criteria = {}
+    session.pending_relaxation = None
+    session.pending_upload = {}
+    session.pending_upload_mode = "replace"
+    session.pending_target_id = old.id
+    session.pending_target_version = int(old.version)
+    session.pending_operation_id = assignment.operation_id
+    session.pending_rollout_cohort = assignment.cohort
+    session.pending_rollout_revision = int(assignment.allowlist_revision)
+    session.pending_upload_media_ids = []
+    session.pending_upload_intent = "upload_resume"
+    upload_service.initialize_pending_upload_window(session)
+    session.active_flow = "upload_collecting"
+    return [_reply(user_ctx, "请从头发送完整的新简历信息；不会继承旧简历内容，审核通过后才会替换旧简历。")]
 
 
 def _handle_reset_search(
@@ -615,6 +711,7 @@ _HANDLERS = {
     "switch_to_worker": _handle_switch_to_worker,
     "renew_job": _handle_renew_job,
     "update_job": _handle_update_job,
+    "update_resume": _handle_update_resume,
     "delist_job": _handle_delist_job,
     "filled_job": _handle_filled_job,
     "delete_my_data": _handle_delete_my_data,

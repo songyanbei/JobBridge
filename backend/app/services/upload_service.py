@@ -208,6 +208,8 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_target_id = None
     session.pending_target_version = None
     session.pending_operation_id = None
+    session.pending_rollout_cohort = None
+    session.pending_rollout_revision = None
     session.pending_upload_media_ids = []
     session.attachment_target_type = None
     session.attachment_target_id = None
@@ -344,18 +346,28 @@ def process_upload(
         )
 
     # 入库（带审核结果）
-    if entity_type == "job" and session.pending_upload_mode == "replace":
+    if entity_type in {"job", "resume"} and session.pending_upload_mode == "replace":
         if not (
             session.pending_target_id
             and session.pending_target_version
             and session.pending_operation_id
         ):
             raise RuntimeError("replacement_session_context_incomplete")
-        from app.services.job_replace_service import create_replacement_candidate
+        if entity_type == "resume" and not (
+            session.pending_rollout_cohort == "enabled"
+            and session.pending_rollout_revision is not None
+        ):
+            raise RuntimeError("resume_replacement_assignment_context_incomplete")
+        if entity_type == "job":
+            from app.services.job_replace_service import create_replacement_candidate
+            target_kw = {"target_job_id": session.pending_target_id}
+        else:
+            from app.services.resume_replace_service import create_replacement_candidate
+            target_kw = {"target_resume_id": session.pending_target_id}
         _, entity = create_replacement_candidate(
             db,
             owner_userid=user_ctx.external_userid,
-            target_job_id=session.pending_target_id,
+            **target_kw,
             expected_version=session.pending_target_version,
             operation_id=session.pending_operation_id,
             source_msg_id=source_msg_id or session.pending_operation_id,
@@ -439,19 +451,18 @@ def attach_image(
         discard_unattached_media(db, media_lifecycle_id)
         return "图片保存失败，请稍后重试。"
 
-    if (
-        session.pending_upload_intent
-        and _attach_target_entity_type(session.pending_upload_intent) == "job"
-    ):
+    if session.pending_upload_intent:
         if media_lifecycle_id is None:
             return "图片保存失败，请稍后重试。"
         if media_lifecycle_id in session.pending_upload_media_ids:
-            return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+            kind = "岗位" if _attach_target_entity_type(session.pending_upload_intent) == "job" else "简历"
+            return f"图片已加入新{kind}草稿（第 {len(session.pending_upload_media_ids)} 张）。"
         if len(session.pending_upload_media_ids) >= _MAX_IMAGES_PER_RECORD:
             discard_unattached_media(db, media_lifecycle_id)
             return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
         session.pending_upload_media_ids.append(media_lifecycle_id)
-        return f"图片已加入新岗位草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+        kind = "岗位" if _attach_target_entity_type(session.pending_upload_intent) == "job" else "简历"
+        return f"图片已加入新{kind}草稿（第 {len(session.pending_upload_media_ids)} 张）。"
 
     entity_type = session.attachment_target_type
     target_id = session.attachment_target_id

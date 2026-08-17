@@ -957,7 +957,7 @@ def _route_command_with_state_guard(
         )
         return _enter_upload_conflict(synthesized, msg, session)
 
-    return _handle_command_intent(intent_result, user_ctx, session, db)
+    return _handle_command_intent(intent_result, user_ctx, session, db, msg=msg)
 
 
 def _route_upload_collecting(
@@ -1551,11 +1551,15 @@ def _handle_command_intent(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    msg: WeComMessage | None = None,
 ) -> list[ReplyMessage]:
     data = intent_result.structured_data or {}
     cmd = data.get("command", "")
     args = data.get("args", "") or ""
-    return command_service.execute(cmd, args, user_ctx, session, db)
+    return command_service.execute(
+        cmd, args, user_ctx, session, db,
+        source_msg_id=msg.msg_id if msg is not None else None,
+    )
 
 
 def _handle_upload(

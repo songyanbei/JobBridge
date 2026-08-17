@@ -68,6 +68,8 @@ class SessionState(BaseModel):
     pending_target_id: int | None = Field(default=None)
     pending_target_version: int | None = Field(default=None)
     pending_operation_id: str | None = Field(default=None)
+    pending_rollout_cohort: str | None = Field(default=None, pattern="^(enabled|control)$")
+    pending_rollout_revision: int | None = Field(default=None, ge=1)
     pending_upload_media_ids: list[int] = Field(default_factory=list)
     attachment_target_type: str | None = Field(
         default=None,
