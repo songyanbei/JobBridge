@@ -30,7 +30,7 @@ from app.core.redis_client import (
     save_undo,
     validate_undo_unchanged,
 )
-from app.models import AuditLog, Job, JobReplacement, Resume, User
+from app.models import AuditLog, Job, JobReplacement, Resume, ResumeReplacement, User
 from app.services import audit_service
 from app.services.admin_log_service import _json_safe, write_admin_log
 
@@ -260,14 +260,21 @@ def list_queue(
         for row in rows:
             obj_map[(tt, row.id)] = row
 
-    replacement_map: dict[int, JobReplacement] = {}
+    replacement_map: dict[tuple[str, int], Any] = {}
     if by_type["job"]:
-        replacement_map = {
-            int(relation.new_job_id): relation
+        replacement_map.update({
+            ("job", int(relation.new_job_id)): relation
             for relation in db.query(JobReplacement).filter(
                 JobReplacement.new_job_id.in_(by_type["job"]),
             ).all()
-        }
+        })
+    if by_type["resume"]:
+        replacement_map.update({
+            ("resume", int(relation.new_resume_id)): relation
+            for relation in db.query(ResumeReplacement).filter(
+                ResumeReplacement.new_resume_id.in_(by_type["resume"]),
+            ).all()
+        })
 
     for tt, rid in order_key:
         obj = obj_map.get((tt, rid))
@@ -279,7 +286,7 @@ def list_queue(
             holder = get_audit_lock_holder(tt, obj.id)
         except Exception:
             pass
-        relation = replacement_map.get(int(obj.id)) if tt == "job" else None
+        relation = replacement_map.get((tt, int(obj.id)))
         items.append(QueueItem(
             target_type=tt,
             obj=obj,
@@ -398,6 +405,19 @@ def get_detail(db: Session, target_type: str, target_id: int) -> dict:
     if target_type == "job":
         from app.services.job_admin_service import replacement_projections
         lifecycle = replacement_projections(db, [obj]).get(obj.id, {})
+    elif target_type == "resume":
+        relation = db.query(ResumeReplacement).filter(or_(
+            ResumeReplacement.old_resume_id == obj.id,
+            ResumeReplacement.new_resume_id == obj.id,
+        )).order_by(ResumeReplacement.id.desc()).first()
+        if relation is not None:
+            lifecycle = {
+                "replacement_id": int(relation.id),
+                "replacement_review_outcome": relation.review_outcome,
+                "replacement_lifecycle_status": relation.lifecycle_status,
+                "replacement_closed_reason": relation.closed_reason,
+                "replacement_conflict_reason": relation.conflict_reason,
+            }
 
     return {
         "id": obj.id,
@@ -541,6 +561,41 @@ def _pass_resume(db: Session, target_id: int, version: int, operator: str) -> No
     )
 
     assert_resume_writes_allowed()
+    relation_hint = db.query(ResumeReplacement).filter(
+        ResumeReplacement.new_resume_id == target_id,
+    ).first()
+    if isinstance(relation_hint, ResumeReplacement):
+        from app.services.resume_replace_service import activate_replacement_locked
+        from app.services.resume_replacement_lock_service import lock_replacement_graph
+
+        relation, _, graph = lock_replacement_graph(db, relation_hint.id)
+        if relation is None or not isinstance(graph, dict) or target_id not in graph:
+            raise BusinessException(40904, "replacement_graph_incomplete")
+        candidate = graph[target_id]
+        _check_version(candidate, version)
+        if relation.lifecycle_status != "awaiting_review" or relation.review_outcome != "pending":
+            raise BusinessException(40904, "replacement_already_reviewed")
+        now = utc_now_naive()
+        if not candidate.candidate_expires_at or candidate.candidate_expires_at <= now:
+            raise BusinessException(40904, "candidate_expired")
+        before = _snapshot(candidate, "resume")
+        relation.review_outcome = "passed"
+        relation.reviewed_at = now
+        relation.reviewed_by = operator
+        candidate.audited_by = operator
+        candidate.audited_at = now
+        activated = activate_replacement_locked(
+            db, relation, graph[relation.old_resume_id], candidate,
+            expected_old_version=relation.old_resume_version, now=now,
+        )
+        write_admin_log(
+            db, target_type="resume", target_id=target_id, action="manual_pass",
+            operator=operator, before=before, after=_snapshot(candidate, "resume"),
+            reason=None if activated else "replacement_conflict",
+        )
+        db.commit()
+        return
+
     candidate = lock_resume(db, target_id)
     _check_version(candidate, version)
     now = utc_now_naive()
@@ -782,7 +837,21 @@ def _reject_resume(
     from app.services.lifecycle_config_service import get_resume_candidate_ttl_days
 
     assert_resume_writes_allowed()
-    candidate = lock_resume(db, target_id)
+    relation_hint = db.query(ResumeReplacement).filter(
+        ResumeReplacement.new_resume_id == target_id,
+    ).first()
+    if isinstance(relation_hint, ResumeReplacement):
+        from app.services.resume_replacement_lock_service import lock_replacement_graph
+
+        relation, _, graph = lock_replacement_graph(db, relation_hint.id)
+        if relation is None or not isinstance(graph, dict) or target_id not in graph:
+            raise BusinessException(40904, "replacement_graph_incomplete")
+        candidate = graph[target_id]
+        if relation.lifecycle_status != "awaiting_review" or relation.review_outcome != "pending":
+            raise BusinessException(40904, "replacement_already_reviewed")
+    else:
+        relation = None
+        candidate = lock_resume(db, target_id)
     _check_version(candidate, version)
     if candidate.audit_status != "pending":
         raise BusinessException(40904, "resume_not_pending_review")
@@ -799,6 +868,13 @@ def _reject_resume(
     candidate.audited_by = operator
     candidate.audited_at = now
     increment_resume_version(candidate)
+    if relation is not None:
+        relation.review_outcome = "rejected"
+        relation.reviewed_at = now
+        relation.reviewed_by = operator
+        relation.lifecycle_status = "closed"
+        relation.active_old_resume_id = None
+        relation.closed_reason = "rejected"
     write_admin_log(
         db,
         target_type="resume",
@@ -883,6 +959,50 @@ def edit_action(
             })
             return
 
+    if target_type == "resume":
+        from app.services.resume_mutation_service import (
+            increment_resume_version, lock_resume, reject_if_replacement_in_progress,
+        )
+        relation_hint = db.query(ResumeReplacement).filter(
+            ResumeReplacement.new_resume_id == target_id,
+        ).first()
+        if isinstance(relation_hint, ResumeReplacement):
+            from app.services.resume_replacement_lock_service import lock_replacement_graph
+
+            relation, _, graph = lock_replacement_graph(db, relation_hint.id)
+            if relation is None or not isinstance(graph, dict) or target_id not in graph:
+                raise BusinessException(40904, "replacement_graph_incomplete")
+            obj = graph[target_id]
+            if relation.review_outcome != "pending" or relation.lifecycle_status != "awaiting_review":
+                raise BusinessException(40904, "replacement_already_reviewed")
+            if (
+                obj.audit_status != "pending" or obj.activated_at is not None
+                or obj.deleted_at is not None or not obj.candidate_expires_at
+                or obj.candidate_expires_at <= datetime.now(timezone.utc).replace(tzinfo=None)
+            ):
+                raise BusinessException(40904, "resume_not_pending_review")
+        else:
+            obj = lock_resume(db, target_id)
+            reject_if_replacement_in_progress(db, target_id)
+            if obj.audit_status != "pending":
+                raise BusinessException(40904, "resume_not_pending_review")
+        _check_version(obj, version)
+        before = _snapshot(obj, target_type)
+        for key, value in fields.items():
+            setattr(obj, key, value)
+        increment_resume_version(obj)
+        after = _snapshot(obj, target_type)
+        write_admin_log(
+            db, target_type=target_type, target_id=target_id,
+            action="manual_edit", operator=operator, before=before, after=after,
+        )
+        db.commit()
+        save_undo(target_type, target_id, {
+            "action": "edit", "operator": operator,
+            "before": before, "after": after, "ts": time.time(),
+        })
+        return
+
     obj = _load(db, target_type, target_id)
     _check_version(obj, version)
     before = _snapshot(obj, target_type)
@@ -937,6 +1057,16 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
     payload, snapshot_token = snapshot
     if target_type == "resume" and payload.get("action") in {"pass", "reject"}:
         raise BusinessException(40904, "resume_lifecycle_transition_not_undoable")
+    if target_type == "resume":
+        terminal_relation = db.query(ResumeReplacement.id).filter(
+            or_(
+                ResumeReplacement.old_resume_id == target_id,
+                ResumeReplacement.new_resume_id == target_id,
+            ),
+            ResumeReplacement.lifecycle_status.in_(("activated", "closed", "conflict")),
+        ).with_for_update().first()
+        if terminal_relation is not None:
+            raise BusinessException(40904, "resume_lifecycle_transition_not_undoable")
     if target_type == "job":
         relation = next(
             (row for row in relations if int(row.new_job_id) == int(target_id)),

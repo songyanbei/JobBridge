@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Job, TargetCleanupTask
+from app.models import Job, Resume, TargetCleanupTask
 
 
 TARGET_CLEANUP_LEASE = timedelta(minutes=4)
@@ -19,43 +19,53 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _lock_job_cleanup_task(
-    db: Session, job_id: int,
+def _target_model(target_type: str):
+    if target_type == "job":
+        return Job
+    if target_type == "resume":
+        return Resume
+    raise ValueError("unsupported_cleanup_target_type")
+
+
+def _lock_cleanup_task(
+    db: Session, target_type: str, target_id: int,
 ) -> TargetCleanupTask | None:
     return (
         db.query(TargetCleanupTask)
         .populate_existing()
         .filter(
-            TargetCleanupTask.target_type == "job",
-            TargetCleanupTask.target_id == job_id,
+            TargetCleanupTask.target_type == target_type,
+            TargetCleanupTask.target_id == target_id,
         )
         .with_for_update()
         .first()
     )
 
 
-def upsert_job_cleanup_task(
+def upsert_target_cleanup_task(
     db: Session,
-    job_id: int,
+    target_type: str,
+    target_id: int,
     *,
     reason: str,
     operation_id: str | None = None,
 ) -> tuple[TargetCleanupTask, bool]:
-    # The Job row serializes creation while no target_cleanup_task row exists.
+    # The target row serializes creation while no cleanup row exists.
+    model = _target_model(target_type)
     (
-        db.query(Job.id)
+        db.query(model.id)
         .populate_existing()
-        .filter(Job.id == job_id)
+        .filter(model.id == target_id)
         .with_for_update()
         .one()
     )
-    task = _lock_job_cleanup_task(db, job_id)
+    task = _lock_cleanup_task(db, target_type, target_id)
     created = False
     if task is None:
         task = TargetCleanupTask(
             operation_id=operation_id or str(uuid.uuid4()),
-            target_type="job",
-            target_id=job_id,
+            target_type=target_type,
+            target_id=target_id,
             reason=reason,
             reason_history=[reason],
             status="pending",
@@ -69,7 +79,7 @@ def upsert_job_cleanup_task(
                 db.flush()
             created = True
         except IntegrityError:
-            task = _lock_job_cleanup_task(db, job_id)
+            task = _lock_cleanup_task(db, target_type, target_id)
             if task is None:
                 raise
 
@@ -82,6 +92,32 @@ def upsert_job_cleanup_task(
     return task, created
 
 
+def ensure_target_cleanup_task(
+    db: Session, target_type: str, target_id: int, *, reason: str,
+    operation_id: str | None = None,
+) -> TargetCleanupTask:
+    task, _ = upsert_target_cleanup_task(
+        db, target_type, target_id, reason=reason, operation_id=operation_id,
+    )
+    return task
+
+
+def target_cleanup_succeeded(db: Session, target_type: str, target_id: int) -> bool:
+    _target_model(target_type)
+    task = db.query(TargetCleanupTask).filter_by(
+        target_type=target_type, target_id=target_id,
+    ).first()
+    return bool(task and task.status == "succeeded")
+
+
+def upsert_job_cleanup_task(
+    db: Session, job_id: int, *, reason: str, operation_id: str | None = None,
+) -> tuple[TargetCleanupTask, bool]:
+    return upsert_target_cleanup_task(
+        db, "job", job_id, reason=reason, operation_id=operation_id,
+    )
+
+
 def ensure_job_cleanup_task(
     db: Session,
     job_id: int,
@@ -89,18 +125,13 @@ def ensure_job_cleanup_task(
     reason: str,
     operation_id: str | None = None,
 ) -> TargetCleanupTask:
-    task, _ = upsert_job_cleanup_task(
-        db,
-        job_id,
-        reason=reason,
-        operation_id=operation_id,
+    return ensure_target_cleanup_task(
+        db, "job", job_id, reason=reason, operation_id=operation_id,
     )
-    return task
 
 
 def job_cleanup_succeeded(db: Session, job_id: int) -> bool:
-    task = db.query(TargetCleanupTask).filter_by(target_type="job", target_id=job_id).first()
-    return bool(task and task.status == "succeeded")
+    return target_cleanup_succeeded(db, "job", job_id)
 
 
 def claim_cleanup_tasks(

@@ -248,11 +248,32 @@ def delete_user_data(external_userid: str, db: Session) -> str:
     # 1. 清空 Redis session
     conversation_service.clear_session(external_userid)
 
-    # 2. 软删除简历
-    db.query(Resume).filter(
-        Resume.owner_userid == external_userid,
-        Resume.deleted_at.is_(None),
-    ).update({"deleted_at": now})
+    # 2. 逐份锁定并关闭 replacement；状态、版本与 cleanup task 同事务写入。
+    from app.services.job_media_service import mark_resume_media_delete_pending
+    from app.services.resume_mutation_service import (
+        close_active_replacement, increment_resume_version, to_utc_naive,
+    )
+    from app.services.target_cleanup_service import ensure_target_cleanup_task
+
+    deleted_at = to_utc_naive(now)
+    # Candidate creation uses User -> Resume -> relation; deletion follows the
+    # same prefix so it cannot invert locks with an in-flight replacement.
+    locked_user = db.query(User).filter(
+        User.external_userid == external_userid,
+    ).with_for_update().one_or_none()
+    resume_ids = [
+        int(row[0]) for row in db.query(Resume.id).filter(
+            Resume.owner_userid == external_userid,
+        ).order_by(Resume.id).all()
+    ]
+    for resume_id in resume_ids:
+        resume = close_active_replacement(db, resume_id, reason="user_deleted")
+        if resume.deleted_at is None:
+            resume.deleted_at = deleted_at
+            resume.delist_reason = "user_deleted"
+            increment_resume_version(resume)
+        mark_resume_media_delete_pending(db, resume_id)
+        ensure_target_cleanup_task(db, "resume", resume_id, reason="user_deleted")
 
     # 3. 设置对话日志过期（等价于软删除）
     db.query(ConversationLog).filter(
@@ -278,9 +299,8 @@ def delete_user_data(external_userid: str, db: Session) -> str:
         )
 
     # 5. 标记用户状态
-    db.query(User).filter(
-        User.external_userid == external_userid,
-    ).update({"status": "deleted"})
+    if locked_user is not None:
+        locked_user.status = "deleted"
 
     # 6. 写 conversation_log
     delete_log = ConversationLog(

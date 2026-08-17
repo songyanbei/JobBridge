@@ -11,7 +11,9 @@ from sqlalchemy.orm import Session
 
 from sqlalchemy.orm import Session as _Session
 
-from app.api.deps import get_db, require_admin_password_changed as require_admin
+from app.api.deps import (
+    get_db, require_admin_password_changed as require_admin, require_admin_role,
+)
 from app.core.csv_export import rows_to_csv_bytes
 from app.core.responses import ok, paged
 from app.models import AdminUser, User
@@ -59,6 +61,15 @@ class DelistRequest(BaseModel):
 class ExtendRequest(BaseModel):
     version: int = Field(..., ge=1)
     days: int
+
+
+class ReplacementRetryRequest(BaseModel):
+    old_resume_version: int = Field(..., ge=1)
+    reason: str = Field(..., min_length=1, max_length=255)
+
+
+class ReplacementCancelRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=64)
 
 
 def _collect_filters(
@@ -195,3 +206,32 @@ def extend_resume(
 ):
     r = resume_admin_service.extend(db, resume_id, req.version, req.days, current.username)
     return ok({"expires_at": r.expires_at.isoformat() if r.expires_at else None})
+
+
+@router.post("/replacements/{replacement_id}/retry", summary="重试简历替换激活")
+def retry_replacement(
+    replacement_id: int, req: ReplacementRetryRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role("operator", "super_admin")),
+):
+    from app.services.resume_replace_service import retry_activation
+
+    activated = retry_activation(
+        db, replacement_id, req.old_resume_version,
+        operator=current.username, reason=req.reason,
+    )
+    db.commit()
+    return ok({"activated": activated})
+
+
+@router.post("/replacements/{replacement_id}/cancel", summary="取消简历替换候选")
+def cancel_replacement(
+    replacement_id: int, req: ReplacementCancelRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role("operator", "super_admin")),
+):
+    from app.services.resume_replace_service import cancel_candidate
+
+    cancel_candidate(db, replacement_id, operator=current.username, reason=req.reason)
+    db.commit()
+    return ok()

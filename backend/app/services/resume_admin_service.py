@@ -1,7 +1,7 @@
 """简历管理 service（Phase 5 模块 E）。"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 import json
@@ -12,6 +12,10 @@ from sqlalchemy.orm import Query, Session
 from app.core.exceptions import BusinessException
 from app.models import Resume, SystemConfig
 from app.services.admin_log_service import _json_safe, write_admin_log
+from app.services.resume_mutation_service import (
+    close_active_replacement, increment_resume_version, lock_resume,
+    reject_if_replacement_in_progress, resume_is_online, utc_now_naive,
+)
 
 
 _FILTER_WHITELIST = {
@@ -131,7 +135,7 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
     from app.services.resume_cutover_service import assert_resume_writes_allowed
 
     assert_resume_writes_allowed()
-    resume = get_resume(db, resume_id)
+    resume = lock_resume(db, resume_id)
     if int(resume.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(resume.version or 0)})
@@ -139,6 +143,9 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
     unknown = [k for k in payload.keys() if k not in _EDIT_WHITELIST]
     if unknown:
         raise BusinessException(40101, f"不允许编辑的字段: {','.join(unknown)}")
+    if not resume_is_online(resume, now=utc_now_naive(), strict=True):
+        raise BusinessException(40904, "resume_not_active")
+    reject_if_replacement_in_progress(db, resume_id)
 
     before = _snapshot(resume)
 
@@ -191,19 +198,23 @@ def _atomic_resume_update(db: Session, resume_id: int, expected_version: int, pa
 
 
 def delist(db: Session, resume_id: int, version: int, reason: str, operator: str) -> None:
-    """简历软下架：置 deleted_at（简历没有 delist_reason 字段）。"""
+    """Close any candidate and delist the active resume in one transaction."""
     from app.services.resume_cutover_service import assert_resume_writes_allowed
 
     assert_resume_writes_allowed()
-    resume = get_resume(db, resume_id)
+    resume = close_active_replacement(db, resume_id, reason="old_resume_delisted")
     if int(resume.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(resume.version or 0)})
-    if resume.deleted_at is not None:
+    if not resume_is_online(resume, now=utc_now_naive(), strict=True):
         raise BusinessException(40904, "简历已下架")
     before = _snapshot(resume)
-    now = datetime.now()
-    resume = _atomic_resume_update(db, resume_id, version, {"deleted_at": now})
+    now = utc_now_naive()
+    resume.deleted_at = now
+    resume.delist_reason = "manual_delist"
+    increment_resume_version(resume)
+    from app.services.target_cleanup_service import ensure_target_cleanup_task
+    ensure_target_cleanup_task(db, "resume", resume_id, reason="manual_delist")
     write_admin_log(
         db,
         target_type="resume", target_id=resume.id,
@@ -221,21 +232,24 @@ def extend(db: Session, resume_id: int, version: int, days: int, operator: str) 
     assert_resume_writes_allowed()
     if days not in (15, 30):
         raise BusinessException(40101, "延期天数仅支持 15 或 30")
-    resume = get_resume(db, resume_id)
+    resume = lock_resume(db, resume_id)
     if int(resume.version or 0) != int(version):
         raise BusinessException(40902, "此条目已被修改，请刷新",
                                 {"current_version": int(resume.version or 0)})
 
+    now = utc_now_naive()
+    if not resume_is_online(resume, now=now, strict=True):
+        raise BusinessException(40904, "resume_not_active")
+    reject_if_replacement_in_progress(db, resume_id)
     before = _snapshot(resume)
-    now = datetime.now()
-    max_days = _load_config_int(db, "ttl.resume.days", 30) * 2
-    base = resume.expires_at if resume.expires_at and resume.expires_at > now else now
-    new_expires = base + timedelta(days=days)
-    ceiling = (resume.created_at or now) + timedelta(days=max_days)
-    if new_expires > ceiling:
-        new_expires = ceiling
-
-    resume = _atomic_resume_update(db, resume_id, version, {"expires_at": new_expires})
+    ttl_days = _load_config_int(db, "ttl.resume.days", 30)
+    base = max(resume.expires_at, now)
+    ceiling = max(resume.expires_at, resume.activated_at + timedelta(days=2 * ttl_days))
+    if base >= ceiling:
+        raise BusinessException(40904, "extension_limit_reached")
+    new_expires = min(base + timedelta(days=days), ceiling)
+    resume.expires_at = new_expires
+    increment_resume_version(resume)
     write_admin_log(
         db,
         target_type="resume", target_id=resume.id,
