@@ -6,11 +6,11 @@ from typing import Any
 
 import json
 
-from sqlalchemy import asc, desc, func
+from sqlalchemy import and_, asc, desc, func, or_
 from sqlalchemy.orm import Query, Session
 
 from app.core.exceptions import BusinessException
-from app.models import Resume, SystemConfig
+from app.models import Resume, ResumeReplacement, SystemConfig
 from app.services.admin_log_service import _json_safe, write_admin_log
 from app.services.resume_mutation_service import (
     close_active_replacement, increment_resume_version, lock_resume,
@@ -38,6 +38,8 @@ _EDIT_WHITELIST = {
     "ethnicity", "available_from", "has_tattoo", "taboo",
     "description",
 }
+
+_LIFECYCLE_SCOPES = {"active", "candidate", "history", "all"}
 
 
 def _load_config_int(db: Session, key: str, default: int) -> int:
@@ -99,6 +101,49 @@ def _apply_sort(query: Query, sort: str | None) -> Query:
     return query.order_by(Resume.created_at.desc())
 
 
+def _apply_lifecycle_scope(query: Query, lifecycle_scope: str | None) -> Query:
+    """Apply mutually-exclusive lifecycle views.
+
+    ``None`` intentionally preserves the pre-stage-6 admin API behaviour: all
+    non-deleted rows.  Operators opt into the stricter lifecycle views.
+    """
+    if lifecycle_scope is not None and lifecycle_scope not in _LIFECYCLE_SCOPES:
+        raise BusinessException(40101, "无效的 lifecycle_scope")
+    if lifecycle_scope in (None, "all"):
+        return query
+    now = utc_now_naive()
+    active = and_(
+        Resume.audit_status == "passed",
+        Resume.activated_at.isnot(None),
+        Resume.expires_at.isnot(None),
+        Resume.expires_at > now,
+        Resume.delist_reason.is_(None),
+        Resume.deleted_at.is_(None),
+    )
+    candidate = and_(
+        Resume.audit_status.in_(("pending", "rejected")),
+        Resume.activated_at.is_(None),
+        Resume.expires_at.is_(None),
+        Resume.candidate_expires_at.isnot(None),
+        Resume.candidate_expires_at > now,
+        Resume.deleted_at.is_(None),
+    )
+    if lifecycle_scope == "active":
+        return query.filter(active)
+    if lifecycle_scope == "candidate":
+        return query.filter(candidate)
+    return query.filter(or_(
+        Resume.deleted_at.isnot(None),
+        Resume.delist_reason.isnot(None),
+        and_(Resume.expires_at.isnot(None), Resume.expires_at <= now),
+        and_(
+            Resume.activated_at.is_(None),
+            Resume.candidate_expires_at.isnot(None),
+            Resume.candidate_expires_at <= now,
+        ),
+    ))
+
+
 def list_resumes(
     db: Session,
     filters: dict[str, Any],
@@ -106,17 +151,53 @@ def list_resumes(
     size: int = 20,
     sort: str | None = None,
     include_deleted: bool = False,
+    lifecycle_scope: str | None = None,
 ) -> tuple[list[Resume], int]:
     page = max(1, page)
     size = max(1, min(size, 100))
     query = db.query(Resume)
-    if not include_deleted:
+    if not include_deleted and lifecycle_scope != "history":
         query = query.filter(Resume.deleted_at.is_(None))
+    query = _apply_lifecycle_scope(query, lifecycle_scope)
     query = _apply_filters(query, filters)
     total = query.count()
     query = _apply_sort(query, sort)
     rows = query.offset((page - 1) * size).limit(size).all()
     return rows, total
+
+
+def replacement_projections(db: Session, resumes: list[Resume]) -> dict[int, dict]:
+    resume_ids = {int(row.id) for row in resumes}
+    if not resume_ids:
+        return {}
+    relations = db.query(ResumeReplacement).filter(
+        (ResumeReplacement.old_resume_id.in_(resume_ids))
+        | (ResumeReplacement.new_resume_id.in_(resume_ids))
+    ).order_by(ResumeReplacement.created_at.desc(), ResumeReplacement.id.desc()).all()
+    incoming: dict[int, ResumeReplacement] = {}
+    outgoing: dict[int, ResumeReplacement] = {}
+    for relation in relations:
+        if int(relation.new_resume_id) in resume_ids:
+            incoming.setdefault(int(relation.new_resume_id), relation)
+        if int(relation.old_resume_id) in resume_ids:
+            outgoing.setdefault(int(relation.old_resume_id), relation)
+    result: dict[int, dict] = {}
+    for resume_id in resume_ids:
+        before = incoming.get(resume_id)
+        after = outgoing.get(resume_id)
+        relation = before or after
+        if relation is None:
+            continue
+        result[resume_id] = {
+            "replacement_id": int(relation.id),
+            "replacement_review_outcome": relation.review_outcome,
+            "replacement_lifecycle_status": relation.lifecycle_status,
+            "replacement_closed_reason": relation.closed_reason,
+            "replacement_conflict_reason": relation.conflict_reason,
+            "replaces_resume_id": int(before.old_resume_id) if before else None,
+            "replaced_by_resume_id": int(after.new_resume_id) if after else None,
+        }
+    return result
 
 
 def get_resume(db: Session, resume_id: int) -> Resume:

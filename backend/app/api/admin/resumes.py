@@ -41,10 +41,11 @@ def _enrich_with_owner(db: _Session, resumes: list) -> dict[str, dict]:
     return {r[0]: {"owner_phone": r[1], "owner_display_name": r[2]} for r in rows}
 
 
-def _resume_to_dict(resume, owner_map: dict[str, dict]) -> dict:
+def _resume_to_dict(resume, owner_map: dict[str, dict], projection: dict | None = None) -> dict:
     item = ResumeRead.model_validate(resume).model_dump(mode="json")
     item["images"] = storage_urls_for_response(item.get("images"))
     item.update(owner_map.get(resume.owner_userid, {}))
+    item.update(projection or {})
     return item
 
 
@@ -101,6 +102,7 @@ def list_resumes(
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     sort: str = "created_at:desc",
+    lifecycle_scope: str | None = Query(None, description="active / candidate / history / all"),
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ):
@@ -108,9 +110,14 @@ def list_resumes(
         gender, age_min, age_max, expected_cities, expected_job_categories,
         audit_status, owner_userid, created_from, created_to,
     )
-    rows, total = resume_admin_service.list_resumes(db, filters, page, size, sort)
+    rows, total = resume_admin_service.list_resumes(
+        db, filters, page, size, sort, lifecycle_scope=lifecycle_scope,
+    )
     owner_map = _enrich_with_owner(db, rows)
-    return paged([_resume_to_dict(r, owner_map) for r in rows], total, page, size)
+    projections = resume_admin_service.replacement_projections(db, rows)
+    return paged([
+        _resume_to_dict(r, owner_map, projections.get(int(r.id))) for r in rows
+    ], total, page, size)
 
 
 @router.get("/export", summary="简历导出 CSV")
@@ -171,7 +178,8 @@ def get_resume(
 ):
     r = resume_admin_service.get_resume(db, resume_id)
     owner_map = _enrich_with_owner(db, [r])
-    return ok(_resume_to_dict(r, owner_map))
+    projection = resume_admin_service.replacement_projections(db, [r]).get(int(r.id))
+    return ok(_resume_to_dict(r, owner_map, projection))
 
 
 @router.put("/{resume_id}", summary="简历编辑（带 version 乐观锁）")

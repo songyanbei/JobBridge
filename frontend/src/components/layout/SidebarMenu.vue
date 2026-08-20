@@ -136,6 +136,7 @@ const dictItems = [
   { path: '/admin/dicts/sensitive-words', label: '敏感词', icon: Warning },
 ]
 const systemItems = [
+  { path: '/admin/cleanup', label: '清理运维', icon: Warning },
   { path: '/admin/recommendation-strategies', label: '推荐策略', icon: TrendCharts },
   { path: '/admin/config', label: '系统配置', icon: Setting },
 ]

@@ -6,6 +6,7 @@ from . import (
     audit,
     auth,
     config,
+    cleanup,
     dicts,
     jobs,
     logs,
@@ -23,6 +24,7 @@ router.include_router(jobs.router)
 router.include_router(resumes.router)
 router.include_router(dicts.router)
 router.include_router(config.router)
+router.include_router(cleanup.router)
 router.include_router(reports.router)
 router.include_router(logs.router)
 router.include_router(recommendation_strategies.router)

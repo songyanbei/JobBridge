@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -35,12 +35,52 @@ class VisibilityPolicyRestoreRequest(BaseModel):
     confirm_sensitive_expansion: bool = False
 
 
+class ResumeReplacementRolloutRequest(BaseModel):
+    expected_revision: int = Field(..., ge=1)
+    userids: list[str] = Field(default_factory=list, max_length=10000)
+    reason: str = Field(..., min_length=1, max_length=160)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must not be blank")
+        return value
+
+
 @router.get("", summary="系统配置（按 key 前缀分组）")
 def list_config(
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
 ):
     return ok(system_config_service.list_grouped(db))
+
+
+@router.get("/resume-replacement-rollout", summary="读取简历替换 allowlist")
+def get_resume_replacement_rollout(
+    db: Session = Depends(get_db),
+    _: AdminUser = Depends(require_admin_role(*_OPERATOR)),
+):
+    from app.services.resume_replacement_rollout_service import get_allowlist
+
+    value = get_allowlist(db)
+    return ok({"revision": value.revision, "member_count": len(value.userids)})
+
+
+@router.put("/resume-replacement-rollout", summary="更新简历替换 allowlist")
+def update_resume_replacement_rollout(
+    req: ResumeReplacementRolloutRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
+):
+    from app.services.resume_replacement_rollout_service import update_allowlist
+
+    value = update_allowlist(
+        db, expected_revision=req.expected_revision, userids=req.userids,
+        reason=req.reason, operator=current.username,
+    )
+    return ok({"revision": value.revision, "member_count": len(value.userids)})
 
 
 @router.get("/visibility-policy", summary="读取推荐权限字段策略")

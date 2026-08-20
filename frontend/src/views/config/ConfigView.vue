@@ -8,6 +8,17 @@
     </div>
 
     <div v-loading="loading" class="config-container">
+      <el-card v-if="rollout" shadow="never" style="margin-bottom: 16px">
+        <template #header>
+          <div class="visibility-header">
+            <span>简历全量更新 allowlist（revision {{ rollout.revision }}，当前 {{ rollout.member_count }} 人）</span>
+            <el-button size="small" type="primary" :disabled="!canWriteRollout || !rolloutReason.trim()" :loading="rolloutSaving" @click="saveRollout">替换名单</el-button>
+          </div>
+        </template>
+        <el-alert title="出于隐私保护，现有名单不回显。保存会用输入的完整名单替换现有名单；每行一个 userid，空名单表示清空。" type="warning" :closable="false" />
+        <el-input v-model="rolloutText" type="textarea" :rows="5" placeholder="输入完整新名单（每行一个 worker userid）" style="margin-top: 12px" :disabled="!canWriteRollout" />
+        <el-input v-model="rolloutReason" maxlength="160" show-word-limit placeholder="替换理由（必填；请勿填写手机号、邮箱、URL 或文件路径）" style="margin-top: 8px" :disabled="!canWriteRollout" />
+      </el-card>
       <el-card v-if="policy" class="visibility-card" shadow="never">
         <template #header>
           <div class="visibility-header">
@@ -138,8 +149,12 @@ import JsonEditor from '@/components/JsonEditor.vue'
 import {
   fetchConfig, updateConfig, fetchVisibilityPolicy, saveVisibilityPolicy,
   fetchVisibilityPolicyHistory, fetchVisibilityPolicyHistoryDetail, restoreVisibilityPolicy,
+  fetchResumeReplacementRollout, saveResumeReplacementRollout,
 } from '@/api/config'
 import { DANGEROUS_CONFIG_KEYS } from '@/utils/constants'
+import { useAuthStore } from '@/stores/auth'
+
+const auth = useAuthStore()
 
 const loading = ref(false)
 const groups = ref({})
@@ -150,6 +165,11 @@ const history = ref([])
 const restoreRevision = ref(null)
 const confirmSensitive = ref(false)
 const policySaving = ref(false)
+const rollout = ref(null)
+const rolloutText = ref('')
+const rolloutReason = ref('')
+const rolloutSaving = ref(false)
+const canWriteRollout = computed(() => auth.admin?.role === 'super_admin')
 
 const grouped = computed(() => groups.value)
 
@@ -211,10 +231,30 @@ async function load() {
     }
     groups.value = next
     if (!activeGroups.value.length) activeGroups.value = Object.keys(next)
-    await loadPolicy()
+    await Promise.all([loadPolicy(), loadRollout()])
   } finally {
     loading.value = false
   }
+}
+
+async function loadRollout() {
+  if (!['operator', 'super_admin'].includes(auth.admin?.role)) return
+  rollout.value = await fetchResumeReplacementRollout()
+  rolloutText.value = ''
+  rolloutReason.value = ''
+}
+
+async function saveRollout() {
+  rolloutSaving.value = true
+  try {
+    const userids = rolloutText.value.split(/\r?\n/).map((v) => v.trim()).filter(Boolean)
+    rollout.value = await saveResumeReplacementRollout({
+      expected_revision: rollout.value.revision, userids, reason: rolloutReason.value.trim(),
+    })
+    rolloutText.value = ''
+    rolloutReason.value = ''
+    ElMessage.success('allowlist 已保存')
+  } finally { rolloutSaving.value = false }
 }
 
 async function loadPolicy() {

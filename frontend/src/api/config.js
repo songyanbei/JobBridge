@@ -31,3 +31,11 @@ export function fetchVisibilityPolicyHistoryDetail(revision) {
 export function restoreVisibilityPolicy(revision, data) {
   return request.post(`/admin/config/visibility-policy/history/${revision}/restore`, data)
 }
+
+export function fetchResumeReplacementRollout() {
+  return request.get('/admin/config/resume-replacement-rollout')
+}
+
+export function saveResumeReplacementRollout(data) {
+  return request.put('/admin/config/resume-replacement-rollout', data)
+}
