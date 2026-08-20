@@ -122,10 +122,12 @@ import ImagePreview from '@/components/ImagePreview.vue'
 import { fetchResumeDetail, updateResume, delistResume, extendResume } from '@/api/resumes'
 import { formatDateTime, ttlLevel } from '@/utils/format'
 import { ERROR_CODES } from '@/utils/constants'
+import { resolveResumeLifecycle } from '@/utils/resumeLifecycle'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   resumeId: { type: [Number, String], default: null },
+  now: { type: [Date, String, Number], default: null },
 })
 const emit = defineEmits(['update:modelValue', 'updated'])
 
@@ -142,9 +144,7 @@ const dirty = ref(false)
 const form = reactive({})
 const canMutate = computed(() => {
   if (!detail.value) return false
-  const expires = detail.value.expires_at ? new Date(detail.value.expires_at) : null
-  return !!detail.value.activated_at && !!expires && expires > new Date()
-    && !detail.value.deleted_at && !detail.value.delist_reason
+  return resolveResumeLifecycle(detail.value, props.now ?? new Date()) === 'active'
 })
 
 watch(

@@ -20,4 +20,15 @@ describe('ResumeLifecycleBadge', () => {
     } } })
     expect(wrapper.text()).toContain('replacement_conflict')
   })
+
+  it('uses the shared UTC-naive resolver at an Asia/Shanghai boundary', () => {
+    const wrapper = mount(ResumeLifecycleBadge, { props: {
+      resume: {
+        activated_at: null,
+        candidate_expires_at: '2026-08-20 16:00:00.000000',
+      },
+      now: '2026-08-21T00:00:00+08:00',
+    } })
+    expect(wrapper.attributes('data-state')).toBe('history')
+  })
 })

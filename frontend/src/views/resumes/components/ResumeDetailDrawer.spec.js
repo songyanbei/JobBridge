@@ -44,4 +44,20 @@ describe('ResumeDetailDrawer lifecycle mutation gate', () => {
     await flushPromises()
     expect(wrapper.vm.canMutate).toBe(true)
   })
+
+  it('uses the shared UTC-naive resolver for the mutation boundary', async () => {
+    fetchResumeDetail.mockResolvedValue({
+      id: 3, version: 1,
+      activated_at: '2026-08-01 00:00:00.000000',
+      expires_at: '2026-08-20 16:00:00.000000',
+    })
+    const wrapper = shallowMount(ResumeDetailDrawer, {
+      props: {
+        modelValue: true, resumeId: 3, now: '2026-08-21T00:00:00+08:00',
+      },
+      global: { stubs: uiStubs },
+    })
+    await flushPromises()
+    expect(wrapper.vm.canMutate).toBe(false)
+  })
 })

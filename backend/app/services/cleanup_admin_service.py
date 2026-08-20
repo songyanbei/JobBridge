@@ -95,6 +95,7 @@ def redrive_dead_letters(
     unique_ids = list(dict.fromkeys(ids))
     if not unique_ids or len(unique_ids) > MAX_REDRIVE_BATCH:
         raise BusinessException(40101, "cleanup_redrive_batch_invalid")
+    reason_digest = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:16]
     _enforce_redrive_rate(db, operator)
     now = utc_now_naive()
     results: list[dict] = []
@@ -146,7 +147,7 @@ def redrive_dead_letters(
     write_admin_log(
         db, target_type="system", target_id=f"cleanup:{kind}", action="manual_edit",
         operator=operator, before={"items": before_rows}, after={"items": results},
-        reason=f"cleanup_dead_letter_retry:{reason}"[:255],
+        reason=f"cleanup_dead_letter_retry:reason_sha256={reason_digest}",
     )
     db.commit()
     return results

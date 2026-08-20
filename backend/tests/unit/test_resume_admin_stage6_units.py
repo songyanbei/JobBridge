@@ -139,6 +139,39 @@ def test_redrive_is_per_item_and_audit_is_redacted(db):
     assert "private/resume" not in serialized and "secret" not in serialized
 
 
+@pytest.mark.parametrize("canary", [
+    "联系 13800138000",
+    "邮件 worker@example.test",
+    "详见 https://private.example.test/resume/7",
+    r"文件 D:\\private\\resume\\worker.pdf",
+])
+def test_redrive_audit_hashes_sensitive_reason_and_keeps_safe_snapshot(db, canary):
+    target = TargetCleanupTask(
+        operation_id=f"redacted-{hash(canary)}", target_type="resume", target_id=7,
+        reason="expired", status="dead_letter", attempt_count=10,
+        last_error="private/object/key.jpg worker@example.test",
+    )
+    db.add(target)
+    db.commit()
+
+    redrive_dead_letters(
+        db, kind="target", ids=[target.id], reason=canary, operator="root",
+    )
+
+    audit = db.query(AuditLog).order_by(AuditLog.id.desc()).first()
+    serialized = f"{audit.reason}|{audit.snapshot}"
+    expected = __import__("hashlib").sha256(canary.encode("utf-8")).hexdigest()[:16]
+    assert audit.reason == f"cleanup_dead_letter_retry:reason_sha256={expected}"
+    assert canary not in serialized
+    for fragment in ("13800138000", "worker@example.test", "private.example.test",
+                     "private\\\\resume", "private/object/key.jpg"):
+        assert fragment not in serialized
+    assert audit.snapshot == {
+        "before": {"items": [{"id": target.id, "status": "dead_letter", "attempt_count": 10}]},
+        "after": {"items": [{"id": target.id, "result": "queued"}]},
+    }
+
+
 def test_media_isolation_requires_two_distinct_admins_and_never_returns_key_hash(db):
     resume = _resume(db, images=["private/resume/photo.jpg"])
     issue = ResumeMediaIsolationIssue(
