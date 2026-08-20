@@ -166,7 +166,9 @@ def _build_outbox_claim_query(
     due,
     *,
     inbound_event_id: Any = None,
+    outbox_id: int | None = None,
     limit: int = OUTBOX_CLAIM_BATCH_SIZE,
+    lock_rows: bool = True,
 ):
     earlier = aliased(WecomOutboundOutbox)
     no_earlier_unsent_for_user = ~exists().where(and_(
@@ -197,11 +199,12 @@ def _build_outbox_claim_query(
         query = query.filter(
             WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
         )
-    return (
-        query.order_by(WecomOutboundOutbox.id)
-        .with_for_update(skip_locked=True)
-        .limit(limit)
-    )
+    if outbox_id is not None:
+        query = query.filter(WecomOutboundOutbox.id == int(outbox_id))
+    query = query.order_by(WecomOutboundOutbox.id)
+    if lock_rows:
+        query = query.with_for_update(skip_locked=True)
+    return query.limit(limit)
 
 # §10.4.1：dispatcher / prepared session reconciler 各自独立 250ms 扫描，
 # 每批最多 100 条；§10.5 的 impression deriver 同样 250ms。
@@ -1485,7 +1488,73 @@ class Worker:
         inbound_event_id: Any = None,
         limit: int = OUTBOX_CLAIM_BATCH_SIZE,
     ) -> list[dict]:
-        """原子认领到期 outbox；stale sending 在 Worker crash 后可恢复。"""
+        """认领到期 outbox；推荐目标始终先于对应 outbox 加锁。
+
+        候选发现不加锁，每条候选随后在独立短事务中重新校验 readiness。
+        推荐候选先按稳定顺序锁住全部 Job/Resume，之后才以 ``SKIP
+        LOCKED`` 锁 outbox。这保留 claim 的二次复核/租约语义，并避免与
+        ``Resume -> TargetCleanupTask -> outbox`` 清理链形成反向锁边。
+        """
+        if not self._recover_stale_outbox_claims():
+            return []
+
+        discovery = SessionLocal()
+        try:
+            candidates = (
+                _build_outbox_claim_query(
+                    discovery,
+                    self._outbox_due_predicate(func.now(6)),
+                    inbound_event_id=inbound_event_id,
+                    limit=limit,
+                    lock_rows=False,
+                )
+                .with_entities(
+                    WecomOutboundOutbox.id,
+                    WecomOutboundOutbox.recommendation_delivery_id,
+                )
+                .all()
+            )
+            discovery.rollback()
+        except Exception:
+            discovery.rollback()
+            logger.exception("worker: discover outbox candidates failed")
+            return []
+        finally:
+            discovery.close()
+
+        claimed: list[dict] = []
+        for candidate in candidates:
+            item = self._claim_outbox_candidate(
+                int(candidate[0]),
+                candidate[1],
+                inbound_event_id=inbound_event_id,
+            )
+            if item is not None:
+                claimed.append(item)
+        return claimed
+
+    @staticmethod
+    def _outbox_due_predicate(now: Any):
+        stale_before = func.timestampadd(
+            text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
+        )
+        return or_(
+            and_(
+                WecomOutboundOutbox.status == "pending",
+                or_(
+                    WecomOutboundOutbox.next_attempt_at.is_(None),
+                    WecomOutboundOutbox.next_attempt_at <= now,
+                ),
+            ),
+            and_(
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.recommendation_delivery_id.is_(None),
+            ),
+        )
+
+    def _recover_stale_outbox_claims(self) -> bool:
+        """在独立事务收敛陈旧 lease，不把这些锁带入目标复核。"""
         db = SessionLocal()
         try:
             now = func.now(6)
@@ -1521,52 +1590,87 @@ class Worker:
                 "last_error": "sending lease expired; automatic resend disabled",
                 "last_error_code": "sending_lease_expired",
             }, synchronize_session=False)
-            due = or_(
-                and_(
-                    WecomOutboundOutbox.status == "pending",
-                    or_(
-                        WecomOutboundOutbox.next_attempt_at.is_(None),
-                        WecomOutboundOutbox.next_attempt_at <= now,
-                    ),
-                ),
-                and_(
-                    WecomOutboundOutbox.status == "sending",
-                    WecomOutboundOutbox.locked_at <= stale_before,
-                    WecomOutboundOutbox.recommendation_delivery_id.is_(None),
-                ),
-            )
-            # All readiness gates stay in correlated EXISTS clauses so this
-            # locking SELECT owns only outbox rows.
-            rows = _build_outbox_claim_query(
-                db,
-                due,
-                inbound_event_id=inbound_event_id,
-                limit=limit,
-            ).all()
-            claimed: list[dict] = []
-            for row in rows:
-                content = row.content
-                if row.recommendation_delivery_id:
-                    content = self._claim_recommendation_body(db, row, now)
-                    if content is None:
-                        continue
-                else:
-                    row.status = "sending"
-                    row.locked_at = now
-                    row.attempt_count = int(row.attempt_count or 0) + 1
-                claimed.append({
-                    "id": int(row.id),
-                    "userid": row.userid,
-                    "content": content or "",
-                    "recommendation_delivery_id": row.recommendation_delivery_id,
-                    "attempt_count": int(row.attempt_count),
-                })
             db.commit()
-            return claimed
+            return True
         except Exception:
             db.rollback()
-            logger.exception("worker: claim outbox failed")
-            return []
+            logger.exception("worker: recover stale outbox claims failed")
+            return False
+        finally:
+            db.close()
+
+    def _claim_outbox_candidate(
+        self,
+        outbox_id: int,
+        discovered_delivery_id: str | None,
+        *,
+        inbound_event_id: Any = None,
+    ) -> dict | None:
+        db = SessionLocal()
+        try:
+            # The discovery snapshot is never trusted for the state transition;
+            # it only determines which target locks must precede the outbox lock.
+            references: list[tuple[str, int]] | None = []
+            if discovered_delivery_id:
+                delivery = db.get(RecommendationDelivery, discovered_delivery_id)
+                if delivery is None:
+                    references = None
+                else:
+                    references, _, _ = _recommendation_target_references(
+                        copy.deepcopy(delivery.recommendation_context),
+                    )
+                if references is not None:
+                    for target_type, target_id in references:
+                        model = Job if target_type == "job" else Resume
+                        (
+                            db.query(model.id)
+                            .filter(model.id == target_id)
+                            .with_for_update()
+                            .first()
+                        )
+
+            now = func.now(6)
+            row = (
+                _build_outbox_claim_query(
+                    db,
+                    self._outbox_due_predicate(now),
+                    inbound_event_id=inbound_event_id,
+                    outbox_id=outbox_id,
+                    limit=1,
+                )
+                .populate_existing()
+                .first()
+            )
+            if row is None:
+                db.rollback()
+                return None
+            if row.recommendation_delivery_id != discovered_delivery_id:
+                db.rollback()
+                return None
+
+            content = row.content
+            if row.recommendation_delivery_id:
+                content = self._claim_recommendation_body(db, row, now)
+                if content is None:
+                    db.commit()
+                    return None
+            else:
+                row.status = "sending"
+                row.locked_at = now
+                row.attempt_count = int(row.attempt_count or 0) + 1
+            item = {
+                "id": int(row.id),
+                "userid": row.userid,
+                "content": content or "",
+                "recommendation_delivery_id": row.recommendation_delivery_id,
+                "attempt_count": int(row.attempt_count),
+            }
+            db.commit()
+            return item
+        except Exception:
+            db.rollback()
+            logger.exception("worker: claim outbox candidate failed")
+            return None
         finally:
             db.close()
 
@@ -1642,15 +1746,16 @@ class Worker:
             valid = bool(
                 target
                 and target.audit_status == "passed"
+                and target.activated_at is not None
+                and target.candidate_expires_at is None
                 and target.deleted_at is None
+                and target.delist_reason is None
                 and target.expires_at is not None
                 and target.expires_at > now_utc
             )
-            if target_type == "job":
-                valid = valid and target.delist_reason is None
             if not valid and target_error is None:
                 target_error = (
-                    "target_missing" if target is None else "target_inactive",
+                    "recommendation_target_stale",
                     "recommendation target is missing"
                     if target is None
                     else "recommendation target is no longer active",

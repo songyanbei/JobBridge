@@ -24,6 +24,7 @@ from app.models import (
     RecommendationDelivery,
     RecommendationRequest,
     RecommendationSearchAttempt,
+    Resume,
     WecomOutboundOutbox,
 )
 from app.schemas.recommendation import (
@@ -329,6 +330,74 @@ _ASSIGNMENTS = frozenset({"legacy", "stable", "candidate"})
 _ATTEMPT_KINDS = frozenset(get_args(AttemptKind))
 _LLM_STATUSES = frozenset(get_args(LlmAttemptStatus))
 _MAX_CANDIDATE_IDS = 50
+
+
+class RecommendationTargetStale(RuntimeError):
+    """Stable fail-closed result for a target invalidated after search."""
+
+    code = "recommendation_target_stale"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _resume_target_ids(
+    ctx: Mapping[str, Any], fact: Mapping[str, Any],
+) -> list[int]:
+    """Return every Resume id that the transaction is about to persist."""
+    ids: set[int] = set()
+    for item in ctx.get("items") or []:
+        if not isinstance(item, Mapping) or item.get("target_type") != "resume":
+            continue
+        value = _optional_int(item.get("target_id"))
+        if value is not None and value > 0:
+            ids.add(value)
+    if str(fact.get("direction") or ctx.get("direction") or "") == "search_worker":
+        for key in ("candidate_ids", "served_top_ids"):
+            for raw in fact.get(key) or []:
+                value = _optional_int(raw)
+                if value is not None and value > 0:
+                    ids.add(value)
+    return sorted(ids)
+
+
+def lock_and_validate_recommendation_targets(
+    db: Session,
+    *,
+    ctx: Mapping[str, Any],
+    fact: Mapping[str, Any],
+    now: datetime,
+) -> list[int]:
+    """Linearize Resume recommendation persistence against delist/expiry.
+
+    Lock ordering is the canonical ascending Resume id order.  The caller must
+    invoke this before writing request, attempt, delivery, outbox or a durable
+    session patch and retain the locks until its transaction commits.
+    """
+    target_ids = _resume_target_ids(ctx, fact)
+    if not target_ids:
+        return []
+    moment = to_naive_utc(now)
+    rows = (
+        db.query(Resume)
+        .populate_existing()
+        .filter(Resume.id.in_(target_ids))
+        .order_by(Resume.id)
+        .with_for_update()
+        .all()
+    )
+    if [int(row.id) for row in rows] != target_ids or any(
+        row.audit_status != "passed"
+        or row.activated_at is None
+        or row.candidate_expires_at is not None
+        or row.deleted_at is not None
+        or row.delist_reason is not None
+        or row.expires_at is None
+        or row.expires_at <= moment
+        for row in rows
+    ):
+        raise RecommendationTargetStale()
+    return target_ids
 
 
 def _enum(value: Any, allowed: frozenset[str], default: str) -> str:
@@ -663,6 +732,10 @@ def prepare_delivery(
     request_index = fact.get("request_index")
     request_index = reply_index if request_index is None else int(request_index)
 
+    lock_and_validate_recommendation_targets(
+        db, ctx=ctx, fact=fact, now=moment,
+    )
+
     _persist_request_facts(
         db,
         request_id=request_id,
@@ -745,6 +818,9 @@ def persist_request_fact_only(
     )[:64]
     request_index = fact.get("request_index")
     request_index = reply_index if request_index is None else int(request_index)
+    lock_and_validate_recommendation_targets(
+        db, ctx={}, fact=fact, now=moment,
+    )
     _persist_request_facts(
         db,
         request_id=request_id,

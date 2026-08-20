@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from app.core.redis_client import (
@@ -657,9 +657,14 @@ def _scrub_request_facts(
     """
     changed = 0
     for chunk in _chunks(list(request_ids)):
-        requests = db.query(RecommendationRequest).filter(
-            RecommendationRequest.request_id.in_(chunk),
-        ).all()
+        requests = (
+            db.query(RecommendationRequest)
+            .populate_existing()
+            .filter(RecommendationRequest.request_id.in_(chunk))
+            .order_by(RecommendationRequest.request_id)
+            .with_for_update()
+            .all()
+        )
         for request in requests:
             removable = _removable_ids(
                 grouped, _TARGET_TYPE_BY_DIRECTION.get(str(request.direction or "")),
@@ -681,9 +686,14 @@ def _scrub_request_facts(
                     hit = True
             if hit:
                 changed += 1
-        attempts = db.query(RecommendationSearchAttempt).filter(
-            RecommendationSearchAttempt.request_id.in_(chunk),
-        ).all()
+        attempts = (
+            db.query(RecommendationSearchAttempt)
+            .populate_existing()
+            .filter(RecommendationSearchAttempt.request_id.in_(chunk))
+            .order_by(RecommendationSearchAttempt.attempt_id)
+            .with_for_update()
+            .all()
+        )
         directions = {r.request_id: r.direction for r in requests}
         for attempt in attempts:
             removable = _removable_ids(
@@ -703,6 +713,70 @@ def _scrub_request_facts(
             if hit:
                 changed += 1
     return changed
+
+
+def _fact_request_ids_referencing_targets(
+    db: Session, grouped: dict[str, set[str]],
+) -> set[str]:
+    """Locate fact-only request/attempt rows which have no delivery index.
+
+    MySQL uses JSON predicates so a target cleanup does not scan unrelated
+    recommendation history.  The small ORM fallback keeps SQLite unit tests
+    executable; production is MySQL-only.
+    """
+    found: set[str] = set()
+    dialect = db.get_bind().dialect.name
+    if dialect == "mysql":
+        statement = text(
+            "SELECT DISTINCT r.request_id FROM recommendation_request r "
+            "LEFT JOIN recommendation_search_attempt a ON a.request_id=r.request_id "
+            "WHERE r.direction=:direction AND ("
+            "JSON_CONTAINS(r.served_top_ids,JSON_QUOTE(:target_id))=1 OR "
+            "JSON_CONTAINS(r.shadow_top_ids,JSON_QUOTE(:target_id))=1 OR "
+            "JSON_CONTAINS(a.candidate_ids,JSON_QUOTE(:target_id))=1 OR "
+            "JSON_CONTAINS(a.precision_pool_ids,JSON_QUOTE(:target_id))=1) "
+            "ORDER BY r.request_id"
+        )
+        for direction, target_type in _TARGET_TYPE_BY_DIRECTION.items():
+            for target_id in sorted(grouped.get(target_type, set())):
+                found.update(str(row[0]) for row in db.execute(statement, {
+                    "direction": direction, "target_id": str(target_id),
+                }).fetchall())
+        return found
+
+    directions = {
+        direction: grouped.get(target_type, set())
+        for direction, target_type in _TARGET_TYPE_BY_DIRECTION.items()
+        if grouped.get(target_type)
+    }
+    if not directions:
+        return found
+    requests = db.query(RecommendationRequest).filter(
+        RecommendationRequest.direction.in_(tuple(directions)),
+    ).all()
+    by_id = {str(row.request_id): row for row in requests}
+    for request in requests:
+        removable = directions[str(request.direction)]
+        if any(
+            _strip_ids(getattr(request, column, None), removable)[1]
+            for column in ("served_top_ids", "shadow_top_ids")
+        ):
+            found.add(str(request.request_id))
+    if by_id:
+        attempts = db.query(RecommendationSearchAttempt).filter(
+            RecommendationSearchAttempt.request_id.in_(tuple(by_id)),
+        ).all()
+        for attempt in attempts:
+            request = by_id.get(str(attempt.request_id))
+            if request is None:
+                continue
+            removable = directions[str(request.direction)]
+            if any(
+                _strip_ids(getattr(attempt, column, None), removable)[1]
+                for column in ("candidate_ids", "precision_pool_ids")
+            ):
+                found.add(str(attempt.request_id))
+    return found
 
 
 def _lock_outboxes_for_deliveries(
@@ -749,7 +823,8 @@ def redact_deliveries_for_targets(
     trace = batch_id or _new_batch_id()
     moment = now or utc_now()
     delivery_ids = _delivery_ids_referencing_targets(db, grouped)
-    if not delivery_ids:
+    fact_request_ids = _fact_request_ids_referencing_targets(db, grouped)
+    if not delivery_ids and not fact_request_ids:
         return set()
 
     ordered_delivery_ids = sorted(delivery_ids)
@@ -757,7 +832,7 @@ def redact_deliveries_for_targets(
         _lock_outboxes_for_deliveries(db, ordered_delivery_ids)
 
     touched: set[str] = set()
-    request_ids: set[str] = set()
+    request_ids: set[str] = set(fact_request_ids)
     for chunk in _chunks(ordered_delivery_ids):
         if commit:
             _lock_outboxes_for_deliveries(db, chunk)
@@ -786,6 +861,16 @@ def redact_deliveries_for_targets(
     if touched and not commit:
         _fail_pending_outbox(db, sorted(touched))
     scrubbed = _scrub_request_facts(db, sorted(request_ids), grouped)
+    # Do not let the durable cleanup task checkpoint this database stage until
+    # every request/attempt fact which names the target is actually gone.  The
+    # explicit flush makes the postcondition independent of Session autoflush
+    # configuration and keeps retries safe if a future schema column is missed.
+    db.flush()
+    remaining_fact_request_ids = _fact_request_ids_referencing_targets(
+        db, grouped,
+    )
+    if remaining_fact_request_ids:
+        raise RuntimeError("target_recommendation_facts_not_redacted")
     _settle(db, commit)
     _log_batch(trace, "target_redaction", "recommendation_request", scrubbed)
     _log_batch(trace, "target_redaction", "recommendation_delivery", len(touched))

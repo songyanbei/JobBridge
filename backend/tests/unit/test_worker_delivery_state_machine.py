@@ -78,11 +78,12 @@ def _valid_context(
 def _active_target(*, target_type: str = "job") -> SimpleNamespace:
     values = {
         "audit_status": "passed",
+        "activated_at": datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1),
+        "candidate_expires_at": None,
         "deleted_at": None,
+        "delist_reason": None,
         "expires_at": datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
     }
-    if target_type == "job":
-        values["delist_reason"] = None
     return SimpleNamespace(**values)
 
 
@@ -340,24 +341,28 @@ class TestDeliveryStatusMachine:
         )
 
     @pytest.mark.parametrize(("target", "error_code"), [
-        (None, "target_missing"),
+        (None, "recommendation_target_stale"),
         (
             SimpleNamespace(
                 audit_status="pending",
+                activated_at=None,
+                candidate_expires_at=None,
                 deleted_at=None,
                 expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1),
                 delist_reason=None,
             ),
-            "target_inactive",
+            "recommendation_target_stale",
         ),
         (
             SimpleNamespace(
                 audit_status="passed",
+                activated_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1),
+                candidate_expires_at=None,
                 deleted_at=None,
                 expires_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1),
                 delist_reason=None,
             ),
-            "target_inactive",
+            "recommendation_target_stale",
         ),
     ])
     def test_missing_or_inactive_target_terminalizes_both_rows(
@@ -459,7 +464,7 @@ class TestDeliveryStatusMachine:
 
         assert row.status == "dead_letter"
         assert delivery.status == "permanent_failed"
-        assert delivery.last_error_code == "target_inactive"
+        assert delivery.last_error_code == "recommendation_target_stale"
         target_query.populate_existing.assert_called_once_with()
         log.assert_called_once()
 

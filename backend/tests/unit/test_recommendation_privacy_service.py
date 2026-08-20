@@ -603,6 +603,22 @@ class TestDeleteRecommendationUserData:
         assert first_delivery > 0
         assert all(event == "outbox" for event in events[:first_delivery])
 
+
+    def test_fact_only_target_reference_is_scrubbed_without_a_delivery(self, db):
+        request = _add_request(db, "req-fact-only", VIEWER, ["7", "9"])
+        attempt = _add_attempt(db, "att-fact-only", request.request_id, ["7", "9"])
+        request.served_attempt_id = attempt.attempt_id
+        db.flush()
+
+        touched = privacy.redact_deliveries_for_targets(
+            db, [privacy.TargetRef("resume", 7)], commit=False,
+        )
+
+        assert touched == set()
+        assert request.served_top_ids == ["9"]
+        assert attempt.candidate_ids == ["9"]
+        assert attempt.precision_pool_ids == ["9"]
+
     def test_removes_every_viewer_side_fact(self, db):
         _build_full_fixture(db)
 

@@ -22,7 +22,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import text
@@ -415,15 +415,13 @@ def _soft_delete_expired_jobs(db) -> int:
 
 
 def _soft_delete_expired_resumes(db) -> int:
-    """简历过期软删：写 deleted_at。"""
-    result = db.execute(
-        text(
-            "UPDATE `resume` SET deleted_at=NOW() "
-            "WHERE expires_at < NOW() AND deleted_at IS NULL"
-        )
-    )
-    db.commit()
-    return int(result.rowcount or 0)
+    """Daily fallback reuses the high-frequency Resume lifecycle transition."""
+    from app.config import settings
+    if not settings.resume_expiry_cleanup_enabled:
+        log_event("resume_expiry_cleanup_disabled", source="daily_fallback")
+        return 0
+    from app.tasks.resume_expiry_cleanup import process_expired_resumes
+    return int(process_expired_resumes(db, max_runtime_seconds=None)["processed"])
 
 
 def _hard_delete_expired_jobs(db, delay_days: int) -> int:
@@ -499,18 +497,42 @@ def _hard_delete_expired_jobs(db, delay_days: int) -> int:
 
 
 def _hard_delete_expired_resumes(db, delay_days: int) -> int:
-    """Hard-delete resumes only after durable media cleanup is complete."""
+    """Fail-closed Resume hard delete after every Phase 11 cleanup gate."""
+    from app.config import settings
     from app.services.job_media_service import (
         mark_resume_media_delete_pending,
         resume_hard_delete_media_complete,
     )
+    from app.services.target_cleanup_service import target_cleanup_succeeded
+
+    if not settings.resume_hard_delete_enabled:
+        log_event("resume_hard_delete_disabled")
+        return 0
+
+    # Migration reconciliation is global: one unverified ledger/orphan row
+    # keeps every Resume recoverable.  Operational exceptions never open this gate.
+    migration_ready = db.execute(text(
+        "SELECT EXISTS(SELECT 1 FROM phase11_migration_ledger "
+        "WHERE stage='verify' AND status='verified') "
+        "AND NOT EXISTS(SELECT 1 FROM phase11_migration_ledger "
+        "WHERE status IN ('running','failed')) "
+        "AND NOT EXISTS(SELECT 1 FROM target_cleanup_task "
+        "WHERE target_type='resume' AND reason='legacy_orphan' AND status<>'succeeded')"
+    )).scalar()
+    if not migration_ready:
+        log_event("resume_hard_delete_migration_gate_closed")
+        return 0
 
     total_deleted = 0
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=int(delay_days))
     cursor_deleted_at = None
     cursor_id = 0
     while True:
         cursor_sql = ""
-        params = {"cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id}
+        params = {
+            "cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id,
+            "hard_delete_cutoff_utc": cutoff,
+        }
         if cursor_deleted_at is not None:
             cursor_sql = (
                 "AND (deleted_at > :cursor_deleted_at "
@@ -518,7 +540,7 @@ def _hard_delete_expired_resumes(db, delay_days: int) -> int:
             )
         rows = db.execute(text(
             "SELECT id, images, deleted_at FROM `resume` "
-            f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+            "WHERE deleted_at IS NOT NULL AND deleted_at <= :hard_delete_cutoff_utc "
             + cursor_sql
             + f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE} FOR UPDATE SKIP LOCKED"
         ), params).fetchall()
@@ -528,17 +550,46 @@ def _hard_delete_expired_resumes(db, delay_days: int) -> int:
         # Hand attached objects to the durable worker before checking the gate.
         for resume_id, images, _deleted_at in rows:
             resume_id = int(resume_id)
+            active_relation = db.execute(text(
+                "SELECT 1 FROM resume_replacement WHERE "
+                "(old_resume_id=:resume_id OR new_resume_id=:resume_id) "
+                "AND lifecycle_status IN ('awaiting_review','conflict') LIMIT 1"
+            ), {"resume_id": resume_id}).first()
+            if active_relation is not None:
+                continue
+            unresolved_issue = db.execute(text(
+                "SELECT 1 FROM resume_media_isolation_issue "
+                "WHERE resume_id=:resume_id AND status<>'resolved' LIMIT 1"
+            ), {"resume_id": resume_id}).first()
+            if unresolved_issue is not None:
+                continue
             if mark_resume_media_delete_pending(db, resume_id):
+                continue
+            if not target_cleanup_succeeded(db, "resume", resume_id):
                 continue
             if not resume_hard_delete_media_complete(db, resume_id, images):
                 continue
             result = db.execute(text(
                 "DELETE FROM `resume` WHERE id=:resume_id "
-                f"AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+                "AND deleted_at <= :hard_delete_cutoff_utc "
+                "AND EXISTS (SELECT 1 FROM target_cleanup_task t WHERE "
+                "t.target_type='resume' AND t.target_id=:resume_id AND t.status='succeeded') "
                 "AND NOT EXISTS (SELECT 1 FROM `media_asset_lifecycle` m "
                 "WHERE m.entity_type='resume' AND m.entity_id=:resume_id "
-                "AND m.state<>'deleted')"
-            ), {"resume_id": resume_id})
+                "AND m.state<>'deleted') "
+                "AND NOT EXISTS (SELECT 1 FROM resume_media_isolation_issue i "
+                "WHERE i.resume_id=:resume_id AND i.status<>'resolved') "
+                "AND NOT EXISTS (SELECT 1 FROM resume_replacement r WHERE "
+                "(r.old_resume_id=:resume_id OR r.new_resume_id=:resume_id) "
+                "AND r.lifecycle_status IN ('awaiting_review','conflict')) "
+                "AND EXISTS (SELECT 1 FROM phase11_migration_ledger l "
+                "WHERE l.stage='verify' AND l.status='verified') "
+                "AND NOT EXISTS (SELECT 1 FROM phase11_migration_ledger l "
+                "WHERE l.status IN ('running','failed')) "
+                "AND NOT EXISTS (SELECT 1 FROM target_cleanup_task o WHERE "
+                "o.target_type='resume' AND o.reason='legacy_orphan' "
+                "AND o.status<>'succeeded')"
+            ), {"resume_id": resume_id, "hard_delete_cutoff_utc": cutoff})
             total_deleted += int(result.rowcount or 0)
 
         db.commit()

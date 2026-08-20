@@ -539,7 +539,13 @@ def _resume_hard_delete_db():
     def execute(statement, _params=None):
         sql = str(statement)
         result = MagicMock()
-        if sql.lstrip().startswith("SELECT id, images, deleted_at"):
+        if "SELECT EXISTS(SELECT 1 FROM phase11_migration_ledger" in sql:
+            result.scalar.return_value = True
+        elif sql.lstrip().startswith("SELECT 1 FROM resume_replacement"):
+            result.first.return_value = None
+        elif sql.lstrip().startswith("SELECT 1 FROM resume_media_isolation_issue"):
+            result.first.return_value = None
+        elif sql.lstrip().startswith("SELECT id, images, deleted_at"):
             result.fetchall.return_value = [
                 (9, '["images/resume/a.jpg"]', datetime(2026, 1, 1))
             ]
@@ -561,6 +567,13 @@ def test_resume_hard_delete_blocks_until_durable_media_finishes(
     monkeypatch, media_marked, media_complete,
 ):
     from app.services import job_media_service
+    from app.config import settings
+    from app.services import target_cleanup_service
+
+    monkeypatch.setattr(settings, "resume_hard_delete_enabled", True)
+    monkeypatch.setattr(
+        target_cleanup_service, "target_cleanup_succeeded", lambda *_: True,
+    )
 
     monkeypatch.setattr(
         job_media_service,
@@ -583,6 +596,13 @@ def test_resume_hard_delete_blocks_until_durable_media_finishes(
 
 def test_resume_hard_delete_rechecks_media_state_in_delete(monkeypatch):
     from app.services import job_media_service
+    from app.config import settings
+    from app.services import target_cleanup_service
+
+    monkeypatch.setattr(settings, "resume_hard_delete_enabled", True)
+    monkeypatch.setattr(
+        target_cleanup_service, "target_cleanup_succeeded", lambda *_: True,
+    )
 
     monkeypatch.setattr(
         job_media_service,
@@ -597,9 +617,18 @@ def test_resume_hard_delete_rechecks_media_state_in_delete(monkeypatch):
     db = _resume_hard_delete_db()
 
     assert ttl_cleanup._hard_delete_expired_resumes(db, 7) == 1
-    select_sql = str(db.execute.call_args_list[0].args[0])
-    delete_sql = str(db.execute.call_args_list[1].args[0])
+    select_sql = next(
+        str(call.args[0]) for call in db.execute.call_args_list
+        if str(call.args[0]).lstrip().startswith("SELECT id, images, deleted_at")
+    )
+    delete_sql = next(
+        str(call.args[0]) for call in db.execute.call_args_list
+        if str(call.args[0]).lstrip().startswith("DELETE FROM `resume`")
+    )
     assert "ORDER BY deleted_at, id" in select_sql
     assert "FOR UPDATE SKIP LOCKED" in select_sql
     assert "media_asset_lifecycle" in delete_sql
     assert "m.state<>'deleted'" in delete_sql
+    assert "target_cleanup_task" in delete_sql
+    assert "resume_media_isolation_issue" in delete_sql
+    assert "resume_replacement" in delete_sql

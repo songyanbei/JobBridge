@@ -142,8 +142,12 @@ def mark_job_media_delete_pending(
     )
 
 
-def mark_resume_media_delete_pending(db: Session, resume_id: int) -> int:
-    return mark_entity_media_delete_pending(db, "resume", resume_id)
+def mark_resume_media_delete_pending(
+    db: Session, resume_id: int, *, include_pending: bool = False,
+) -> int:
+    return mark_entity_media_delete_pending(
+        db, "resume", resume_id, include_pending=include_pending,
+    )
 
 
 def entity_hard_delete_media_complete(

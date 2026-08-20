@@ -31,6 +31,8 @@ def build_scheduler() -> BackgroundScheduler:
         job_expiry_cleanup,
         media_cleanup_worker,
         recommendation_privacy_cleanup,
+        resume_candidate_cleanup,
+        resume_expiry_cleanup,
         send_retry_drain,
         target_cleanup_worker,
         ttl_cleanup,
@@ -89,6 +91,15 @@ def build_scheduler() -> BackgroundScheduler:
         id="job_expiry_cleanup",
         max_instances=1,
         coalesce=True,
+    )
+
+    sched.add_job(
+        resume_candidate_cleanup.run, IntervalTrigger(minutes=10),
+        id="resume_candidate_cleanup", max_instances=1, coalesce=True,
+    )
+    sched.add_job(
+        resume_expiry_cleanup.run, IntervalTrigger(minutes=10),
+        id="resume_expiry_cleanup", max_instances=1, coalesce=True,
     )
 
     # ---- 每日 09:00 企微群日报 ----
@@ -224,6 +235,34 @@ def schedule_job_candidate_continuation() -> bool:
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+    )
+    return True
+
+
+def schedule_resume_expiry_continuation() -> bool:
+    if _scheduler is None:
+        logger.warning("resume expiry continuation skipped: scheduler not running")
+        return False
+    from app.tasks import resume_expiry_cleanup
+    _scheduler.add_job(
+        resume_expiry_cleanup.run,
+        DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=5)),
+        id="resume_expiry_cleanup_continuation", replace_existing=True,
+        max_instances=1, coalesce=True,
+    )
+    return True
+
+
+def schedule_resume_candidate_continuation() -> bool:
+    if _scheduler is None:
+        logger.warning("resume candidate continuation skipped: scheduler not running")
+        return False
+    from app.tasks import resume_candidate_cleanup
+    _scheduler.add_job(
+        resume_candidate_cleanup.run,
+        DateTrigger(run_date=datetime.now(timezone.utc) + timedelta(seconds=5)),
+        id="resume_candidate_cleanup_continuation", replace_existing=True,
+        max_instances=1, coalesce=True,
     )
     return True
 
