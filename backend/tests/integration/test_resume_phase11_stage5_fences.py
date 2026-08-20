@@ -334,7 +334,18 @@ def _cleanup(owner: str, resume_id: int, request_id: str | None = None) -> None:
         db.commit()
 
 
-def test_cleanup_commit_first_rejects_late_recommendation_fact_with_stable_code():
+@pytest.mark.parametrize(
+    "target_fact",
+    [
+        {"precision_pool_ids": "top"},
+        {"additional_attempts": "candidate"},
+        {"additional_attempts": "precision"},
+    ],
+    ids=("precision-pool", "additional-candidate", "additional-precision"),
+)
+def test_cleanup_commit_first_rejects_late_recommendation_fact_with_stable_code(
+    target_fact,
+):
     owner = f"stage5-late-{uuid4().hex}"
     resume_id = _resume(owner)
     request_id = str(uuid4())
@@ -343,6 +354,17 @@ def test_cleanup_commit_first_rejects_late_recommendation_fact_with_stable_code(
     release_expiry = Event()
     failures: list[BaseException] = []
     stale_codes: list[str] = []
+
+    if "precision_pool_ids" in target_fact:
+        target_fields = {"precision_pool_ids": [str(resume_id)]}
+    else:
+        additional_key = (
+            "candidate_ids" if target_fact["additional_attempts"] == "candidate"
+            else "precision_pool_ids"
+        )
+        target_fields = {
+            "additional_attempts": [{additional_key: [str(resume_id)]}],
+        }
 
     def expire_first() -> None:
         with SessionLocal() as db:
@@ -376,12 +398,13 @@ def test_cleanup_commit_first_rejects_late_recommendation_fact_with_stable_code(
                         "direction": "search_worker",
                         "query_digest": "stage5-late-write",
                         "algorithm_version": "legacy",
-                        "candidate_ids": [str(resume_id)],
-                        "served_top_ids": [str(resume_id)],
-                        "candidate_count": 1,
-                        "result_count": 1,
+                        "candidate_ids": [],
+                        "served_top_ids": [],
+                        "candidate_count": 0,
+                        "result_count": 0,
                         "execution_mode": "off",
                         "served_assignment": "legacy",
+                        **target_fields,
                     },
                 )
                 db.commit()
@@ -404,6 +427,9 @@ def test_cleanup_commit_first_rejects_late_recommendation_fact_with_stable_code(
         assert stale_codes == ["recommendation_target_stale"]
         with SessionLocal() as db:
             assert db.get(RecommendationRequest, request_id) is None
+            assert db.query(RecommendationSearchAttempt).filter_by(
+                request_id=request_id,
+            ).count() == 0
     finally:
         release_expiry.set()
         _cleanup(owner, resume_id, request_id)

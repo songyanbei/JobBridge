@@ -55,6 +55,46 @@ def test_unit_a_fact_only_search_worker_locks_persisted_candidate_ids():
     }) == [3, 9]
 
 
+@pytest.mark.parametrize(
+    "fact,expected",
+    [
+        ({"candidate_ids": ["9", "3", "9"]}, [3, 9]),
+        ({"served_top_ids": ["8", "2"]}, [2, 8]),
+        ({"precision_pool_ids": ["7", "4"]}, [4, 7]),
+        ({"shadow_top_ids": ["6", "1"]}, [1, 6]),
+        ({"additional_attempts": [{"candidate_ids": ["5", "3"]}]}, [3, 5]),
+        ({"additional_attempts": [{"precision_pool_ids": ["9", "2"]}]}, [2, 9]),
+    ],
+    ids=(
+        "candidate", "served", "precision", "shadow",
+        "additional-candidate", "additional-precision",
+    ),
+)
+def test_unit_a_prelock_covers_each_persisted_resume_id_collection(fact, expected):
+    fact = {"direction": "search_worker", **fact}
+    assert delivery._resume_target_ids({}, fact) == expected
+
+
+def test_unit_a_prelock_and_attempt_persistence_share_normalization():
+    values = [str(value) for value in range(55, 0, -1)]
+    fact = {
+        "direction": "search_worker",
+        "precision_pool_ids": values,
+        "additional_attempts": [{"candidate_ids": values}],
+    }
+    main_candidates, main_precision = delivery._attempt_persisted_id_lists(fact)
+    extra_candidates, extra_precision = delivery._attempt_persisted_id_lists(
+        fact["additional_attempts"][0],
+    )
+    assert main_candidates == []
+    assert main_precision == values[:50]
+    assert extra_candidates == values[:50]
+    assert extra_precision == []
+    assert delivery._resume_target_ids({}, fact) == sorted(
+        {int(value) for value in values[:50]},
+    )
+
+
 def test_unit_b_expiry_only_creates_task_after_conditional_update(monkeypatch):
     now = datetime(2026, 8, 18)
     db = MagicMock()

@@ -353,8 +353,21 @@ def _resume_target_ids(
         if value is not None and value > 0:
             ids.add(value)
     if str(fact.get("direction") or ctx.get("direction") or "") == "search_worker":
-        for key in ("candidate_ids", "served_top_ids"):
-            for raw in fact.get(key) or []:
+        served_top_ids = _persisted_id_strings(fact.get("served_top_ids") or [])
+        candidate_ids, precision_pool_ids = _attempt_persisted_id_lists(
+            fact, candidate_fallback=served_top_ids,
+        )
+        collections = [
+            served_top_ids,
+            candidate_ids,
+            precision_pool_ids,
+            _persisted_id_strings(fact.get("shadow_top_ids") or []),
+        ]
+        for raw_attempt in fact.get("additional_attempts") or []:
+            if isinstance(raw_attempt, Mapping):
+                collections.extend(_attempt_persisted_id_lists(raw_attempt))
+        for values in collections:
+            for raw in values:
                 value = _optional_int(raw)
                 if value is not None and value > 0:
                     ids.add(value)
@@ -423,6 +436,27 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _persisted_id_strings(values: Any, *, limit: int | None = None) -> list[str]:
+    """Normalize an ID collection exactly once for both locking and storage."""
+    normalized = [str(value) for value in (values or [])]
+    return normalized if limit is None else normalized[:limit]
+
+
+def _attempt_persisted_id_lists(
+    attempt: Mapping[str, Any], *, candidate_fallback: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return the two Resume-bearing collections persisted for an attempt."""
+    candidate_ids = _persisted_id_strings(
+        attempt.get("candidate_ids") or candidate_fallback or [],
+        limit=_MAX_CANDIDATE_IDS,
+    )
+    precision_pool_ids = _persisted_id_strings(
+        attempt.get("precision_pool_ids") or [],
+        limit=_MAX_CANDIDATE_IDS,
+    )
+    return candidate_ids, precision_pool_ids
 
 
 def _criteria_digest(
@@ -520,7 +554,7 @@ def _persist_request_facts(
         else ctx.get("strategy_version_id")
     )
 
-    served_top_ids = [str(value) for value in (fact.get("served_top_ids") or [])]
+    served_top_ids = _persisted_id_strings(fact.get("served_top_ids") or [])
     if not served_top_ids:
         served_top_ids = [
             str(item.get("target_id")) for item in items if item.get("target_id") is not None
@@ -573,9 +607,9 @@ def _persist_request_facts(
     # §9.4：show_more 复用创建快照那次 request 的 served attempt，不建新候选池。
     served_attempt_id = parent.served_attempt_id if is_show_more and parent else None
     if served_attempt_id is None:
-        candidate_ids = [
-            str(value) for value in (fact.get("candidate_ids") or served_top_ids)
-        ][:_MAX_CANDIDATE_IDS]
+        candidate_ids, precision_pool_ids = _attempt_persisted_id_lists(
+            fact, candidate_fallback=served_top_ids,
+        )
         attempt_kind = _enum(
             fact.get("attempt_kind"),
             _ATTEMPT_KINDS,
@@ -597,9 +631,7 @@ def _persist_request_facts(
             scoring_time_utc=to_naive_utc(_as_datetime(fact.get("scoring_time_utc")) or now),
             candidate_count=int(fact.get("candidate_count", len(candidate_ids)) or 0),
             candidate_ids=candidate_ids,
-            precision_pool_ids=[
-                str(value) for value in (fact.get("precision_pool_ids") or [])
-            ][:_MAX_CANDIDATE_IDS],
+            precision_pool_ids=precision_pool_ids,
             result_count=len(items),
             is_zero_result=not candidate_ids,
             strategy_version_id=strategy_version_id,
@@ -626,9 +658,9 @@ def _persist_request_facts(
             if not isinstance(raw_attempt, Mapping):
                 continue
             extra = dict(raw_attempt)
-            extra_candidate_ids = [
-                str(value) for value in (extra.get("candidate_ids") or [])
-            ][:_MAX_CANDIDATE_IDS]
+            extra_candidate_ids, extra_precision_pool_ids = (
+                _attempt_persisted_id_lists(extra)
+            )
             extra_kind = _enum(
                 extra.get("attempt_kind"),
                 _ATTEMPT_KINDS,
@@ -652,11 +684,7 @@ def _persist_request_facts(
                     extra.get("candidate_count", len(extra_candidate_ids)) or 0,
                 ),
                 candidate_ids=extra_candidate_ids,
-                precision_pool_ids=[
-                    str(value) for value in (
-                        extra.get("precision_pool_ids") or []
-                    )
-                ][:_MAX_CANDIDATE_IDS],
+                precision_pool_ids=extra_precision_pool_ids,
                 result_count=int(
                     extra.get("result_count", len(extra_candidate_ids)) or 0,
                 ),
