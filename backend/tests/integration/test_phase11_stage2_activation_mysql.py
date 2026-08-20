@@ -9,7 +9,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from app.db import SessionLocal
-from app.models import Resume, User
+from app.models import AuditLog, Resume, User
 from app.services import audit_workbench_service
 from app.services.resume_mutation_service import lock_resume
 
@@ -33,7 +33,7 @@ def _candidate(owner: str) -> Resume:
     )
 
 
-def test_activation_row_lock_commit_and_failure_rollback(monkeypatch):
+def test_activation_row_lock_commit_and_failure_rollback(monkeypatch, request):
     owner = f"phase11-s2-{uuid4().hex}"
     setup = SessionLocal()
     try:
@@ -47,6 +47,30 @@ def test_activation_row_lock_commit_and_failure_rollback(monkeypatch):
     finally:
         setup.close()
 
+    def cleanup_owned_rows() -> None:
+        cleanup = SessionLocal()
+        try:
+            target_ids = [str(committed_id), str(rollback_id)]
+            cleanup.query(AuditLog).filter(
+                AuditLog.target_type == "resume",
+                AuditLog.target_id.in_(target_ids),
+            ).delete(synchronize_session=False)
+            cleanup.query(Resume).filter(
+                Resume.id.in_([committed_id, rollback_id]),
+                Resume.owner_userid == owner,
+            ).delete(synchronize_session=False)
+            cleanup.query(User).filter(
+                User.external_userid == owner,
+            ).delete(synchronize_session=False)
+            cleanup.commit()
+        finally:
+            cleanup.close()
+
+    # Register immediately after the fixture rows commit, so assertion and
+    # worker failures cannot leak a passed or pending Resume into later
+    # LIMIT/SKIP LOCKED acceptance units sharing this isolated schema.
+    request.addfinalizer(cleanup_owned_rows)
+
     locker = SessionLocal()
     contender = SessionLocal()
     try:
@@ -56,6 +80,10 @@ def test_activation_row_lock_commit_and_failure_rollback(monkeypatch):
             lock_resume(contender, committed_id)
         assert exc.value.orig.args[0] == 1205
         contender.rollback()
+        contender.execute(text(
+            "SET SESSION innodb_lock_wait_timeout=@@GLOBAL.innodb_lock_wait_timeout"
+        ))
+        contender.commit()
     finally:
         locker.rollback()
         locker.close()

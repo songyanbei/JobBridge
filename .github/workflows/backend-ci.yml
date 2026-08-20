@@ -218,3 +218,101 @@ jobs:
             sleep 1
           done
           test "$(docker exec jobbridge-ci-redis redis-cli --raw GET phase10:ci:revocation-fence)" = retained
+
+  backend-phase11-resume-mysql-redis:
+    name: backend-phase11-resume-mysql-redis
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: jobbridge_phase11
+          MYSQL_USER: jobbridge_phase11
+          MYSQL_PASSWORD: jobbridge_phase11
+          MYSQL_ROOT_PASSWORD: root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot_password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      APP_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_NAME: jobbridge_phase11
+      DB_USER: root
+      DB_PASSWORD: root_password
+      PHASE11_TEST_MYSQL_DSN: mysql+pymysql://root:root_password@127.0.0.1:3306/jobbridge_phase11
+      PHASE11_TEST_REDIS_DSN: redis://127.0.0.1:6379/11
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_DB: "11"
+      RUN_INTEGRATION: "1"
+      RECOMMENDATION_CONTENT_KEY: ci-only-phase11-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt
+      - name: Load production schema
+        working-directory: backend
+        run: >-
+          mysql -h127.0.0.1 -uroot -proot_password
+          jobbridge_phase11 < sql/schema.sql
+      - name: Start isolated durable Redis
+        run: |
+          docker run -d --name jobbridge-phase11-ci-redis \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-retries 30 \
+            -p 6379:6379 \
+            redis:7 redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec jobbridge-phase11-ci-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs jobbridge-phase11-ci-redis
+          exit 1
+      - name: Check Phase 11 rollout manifest
+        working-directory: backend
+        run: >-
+          python scripts/apply_phase11_migrations.py
+          manifest-check --manifest sql/migrations/phase11_manifest.json
+      - name: Run Phase 11 resume acceptance units
+        working-directory: backend
+        run: python scripts/phase11_release_gate.py release
+
+  frontend-quality:
+    name: frontend-lint-unit-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
+      - name: Production build
+        working-directory: frontend
+        run: npm run build
