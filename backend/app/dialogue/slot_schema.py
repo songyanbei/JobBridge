@@ -557,6 +557,10 @@ def _build_resume_upload() -> FrameDef:
         required_all=required,
         required_any=frozenset(),
         roles_allowed=frozenset({"worker"}),
+        synonyms_in={
+            "city": "expected_cities",
+            "job_category": "expected_job_categories",
+        },
     )
 
 

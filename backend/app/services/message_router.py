@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.config import settings as _settings_module
+from app.dialogue import slot_schema
 from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
 from app.models import Resume
@@ -2278,16 +2279,17 @@ def _extract_field_value(
     field: str,
     intent_result: IntentResult,
     raw_text: str,
+    session: SessionState,
 ):
     """按优先级从三个来源抽取某字段的值（structured_data → criteria_patch → 规则）。"""
     # 1. structured_data
-    sd = intent_result.structured_data or {}
+    sd, criteria_patch = _canonical_upload_patch_sources(session, intent_result)
     val = sd.get(field)
     if not _is_empty(val):
         return val
 
     # 2. criteria_patch
-    for patch in intent_result.criteria_patch or []:
+    for patch in criteria_patch:
         if patch.get("field") == field:
             v = patch.get("value")
             if not _is_empty(v):
@@ -2316,6 +2318,30 @@ def _is_empty(v) -> bool:
     return False
 
 
+def _canonical_upload_patch_sources(
+    session: SessionState,
+    intent_result: IntentResult,
+) -> tuple[dict, list[dict]]:
+    """按当前上传 frame 归一补字段别名，不改变搜索或岗位字段语义。"""
+    structured_data = dict(intent_result.structured_data or {})
+    criteria_patch = [dict(patch) for patch in intent_result.criteria_patch or []]
+    if session.pending_upload_intent != "upload_resume":
+        return structured_data, criteria_patch
+
+    structured_data = slot_schema.remap_synonyms(
+        "resume_upload", structured_data,
+    )
+    for patch in criteria_patch:
+        field = patch.get("field")
+        if not field:
+            continue
+        remapped = slot_schema.remap_synonyms(
+            "resume_upload", {field: patch.get("value")},
+        )
+        patch["field"], patch["value"] = next(iter(remapped.items()))
+    return structured_data, criteria_patch
+
+
 def _merge_other_upload_fields(
     session: SessionState,
     intent_result: IntentResult,
@@ -2325,7 +2351,7 @@ def _merge_other_upload_fields(
     返回是否合入了任何新字段。这部分字段补全不视为“答非所问”。
     """
     merged_any = False
-    sd = intent_result.structured_data or {}
+    sd, criteria_patch = _canonical_upload_patch_sources(session, intent_result)
     pending = dict(session.pending_upload or {})
     for k, v in sd.items():
         if _is_empty(v):
@@ -2333,7 +2359,7 @@ def _merge_other_upload_fields(
         if pending.get(k) != v:
             pending[k] = v
             merged_any = True
-    for patch in intent_result.criteria_patch or []:
+    for patch in criteria_patch:
         f = patch.get("field")
         v = patch.get("value")
         if not f or _is_empty(v):
@@ -2367,7 +2393,9 @@ def _handle_field_patch(
 
     awaiting_value = None
     if awaiting:
-        awaiting_value = _extract_field_value(awaiting, intent_result, raw_text)
+        awaiting_value = _extract_field_value(
+            awaiting, intent_result, raw_text, session,
+        )
 
     if awaiting and not _is_empty(awaiting_value):
         # 补到了 awaiting_field：merge 主字段，重置 failed_patch_rounds

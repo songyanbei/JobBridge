@@ -158,6 +158,13 @@ def test_remap_synonyms_candidate_search_also_remaps():
     assert out == {"job_category": ["餐饮"]}
 
 
+def test_remap_synonyms_resume_upload_maps_search_shaped_city_to_expected_city():
+    out = slot_schema.remap_synonyms(
+        "resume_upload", {"city": ["广州市"]},
+    )
+    assert out == {"expected_cities": ["广州市"]}
+
+
 def test_remap_synonyms_no_alias_passthrough():
     out = slot_schema.remap_synonyms("job_search", {"city": ["北京市"]})
     assert out == {"city": ["北京市"]}

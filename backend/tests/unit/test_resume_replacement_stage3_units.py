@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.llm.base import IntentResult
 from app.schemas.conversation import SessionState
-from app.services import command_service, intent_service, upload_service
+from app.services import command_service, intent_service, message_router, upload_service
 from app.services.resume_business_digest_service import business_digest
 from app.services.user_service import UserContext
 
@@ -150,6 +150,45 @@ def test_unit_b_blank_draft_and_resume_media_are_isolated(monkeypatch):
     assert session.pending_upload_intent == "upload_resume"
     assert session.pending_operation_id == "op-1"
     assert upload_service.attach_image("worker-1", "key", session, MagicMock(), 42) == "图片已加入新简历草稿（第 1 张）。"
+
+
+@pytest.mark.parametrize("upload_mode", ["create", "replace"])
+@pytest.mark.parametrize(
+    "intent_result",
+    [
+        IntentResult(
+            intent="follow_up", structured_data={"city": ["广州市"]},
+        ),
+        IntentResult(
+            intent="follow_up",
+            criteria_patch=[
+                {"op": "update", "field": "city", "value": ["广州市"]},
+            ],
+        ),
+    ],
+)
+def test_unit_b_resume_city_patch_uses_expected_cities_without_old_fields(
+    monkeypatch, upload_mode, intent_result,
+):
+    commit = MagicMock(return_value=[])
+    monkeypatch.setattr(message_router, "_commit_pending_or_followup", commit)
+    session = SessionState(
+        role="worker",
+        active_flow="upload_collecting",
+        pending_upload_intent="upload_resume",
+        pending_upload_mode=upload_mode,
+        awaiting_field="expected_cities",
+        pending_upload={},
+    )
+
+    message_router._handle_field_patch(
+        intent_result, MagicMock(content="期望城市是广州"), _worker(), session,
+        MagicMock(),
+    )
+
+    assert session.pending_upload == {"expected_cities": ["广州市"]}
+    assert "city" not in session.pending_upload
+    commit.assert_called_once()
 
 
 def test_unit_b_digest_is_versioned_and_candidate_does_not_inherit_optional_fields():
