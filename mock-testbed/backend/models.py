@@ -32,7 +32,13 @@ class MockWecomInboundEvent(Base):
 
     __tablename__ = "wecom_inbound_event"
 
-    id = Column(BigInteger().with_variant(mysql.BIGINT(unsigned=True), "mysql"), primary_key=True, autoincrement=True)
+    id = Column(
+        BigInteger()
+        .with_variant(mysql.BIGINT(unsigned=True), "mysql")
+        .with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     msg_id = Column(String(64), nullable=False, unique=True)
     from_userid = Column(String(64), nullable=False)
     msg_type = Column(

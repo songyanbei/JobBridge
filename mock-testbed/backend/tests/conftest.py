@@ -28,14 +28,24 @@ os.environ.setdefault("MOCK_DB_DSN", "sqlite:///:memory:")
 os.environ.setdefault("MOCK_REDIS_URL", "redis://localhost:6379/0")
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def _engine():
     """用 sqlite 建所有表。"""
     from sqlalchemy import create_engine
+    from sqlalchemy.pool import StaticPool
     from db import Base
     import models  # noqa: F401  确保模型注册到 Base.metadata
 
-    engine = create_engine("sqlite:///:memory:", future=True, echo=False)
+    # TestClient serves requests in a worker thread.  Keep one shared in-memory
+    # connection and disable SQLite's thread affinity so the schema and session
+    # remain visible to both the fixture and the request handler.
+    engine = create_engine(
+        "sqlite:///:memory:",
+        future=True,
+        echo=False,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     return engine
 
