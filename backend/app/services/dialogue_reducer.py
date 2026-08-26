@@ -256,6 +256,15 @@ def _resolve_merge_policy(
     if not has_old:
         return "replace", None
 
+    # A repeated, normalized city is not an ambiguity. This commonly happens
+    # when a user searches the same city again after a prior turn; asking
+    # whether to replace or add would render the same city twice.
+    if field == "city":
+        old_values = old_value if isinstance(old_value, list) else [old_value]
+        new_values = new_value if isinstance(new_value, list) else [new_value]
+        if set(old_values) == set(new_values):
+            return "replace", None
+
     # 3) 有旧值 + hint=unknown / 缺失 → 走 schema 声明的 default_merge
     schema_policy = slot_schema.default_merge_policy(frame, field, has_old)
     if schema_policy in ("replace", "add"):
@@ -737,7 +746,9 @@ def _reduce_main(
 
     # 4.3 决定 resolved_merge_policy（仅对 accepted 中存在的 key）
     old_criteria = (
-        {} if broker_direction_switch else dict(session.search_criteria or {})
+        {}
+        if broker_direction_switch or resolved_frame in {"job_upload", "resume_upload"}
+        else dict(session.search_criteria or {})
     )
     resolved_policy: dict[str, str] = {}
     final_criteria = dict(old_criteria)

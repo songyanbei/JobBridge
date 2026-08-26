@@ -310,6 +310,19 @@ class TestMergePolicy:
         finally:
             settings.ambiguous_city_query_policy = original
 
+    def test_unknown_with_same_city_does_not_clarify(self):
+        s = _make_session(search_criteria={"city": ["苏州市"]})
+        parse = _make_parse(
+            dialogue_act="modify_search",
+            frame_hint="job_search",
+            slots_delta={"city": ["苏州市"]},
+            merge_hint={"city": "unknown"},
+        )
+        d = reduce(parse, s, "worker")
+        assert d.clarification is None
+        assert d.resolved_merge_policy.get("city") == "replace"
+        assert d.final_search_criteria.get("city") == ["苏州市"]
+
 
 # ---------------------------------------------------------------------------
 # Role 权限
@@ -352,6 +365,20 @@ class TestUnresolvedFrameClarify:
 
 
 class TestRolePermission:
+    def test_factory_upload_does_not_inherit_search_city(self):
+        s = _make_session(
+            role="factory", search_criteria={"city": ["苏州市"], "job_category": ["电子厂"]},
+        )
+        parse = _make_parse(
+            dialogue_act="start_upload",
+            frame_hint="job_upload",
+            slots_delta={"city": "上海市", "job_category": "服装厂"},
+        )
+        d = reduce(parse, s, "factory")
+        assert d.clarification is None
+        assert d.final_search_criteria["city"] == "上海市"
+        assert d.final_search_criteria["job_category"] == "服装厂"
+
     def test_worker_to_job_upload_denied(self):
         s = _make_session(role="worker")
         parse = _make_parse(
