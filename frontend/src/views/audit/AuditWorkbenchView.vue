@@ -13,6 +13,7 @@
           <el-radio-button label="list">列表速览</el-radio-button>
         </el-radio-group>
         <el-select v-model="targetType" size="small" style="width: 100px" @change="onTargetTypeChange">
+          <el-option label="全部" value="all" />
           <el-option label="岗位" value="job" />
           <el-option label="简历" value="resume" />
         </el-select>
@@ -340,7 +341,9 @@ const appStore = useAppStore()
 const authStore = useAuthStore()
 
 const activeTab = ref('pending')
-const targetType = ref('job')
+// The badge counts pending jobs and resumes together, so the initial queue
+// must use the same scope instead of silently filtering to jobs only.
+const targetType = ref('all')
 const mode = ref('card')
 
 const queue = ref([])
@@ -457,12 +460,13 @@ function isSelfLocked(item) {
 async function loadQueue() {
   queueLoading.value = true
   try {
-    const data = await fetchAuditQueue({
+    const params = {
       status: activeTab.value,
-      target_type: targetType.value,
       page: queuePage.value,
       size: queueSize.value,
-    })
+    }
+    if (targetType.value !== 'all') params.target_type = targetType.value
+    const data = await fetchAuditQueue(params)
     queue.value = data.items || []
     queueTotal.value = data.total || 0
   } finally {
