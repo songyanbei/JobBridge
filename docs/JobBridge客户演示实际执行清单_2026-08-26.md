@@ -1,7 +1,7 @@
 # JobBridge 客户演示实际执行清单
 
-执行日期：2026-08-26（Asia/Shanghai）  
-执行方式：隔离模拟企业微信页面逐条输入，等待 SSE bot 回复；后台/API/数据库仅用于佐证。  
+执行日期：2026-08-26（Asia/Shanghai）
+执行方式：隔离模拟企业微信页面逐条输入，等待 SSE bot 回复；后台/API/数据库仅用于佐证。
 执行代码：`main`，提交 `6a7c3f5 fix(dialogue): guard factory numeric job posting intent`。
 
 ## 环境
@@ -51,4 +51,3 @@
 ## 范围边界
 
 后台 Dashboard、审核工作台、生命周期筛选、清理/dead-letter、媒体双人审批、健康探针和 RBAC 已在隔离 API/后台验收材料中覆盖；本清单重点记录模拟对话页面的实际输入和返回。真实预发布/生产迁移、灰度、10 万条容量、生产 EXPLAIN 和硬删除未执行。
-
