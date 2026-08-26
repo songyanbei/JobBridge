@@ -4,6 +4,47 @@
 >
 > 口径：本文只描述当前代码已实现、已测试或有明确开关控制的能力。现场演示优先使用隔离模拟企业微信环境，不连接真实预发布或生产。
 
+## 当前演示环境（2026-08-26）
+
+本脚本以当前正在运行的隔离服务为准：
+
+| 入口 | 地址 | 数据源 | 用途 |
+|---|---|---|---|
+| 模拟企业微信 | `http://localhost:5174/` | `jb-p11-browser-mysql` | 厂家 / 中介 / 工人对话 |
+| 运营后台 | `http://localhost:18080/admin/` | `jb-p11-browser-mysql` | 后台页面 |
+| Phase 11 API | `http://localhost:18090/` | `jb-p11-browser-mysql` | 生命周期、替换、清理 API（内部） |
+
+当前隔离后台账号：`admin / Demo@12345`。该密码仅用于本地演示，禁止带入生产。
+
+演示数据准备（仅隔离库）：
+
+```bash
+# 统一演示库（对话、后台、Phase 11 共用）
+docker exec -i jb-p11-browser-mysql mysql --default-character-set=utf8mb4 -uroot -proot jobbridge \
+  < scripts/prepare_demo_data.sql
+
+# 补充“苏州电子厂”7 条剧本岗位（重复执行安全）
+docker exec -i jb-p11-browser-mysql mysql --default-character-set=utf8mb4 -uroot -proot jobbridge \
+  < scripts/demo_seed_supplement.sql
+```
+
+准备完成的验收口径：统一库应有 7 条 `demo_supp_v1` 岗位，且这 7 条均有 `hiring_company`；页面推荐应显示“招聘工厂：…”，不显示“（历史回退）”。两条无公司主体的中介历史岗位可保持空值，并不应被当作有效推荐结果。
+
+## 功能地图
+
+| 系统面 | 当前能力 | 演示入口 |
+|---|---|---|
+| 企微对话 | 自然语言意图识别、多轮补全、岗位/工人搜索、条件调整、分页、指令和人工客服 | `5174` 双视角 |
+| 岗位业务 | 岗位发布、敏感词审核、通过/驳回、续期、招满、下架、恢复和岗位替换 | 厂家 / 中介对话 + 后台 |
+| 简历业务 | 简历上传、状态查询、全量更新、新旧 ID 替换、候选/历史/过期状态和删除清理 | 工人对话 + Phase 11 后台 |
+| 推荐与隐私 | SQL 硬过滤、排序、快照翻页、角色字段投影、联系方式隔离、匹配依据开关 | 工人 / 中介搜索 |
+| 运营后台 | 登录、审核工作台、账号、岗位、简历、字典、配置、报表、对话日志 | `18080/admin/` |
+| 生命周期运维 | TTL 到期、候选回收、目标清理、dead-letter 重驱、媒体隔离双人审批、审计 | `18090` API + 清理页 |
+| 外部集成 | 企业微信 webhook 验签/幂等/入队、小程序点击事件回传、出站重试 | API / 隔离模拟器 |
+| 治理与可观测性 | RBAC、版本乐观锁、软锁、rollout、健康/就绪探针、构建信息、CSV 导出 | 后台 + API |
+
+演示顺序遵循“先跑通一条最小业务链路，再按需展开治理能力”：先展示岗位发布 → 工人搜索 → 简历更新，再展示审核、权限、生命周期和清理，不在现场做大规模故障或真实数据操作。
+
 ## 1. 演示目标
 
 用一条完整业务链路说明 JobBridge 如何完成：
@@ -21,10 +62,10 @@
 
 | 环境 | 地址 | 用途 |
 |---|---|---|
-| 模拟企业微信首页 | `http://localhost:35174/` | 双视角演示 |
-| 求职者单视角 | `http://localhost:35174/single?role=worker` | 工人对话 |
-| 厂家单视角 | `http://localhost:35174/single?role=factory` | 厂家对话 |
-| 中介单视角 | `http://localhost:35174/single?role=broker` | 中介对话 |
+| 模拟企业微信首页 | `http://localhost:5174/` | 双视角演示 |
+| 求职者单视角 | `http://localhost:5174/single?role=worker` | 工人对话 |
+| 厂家单视角 | `http://localhost:5174/single?role=factory` | 厂家对话 |
+| 中介单视角 | `http://localhost:5174/single?role=broker` | 中介对话 |
 | 主 API 健康检查 | `http://localhost:18090/health` | 服务状态 |
 | 运营后台 | 由部署清单提供的 admin 地址 | 后台演示 |
 
@@ -52,7 +93,19 @@
 
 ### 3.2 演示数据重置
 
-现场前使用项目已有的 seed/reset 脚本恢复隔离数据。不要现场直接修改生产数据，也不要为了让结果出现而伪造生产容量、迁移或硬删除结果。
+现场前使用项目已有的 seed/reset 脚本恢复隔离数据。需要完全重置时，先备份再执行：
+
+```bash
+docker exec jobbridge-mysql mysqldump -uroot -proot --single-transaction \
+  jobbridge job user > backups/demo-before-reset.sql
+python scripts/reset_and_seed_data.py --yes
+docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 -uroot -proot jobbridge \
+  < scripts/demo_seed_supplement.sql
+docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 -uroot -proot jobbridge \
+  < scripts/prepare_demo_data.sql
+```
+
+当前统一隔离库已准备好：`demo_supp_v1` 剧本岗位 7 条（ID 223–229），并保留了简历替换链路（在线、历史、过期、用户删除等状态）。旧的 `jobbridge-mysql` 与 `jobbridge-merge-ui-mysql` 仅作为备份来源，不参与现场演示。不要现场直接修改生产数据，也不要为了让结果出现而伪造生产容量、迁移或硬删除结果。
 
 ## 4. 必演主线（约 25 分钟）
 
