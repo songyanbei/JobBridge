@@ -290,7 +290,7 @@ def seed_mock_users(conn: pymysql.connections.Connection) -> None:
               ('wm_mock_worker_001',  'worker',  '张工',       NULL,               '张工',   '13800000001', 1, 0, 'active'),
               ('wm_mock_worker_002',  'worker',  '李师傅',     NULL,               '李师傅', '13800000002', 1, 0, 'active'),
               ('wm_mock_factory_001', 'factory', '华东电子厂', '华东电子有限公司', '王经理', '13900000001', 0, 1, 'active'),
-              ('wm_mock_broker_001',  'broker',  '速聘中介',   '速聘人力资源',     '赵中介', '13700000001', 0, 1, 'active')
+              ('wm_mock_broker_001',  'broker',  '速聘中介',   '速聘人力资源',     '赵中介', '13700000001', 1, 1, 'active')
             ON DUPLICATE KEY UPDATE
               role=VALUES(role), display_name=VALUES(display_name), company=VALUES(company),
               contact_person=VALUES(contact_person), phone=VALUES(phone),

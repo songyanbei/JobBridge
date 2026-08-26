@@ -12,6 +12,7 @@ from app.services.upload_service import (
     UploadResult,
     _check_required_fields,
     _generate_followup_text,
+    _normalize_pay_type,
     process_upload,
 )
 from app.services.user_service import UserContext
@@ -56,6 +57,15 @@ class TestCheckRequiredFields:
                 "salary_expect_floor_monthly": 5000, "gender": "男", "age": 30}
         missing = _check_required_fields(data, RESUME_REQUIRED_FIELDS)
         assert "expected_cities" in missing
+
+
+class TestNormalizePayType:
+    def test_free_form_monthly_compensation_maps_to_monthly_enum(self):
+        assert _normalize_pay_type("底薪+提成") == "月薪"
+        assert _normalize_pay_type("unknown", "底薪+提成") == "月薪"
+
+    def test_missing_value_stays_missing_without_compensation_marker(self):
+        assert _normalize_pay_type(None, "苏州电子厂招人") is None
 
 
 class TestGenerateFollowupText:
@@ -166,6 +176,46 @@ class TestProcessUpload:
         assert created_job.accept_couple is True
         assert created_job.employment_type == "厂家直招"
         assert created_job.contract_type == "长期合同"
+
+    @patch("app.services.upload_service.audit_service")
+    @patch("app.services.upload_service.conversation_service")
+    def test_free_form_pay_type_is_persisted_as_monthly_and_raw_text_preserved(
+        self, mock_conv, mock_audit,
+    ):
+        from app.services.audit_service import AuditResult
+
+        mock_audit.audit_content_only.return_value = AuditResult(
+            status="passed", reason="", matched_words=[],
+        )
+        mock_audit.write_audit_log_for_result = MagicMock()
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = MagicMock(
+            config_value="30",
+        )
+        db.add = MagicMock()
+        db.flush = MagicMock()
+        raw_text = "苏州电子厂招普工，底薪+提成"
+        result = process_upload(
+            _make_user_ctx(),
+            IntentResult(
+                intent="upload_job",
+                structured_data={
+                    "city": "苏州市", "job_category": "电子厂",
+                    "salary_floor_monthly": 5500,
+                    "pay_type": "底薪+提成", "headcount": 2,
+                },
+                confidence=0.95,
+            ),
+            raw_text, [], _make_session(), db,
+        )
+        assert result.success is True
+        created_job = next(
+            call.args[0]
+            for call in db.add.call_args_list
+            if call.args and call.args[0].__class__.__name__ == "Job"
+        )
+        assert created_job.pay_type == "月薪"
+        assert created_job.raw_text == raw_text
 
     @pytest.mark.parametrize(
         ("upload_mode", "audit_status", "candidate_cleanup_enabled"),

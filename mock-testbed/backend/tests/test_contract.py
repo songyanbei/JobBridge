@@ -115,6 +115,25 @@ def test_mock_user_seed_sets_utf8mb4_before_insert():
 
     assert set_names_position >= 0
     assert insert_position > set_names_position
+    # Demo broker is intentionally enabled for both search directions; a reset
+    # must not reintroduce the permission-denied demo failure.
+    assert "'wm_mock_broker_001'" in sql
+    broker_row = next(
+        line for line in sql.splitlines()
+        if "'wm_mock_broker_001'" in line
+    )
+    assert ", 1, 1, 'active'" in broker_row
+
+
+def test_demo_reset_seed_enables_broker_search_in_both_directions():
+    script_path = Path(__file__).resolve().parents[3] / "scripts" / "reset_and_seed_data.py"
+    script = script_path.read_text(encoding="utf-8")
+
+    broker_row = next(
+        line for line in script.splitlines()
+        if "'wm_mock_broker_001'" in line
+    )
+    assert ", 1, 1, 'active')" in broker_row
 
 
 # ============================================================================

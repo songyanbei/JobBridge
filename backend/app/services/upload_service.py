@@ -285,7 +285,15 @@ def process_upload(
         assert_resume_writes_allowed()
 
     required = JOB_REQUIRED_FIELDS if entity_type == "job" else RESUME_REQUIRED_FIELDS
-    data = intent_result.structured_data
+    # Providers occasionally return free-form compensation text (for example
+    # "底薪+提成") for the ENUM-backed pay_type slot. Normalize before required
+    # field validation and persistence so malformed values cannot abort upload.
+    # The original wording remains in final_raw_text/description for audit.
+    data = dict(intent_result.structured_data or {})
+    if entity_type == "job":
+        normalized_pay_type = _normalize_pay_type(data.get("pay_type"), raw_text)
+        if normalized_pay_type is not None:
+            data["pay_type"] = normalized_pay_type
 
     # 检查缺失必填字段
     missing = _check_required_fields(data, required)
@@ -576,6 +584,32 @@ def _check_required_fields(data: dict, required: frozenset) -> list[str]:
         elif isinstance(val, (list, str)) and len(val) == 0:
             missing.append(f)
     return missing
+
+
+_JOB_PAY_TYPES = frozenset(("月薪", "时薪", "计件"))
+
+
+def _normalize_pay_type(value, raw_text: str = "") -> str | None:
+    """Map free-form compensation wording to the job pay_type ENUM."""
+    raw_value = "" if value is None else str(value).strip()
+    combined = f"{raw_value} {raw_text or ''}"
+    if not raw_value:
+        if "时薪" in combined:
+            return "时薪"
+        if "计件" in combined:
+            return "计件"
+        if any(marker in combined for marker in ("月薪", "底薪", "月结", "按月")):
+            return "月薪"
+        return None
+    if raw_value in _JOB_PAY_TYPES:
+        return raw_value
+    if "时薪" in combined or "按小时" in combined:
+        return "时薪"
+    if "计件" in combined or "件薪" in combined:
+        return "计件"
+    # "底薪+提成" and other free-form monthly compensation map to 月薪;
+    # final_raw_text still retains the original wording.
+    return "月薪"
 
 
 def _generate_followup_text(missing: list[str], frame: str | None = None) -> str:

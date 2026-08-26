@@ -1679,8 +1679,22 @@ def _handle_search(
     # Routing, session direction and persisted reply intent must share the same
     # authoritative value. A legacy/fallback provider can label a worker turn as
     # search_worker even though the role constraint correctly executes job search.
+    requested_intent = intent_result.intent
+    # A broker's explicit direction switch is authoritative for subsequent
+    # bare searches. Providers can label terse utterances as the opposite
+    # direction; without an explicit object switch, continue the active mode.
+    if (
+        user_ctx.role == "broker"
+        and requested_intent in {"search_job", "search_worker"}
+        and session.broker_direction in {"search_job", "search_worker"}
+        and requested_intent != session.broker_direction
+    ):
+        from app.services.dialogue_reducer import broker_explicit_direction
+
+        if broker_explicit_direction(msg.content or "") is None:
+            requested_intent = session.broker_direction
     effective_intent = _resolve_search_direction(
-        intent_result.intent, user_ctx, session,
+        requested_intent, user_ctx, session,
     )
     if effective_intent != intent_result.intent:
         intent_result = intent_result.model_copy(

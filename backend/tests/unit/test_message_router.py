@@ -435,6 +435,74 @@ class TestSearchDirectionResolution:
     @patch("app.services.message_router.conversation_service.load_session")
     @patch("app.services.message_router.conversation_service.save_session")
     @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_workers")
+    def test_broker_bare_query_keeps_worker_direction_after_command_switch(
+        self, mock_search_workers, mock_classify, mock_save, mock_load,
+        mock_id, mock_check, mock_active,
+    ):
+        mock_id.return_value = _ctx(role="broker")
+        mock_check.return_value = None
+        session = SessionState(role="broker", broker_direction="search_worker")
+        mock_load.return_value = session
+        # Simulate provider drift: terse query is mislabeled as search_job.
+        mock_classify.return_value = IntentResult(
+            intent="search_job",
+            structured_data={"city": ["苏州市"], "job_category": ["普工"]},
+            missing_fields=[], confidence=0.9,
+        )
+        sr = MagicMock(reply_text="找到 3 位求职者")
+        from app.schemas.search import SearchOutcome
+        mock_search_workers.return_value = (sr, SearchOutcome(
+            direction="search_worker", criteria_used={}, initial_count=3,
+            final_count=3, desired_count=3, low_recall_threshold=3,
+        ))
+
+        replies = process(_msg(content="苏州，普工"), MagicMock())
+
+        assert replies[0].content == "找到 3 位求职者"
+        mock_search_workers.assert_called_once()
+        assert session.broker_direction == "search_worker"
+
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
+    @patch("app.services.message_router.search_service.search_jobs")
+    def test_broker_bare_query_keeps_job_direction_after_command_switch(
+        self, mock_search_jobs, mock_classify, mock_save, mock_load,
+        mock_id, mock_check, mock_active,
+    ):
+        mock_id.return_value = _ctx(role="broker")
+        mock_check.return_value = None
+        session = SessionState(role="broker", broker_direction="search_job")
+        mock_load.return_value = session
+        # Simulate the opposite provider drift while the broker is in job mode.
+        mock_classify.return_value = IntentResult(
+            intent="search_worker",
+            structured_data={"city": ["苏州市"], "job_category": ["电子厂"]},
+            missing_fields=[], confidence=0.9,
+        )
+        sr = MagicMock(reply_text="找到 3 个岗位")
+        from app.schemas.search import SearchOutcome
+        mock_search_jobs.return_value = (sr, SearchOutcome(
+            direction="search_job", criteria_used={}, initial_count=3,
+            final_count=3, desired_count=3, low_recall_threshold=3,
+        ))
+
+        replies = process(_msg(content="苏州，电子厂"), MagicMock())
+
+        assert replies[0].content == "找到 3 个岗位"
+        mock_search_jobs.assert_called_once()
+        assert session.broker_direction == "search_job"
+
+    @patch("app.services.message_router.user_service.update_last_active")
+    @patch("app.services.message_router.user_service.check_user_status")
+    @patch("app.services.message_router.user_service.identify_or_register")
+    @patch("app.services.message_router.conversation_service.load_session")
+    @patch("app.services.message_router.conversation_service.save_session")
+    @patch("app.services.message_router.classify_intent")
     @patch("app.services.message_router.search_service.search_jobs")
     def test_worker_provider_direction_drift_uses_and_logs_job_direction(
         self, mock_search_jobs, mock_classify, _mock_save, mock_load,
