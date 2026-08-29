@@ -5,6 +5,8 @@
 目标数据库：MySQL 8.0+，因此直接使用 sqlalchemy.dialects.mysql 类型
 以确保 UNSIGNED / TINYINT / MEDIUMTEXT 等与 DDL 完全对齐。
 """
+from uuid import uuid4
+
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.compiler import compiles
@@ -736,6 +738,11 @@ class WecomInboundEvent(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     msg_id = sa.Column(sa.String(64), nullable=False, unique=True, comment="企微消息 ID，幂等键")
+    turn_id = sa.Column(
+        sa.String(36), nullable=False, unique=True,
+        default=lambda: str(uuid4()),
+        comment="不可变入站轮次 ID；重试复用，人工重放新建",
+    )
     from_userid = sa.Column(sa.String(64), nullable=False, comment="发送者 external_userid")
     msg_type = sa.Column(
         sa.Enum(
@@ -759,6 +766,16 @@ class WecomInboundEvent(Base):
             name="wecom_event_status",
         ),
         nullable=False, server_default="received", comment="处理状态",
+    )
+    rate_limit_decision = sa.Column(
+        sa.Enum("accepted", "rate_limited", name="rate_limit_decision"),
+        nullable=False, server_default="accepted", comment="限流审计决策",
+    )
+    rate_limit_rule = sa.Column(
+        sa.String(128), nullable=True, comment="限流规则/版本（仅审计）",
+    )
+    rate_limited_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=True, comment="限流决策时间",
     )
     retry_count = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default=sa.text("0"), comment="已重试次数")
     session_operation = sa.Column(sa.String(8), nullable=True)
@@ -788,6 +805,9 @@ class WecomInboundEvent(Base):
 
     __table_args__ = (
         sa.Index("idx_status_time", "status", "created_at"),
+        sa.Index(
+            "idx_inbound_dispatch", "status", "rate_limit_decision", "created_at", "id",
+        ),
         sa.Index("idx_status_worker_started", "status", "worker_started_at"),
         sa.Index("idx_status_worker_finished", "status", "worker_finished_at"),
         sa.Index("idx_from_user", "from_userid", "created_at"),
