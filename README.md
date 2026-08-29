@@ -103,6 +103,7 @@ JobBridge/
 
 - [方案设计](方案设计_v0.1.md) — 产品需求、数据模型、匹配引擎、多轮对话、运营后台、部署方案
 - [技术架构](docs/architecture.md) — 分层架构、接口契约、前后端通信协议、Prompt 设计规范
+- [统一 Listing Flow 重构方案文档集](docs/architecture/README.md) — 按架构总览、领域流程、LLM/Skill/MCP、可靠性、迁移测试和开源选型拆分的正式架构基线
 - [实施计划](docs/implementation-plan.md) — 8 阶段开发与测试计划、里程碑、验收标准
 - [Phase 0 验收](docs/phase0-kickoff.md) — Kickoff 基线确认、环境验证、外部依赖清单
 - [前后端协作](collaboration/使用说明.md) — 前后端协作工作区使用说明
