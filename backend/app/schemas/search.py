@@ -16,9 +16,81 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.recommendation import RecommendationItem, StrategyAssignment
+
+
+# ---------------------------------------------------------------------------
+# Recruitment job listing contracts (Phase 2-3)
+# ---------------------------------------------------------------------------
+
+class SearchCriteriaPatch(BaseModel):
+    """Explicit, auditable criteria mutation.
+
+    The reducer is the authority that decides whether a list value means
+    replace/add/remove.  The facade only accepts this closed operation set and
+    never interprets free-form patch keys as SQL.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["add", "update", "remove"]
+    field: str = Field(min_length=1, max_length=64)
+    value: Any = None
+
+
+CriteriaPatch = SearchCriteriaPatch
+
+
+_CARD_FORBIDDEN_NAMES = {
+    "phone", "mobile", "telephone", "wechat", "weixin", "wx",
+    "sql", "query", "raw_sql", "internal_sql", "owner_userid",
+}
+
+
+class ListingCard(BaseModel):
+    """Stable, worker-facing job card.
+
+    Only safe display attributes are allowed.  ``listing_ref`` and
+    ``contact_request_id`` are opaque values; neither is an entity id that a
+    client can use to bypass the contact service.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    listing_id: str = Field(min_length=1)
+    profile: Literal["recruitment.job"] = "recruitment.job"
+    title: str = Field(min_length=1, max_length=200)
+    body_summary: str = Field(default="", max_length=1000)
+    location_text: str | None = Field(default=None, max_length=200)
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    contact_action: str = Field(min_length=1, max_length=200)
+    explanation: str | None = Field(default=None, max_length=500)
+    listing_ref: str | None = Field(default=None, min_length=1, max_length=200)
+    contact_request_id: str | None = Field(default=None, min_length=1, max_length=200)
+    invalid_reason: str | None = Field(default=None, max_length=200)
+
+    @field_validator("listing_id", "listing_ref", "contact_request_id", mode="before")
+    @classmethod
+    def _normalize_ref(cls, value):
+        if value is None:
+            return value
+        return str(value).strip()
+
+    @model_validator(mode="after")
+    def _reject_sensitive_fields(self):
+        names = {str(key).lower() for key in self.attributes}
+        if names & _CARD_FORBIDDEN_NAMES:
+            raise ValueError("ListingCard contains a forbidden field")
+        for value in self.attributes.values():
+            if isinstance(value, dict):
+                nested = {str(key).lower() for key in value}
+                if nested & _CARD_FORBIDDEN_NAMES:
+                    raise ValueError("ListingCard contains a forbidden nested field")
+        return self
 
 
 # ---------------------------------------------------------------------------

@@ -226,6 +226,12 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_secret_key: str = "change-me"
 
+    # Recruitment job-search facade.  The compatibility path remains the
+    # default until an operator explicitly enables and rolls it out.
+    job_search_facade_enabled: bool = False
+    job_search_facade_rollout_percentage: int = 0
+    job_search_facade_timeout_ms: int = 5000
+
     # ---- 数据库 MySQL ----
     db_host: str = "localhost"
     db_port: int = 3306
