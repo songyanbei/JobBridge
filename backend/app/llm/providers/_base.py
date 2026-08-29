@@ -99,7 +99,7 @@ VALID_INTENTS = frozenset({
 VALID_DIALOGUE_ACTS = frozenset({
     "start_search", "modify_search", "answer_missing_slot",
     "show_more", "start_upload", "cancel", "reset",
-    "resolve_conflict", "chitchat",
+    "resolve_conflict", "respond_relaxation_offer", "chitchat",
 })
 VALID_FRAME_HINTS = frozenset({
     "job_search", "candidate_search", "job_upload", "resume_upload", "none",
