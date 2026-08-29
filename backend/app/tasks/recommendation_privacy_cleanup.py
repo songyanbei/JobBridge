@@ -21,6 +21,7 @@ from sqlalchemy import text
 
 from app.db import SessionLocal
 from app.services import recommendation_privacy_service as privacy
+from app.services.lifecycle_config_service import get_hard_delete_delay_days
 from app.tasks.common import log_event, task_lock
 
 # 一轮最多处理多少个用户，避免单次任务无限拉长。
@@ -33,20 +34,7 @@ DEFAULT_DELAY_DAYS = 7
 
 def _read_delay_days(db) -> int:
     """复用 ``ttl.hard_delete.delay_days``，与 ttl_cleanup 保持同一个倒计时。"""
-    row = db.execute(
-        text("SELECT config_value FROM system_config WHERE config_key = :k"),
-        {"k": "ttl.hard_delete.delay_days"},
-    ).first()
-    if row is None or row[0] is None:
-        return DEFAULT_DELAY_DAYS
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):
-        logger.warning(
-            "recommendation_privacy_cleanup: invalid ttl.hard_delete.delay_days, "
-            "falling back to default",
-        )
-        return DEFAULT_DELAY_DAYS
+    return get_hard_delete_delay_days(db)
 
 
 def due_userids(db, delay_days: int, limit: int = MAX_USERS_PER_RUN) -> list[str]:

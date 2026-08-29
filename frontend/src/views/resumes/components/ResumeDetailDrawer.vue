@@ -67,6 +67,14 @@
             {{ formatDateTime(detail.expires_at) }}
           </span>
         </el-descriptions-item>
+        <el-descriptions-item label="激活时间">{{ formatDateTime(detail.activated_at) }}</el-descriptions-item>
+        <el-descriptions-item label="候选回收时间">{{ formatDateTime(detail.candidate_expires_at) }}</el-descriptions-item>
+        <el-descriptions-item v-if="detail.replacement_id" label="替换关系" :span="2">
+          #{{ detail.replacement_id }} · {{ detail.replacement_lifecycle_status }}
+          <span v-if="detail.replaces_resume_id"> · 替换 #{{ detail.replaces_resume_id }}</span>
+          <span v-if="detail.replaced_by_resume_id"> · 被 #{{ detail.replaced_by_resume_id }} 替换</span>
+          <span v-if="detail.replacement_conflict_reason"> · 冲突：{{ detail.replacement_conflict_reason }}</span>
+        </el-descriptions-item>
         <el-descriptions-item v-if="detail.raw_text" label="原始描述" :span="2">
           <span style="white-space: pre-wrap">{{ detail.raw_text }}</span>
         </el-descriptions-item>
@@ -86,7 +94,7 @@
       </template>
       <template v-else-if="detail">
         <el-button @click="visible = false">关闭</el-button>
-        <el-button @click="startEdit">编辑</el-button>
+        <el-button :disabled="!canMutate" @click="startEdit">编辑</el-button>
         <el-dropdown @command="onCommand">
           <el-button>
             更多操作
@@ -94,9 +102,9 @@
           </el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="delist" :disabled="!!detail.delist_reason">下架</el-dropdown-item>
-              <el-dropdown-item command="extend-15">延期 15 天</el-dropdown-item>
-              <el-dropdown-item command="extend-30">延期 30 天</el-dropdown-item>
+              <el-dropdown-item command="delist" :disabled="!canMutate">下架</el-dropdown-item>
+              <el-dropdown-item command="extend-15" :disabled="!canMutate">延期 15 天</el-dropdown-item>
+              <el-dropdown-item command="extend-30" :disabled="!canMutate">延期 30 天</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -114,10 +122,12 @@ import ImagePreview from '@/components/ImagePreview.vue'
 import { fetchResumeDetail, updateResume, delistResume, extendResume } from '@/api/resumes'
 import { formatDateTime, ttlLevel } from '@/utils/format'
 import { ERROR_CODES } from '@/utils/constants'
+import { resolveResumeLifecycle } from '@/utils/resumeLifecycle'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   resumeId: { type: [Number, String], default: null },
+  now: { type: [Date, String, Number], default: null },
 })
 const emit = defineEmits(['update:modelValue', 'updated'])
 
@@ -132,6 +142,10 @@ const saving = ref(false)
 const editing = ref(false)
 const dirty = ref(false)
 const form = reactive({})
+const canMutate = computed(() => {
+  if (!detail.value) return false
+  return resolveResumeLifecycle(detail.value, props.now ?? new Date()) === 'active'
+})
 
 watch(
   () => [props.modelValue, props.resumeId],

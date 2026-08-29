@@ -8,6 +8,17 @@
     </div>
 
     <div v-loading="loading" class="config-container">
+      <el-card v-if="rollout" shadow="never" style="margin-bottom: 16px">
+        <template #header>
+          <div class="visibility-header">
+            <span>简历全量更新 allowlist（revision {{ rollout.revision }}，当前 {{ rollout.member_count }} 人）</span>
+            <el-button size="small" type="primary" :disabled="!canWriteRollout || !rolloutReason.trim()" :loading="rolloutSaving" @click="saveRollout">替换名单</el-button>
+          </div>
+        </template>
+        <el-alert title="出于隐私保护，现有名单不回显。保存会用输入的完整名单替换现有名单；每行一个 userid，空名单表示清空。" type="warning" :closable="false" />
+        <el-input v-model="rolloutText" type="textarea" :rows="5" placeholder="输入完整新名单（每行一个 worker userid）" style="margin-top: 12px" :disabled="!canWriteRollout" />
+        <el-input v-model="rolloutReason" maxlength="160" show-word-limit placeholder="替换理由（必填；请勿填写手机号、邮箱、URL 或文件路径）" style="margin-top: 8px" :disabled="!canWriteRollout" />
+      </el-card>
       <el-card v-if="policy" class="visibility-card" shadow="never">
         <template #header>
           <div class="visibility-header">
@@ -76,12 +87,18 @@
                   v-if="row.value_type === 'bool'"
                   v-model="row._draft"
                 />
-                <el-input-number
-                  v-else-if="row.value_type === 'int'"
-                  v-model="row._draft"
-                  :min="0"
-                  style="width: 220px"
-                />
+                <div v-else-if="row.value_type === 'int'" class="number-editor">
+                  <el-input-number
+                    v-model="row._draft"
+                    :min="numberRange(row).min"
+                    :max="numberRange(row).max"
+                    style="width: 220px"
+                  />
+                  <span v-if="isJobTtl(row)" class="unit">天</span>
+                  <div v-if="isJobTtl(row)" class="ttl-hint">
+                    {{ ttlHint(row) }}
+                  </div>
+                </div>
                 <JsonEditor
                   v-else-if="row.value_type === 'json'"
                   v-model="row._draft"
@@ -132,8 +149,12 @@ import JsonEditor from '@/components/JsonEditor.vue'
 import {
   fetchConfig, updateConfig, fetchVisibilityPolicy, saveVisibilityPolicy,
   fetchVisibilityPolicyHistory, fetchVisibilityPolicyHistoryDetail, restoreVisibilityPolicy,
+  fetchResumeReplacementRollout, saveResumeReplacementRollout,
 } from '@/api/config'
 import { DANGEROUS_CONFIG_KEYS } from '@/utils/constants'
+import { useAuthStore } from '@/stores/auth'
+
+const auth = useAuthStore()
 
 const loading = ref(false)
 const groups = ref({})
@@ -144,6 +165,11 @@ const history = ref([])
 const restoreRevision = ref(null)
 const confirmSensitive = ref(false)
 const policySaving = ref(false)
+const rollout = ref(null)
+const rolloutText = ref('')
+const rolloutReason = ref('')
+const rolloutSaving = ref(false)
+const canWriteRollout = computed(() => auth.admin?.role === 'super_admin')
 
 const grouped = computed(() => groups.value)
 
@@ -154,6 +180,23 @@ function editorFor(_row) {
 function isDangerous(row) {
   if (typeof row.danger === 'boolean') return row.danger
   return DANGEROUS_CONFIG_KEYS.includes(row.config_key)
+}
+
+function numberRange(row) {
+  if (row.config_key === 'ttl.job.days') return { min: 1, max: 3650 }
+  if (row.config_key === 'ttl.job.candidate.days') return { min: 1, max: 365 }
+  return { min: 0, max: undefined }
+}
+
+function isJobTtl(row) {
+  return row.config_key === 'ttl.job.days' || row.config_key === 'ttl.job.candidate.days'
+}
+
+function ttlHint(row) {
+  if (row.config_key === 'ttl.job.candidate.days') {
+    return '适用于首次发布和全量更新候选，仅影响后续创建的候选。'
+  }
+  return '仅影响后续激活的岗位，不追溯修改已有岗位。'
 }
 
 function normalize(row) {
@@ -188,10 +231,30 @@ async function load() {
     }
     groups.value = next
     if (!activeGroups.value.length) activeGroups.value = Object.keys(next)
-    await loadPolicy()
+    await Promise.all([loadPolicy(), loadRollout()])
   } finally {
     loading.value = false
   }
+}
+
+async function loadRollout() {
+  if (!['operator', 'super_admin'].includes(auth.admin?.role)) return
+  rollout.value = await fetchResumeReplacementRollout()
+  rolloutText.value = ''
+  rolloutReason.value = ''
+}
+
+async function saveRollout() {
+  rolloutSaving.value = true
+  try {
+    const userids = rolloutText.value.split(/\r?\n/).map((v) => v.trim()).filter(Boolean)
+    rollout.value = await saveResumeReplacementRollout({
+      expected_revision: rollout.value.revision, userids, reason: rolloutReason.value.trim(),
+    })
+    rolloutText.value = ''
+    rolloutReason.value = ''
+    ElMessage.success('allowlist 已保存')
+  } finally { rolloutSaving.value = false }
 }
 
 async function loadPolicy() {
@@ -306,8 +369,32 @@ load()
 .config-container {
   padding-bottom: 20px;
 }
-.visibility-card { margin-bottom: 18px; }
-.visibility-header, .history-row { display: flex; align-items: center; gap: 12px; justify-content: space-between; }
-.history-row { justify-content: flex-start; margin-top: 16px; color: var(--el-text-color-secondary); }
-.el-checkbox { margin-right: 12px; }
+.number-editor .unit {
+  margin-left: 8px;
+  color: var(--el-text-color-regular);
+}
+.ttl-hint {
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+.visibility-card {
+  margin-bottom: 18px;
+}
+.visibility-header,
+.history-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+.history-row {
+  justify-content: flex-start;
+  margin-top: 16px;
+  color: var(--el-text-color-secondary);
+}
+.el-checkbox {
+  margin-right: 12px;
+}
 </style>

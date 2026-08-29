@@ -2025,13 +2025,13 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
     """构建简历硬过滤查询。"""
     if not has_effective_search_criteria(criteria):
         return []
-    now = datetime.now(timezone.utc)
+    from app.services.resume_mutation_service import online_resume_filters, utc_now_naive
+
+    now = utc_now_naive()
     q = db.query(Resume).join(
         User, Resume.owner_userid == User.external_userid,
     ).filter(
-        Resume.audit_status == "passed",
-        Resume.deleted_at.is_(None),
-        Resume.expires_at > now,
+        *online_resume_filters(now=now),
         User.status == "active",
     )
 
@@ -3055,7 +3055,9 @@ def _validate_job_ids(job_ids: list[str], db: Session) -> list:
 
 def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
     """重新查询 ID 列表，过滤已失效的，并按输入顺序恢复。"""
-    now = datetime.now(timezone.utc)
+    from app.services.resume_mutation_service import online_resume_filters, utc_now_naive
+
+    now = utc_now_naive()
     int_ids = [int(i) for i in resume_ids if i.isdigit()]
     if not int_ids:
         return []
@@ -3063,9 +3065,7 @@ def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
         User, Resume.owner_userid == User.external_userid,
     ).filter(
         Resume.id.in_(int_ids),
-        Resume.audit_status == "passed",
-        Resume.deleted_at.is_(None),
-        Resume.expires_at > now,
+        *online_resume_filters(now=now),
         User.status == "active",
     ).all()
     return _restore_input_order(rows, resume_ids)

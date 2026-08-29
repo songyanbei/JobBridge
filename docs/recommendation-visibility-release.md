@@ -76,7 +76,7 @@
 
 ## 4. 数据库迁移
 
-上线前按顺序执行：
+独立发布时按以下顺序执行；与岗位生命周期 Phase 10 合并发布时，不得单独执行本节，必须遵循《岗位生命周期 Phase 10 发布手册》的统一顺序和证据门禁：
 
 1. `backend/sql/migrations/phase10_001_job_visibility_fields.sql`
 2. `backend/sql/migrations/phase10_002_ensure_visibility_config.sql`
@@ -101,7 +101,7 @@
 
 发布顺序：
 
-1. 备份数据库并在目标 MySQL 版本执行两次迁移演练。
+1. 备份数据库并在目标 MySQL 版本执行两次迁移演练；合并发布时使用统一 Phase 10 发布手册，禁止按文件名 glob 排序。
 2. 执行生产迁移，确认岗位字段、默认策略和 revision 1 审计锚点存在。
 3. 部署后端和管理后台，等待 `/ready` 返回 200 后再接入流量。
 4. 分角色验证四条搜索路径及后台策略读取、保存和历史恢复。

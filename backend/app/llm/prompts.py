@@ -11,6 +11,10 @@ Token 预算：每个 prompt 上方标注 input/output token 上限。
 # Intent Extraction Prompt
 # ---------------------------------------------------------------------------
 
+# v2.10 2026-08-15
+# 合并完整更新可选字段与岗位级招聘主体、联系人和电话抽取契约。
+# v2.9 2026-08-14
+# 补齐岗位上传中的详细地址、夫妻工、用工类型和合同类型抽取契约。
 # v2.8 2026-05-02
 # 防幻觉收口：补"抽取忠实度"段（禁止参照 few-shot 中具体城市/薪资脑补）+
 # upload_resume 锚点示例（示例13：用户只说性别/年龄/工种时不输出
@@ -87,6 +91,10 @@ INTENT_SYSTEM_PROMPT = """\
 - salary_ceiling_monthly (int)：月综合收入上限
 - provide_meal (bool)：包吃
 - provide_housing (bool)：包住
+- accept_couple (bool)：是否接受夫妻工
+- employment_type (str)：用工类型（厂家直招/劳务派遣/中介代招）
+- contract_type (str)：合同类型（长期合同/短期合同/劳务关系）
+- education_required (str)：学历要求（不限/初中/高中/中专/大专及以上）
 
 简历字段：
 - expected_cities (list[str])：期望城市列表
@@ -168,8 +176,8 @@ structured_data**表达本轮抽取到的字段，**不要再用 op 语义**。
 {{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000, "provide_meal": true, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.92}}
 
 示例2 - 厂家发布岗位:
-用户消息: "华星电子苏州吴中区木渎镇金山路88号招普工30人，月薪5500-6500，联系人张经理13800138000，包吃住，两班倒"
-{{"intent": "upload_job", "structured_data": {{"hiring_company": "华星电子", "city": "苏州市", "district": "吴中区", "address": "木渎镇金山路88号", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "contact_person": "张经理", "phone": "13800138000", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
+用户消息: "华星电子苏州吴中区木渎镇金山路88号招普工30人，厂家直招，月薪5500-6500，联系人张经理13800138000，包吃住，两班倒，接受夫妻工，签长期合同"
+{{"intent": "upload_job", "structured_data": {{"hiring_company": "华星电子", "city": "苏州市", "district": "吴中区", "address": "木渎镇金山路88号", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "contact_person": "张经理", "phone": "13800138000", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
 
 示例3 - 厂家发布岗位并顺便找工人:
 用户消息: "我们苏州工业园区招电子厂普工20人，5500-6500包吃住，顺便帮我找几个合适的工人"
@@ -405,6 +413,10 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 示例 20（broker 手上有工人想找岗位，工人是受益人而不是搜索对象）：
 用户消息：有个工人想去苏州做电工
 {{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["苏州市"], "job_category": ["技工"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+
+示例 21（factory 提交包含可选字段的完整岗位）：
+用户消息：华星电子在苏州招30人，厂家直招，接受夫妻工，签长期合同，地址兴吴路88号，联系人张经理13800138000，月薪5500-6500
+{{"dialogue_act": "start_upload", "frame_hint": "job_upload", "slots_delta": {{"hiring_company": "华星电子", "city": "苏州市", "address": "兴吴路88号", "contact_person": "张经理", "phone": "13800138000", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
 """
 
 
@@ -437,25 +449,25 @@ def _render_dialogue_parse_prompt_v2() -> str:
     )
 
 
-# 阶段三：DIALOGUE_PARSE_PROMPT_V2 走模块级 __getattr__ 懒加载，避免与
+# 阶段三：保留模块级 __getattr__ 兼容旧调用方，避免与
 # slot_schema → intent_service → prompts 形成 import-time 循环依赖。
-# 首次访问时渲染并缓存；providers 在 request 时拿到的字符串与启动期同（schema
-# 注册表本身只构建一次）。
-_DIALOGUE_PARSE_PROMPT_V2_CACHE: str | None = None
+# Provider 每次请求都重新渲染：正常情况下 ontology 已在内存缓存；首次读库
+# 失败时不固化 fallback，下次请求可自动恢复。
+
+
+def get_dialogue_parse_prompt_v2() -> str:
+    return _render_dialogue_parse_prompt_v2()
 
 
 def __getattr__(name: str):  # pragma: no cover - py3.7+ module __getattr__
-    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
     if name == "DIALOGUE_PARSE_PROMPT_V2":
-        if _DIALOGUE_PARSE_PROMPT_V2_CACHE is None:
-            _DIALOGUE_PARSE_PROMPT_V2_CACHE = _render_dialogue_parse_prompt_v2()
-        return _DIALOGUE_PARSE_PROMPT_V2_CACHE
+        return get_dialogue_parse_prompt_v2()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _reset_dialogue_parse_prompt_v2_cache_for_tests() -> None:
-    global _DIALOGUE_PARSE_PROMPT_V2_CACHE
-    _DIALOGUE_PARSE_PROMPT_V2_CACHE = None
+    # 保留调用契约；prompt 已改为请求时渲染，无独立字符串缓存。
+    return None
 
 
 DIALOGUE_USER_TEMPLATE = """\
@@ -556,6 +568,8 @@ def format_soft_preferences_block(
 # 否则 message_router 落 conversation_log.criteria_snapshot.prompt_version 会错记
 # 旧版本，回溯排查时被误导。intent_service.classify_intent 的 llm_call 日志也读这里。
 #
+# v2.10 (2026-08-15)：合并完整更新字段与招聘主体、联系人、电话抽取契约。
+# v2.9 (2026-08-14)：补齐完整岗位可选字段抽取契约和示例。
 # v2.8 (2026-05-02)：补"抽取忠实度"反幻觉条款 + upload_resume 锚点示例（示例13），
 #                   修复"用户没说城市但 LLM 输出 expected_cities=['苏州市']"漂移。
 # v2.7 (阶段四 PR3)：criteria_patch 收口 — prompt 明确该字段已废弃，
@@ -577,12 +591,12 @@ def format_soft_preferences_block(
 # v2.2 (Bug 4)：明确搜索/follow_up 必须用 city / job_category，禁止 expected_*；
 #               加 broker search_worker / follow_up 补 city / "换成 X" 三条 few-shot。
 # v2.1 (Stage B)：补 job_category 闭集 + few-shot 同义词归并（餐饮/物流仓储等）。
-INTENT_PROMPT_VERSION = "v2.8"
+INTENT_PROMPT_VERSION = "v2.10"
 
 # PROMPT_VERSION 是给 conversation_log.criteria_snapshot 用的"对话快照版本"，
 # 与 INTENT_PROMPT_VERSION 同步 bump（一次 prompt 修订只对应一组版本号）。
 PROMPT_VERSION = INTENT_PROMPT_VERSION
-PROMPT_DATE = "2026-05-02"
+PROMPT_DATE = "2026-08-15"
 
 # v2.2 (recommendation-v1, 方案 §11.5)：prompt 文本未变，但**送进 prompt 的候选
 #      契约变了** —— v1 只发 §6.2.1 预评分 Top 20 精排池、固定 top_n=3，返回的 rank
@@ -599,10 +613,12 @@ RERANK_PROMPT_VERSION = "v2.2"
 #                   与 INTENT v2.8 同步修复 expected_cities 脑补漂移。
 # v0.4 (2026-07-22)：补三角色 search/upload 歧义消解和 broker 宾语方向锚点。
 # v0.5 (2026-07-22)：补 factory 数量+工种、broker 为明确人员找岗位锚点。
+# v0.8 (2026-08-15)：合并完整岗位与岗位级招聘主体、联系人、电话示例。
+# v0.7 (2026-08-14)：补包含地址、夫妻工、用工和合同类型的完整岗位示例。
 # v0.6 (2026-07-25)：补 broker“有个工人想去 X 做 Y”的受益人方向锚点。
 # v0.2 (Stage 3)：字段清单段落改为启动期由 slot_schema 渲染（一次性）；fallback 文案保留。
 # v0.1 2026-05-01：DialogueParseResult v2 首版（hard-coded 字段清单）。
-DIALOGUE_PROMPT_VERSION = "v0.6"
+DIALOGUE_PROMPT_VERSION = "v0.8"
 
 
 def build_criteria_snapshot_meta() -> dict:

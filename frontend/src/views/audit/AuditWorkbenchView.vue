@@ -13,6 +13,7 @@
           <el-radio-button label="list">列表速览</el-radio-button>
         </el-radio-group>
         <el-select v-model="targetType" size="small" style="width: 100px" @change="onTargetTypeChange">
+          <el-option label="全部" value="all" />
           <el-option label="岗位" value="job" />
           <el-option label="简历" value="resume" />
         </el-select>
@@ -77,6 +78,14 @@
           >
             中风险内容：请谨慎判断
           </div>
+          <el-alert
+            v-if="isConflictReplacement"
+            title="该候选已完成审核，只能在岗位生命周期详情中重试激活或取消候选"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-bottom: 12px"
+          />
 
           <div
             class="detail-card"
@@ -125,7 +134,7 @@
               驳回 (R)
             </el-button>
             <el-button @click="onNext">稍后 (S)</el-button>
-            <el-button :icon="EditPen" @click="editVisible = true">编辑 (E)</el-button>
+            <el-button :icon="EditPen" :disabled="!canEdit" @click="editVisible = true">编辑 (E)</el-button>
             <el-button
               :type="undoSecondsLeft > 0 ? 'warning' : 'default'"
               :disabled="undoSecondsLeft <= 0 || !undoTarget"
@@ -332,7 +341,9 @@ const appStore = useAppStore()
 const authStore = useAuthStore()
 
 const activeTab = ref('pending')
-const targetType = ref('job')
+// The badge counts pending jobs and resumes together, so the initial queue
+// must use the same scope instead of silently filtering to jobs only.
+const targetType = ref('all')
 const mode = ref('card')
 
 const queue = ref([])
@@ -404,9 +415,42 @@ const submitterHistoryFull = computed(() => {
   return detail.value.submitter_history_full || submitter7d.value
 })
 
-const canPass = computed(() => !!currentItem.value && !!detail.value.version && activeTab.value === 'pending')
+function isQueueItemAuditable(item) {
+  if (!item || item.target_type !== 'job' || !item.replacement_id) return true
+  return item.replacement_review_outcome === 'pending'
+    && item.replacement_lifecycle_status === 'awaiting_review'
+}
+
+function isDetailAuditable(targetTypeValue, value) {
+  if (targetTypeValue !== 'job' || !value?.replacement_id) return true
+  return value.replacement_review_outcome === 'pending'
+    && value.replacement_lifecycle_status === 'awaiting_review'
+}
+
+const isConflictReplacement = computed(() => (
+  currentItem.value?.target_type === 'job'
+  && !!detail.value.replacement_id
+  && detail.value.replacement_lifecycle_status === 'conflict'
+))
+const canPass = computed(() => (
+  !!currentItem.value
+  && !!detail.value.version
+  && activeTab.value === 'pending'
+  && isQueueItemAuditable(currentItem.value)
+  && isDetailAuditable(currentItem.value.target_type, detail.value)
+))
 const canReject = computed(() => canPass.value)
-const canBatch = computed(() => activeTab.value === 'pending' && selectedRows.value.length > 0)
+const canEdit = computed(() => (
+  !!currentItem.value
+  && !!detail.value.version
+  && isQueueItemAuditable(currentItem.value)
+  && isDetailAuditable(currentItem.value.target_type, detail.value)
+))
+const canBatch = computed(() => (
+  activeTab.value === 'pending'
+  && selectedRows.value.length > 0
+  && selectedRows.value.every(isQueueItemAuditable)
+))
 
 function isSelfLocked(item) {
   const me = authStore.admin?.username
@@ -416,12 +460,13 @@ function isSelfLocked(item) {
 async function loadQueue() {
   queueLoading.value = true
   try {
-    const data = await fetchAuditQueue({
+    const params = {
       status: activeTab.value,
-      target_type: targetType.value,
       page: queuePage.value,
       size: queueSize.value,
-    })
+    }
+    if (targetType.value !== 'all') params.target_type = targetType.value
+    const data = await fetchAuditQueue(params)
     queue.value = data.items || []
     queueTotal.value = data.total || 0
   } finally {
@@ -592,7 +637,13 @@ async function onPass() {
   try {
     await passAuditItem(target.target_type, target.id, detail.value.version)
     ElMessage.success('已通过')
-    startUndoCountdown(target)
+    if (target.target_type === 'job') {
+      undoSecondsLeft.value = 0
+      undoTarget.value = null
+      ElMessage.info('岗位审核已触发生命周期变化，不能撤销')
+    } else {
+      startUndoCountdown(target)
+    }
     stopLockRenew()
     await moveToNext()
   } catch (err) {
@@ -615,7 +666,13 @@ async function onReject(payload) {
     })
     ElMessage.success('已驳回')
     rejectVisible.value = false
-    startUndoCountdown(target)
+    if (target.target_type === 'job') {
+      undoSecondsLeft.value = 0
+      undoTarget.value = null
+      ElMessage.info('岗位审核已触发生命周期变化，不能撤销')
+    } else {
+      startUndoCountdown(target)
+    }
     stopLockRenew()
     await moveToNext()
   } catch (err) {
@@ -626,7 +683,7 @@ async function onReject(payload) {
 }
 
 async function onEdit(fields) {
-  if (!currentItem.value || actionSubmitting.value) return
+  if (!canEdit.value || actionSubmitting.value) return
   actionSubmitting.value = true
   try {
     await editAuditItem(currentItem.value.target_type, currentItem.value.id, {
@@ -694,6 +751,10 @@ async function onBatch(action) {
     return
   }
   if (selectedRows.value.length === 0) return
+  if (!selectedRows.value.every(isQueueItemAuditable)) {
+    ElMessage.warning('已完成审核的替换候选不能再次审核')
+    return
+  }
   if (selectedRows.value.length > BATCH_AUDIT_LIMIT) {
     ElMessage.error(`批量操作一次最多 ${BATCH_AUDIT_LIMIT} 条`)
     return
@@ -728,6 +789,11 @@ async function runBatch() {
         await lockAuditItem(row.target_type, row.id)
         locked = true
         const d = await fetchAuditDetail(row.target_type, row.id)
+        if (!isDetailAuditable(row.target_type, d)) {
+          const error = new Error('该替换候选已完成审核，只能重试激活或取消候选')
+          error.code = 'REPLACEMENT_ALREADY_REVIEWED'
+          throw error
+        }
         const ver = d.version
         if (batchAction.value === 'pass') {
           await passAuditItem(row.target_type, row.id, ver)
@@ -779,8 +845,9 @@ useKeyboard([
   {
     key: 'e',
     handler: () => {
-      if (currentItem.value && !editVisible.value) editVisible.value = true
+      if (canEdit.value && !editVisible.value) editVisible.value = true
     },
+    disabled: () => !canEdit.value,
   },
   {
     key: 'u',

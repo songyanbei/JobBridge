@@ -174,6 +174,40 @@ class TestCheckOutbox:
         mock_alert.assert_not_called()
 
 
+class TestCheckMediaCleanup:
+    def test_dead_letter_media_alerts(self, monkeypatch):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.return_value = 3
+        monkeypatch.setattr(worker_monitor, "SessionLocal", lambda: db)
+
+        with patch.object(
+            worker_monitor, "task_lock", return_value=_ctx_acquired(True)
+        ), patch.object(worker_monitor, "_alert") as mock_alert, patch.object(
+            worker_monitor, "log_event"
+        ) as mock_log:
+            worker_monitor.check_media_cleanup()
+
+        mock_alert.assert_called_once()
+        assert mock_alert.call_args.args[0] == "media_cleanup_dead_letter"
+        mock_log.assert_called_once_with(
+            "media_cleanup_health", dead_letter_count=3
+        )
+        db.close.assert_called_once()
+
+    def test_healthy_media_cleanup_does_not_alert(self, monkeypatch):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.return_value = 0
+        monkeypatch.setattr(worker_monitor, "SessionLocal", lambda: db)
+
+        with patch.object(
+            worker_monitor, "task_lock", return_value=_ctx_acquired(True)
+        ), patch.object(worker_monitor, "_alert") as mock_alert:
+            worker_monitor.check_media_cleanup()
+
+        mock_alert.assert_not_called()
+        db.close.assert_called_once()
+
+
 class TestCheckSessionCommits:
     def test_stale_pending_session_commit_alerts(self, monkeypatch):
         db = MagicMock()

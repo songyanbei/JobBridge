@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import secrets
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Generator
 
 from loguru import logger
@@ -32,6 +33,36 @@ else
     return 0
 end
 """
+
+_RENEW_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+
+@dataclass
+class TaskLease:
+    redis: Any
+    key: str
+    token: str
+    ttl: int
+    acquired: bool
+
+    def __bool__(self) -> bool:
+        return self.acquired
+
+    def renew(self) -> bool:
+        if not self.acquired:
+            return False
+        renewed = bool(self.redis.eval(
+            _RENEW_SCRIPT, 1, self.key, self.token, int(self.ttl),
+        ))
+        if not renewed:
+            self.acquired = False
+        return renewed
 
 
 @contextmanager
@@ -67,6 +98,29 @@ def task_lock(name: str, ttl: int = 3600) -> Generator[bool, None, None]:
                 logger.exception(f"task_lock release failed: name={name}")
 
 
+@contextmanager
+def renewable_task_lock(name: str, ttl: int = 1200) -> Generator[TaskLease, None, None]:
+    """Owner-token task lock whose lease can be refreshed between committed batches."""
+    r = get_redis()
+    key = f"task_lock:{name}"
+    token = secrets.token_hex(16)
+    lease = TaskLease(
+        redis=r,
+        key=key,
+        token=token,
+        ttl=int(ttl),
+        acquired=bool(r.set(key, token, nx=True, ex=int(ttl))),
+    )
+    try:
+        yield lease
+    finally:
+        if lease.acquired:
+            try:
+                r.eval(_RELEASE_SCRIPT, 1, key, token)
+            except Exception:
+                logger.exception(f"task_lock release failed: name={name}")
+
+
 def log_event(event: str, **fields: Any) -> None:
     """统一的 loguru 结构化事件打点。
 
@@ -83,7 +137,9 @@ def log_event(event: str, **fields: Any) -> None:
 # (config_key, default_value, value_type, description)
 _TTL_CONFIG_DEFAULTS: tuple[tuple[str, str, str, str], ...] = (
     ("ttl.job.days",                 "30",  "int", "岗位 TTL（天）"),
+    ("ttl.job.candidate.days",         "7",  "int", "岗位候选版本保留期（天）"),
     ("ttl.resume.days",              "30",  "int", "简历 TTL（天）"),
+    ("ttl.resume.candidate.days",     "7",  "int", "简历候选版本保留期（天）"),
     ("ttl.conversation_log.days",    "30",  "int", "对话日志 TTL（天）"),
     ("ttl.audit_log.days",           "180", "int", "审核日志 TTL（天）— Phase 7 新增"),
     ("ttl.wecom_inbound_event.days", "30",  "int", "入站事件表 TTL（天）— Phase 7 新增"),

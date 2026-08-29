@@ -25,6 +25,8 @@ class WeComMessage:
     media_id: str = ""
     create_time: int = 0
     image_url: str = ""
+    media_lifecycle_id: int | None = None
+    expired_upload_draft: bool = False
 
 
 def parse_xml(xml_text: str) -> dict:

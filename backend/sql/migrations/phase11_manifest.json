@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "mysql": {"vendor": "mysql", "min_version": "8.0"},
+  "minimum_build": {
+    "ready": true,
+    "build_number": 249,
+    "build_sha": "083be7e8fa37045a94f5247ea4fb9cb8d1a35652",
+    "capabilities": ["resume_nullable_dto", "resume_lifecycle_double_write"]
+  },
+  "steps": [
+    {
+      "key": "phase11_resume_lifecycle_additive", "stage": "pre_cutover", "kind": "sql",
+      "path": "sql/migrations/phase11_001_resume_lifecycle_additive.sql",
+      "sha256": "2b44c915f6af0211319681633b28159ea289c8d0682c7840b8cfe3f7092ec894",
+      "requires": [], "resumable": true,
+      "verify_sql": "SELECT ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume' AND ((column_name IN ('activated_at','candidate_expires_at','expires_at','deleted_at') AND data_type='datetime' AND datetime_precision=6 AND is_nullable='YES') OR (column_name IN ('created_at','updated_at') AND data_type='datetime' AND datetime_precision=6 AND is_nullable='NO') OR (column_name='delist_reason' AND data_type='varchar' AND character_maximum_length=32 AND is_nullable='YES')))<>7) + (COALESCE((SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='resume' AND index_name='idx_resume_candidate_expiry'),'')<>'audit_status,candidate_expires_at') + (COALESCE((SELECT GROUP_CONCAT(column_name ORDER BY seq_in_index) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='resume' AND index_name='idx_resume_hard_delete'),'')<>'deleted_at,id') + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='phase11_migration_ledger')<>16) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume_replacement')<>21) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume_replacement_rollout_assignment')<>7) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume_media_isolation_issue')<>14) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='phase11_resume_lifecycle_backup')<>8) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='phase11_resume_media_key_scan')<>5) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='phase11_resume_media_key_scan' AND ((column_name='resume_id' AND column_type='bigint unsigned' AND is_nullable='NO') OR (column_name='key_hash' AND column_type='char(64)' AND is_nullable='NO') OR (column_name='reference_kind' AND column_type=\"enum('valid','invalid')\" AND is_nullable='NO') OR (column_name='reference_count' AND column_type='int unsigned' AND is_nullable='NO') OR (column_name='first_seen_at' AND data_type='datetime' AND datetime_precision=6 AND is_nullable='NO')))<>5) + ((SELECT COUNT(*) FROM information_schema.table_constraints WHERE constraint_schema=DATABASE() AND ((table_name='resume_replacement' AND constraint_name IN ('uq_resume_replacement_operation','uq_resume_replacement_message','uq_resume_replacement_new','uq_resume_replacement_active_old')) OR (table_name='resume_replacement_rollout_assignment' AND constraint_name IN ('uq_resume_rollout_operation','uq_resume_rollout_message')) OR (table_name='resume_media_isolation_issue' AND constraint_name='uq_resume_media_isolation_issue')) AND constraint_type='UNIQUE')<>7) + (SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema=DATABASE() AND table_name IN ('resume_replacement','resume_replacement_rollout_assignment','resume_media_isolation_issue','phase11_resume_media_key_scan','phase11_resume_lifecycle_backup','phase11_migration_ledger')) AS anomaly_count"
+    },
+    {
+      "key": "phase11_resume_config_seed", "stage": "pre_cutover", "kind": "sql",
+      "path": "sql/migrations/phase11_002_resume_config_seed.sql",
+      "sha256": "032e05fd43dacd159bc85084f708bd5ea42f9815a53c801d90e149210d1ad055",
+      "requires": ["phase11_resume_lifecycle_additive"], "resumable": true,
+      "verify_sql": "SELECT (SELECT COUNT(*)<>3 FROM system_config WHERE config_key IN ('ttl.resume.days','ttl.resume.candidate.days','resume.replacement.rollout.allowlist')) + (SELECT COUNT(*) FROM system_config WHERE config_key='rollout.resume_replacement.allowlist') + (SELECT COUNT(*) FROM system_config WHERE config_key='ttl.resume.days' AND NOT (value_type='int' AND config_value REGEXP '^[0-9]+$' AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 3650 AND CAST(CAST(config_value AS UNSIGNED) AS CHAR)=config_value)) + (SELECT COUNT(*) FROM system_config WHERE config_key='ttl.resume.candidate.days' AND NOT (value_type='int' AND config_value REGEXP '^[0-9]+$' AND CAST(config_value AS UNSIGNED) BETWEEN 1 AND 365 AND CAST(CAST(config_value AS UNSIGNED) AS CHAR)=config_value)) + (SELECT COUNT(*) FROM system_config WHERE config_key='resume.replacement.rollout.allowlist' AND NOT (value_type='json' AND JSON_VALID(config_value) AND JSON_TYPE(CAST(config_value AS JSON))='OBJECT' AND JSON_LENGTH(JSON_KEYS(CAST(config_value AS JSON)))=2 AND JSON_CONTAINS_PATH(CAST(config_value AS JSON),'all','$.revision','$.userids') AND JSON_TYPE(JSON_EXTRACT(CAST(config_value AS JSON),'$.revision')) IN ('INTEGER','UNSIGNED INTEGER') AND CAST(JSON_UNQUOTE(JSON_EXTRACT(CAST(config_value AS JSON),'$.revision')) AS DECIMAL(20,0)) BETWEEN 1 AND 18446744073709551615 AND JSON_TYPE(JSON_EXTRACT(CAST(config_value AS JSON),'$.userids'))='ARRAY' AND NOT EXISTS (SELECT 1 FROM JSON_TABLE(CAST(config_value AS JSON),'$.userids[*]' COLUMNS (userid VARCHAR(256) PATH '$', item JSON PATH '$')) members WHERE JSON_TYPE(item)<>'STRING' OR userid<>TRIM(userid) OR CHAR_LENGTH(userid)=0 OR CHAR_LENGTH(userid)>64) AND (SELECT COUNT(*) FROM JSON_TABLE(CAST(config_value AS JSON),'$.userids[*]' COLUMNS (userid VARCHAR(256) PATH '$')) all_members)=(SELECT COUNT(DISTINCT userid) FROM JSON_TABLE(CAST(config_value AS JSON),'$.userids[*]' COLUMNS (userid VARCHAR(256) PATH '$')) unique_members))) AS anomaly_count"
+    },
+    {
+      "key": "phase11_resume_lifecycle_backfill", "stage": "post_cutover", "kind": "python",
+      "path": "scripts/phase11_resume_lifecycle_backfill.py",
+      "sha256": "8648e4f57fda06cf1b06ccbe2e04bf3c2e0ff922d76d8b1462830e3d814fbd1c",
+      "requires": ["phase11_resume_config_seed"], "resumable": true,
+      "cursor_key": "lifecycle_cursor"
+    },
+    {
+      "key": "phase11_resume_media_reconcile", "stage": "post_cutover", "kind": "python",
+      "path": "scripts/phase11_resume_media_reconcile.py",
+      "sha256": "d3efc605eb45b2765efd45032e7b667b76b13756b06526b9d96556aa68421906",
+      "requires": ["phase11_resume_lifecycle_backfill"], "resumable": true, "cursor_key": "resume_cursor"
+    },
+    {
+      "key": "phase11_resume_orphan_target_reconcile", "stage": "post_cutover", "kind": "python",
+      "path": "scripts/phase11_resume_orphan_target_reconcile.py",
+      "sha256": "1d85360bfb7de4db59e34db27b35451435c8bc911908adf0bdf44253840cbdee",
+      "requires": ["phase11_resume_media_reconcile"], "resumable": true, "cursor_key": "orphan_cursor"
+    },
+    {
+      "key": "phase11_resume_deleted_target_backfill", "stage": "post_cutover", "kind": "python",
+      "path": "scripts/phase11_resume_deleted_target_backfill.py",
+      "sha256": "a7ce0b0ef01cecdc852fb77f748dd9eb0cef9db7d1e4f3e15dd7757970a7b2f8",
+      "requires": ["phase11_resume_orphan_target_reconcile"], "resumable": true, "cursor_key": "deleted_cursor"
+    },
+    {
+      "key": "phase11_resume_verify", "stage": "verify", "kind": "verify_sql",
+      "path": "sql/migrations/phase11_resume_verify.sql",
+      "sha256": "060470cd6ce06b46ba1f44aef6ee548b8fd4151080d71be158a9ba04b3a42582",
+      "requires": ["phase11_resume_deleted_target_backfill"], "resumable": true, "verify_sql": "SELECT 0 AS anomaly_count"
+    },
+    {
+      "key": "phase11_resume_lifecycle_down", "stage": "down", "kind": "sql",
+      "path": "sql/migrations/phase11_down_001_resume_lifecycle.sql",
+      "sha256": "845b6e8ddc32ae9c5431cc492f6968e28a42eedb1d262f58a578286f5e658c81",
+      "requires": ["phase11_resume_verify"], "resumable": true,
+      "verify_sql": "SELECT (SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume' AND column_name IN ('activated_at','candidate_expires_at','delist_reason')) + ((SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='resume' AND column_name='expires_at' AND data_type='datetime' AND datetime_precision=6 AND is_nullable='NO')<>1) + (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('resume_replacement','resume_replacement_rollout_assignment','resume_media_isolation_issue')) + ((SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name IN ('phase11_migration_ledger','phase11_resume_down_backup','phase11_resume_down_replacement_backup','phase11_resume_down_assignment_backup','phase11_resume_down_media_issue_backup','phase11_resume_down_ledger_backup','phase11_resume_down_export_audit'))<>7) + ((SELECT COUNT(*) FROM phase11_resume_down_export_audit WHERE artifact_name IN ('source_resume','backup_resume','source_replacement','backup_replacement','source_assignment','backup_assignment','source_media_issue','backup_media_issue','source_ledger','backup_ledger'))<>10) + (SELECT COUNT(*) FROM phase11_resume_down_export_audit WHERE artifact_name NOT IN ('source_resume','backup_resume','source_replacement','backup_replacement','source_assignment','backup_assignment','source_media_issue','backup_media_issue','source_ledger','backup_ledger')) + (SELECT COUNT(*) FROM (SELECT SUBSTRING(artifact_name,8) AS name,row_count,row_digest FROM phase11_resume_down_export_audit WHERE LEFT(artifact_name,7)='source_') s JOIN (SELECT SUBSTRING(artifact_name,8) AS name,row_count,row_digest FROM phase11_resume_down_export_audit WHERE LEFT(artifact_name,7)='backup_') b USING(name) WHERE s.row_count<>b.row_count OR s.row_digest<>b.row_digest) + (SELECT COUNT(*) FROM resume WHERE expires_at IS NULL) AS anomaly_count"
+    }
+  ]
+}

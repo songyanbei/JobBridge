@@ -42,6 +42,12 @@
         >
           <el-option v-for="o in DELIST_REASON_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
         </el-select>
+        <el-select v-model="filters.lifecycle_scope" placeholder="生命周期" clearable style="width: 140px">
+          <el-option label="在线岗位" value="active" />
+          <el-option label="候选版本" value="candidate" />
+          <el-option label="历史岗位" value="history" />
+          <el-option label="全部" value="all" />
+        </el-select>
         <el-input v-model="filters.owner_userid" placeholder="发布人 userid" clearable style="width: 160px" />
         <el-input-number v-model="filters.salary_min" placeholder="薪资下限" :min="0" style="width: 130px" />
         <el-input-number v-model="filters.salary_max" placeholder="薪资上限" :min="0" style="width: 130px" />
@@ -89,10 +95,17 @@
           </el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="生命周期" width="130">
+        <template #default="{ row }">
+          <el-tag :type="lifecycleTagType(row)" size="small">
+            {{ lifecycleLabel(row) }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="到期" width="130">
         <template #default="{ row }">
-          <span :class="`jb-${ttlLevel(row.expires_at)}-text`">
-            {{ formatDate(row.expires_at) }}
+          <span :class="`jb-${ttlLevel(row.expires_at || row.candidate_expires_at)}-text`">
+            {{ formatDate(row.expires_at || row.candidate_expires_at) }}
           </span>
         </template>
       </el-table-column>
@@ -142,6 +155,7 @@ const { state, filters, load, setPage, setSize, setSort, applyFilters, resetFilt
       pay_type: '',
       audit_status: '',
       delist_reason: '',
+      lifecycle_scope: '',
       owner_userid: '',
       salary_min: null,
       salary_max: null,
@@ -184,6 +198,23 @@ const currentId = ref(null)
 function openDetail(row) {
   currentId.value = row.id
   detailVisible.value = true
+}
+
+function lifecycleLabel(row) {
+  if (row.replaces_job_id && row.replacement_lifecycle_status === 'conflict') return '激活冲突'
+  if (row.delist_reason === 'replaced') return '已被新版本替换'
+  if (!row.activated_at && row.audit_status === 'pending') return '候选待审'
+  if (!row.activated_at && row.audit_status === 'rejected') return '候选已驳回'
+  if (row.deleted_at) return '历史记录'
+  if (row.audit_status === 'passed' && row.activated_at) return '在线岗位'
+  return '未激活'
+}
+
+function lifecycleTagType(row) {
+  if (row.replaces_job_id && row.replacement_lifecycle_status === 'conflict') return 'danger'
+  if (row.delist_reason === 'replaced' || row.deleted_at) return 'info'
+  if (!row.activated_at) return 'warning'
+  return 'success'
 }
 
 load()

@@ -30,10 +30,10 @@ jobs:
         working-directory: backend
         run: pytest -p no:cacheprovider tests/unit -q
 
-  backend-search-mysql:
-    name: backend-search-mysql
+  backend-phase10-mysql-redis:
+    name: backend-phase10-mysql-redis
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     services:
       mysql:
@@ -46,7 +46,7 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -ujobbridge_test -pjobbridge_test"
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot_password"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=10
@@ -56,9 +56,14 @@ jobs:
       DB_HOST: 127.0.0.1
       DB_PORT: "3306"
       DB_NAME: jobbridge_test
-      DB_USER: jobbridge_test
-      DB_PASSWORD: jobbridge_test
+      DB_USER: root
+      DB_PASSWORD: root_password
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_OUTAGE_CONTAINER: jobbridge-phase10-ci-redis
       RUN_INTEGRATION: "1"
+      RECOMMENDATION_CONTENT_KEY: ci-only-phase10-key
 
     steps:
       - name: Check out repository
@@ -73,9 +78,56 @@ jobs:
         working-directory: backend
         run: python -m pip install -r requirements.txt
 
-      - name: Run MySQL search integration tests
+      - name: Load production schema
         working-directory: backend
-        run: pytest -p no:cacheprovider tests/integration/test_search_sql_mysql.py -q
+        run: >-
+          mysql -h127.0.0.1 -uroot -proot_password
+          jobbridge_test < sql/schema.sql
+
+      - name: Start durable Redis
+        run: |
+          docker run -d --name jobbridge-phase10-ci-redis \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-retries 30 \
+            -p 6379:6379 \
+            redis:7 redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec jobbridge-phase10-ci-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs jobbridge-phase10-ci-redis
+          exit 1
+
+      - name: Run Phase 10 MySQL and Redis integration tests
+        working-directory: backend
+        run: |
+          pytest -p no:cacheprovider -q \
+            tests/integration/test_search_sql_mysql.py \
+            tests/integration/test_phase10_preflight_mysql.py \
+            tests/integration/test_phase10_down_migration_mysql.py \
+            tests/integration/test_job_candidate_creation_gate_mysql.py \
+            tests/integration/test_job_media_hard_delete_delay_mysql.py \
+            tests/integration/test_job_replace_mysql.py \
+            tests/integration/test_media_target_cleanup_lock_order_mysql.py \
+            tests/integration/test_outbox_claim_lock_scope_mysql.py \
+            tests/integration/test_privacy_lock_order_mysql.py \
+            tests/integration/test_privacy_redaction_batch_mysql.py \
+            tests/integration/test_session_commit_deadline_mysql.py \
+            tests/integration/test_session_commit_lease_owner_mysql.py \
+            tests/integration/test_target_cleanup_backfill_mysql.py \
+            tests/integration/test_target_cleanup_checkpoint_redis_mysql.py \
+            tests/integration/test_target_cleanup_lease_mysql.py \
+            tests/integration/test_target_cleanup_upsert_mysql.py \
+            tests/integration/test_ttl_outbox_delivery_lock_order_mysql.py \
+            tests/integration/test_redis.py
+          pytest -p no:cacheprovider -q \
+            tests/integration/test_session_commit_redis_unavailable_mysql.py
 
   backend-recommendation-mysql:
     name: backend-recommendation-mysql
@@ -96,10 +148,6 @@ jobs:
           --health-interval=10s
           --health-timeout=5s
           --health-retries=10
-      redis:
-        image: redis:7
-        ports:
-          - 6379:6379
     env:
       PHASE9_DSN: mysql+pymysql://jobbridge_test:jobbridge_test@127.0.0.1:3306/jobbridge_test
       APP_ENV: test
@@ -120,6 +168,25 @@ jobs:
       - name: Install dependencies
         working-directory: backend
         run: python -m pip install -r requirements.txt
+      - name: Start durable Redis
+        run: |
+          docker run -d --name jobbridge-ci-redis \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-retries 30 \
+            -p 6379:6379 \
+            redis:7 redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec jobbridge-ci-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs jobbridge-ci-redis
+          exit 1
       - name: Load base schema and conversation migrations
         working-directory: backend
         run: |
@@ -139,4 +206,113 @@ jobs:
         # single file made this job look far broader than it actually was.
         run: |
           pytest -p no:cacheprovider -q tests/unit -k "recommendation or click_attribution or delivery_state_machine"
-          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py
+          pytest -p no:cacheprovider -q tests/integration/test_recommendation_*.py tests/integration/test_llm_call_policy.py tests/integration/test_redis.py
+      - name: Verify revocation fence survives Redis restart
+        run: |
+          docker exec jobbridge-ci-redis redis-cli SET phase10:ci:revocation-fence retained
+          docker restart jobbridge-ci-redis
+          for attempt in {1..30}; do
+            if docker exec jobbridge-ci-redis redis-cli ping | grep -q PONG; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(docker exec jobbridge-ci-redis redis-cli --raw GET phase10:ci:revocation-fence)" = retained
+
+  backend-phase11-resume-mysql-redis:
+    name: backend-phase11-resume-mysql-redis
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_DATABASE: jobbridge_phase11
+          MYSQL_USER: jobbridge_phase11
+          MYSQL_PASSWORD: jobbridge_phase11
+          MYSQL_ROOT_PASSWORD: root_password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot_password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      APP_ENV: test
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_NAME: jobbridge_phase11
+      DB_USER: root
+      DB_PASSWORD: root_password
+      PHASE11_TEST_MYSQL_DSN: mysql+pymysql://root:root_password@127.0.0.1:3306/jobbridge_phase11
+      PHASE11_TEST_REDIS_DSN: redis://127.0.0.1:6379/11
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_DB: "11"
+      RUN_INTEGRATION: "1"
+      RECOMMENDATION_CONTENT_KEY: ci-only-phase11-key
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        working-directory: backend
+        run: python -m pip install -r requirements.txt
+      - name: Load production schema
+        working-directory: backend
+        run: >-
+          mysql -h127.0.0.1 -uroot -proot_password
+          jobbridge_phase11 < sql/schema.sql
+      - name: Start isolated durable Redis
+        run: |
+          docker run -d --name jobbridge-phase11-ci-redis \
+            --health-cmd "redis-cli ping" \
+            --health-interval 1s \
+            --health-retries 30 \
+            -p 6379:6379 \
+            redis:7 redis-server \
+            --appendonly yes \
+            --appendfsync always \
+            --maxmemory-policy noeviction
+          for attempt in {1..30}; do
+            if docker exec jobbridge-phase11-ci-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs jobbridge-phase11-ci-redis
+          exit 1
+      - name: Check Phase 11 rollout manifest
+        working-directory: backend
+        run: >-
+          python scripts/apply_phase11_migrations.py
+          manifest-check --manifest sql/migrations/phase11_manifest.json
+      - name: Run Phase 11 resume acceptance units
+        working-directory: backend
+        run: python scripts/phase11_release_gate.py release
+
+  frontend-quality:
+    name: frontend-lint-unit-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Lint
+        working-directory: frontend
+        run: npm run lint
+      - name: Unit tests
+        working-directory: frontend
+        run: npm test
+      - name: Production build
+        working-directory: frontend
+        run: npm run build

@@ -44,7 +44,9 @@ class TestEnsureTtlConfigDefaults:
         keys = {k for k, *_ in _TTL_CONFIG_DEFAULTS}
         assert keys == {
             "ttl.job.days",
+            "ttl.job.candidate.days",
             "ttl.resume.days",
+            "ttl.resume.candidate.days",
             "ttl.conversation_log.days",
             "ttl.audit_log.days",
             "ttl.wecom_inbound_event.days",
@@ -167,3 +169,32 @@ class TestTaskLockOwnerToken:
             assert acquired is False
 
         fake_redis.eval.assert_not_called()
+
+
+class TestRenewableTaskLock:
+    def test_renew_uses_owner_token_and_ttl(self, monkeypatch):
+        fake_redis = MagicMock()
+        fake_redis.set.return_value = True
+        fake_redis.eval.return_value = 1
+        monkeypatch.setattr(common, "get_redis", lambda: fake_redis)
+
+        with common.renewable_task_lock("expiry", ttl=1200) as lease:
+            assert lease.renew() is True
+            token = fake_redis.set.call_args.args[1]
+            renew_args = fake_redis.eval.call_args.args
+            assert renew_args[2:] == ("task_lock:expiry", token, 1200)
+
+        release_args = fake_redis.eval.call_args_list[-1].args
+        assert release_args[2:] == ("task_lock:expiry", token)
+
+    def test_lost_lease_is_not_released(self, monkeypatch):
+        fake_redis = MagicMock()
+        fake_redis.set.return_value = True
+        fake_redis.eval.return_value = 0
+        monkeypatch.setattr(common, "get_redis", lambda: fake_redis)
+
+        with common.renewable_task_lock("expiry", ttl=60) as lease:
+            assert lease.renew() is False
+            assert lease.acquired is False
+
+        assert fake_redis.eval.call_count == 1

@@ -14,6 +14,9 @@
 --   DELETE FROM user WHERE external_userid LIKE 'wm_mock_%';
 -- ===========================================================================
 
+-- Keep direct/manual imports safe even when the mysql client defaults to latin1.
+SET NAMES utf8mb4;
+
 INSERT INTO user (
   external_userid,
   role,
@@ -34,7 +37,7 @@ VALUES
   ('wm_mock_factory_001', 'factory', '华东电子厂', '华东电子有限公司', '王经理', '13900000001', 0, 1, 'active'),
 
   -- 中介（招聘者）× 1
-  ('wm_mock_broker_001',  'broker',  '速聘中介',   '速聘人力资源',     '赵中介', '13700000001', 0, 1, 'active')
+  ('wm_mock_broker_001',  'broker',  '速聘中介',   '速聘人力资源',     '赵中介', '13700000001', 1, 1, 'active')
 ON DUPLICATE KEY UPDATE
   role           = VALUES(role),
   display_name   = VALUES(display_name),

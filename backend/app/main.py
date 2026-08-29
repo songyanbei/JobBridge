@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from app.api.admin import router as admin_router
@@ -21,6 +22,7 @@ from app.api.webhook import router as webhook_router
 from app.config import settings
 from app.core.exceptions import AppError, BusinessException
 from app.core.logging_setup import configure_loguru
+from app.core.redis_client import validate_redis_durability_policy
 from app.core.responses import fail
 from app.db import SessionLocal
 from app.tasks import scheduler as task_scheduler
@@ -36,6 +38,7 @@ async def lifespan(app: FastAPI):
     - 关闭阶段：`shutdown(wait=False)` 让进程能快速退出，分布式锁靠 TTL 兜底。
     """
     configure_loguru(settings.app_env)
+    validate_redis_durability_policy()
     from app.services.recommendation_shadow_service import start_shadow_runner
     from app.services.recommendation_strategy_service import (
         start_runtime_control_watcher,
@@ -177,10 +180,43 @@ app.include_router(admin_router)
 app.include_router(events_router)
 
 
+def mount_local_storage_files(
+    target_app: FastAPI,
+    *,
+    provider: str | None = None,
+    url_prefix: str | None = None,
+    directory: str | None = None,
+) -> StaticFiles | None:
+    """Mount the configured local object directory at its presentation prefix."""
+    if (provider or settings.oss_provider) != "local":
+        return None
+    prefix = "/" + (url_prefix or settings.oss_local_url_prefix).strip("/")
+    if prefix == "/":
+        raise ValueError("local storage URL prefix cannot be root")
+    static_files = StaticFiles(
+        directory=directory or settings.oss_local_dir,
+        check_dir=False,
+    )
+    target_app.mount(prefix, static_files, name="local-storage-files")
+    return static_files
+
+
+# Local storage persists object keys in business rows.  Production mounts the
+# same directory in app and worker containers.
+mount_local_storage_files(app)
+
+
 @app.get("/health", tags=["system"])
 def health_check():
     """Liveness: the API process is running."""
-    return {"status": "ok", "env": settings.app_env, "version": app.version}
+    from app.services.phase11_build_info import build_probe_payload
+
+    return {
+        "status": "ok",
+        "env": settings.app_env,
+        "version": app.version,
+        **build_probe_payload(),
+    }
 
 
 def _readiness_report() -> dict:

@@ -9,6 +9,7 @@ import logging
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.core.redis_client import (
     current_user_lock_fence,
@@ -34,6 +35,7 @@ class StagedSessionCommit:
     operation: str
     expected_version: int
     payload: dict | None
+    deadline_epoch: Decimal | float | None = None
 
 
 @dataclass
@@ -226,6 +228,7 @@ def apply_staged_session(commit: StagedSessionCommit) -> bool:
             commit.userid,
             commit.expected_version,
             lock_fence=fence,
+            deadline_epoch=commit.deadline_epoch,
         )
     if commit.operation == "save" and commit.payload is not None:
         return redis_save_session_if_version(
@@ -237,16 +240,22 @@ def apply_staged_session(commit: StagedSessionCommit) -> bool:
             # session_pending, the durable per-user order gate prevents a later
             # turn from advancing state, so restoring an expired key is safe.
             allow_missing=True,
+            deadline_epoch=commit.deadline_epoch,
         )
     raise ValueError(f"invalid staged session operation: {commit.operation}")
 
 
 def is_staged_session_applied(commit: StagedSessionCommit) -> bool:
     """识别“Redis 已成功、DB 状态回写前崩溃”的幂等恢复窗口。"""
-    current = redis_get_session(commit.userid)
     if commit.operation == "delete":
-        return current is None
-    return current == commit.payload
+        return redis_get_session(commit.userid) is None
+    if (
+        commit.operation != "save"
+        or not isinstance(commit.payload, dict)
+        or not commit.payload
+    ):
+        return False
+    return redis_get_session(commit.userid) == commit.payload
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +371,8 @@ def reset_search(session: SessionState) -> None:
     if not has_pending:
         session.follow_up_rounds = 0
         session.current_intent = None
+        session.attachment_target_type = None
+        session.attachment_target_id = None
         # Stage C1：无 pending 时，/重新找 收敛为 idle；有 pending 时保留 upload_collecting
         session.active_flow = "idle"
     # Phase 1（dialogue-intent-extraction-phased-plan §1.1.2）：搜索 awaiting
@@ -530,6 +541,8 @@ def set_broker_direction(
     clear_search_awaiting(session)
     if not session.pending_upload_intent:
         session.follow_up_rounds = 0
+        session.attachment_target_type = None
+        session.attachment_target_id = None
         # Stage C1：无 pending 时，方向切换后回 idle，等待下一次搜索把 active_flow 推进
         session.active_flow = "idle"
     return None

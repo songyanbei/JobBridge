@@ -22,17 +22,171 @@
 """
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import text
 
 from app.core.logging_setup import identifier_hash
 from app.db import SessionLocal
-from app.storage import get_storage
+from app.models import RecommendationDelivery, WecomOutboundOutbox
 from app.tasks.common import ensure_ttl_config_defaults, log_event, task_lock
 
 BATCH_SIZE = 500
+
+_DELIVERY_CONTENT_EXPIRED = "recommendation content expired before send"
+_OUTBOX_CONTENT_EXPIRED = "recommendation delivery expired before send"
+_SENDING_CONTENT_EXPIRED = "sending lease expired after content TTL"
+_OUTBOX_SENDING_AMBIGUOUS = (
+    "ambiguous provider outcome; automatic resend disabled"
+)
+
+
+def _expired_content_candidate_ids(db, after_id: str | None) -> list[str]:
+    """Read one keyset page without locking either durable table."""
+    rows = db.execute(
+        text(
+            "SELECT d.delivery_id FROM recommendation_delivery d "
+            "WHERE (:after_id IS NULL OR d.delivery_id > :after_id) AND ("
+            "  (d.content_expires_at IS NOT NULL "
+            "   AND d.content_expires_at <= NOW(6) AND ("
+            "     d.status IN ('prepared','pending','retry_wait') "
+            "     OR (d.status='sending' AND d.lease_expires_at IS NOT NULL "
+            "         AND d.lease_expires_at <= NOW(6)) "
+            "     OR (d.status IN ('sent','permanent_failed','unknown') "
+            "         AND (d.content_ciphertext IS NOT NULL "
+            "              OR d.session_patch_ciphertext IS NOT NULL))"
+            "   )) "
+            "  OR (d.status='prepared' "
+            "      AND d.created_at < NOW(6) - INTERVAL 24 HOUR) "
+            "  OR (d.status='unknown' AND d.content_ciphertext IS NOT NULL "
+            "      AND d.updated_at < NOW(6) - INTERVAL 7 DAY)"
+            ") ORDER BY d.delivery_id LIMIT :limit"
+        ),
+        {"after_id": after_id, "limit": BATCH_SIZE},
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _lock_outboxes_for_deliveries(
+    db, delivery_ids: list[str],
+) -> dict[str, WecomOutboundOutbox]:
+    if not delivery_ids:
+        return {}
+    rows = (
+        db.query(WecomOutboundOutbox)
+        .populate_existing()
+        .filter(WecomOutboundOutbox.recommendation_delivery_id.in_(delivery_ids))
+        .order_by(WecomOutboundOutbox.id)
+        .with_for_update()
+        .all()
+    )
+    return {
+        str(row.recommendation_delivery_id): row
+        for row in rows
+        if row.recommendation_delivery_id is not None
+    }
+
+
+def _lock_expired_content_deliveries(
+    db, delivery_ids: list[str],
+) -> list[RecommendationDelivery]:
+    if not delivery_ids:
+        return []
+    return (
+        db.query(RecommendationDelivery)
+        .populate_existing()
+        .filter(RecommendationDelivery.delivery_id.in_(delivery_ids))
+        .order_by(RecommendationDelivery.delivery_id)
+        .with_for_update()
+        .all()
+    )
+
+
+def _clear_delivery_ciphertext(delivery: RecommendationDelivery) -> bool:
+    changed = False
+    if delivery.content_ciphertext is not None:
+        delivery.content_ciphertext = None
+        changed = True
+    if delivery.session_patch_ciphertext is not None:
+        delivery.session_patch_ciphertext = None
+        changed = True
+    return changed
+
+
+def _dead_letter_outbox(
+    outbox: WecomOutboundOutbox | None, *, ambiguous: bool,
+) -> None:
+    if outbox is None:
+        return
+    eligible = ("pending", "sending") if ambiguous else ("pending",)
+    if outbox.status not in eligible:
+        return
+    outbox.status = "dead_letter"
+    outbox.locked_at = None
+    outbox.next_attempt_at = None
+    outbox.last_error = (
+        _OUTBOX_SENDING_AMBIGUOUS if ambiguous else _OUTBOX_CONTENT_EXPIRED
+    )
+
+
+def _apply_expired_content_rules(
+    delivery: RecommendationDelivery,
+    outbox: WecomOutboundOutbox | None,
+    now: datetime,
+) -> bool:
+    """Apply TTL transitions after both tables have been locked."""
+    status = str(delivery.status or "")
+    content_expired = (
+        delivery.content_expires_at is not None
+        and delivery.content_expires_at <= now
+    )
+
+    if (
+        status == "sending"
+        and content_expired
+        and delivery.lease_expires_at is not None
+        and delivery.lease_expires_at <= now
+    ):
+        delivery.status = "unknown"
+        delivery.last_error = _SENDING_CONTENT_EXPIRED
+        delivery.last_error_code = "sending_lease_expired"
+        delivery.lease_owner = None
+        delivery.lease_expires_at = None
+        _clear_delivery_ciphertext(delivery)
+        _dead_letter_outbox(outbox, ambiguous=True)
+        return True
+
+    if content_expired and status in ("prepared", "pending", "retry_wait"):
+        delivery.status = "permanent_failed"
+        delivery.last_error = _DELIVERY_CONTENT_EXPIRED
+        _clear_delivery_ciphertext(delivery)
+        _dead_letter_outbox(outbox, ambiguous=False)
+        return True
+
+    if content_expired and status in ("sent", "permanent_failed", "unknown"):
+        return _clear_delivery_ciphertext(delivery)
+
+    if (
+        status == "prepared"
+        and delivery.created_at is not None
+        and delivery.created_at < now - timedelta(hours=24)
+    ):
+        delivery.status = "permanent_failed"
+        delivery.last_error = "prepared session never committed within 24h"
+        delivery.last_error_code = "session_commit_timeout"
+        _clear_delivery_ciphertext(delivery)
+        return True
+
+    if (
+        status == "unknown"
+        and delivery.content_ciphertext is not None
+        and delivery.updated_at is not None
+        and delivery.updated_at < now - timedelta(days=7)
+    ):
+        return _clear_delivery_ciphertext(delivery)
+
+    return False
 
 
 def _redact_expired_recommendation_content(db) -> int:
@@ -47,59 +201,29 @@ def _redact_expired_recommendation_content(db) -> int:
       （旧实现写的 ``expired`` 不在枚举内）；
     - sending 且租约已过期转 ``unknown``，不自动重发（§10.3）。
     """
-    unknown = db.execute(text(
-        "UPDATE recommendation_delivery d "
-        "JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
-        "SET d.status='unknown', d.last_error='sending lease expired after content TTL', "
-        "d.last_error_code='sending_lease_expired', "
-        "o.status='dead_letter', o.locked_at=NULL, o.next_attempt_at=NULL, "
-        "o.last_error='ambiguous provider outcome; automatic resend disabled' "
-        "WHERE d.status='sending' AND d.lease_expires_at IS NOT NULL "
-        "AND d.lease_expires_at <= NOW(6) "
-        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
-    ))
-    expired = db.execute(text(
-        "UPDATE recommendation_delivery d "
-        "LEFT JOIN wecom_outbound_outbox o ON o.recommendation_delivery_id=d.delivery_id "
-        "SET d.content_ciphertext=NULL, d.session_patch_ciphertext=NULL, "
-        # MySQL 的多列 UPDATE 是左到右求值，后面的 CASE 会读到已经被改写的列值，
-        # 因此所有依赖旧 status 的赋值必须排在 status 之前。
-        "d.last_error=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
-        "             THEN 'recommendation content expired before send' ELSE d.last_error END, "
-        # P2-12：retry_wait 同样是“还没发出去”的可恢复状态，必须纳入。
-        "d.status=CASE WHEN d.status IN ('prepared','pending','retry_wait') "
-        "             THEN 'permanent_failed' ELSE d.status END, "
-        "o.last_error=CASE WHEN o.status='pending' "
-        "                 THEN 'recommendation delivery expired before send' ELSE o.last_error END, "
-        "o.status=CASE WHEN o.status='pending' THEN 'dead_letter' ELSE o.status END, "
-        "o.locked_at=NULL, o.next_attempt_at=NULL "
-        "WHERE d.status IN ('prepared','pending','retry_wait','sent','permanent_failed','unknown') "
-        "AND d.content_expires_at IS NOT NULL AND d.content_expires_at <= NOW(6)"
-    ))
-    # §9.11 行 2109：prepared 超过 24 小时仍无法提交 session 时转 permanent_failed
-    # 并同时清空正文，避免可解密的推荐正文无限期停留。
-    stale_prepared = db.execute(text(
-        "UPDATE recommendation_delivery "
-        "SET status='permanent_failed', content_ciphertext=NULL, "
-        "session_patch_ciphertext=NULL, "
-        "last_error='prepared session never committed within 24h', "
-        "last_error_code='session_commit_timeout' "
-        "WHERE status='prepared' AND created_at < NOW(6) - INTERVAL 24 HOUR"
-    ))
-    # unknown 最多保留 7 天正文，供人工按 msgid 核对后再清理。
-    stale_unknown = db.execute(text(
-        "UPDATE recommendation_delivery "
-        "SET content_ciphertext=NULL, session_patch_ciphertext=NULL "
-        "WHERE status='unknown' AND content_ciphertext IS NOT NULL "
-        "AND updated_at < NOW(6) - INTERVAL 7 DAY"
-    ))
-    db.commit()
-    return (
-        int(unknown.rowcount or 0)
-        + int(expired.rowcount or 0)
-        + int(stale_prepared.rowcount or 0)
-        + int(stale_unknown.rowcount or 0)
-    )
+    total = 0
+    after_id: str | None = None
+    while True:
+        candidate_ids = _expired_content_candidate_ids(db, after_id)
+        if not candidate_ids:
+            break
+
+        # Global order shared with the worker terminalizer: every outbox row
+        # first, then every delivery row. No write starts until both sets are held.
+        outboxes = _lock_outboxes_for_deliveries(db, candidate_ids)
+        deliveries = _lock_expired_content_deliveries(db, candidate_ids)
+        now = db.execute(text("SELECT NOW(6)")).scalar_one()
+        for delivery in deliveries:
+            if _apply_expired_content_rules(
+                delivery, outboxes.get(str(delivery.delivery_id)), now,
+            ):
+                total += 1
+
+        db.commit()
+        after_id = candidate_ids[-1]
+        if len(candidate_ids) < BATCH_SIZE:
+            break
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +334,10 @@ def _load_ttl_config(db) -> dict[str, int]:
     说明：``ttl.job.days`` / ``ttl.resume.days`` 在 upload_service 写 expires_at
     时消费，本任务不再二次读取。
     """
+    from app.services.lifecycle_config_service import get_hard_delete_delay_days
+
     return {
-        "hard_delete_delay_days": _read_int_config(db, "ttl.hard_delete.delay_days", 7),
+        "hard_delete_delay_days": get_hard_delete_delay_days(db),
         "conversation_log_days": _read_int_config(db, "ttl.conversation_log.days", 30),
         "wecom_inbound_event_days": _read_int_config(db, "ttl.wecom_inbound_event.days", 30),
         "audit_log_days": _read_int_config(db, "ttl.audit_log.days", 180),
@@ -277,97 +403,201 @@ def _safe_step(step_name: str, stats: dict, fn) -> None:
 # ---------------------------------------------------------------------------
 
 def _soft_delete_expired_jobs(db) -> int:
-    """岗位过期软删：标记 delist_reason='expired' 并写 deleted_at。"""
-    result = db.execute(
-        text(
-            "UPDATE `job` SET delist_reason='expired', deleted_at=NOW() "
-            "WHERE expires_at < NOW() AND delist_reason IS NULL AND deleted_at IS NULL"
-        )
-    )
-    db.commit()
-    return int(result.rowcount or 0)
+    """每日兜底复用高频任务的行锁、状态复核和 durable 清理生产逻辑。"""
+    from app.config import settings
+
+    if not settings.job_expiry_cleanup_enabled:
+        log_event("job_expiry_cleanup_disabled", source="daily_fallback")
+        return 0
+    from app.tasks.job_expiry_cleanup import process_expired_jobs
+    stats = process_expired_jobs(db, max_runtime_seconds=None)
+    return int(stats["processed"])
 
 
 def _soft_delete_expired_resumes(db) -> int:
-    """简历过期软删：写 deleted_at。"""
-    result = db.execute(
-        text(
-            "UPDATE `resume` SET deleted_at=NOW() "
-            "WHERE expires_at < NOW() AND deleted_at IS NULL"
-        )
-    )
-    db.commit()
-    return int(result.rowcount or 0)
+    """Daily fallback reuses the high-frequency Resume lifecycle transition."""
+    from app.config import settings
+    if not settings.resume_expiry_cleanup_enabled:
+        log_event("resume_expiry_cleanup_disabled", source="daily_fallback")
+        return 0
+    from app.tasks.resume_expiry_cleanup import process_expired_resumes
+    return int(process_expired_resumes(db, max_runtime_seconds=None)["processed"])
 
 
 def _hard_delete_expired_jobs(db, delay_days: int) -> int:
-    """岗位软删 ``delay_days`` 天后硬删。"""
-    return _batch_hard_delete(
-        db, "job",
-        f"deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY",
+    """Fail-closed Job hard delete with replacement, cleanup and media gates."""
+    from app.config import settings
+    from app.models import JobReplacement
+    from app.services.job_media_service import (
+        hard_delete_media_complete,
+        mark_job_media_delete_pending,
     )
+    from app.services.target_cleanup_service import job_cleanup_succeeded
+
+    if not settings.job_hard_delete_enabled:
+        log_event("job_hard_delete_disabled")
+        return 0
+
+    deleted = 0
+    cursor_deleted_at = None
+    cursor_id = 0
+    while True:
+        cursor_sql = ""
+        params = {"cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id}
+        if cursor_deleted_at is not None:
+            cursor_sql = (
+                "AND (deleted_at > :cursor_deleted_at "
+                "OR (deleted_at = :cursor_deleted_at AND id > :cursor_id)) "
+            )
+        rows = db.execute(text(
+            "SELECT id, images, deleted_at FROM `job` "
+            f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+            + cursor_sql
+            + f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE}"
+        ), params).fetchall()
+        if not rows:
+            break
+        for job_id, images, deleted_at in rows:
+            job_id = int(job_id)
+            active_relation = db.query(JobReplacement.id).filter(
+                (
+                    (JobReplacement.old_job_id == job_id)
+                    | (JobReplacement.new_job_id == job_id)
+                ),
+                JobReplacement.lifecycle_status.in_(("awaiting_review", "conflict")),
+            ).first()
+            if active_relation is not None:
+                continue
+            if mark_job_media_delete_pending(db, job_id):
+                continue
+            if not job_cleanup_succeeded(db, int(job_id)):
+                continue
+            if not hard_delete_media_complete(db, int(job_id), images):
+                continue
+            result = db.execute(text(
+                "DELETE FROM `job` WHERE id=:job_id "
+                f"AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
+                "AND EXISTS (SELECT 1 FROM `target_cleanup_task` t "
+                "WHERE t.target_type='job' AND t.target_id=:job_id "
+                "AND t.status='succeeded') "
+                "AND NOT EXISTS (SELECT 1 FROM `media_asset_lifecycle` m "
+                "WHERE m.entity_type='job' AND m.entity_id=:job_id "
+                "AND m.state<>'deleted') "
+                "AND NOT EXISTS (SELECT 1 FROM `job_replacement` r "
+                "WHERE (r.old_job_id=:job_id OR r.new_job_id=:job_id) "
+                "AND r.lifecycle_status IN ('awaiting_review','conflict'))"
+            ), {"job_id": job_id})
+            deleted += int(result.rowcount or 0)
+        db.commit()
+        cursor_id = int(rows[-1][0])
+        cursor_deleted_at = rows[-1][2]
+        if len(rows) < BATCH_SIZE:
+            break
+    return deleted
 
 
 def _hard_delete_expired_resumes(db, delay_days: int) -> int:
-    """简历软删 ``delay_days`` 天后硬删；删除前先收集 images 中的对象存储 key 并调用 storage.delete()。"""
-    storage = None
-    try:
-        storage = get_storage()
-    except Exception:
-        logger.exception("ttl_cleanup: get_storage failed (skip storage cleanup)")
+    """Fail-closed Resume hard delete after every Phase 11 cleanup gate."""
+    from app.config import settings
+    from app.services.job_media_service import (
+        mark_resume_media_delete_pending,
+        resume_hard_delete_media_complete,
+    )
+    from app.services.target_cleanup_service import target_cleanup_succeeded
+
+    if not settings.resume_hard_delete_enabled:
+        log_event("resume_hard_delete_disabled")
+        return 0
+
+    # Migration reconciliation is global: one unverified ledger/orphan row
+    # keeps every Resume recoverable.  Operational exceptions never open this gate.
+    migration_ready = db.execute(text(
+        "SELECT EXISTS(SELECT 1 FROM phase11_migration_ledger "
+        "WHERE stage='verify' AND status='verified') "
+        "AND NOT EXISTS(SELECT 1 FROM phase11_migration_ledger "
+        "WHERE status IN ('running','failed')) "
+        "AND NOT EXISTS(SELECT 1 FROM target_cleanup_task "
+        "WHERE target_type='resume' AND reason='legacy_orphan' AND status<>'succeeded')"
+    )).scalar()
+    if not migration_ready:
+        log_event("resume_hard_delete_migration_gate_closed")
+        return 0
 
     total_deleted = 0
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=int(delay_days))
+    cursor_deleted_at = None
+    cursor_id = 0
     while True:
-        rows = db.execute(
-            text(
-                "SELECT id, images FROM `resume` "
-                f"WHERE deleted_at IS NOT NULL AND deleted_at < NOW() - INTERVAL {int(delay_days)} DAY "
-                f"LIMIT {BATCH_SIZE}"
+        cursor_sql = ""
+        params = {
+            "cursor_deleted_at": cursor_deleted_at, "cursor_id": cursor_id,
+            "hard_delete_cutoff_utc": cutoff,
+        }
+        if cursor_deleted_at is not None:
+            cursor_sql = (
+                "AND (deleted_at > :cursor_deleted_at "
+                "OR (deleted_at = :cursor_deleted_at AND id > :cursor_id)) "
             )
-        ).fetchall()
+        rows = db.execute(text(
+            "SELECT id, images, deleted_at FROM `resume` "
+            "WHERE deleted_at IS NOT NULL AND deleted_at <= :hard_delete_cutoff_utc "
+            + cursor_sql
+            + f"ORDER BY deleted_at, id LIMIT {BATCH_SIZE} FOR UPDATE SKIP LOCKED"
+        ), params).fetchall()
         if not rows:
             break
 
-        # 1) 清理对象存储
-        for rid, images in rows:
-            keys = _extract_image_keys(images)
-            for key in keys:
-                if storage is None:
-                    continue
-                try:
-                    storage.delete(key)
-                except Exception:
-                    logger.exception(
-                        f"ttl_cleanup: storage.delete failed key={key} resume_id={rid}"
-                    )
+        # Hand attached objects to the durable worker before checking the gate.
+        for resume_id, images, _deleted_at in rows:
+            resume_id = int(resume_id)
+            active_relation = db.execute(text(
+                "SELECT 1 FROM resume_replacement WHERE "
+                "(old_resume_id=:resume_id OR new_resume_id=:resume_id) "
+                "AND lifecycle_status IN ('awaiting_review','conflict') LIMIT 1"
+            ), {"resume_id": resume_id}).first()
+            if active_relation is not None:
+                continue
+            unresolved_issue = db.execute(text(
+                "SELECT 1 FROM resume_media_isolation_issue "
+                "WHERE resume_id=:resume_id AND status<>'resolved' LIMIT 1"
+            ), {"resume_id": resume_id}).first()
+            if unresolved_issue is not None:
+                continue
+            if mark_resume_media_delete_pending(db, resume_id):
+                continue
+            if not target_cleanup_succeeded(db, "resume", resume_id):
+                continue
+            if not resume_hard_delete_media_complete(db, resume_id, images):
+                continue
+            result = db.execute(text(
+                "DELETE FROM `resume` WHERE id=:resume_id "
+                "AND deleted_at <= :hard_delete_cutoff_utc "
+                "AND EXISTS (SELECT 1 FROM target_cleanup_task t WHERE "
+                "t.target_type='resume' AND t.target_id=:resume_id AND t.status='succeeded') "
+                "AND NOT EXISTS (SELECT 1 FROM `media_asset_lifecycle` m "
+                "WHERE m.entity_type='resume' AND m.entity_id=:resume_id "
+                "AND m.state<>'deleted') "
+                "AND NOT EXISTS (SELECT 1 FROM resume_media_isolation_issue i "
+                "WHERE i.resume_id=:resume_id AND i.status<>'resolved') "
+                "AND NOT EXISTS (SELECT 1 FROM resume_replacement r WHERE "
+                "(r.old_resume_id=:resume_id OR r.new_resume_id=:resume_id) "
+                "AND r.lifecycle_status IN ('awaiting_review','conflict')) "
+                "AND EXISTS (SELECT 1 FROM phase11_migration_ledger l "
+                "WHERE l.stage='verify' AND l.status='verified') "
+                "AND NOT EXISTS (SELECT 1 FROM phase11_migration_ledger l "
+                "WHERE l.status IN ('running','failed')) "
+                "AND NOT EXISTS (SELECT 1 FROM target_cleanup_task o WHERE "
+                "o.target_type='resume' AND o.reason='legacy_orphan' "
+                "AND o.status<>'succeeded')"
+            ), {"resume_id": resume_id, "hard_delete_cutoff_utc": cutoff})
+            total_deleted += int(result.rowcount or 0)
 
-        # 2) 删库
-        ids = [str(r[0]) for r in rows]
-        id_list = ",".join(ids)
-        result = db.execute(text(f"DELETE FROM `resume` WHERE id IN ({id_list})"))
         db.commit()
-        deleted = int(result.rowcount or 0)
-        total_deleted += deleted
-        if deleted < BATCH_SIZE:
+        cursor_id = int(rows[-1][0])
+        cursor_deleted_at = rows[-1][2]
+        if len(rows) < BATCH_SIZE:
             break
     return total_deleted
-
-
-def _extract_image_keys(images: Any) -> list[str]:
-    """images 列存的是 storage key 数组，既可能是 list 也可能是 JSON 字符串。"""
-    if images is None:
-        return []
-    if isinstance(images, list):
-        return [str(k) for k in images if k]
-    if isinstance(images, (bytes, str)):
-        import json
-        try:
-            data = json.loads(images)
-        except Exception:
-            return []
-        if isinstance(data, list):
-            return [str(k) for k in data if k]
-    return []
 
 
 def _hard_delete_deleted_users(db, delay_days: int) -> int:
@@ -427,18 +657,6 @@ def _hard_delete_deleted_users(db, delay_days: int) -> int:
 
     total_deleted = 0
     for uid in userids:
-        # 硬删该用户 resume（含 storage 清理）
-        try:
-            total_deleted += _batch_hard_delete(
-                db,
-                "resume",
-                f"owner_userid = {_escape_literal(uid)}",
-            )
-        except Exception:
-            logger.exception(
-                "ttl_cleanup: hard delete resume failed user_hash={}",
-                identifier_hash(uid),
-            )
         # 硬删其 conversation_log 残留
         try:
             total_deleted += _batch_hard_delete(

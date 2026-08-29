@@ -174,6 +174,52 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
     )
 
+    # Phase 11 rollout gates.  All remain fail-closed until a later cutover
+    # stage explicitly enables them; keeping them in the contract now lets
+    # mixed-version app/worker fleets parse the same environment.
+    resume_lifecycle_v2_enabled: bool = False
+    resume_replacement_enabled: bool = False
+    resume_expiry_cleanup_enabled: bool = False
+    resume_candidate_cleanup_enabled: bool = False
+    resume_hard_delete_enabled: bool = False
+    ttl_resume_days: int = 30
+    ttl_resume_candidate_days: int = 7
+    phase11_build_number: int = 0
+    phase11_build_sha: str = "0000000000000000000000000000000000000000"
+    phase11_resume_writes_paused: bool = False
+
+    @field_validator("ttl_resume_days", mode="after")
+    @classmethod
+    def _valid_resume_ttl(cls, value: int) -> int:
+        value = int(value)
+        if not 1 <= value <= 3650:
+            raise ValueError("ttl_resume_days must be between 1 and 3650")
+        return value
+
+    @field_validator("ttl_resume_candidate_days", mode="after")
+    @classmethod
+    def _valid_resume_candidate_ttl(cls, value: int) -> int:
+        value = int(value)
+        if not 1 <= value <= 365:
+            raise ValueError("ttl_resume_candidate_days must be between 1 and 365")
+        return value
+
+    @field_validator("phase11_build_number", mode="after")
+    @classmethod
+    def _valid_phase11_build_number(cls, value: int) -> int:
+        value = int(value)
+        if value < 0:
+            raise ValueError("phase11_build_number must be non-negative")
+        return value
+
+    @field_validator("phase11_build_sha", mode="after")
+    @classmethod
+    def _valid_phase11_build_sha(cls, value: str) -> str:
+        value = str(value).strip().lower()
+        if len(value) != 40 or any(ch not in "0123456789abcdef" for ch in value):
+            raise ValueError("phase11_build_sha must be a 40-character lowercase git SHA")
+        return value
+
     # ---- 应用 ----
     app_env: str = "development"
     app_host: str = "0.0.0.0"
@@ -305,13 +351,23 @@ class Settings(BaseSettings):
         "recommendation_shadow_persistence_threads",
         "recommendation_shadow_persistence_queue_capacity",
         "recommendation_shadow_max_output_tokens",
-        "recommendation_content_key_active_version",
         mode="after",
     )
     @classmethod
     def _at_least_one(cls, v: int) -> int:
         """0 / 负数会让 semaphore、队列和密钥版本静默失效，一律夹到 1。"""
         return max(1, int(v))
+
+    @field_validator("recommendation_content_key_active_version", mode="after")
+    @classmethod
+    def _valid_recommendation_content_key_version(cls, v: int) -> int:
+        """Keep key versions representable by the envelope and MySQL SMALLINT."""
+        version = max(1, int(v))
+        if version > 65_535:
+            raise ValueError(
+                "recommendation_content_key_active_version must be between 1 and 65535"
+            )
+        return version
 
     @field_validator("recommendation_shadow_timeout_seconds", mode="after")
     @classmethod
@@ -432,6 +488,7 @@ class Settings(BaseSettings):
     oss_bucket: str = ""
     oss_local_dir: str = "uploads"           # 本地存储目录（oss_provider=local 时生效）
     oss_local_url_prefix: str = "/files"     # 本地文件 URL 前缀
+    oss_trusted_origins: str = ""             # 允许反解为 object key 的历史访问域名，逗号分隔
 
     # ---- 运营后台 JWT ----
     admin_jwt_secret: str = "change-me"
@@ -708,6 +765,10 @@ class Settings(BaseSettings):
 
     # ---- Phase 7：定时任务与监控 ----
     scheduler_timezone: str = "Asia/Shanghai"
+    job_replacement_enabled: bool = False
+    job_expiry_cleanup_enabled: bool = False
+    job_candidate_cleanup_enabled: bool = False
+    job_hard_delete_enabled: bool = False
     daily_report_chat_id: str = ""  # 企微群 chatid；为空时日报/告警只打 loguru 不推送
     monitor_queue_incoming_threshold: int = 50
     monitor_queue_incoming_max_age_seconds: int = 120

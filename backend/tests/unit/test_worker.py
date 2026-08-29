@@ -12,17 +12,23 @@
 import json
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, call, patch
 
 import pytest
+from sqlalchemy.dialects import mysql
+from sqlalchemy.orm import Session
 
-from app.schemas.conversation import ReplyMessage
+from app.core.redis_client import SessionCommitDeadlineExceeded, UserLockUnavailable
+from app.models import WecomOutboundOutbox
+from app.schemas.conversation import ReplyMessage, SessionState
 from app.services.worker import (
     MAX_RETRY,
     MAX_SEND_RETRY,
     QUEUE_SEND_RETRY,
     SEND_RETRY_BACKOFFS,
     Worker,
+    _build_outbox_claim_query,
     _build_wecom_message,
     _coerce_log_msg_type,
 )
@@ -84,6 +90,151 @@ class TestCoerceLogMsgType:
 
     def test_unknown_maps_to_system(self):
         assert _coerce_log_msg_type("weird") == "system"
+
+
+def _replacement_session(**overrides):
+    values = {
+        "role": "factory",
+        "pending_upload_intent": "upload_job",
+        "pending_upload_mode": "replace",
+        "pending_target_id": 42,
+        "pending_target_version": 7,
+        "pending_operation_id": "o" * 36,
+        "pending_expires_at": (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        ).isoformat(),
+    }
+    values.update(overrides)
+    return SessionState(**values)
+
+
+class TestImageMediaOperation:
+    @pytest.mark.parametrize(
+        ("session", "expected_operation_id"),
+        [
+            (None, "image-msg-1"),
+            (SessionState(role="factory", pending_upload_mode="create"), "image-msg-1"),
+            (_replacement_session(), "o" * 36),
+        ],
+    )
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.storage.get_storage")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    def test_media_uses_draft_operation_id_for_replacement_only(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_get_storage,
+        mock_record_pending_media,
+        session,
+        expected_operation_id,
+        worker,
+    ):
+        mock_load_session.return_value = session
+        media_db = MagicMock()
+        mock_session_factory.return_value.__enter__.return_value = media_db
+        mock_record_pending_media.return_value.id = 17
+        worker._wecom_client.download_media.return_value = b"image"
+        storage = mock_get_storage.return_value
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="image-msg-1"),
+            "msg_type": "image",
+            "media_id": "wecom-media-1",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        mock_record_pending_media.assert_called_once_with(
+            media_db,
+            "images/u1/image-msg-1.jpg",
+            owner_userid="u1",
+            operation_id=expected_operation_id,
+        )
+        media_db.commit.assert_called_once_with()
+        storage.save.assert_called_once_with(
+            "images/u1/image-msg-1.jpg",
+            b"image",
+            content_type="image/jpeg",
+        )
+        assert msg.media_lifecycle_id == 17
+        assert msg.image_url == "images/u1/image-msg-1.jpg"
+
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    @pytest.mark.parametrize(
+        "session",
+        [
+            _replacement_session(pending_upload_intent=None),
+            _replacement_session(pending_target_id=None),
+            _replacement_session(pending_target_version=None),
+            _replacement_session(pending_expires_at=None),
+            _replacement_session(
+                pending_expires_at=(
+                    datetime.now(timezone.utc) - timedelta(seconds=1)
+                ).isoformat(),
+            ),
+            _replacement_session(pending_operation_id=None),
+            _replacement_session(pending_operation_id="o" * 37),
+        ],
+    )
+    def test_invalid_replacement_context_fails_before_media_write(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_record_pending_media,
+        session,
+        worker,
+    ):
+        mock_load_session.return_value = session
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="image-msg-2"),
+            "msg_type": "image",
+            "media_id": "wecom-media-2",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        mock_session_factory.assert_not_called()
+        mock_record_pending_media.assert_not_called()
+        assert msg.image_url == ""
+        assert msg.media_lifecycle_id is None
+
+    @patch("app.services.job_media_service.record_pending_media")
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.conversation_service.load_session")
+    def test_expired_create_draft_fails_before_download_or_media_ttl_refresh(
+        self,
+        mock_load_session,
+        mock_session_factory,
+        mock_record_pending_media,
+        worker,
+    ):
+        mock_load_session.return_value = SessionState(
+            role="factory",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="create",
+            pending_upload_media_ids=[41],
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        msg = _build_wecom_message({
+            **_basic_msg_data(msg_id="expired-create-image"),
+            "msg_type": "image",
+            "media_id": "wecom-media-expired",
+        })
+
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        mock_session_factory.assert_not_called()
+        mock_record_pending_media.assert_not_called()
+        assert msg.expired_upload_draft is True
+        assert msg.image_url == ""
+        assert msg.media_lifecycle_id is None
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +466,7 @@ class TestDurableSessionCommit:
         item = {
             "event_id": 42,
             "attempts": 2,
+            "lease_owner": "claim-1",
             "commit": MagicMock(),
         }
         with patch(
@@ -330,8 +482,309 @@ class TestDurableSessionCommit:
         ) as mark_retry:
             assert worker._apply_session_commit_item(item) is True
 
-        mark_applied.assert_called_once_with(42)
+        mark_applied.assert_called_once_with(42, "claim-1")
         mark_retry.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    def test_stale_session_claim_owner_cannot_mark_commit_applied(
+        self, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        query = db.query.return_value
+        query.filter.return_value.update.return_value = 0
+        mock_session_factory.return_value = db
+
+        with patch("app.services.worker._promote_prepared_deliveries") as promote:
+            assert worker._mark_session_commit_applied(42, "stale-owner") is False
+
+        filters = " ".join(str(value) for value in query.filter.call_args.args)
+        assert "session_apply_lease_owner" in filters
+        assert "session_apply_locked_at" in filters
+        promote.assert_not_called()
+
+    @patch("app.services.worker.SessionLocal")
+    def test_stale_session_claim_owner_cannot_schedule_retry(
+        self, mock_session_factory, worker,
+    ):
+        db = MagicMock()
+        query = db.query.return_value
+        query.filter.return_value.update.return_value = 0
+        mock_session_factory.return_value = db
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "lease_owner": "stale-owner",
+        }
+
+        assert worker._mark_session_commit_retry(
+            item, RuntimeError("retry"),
+        ) is False
+
+        filters = " ".join(str(value) for value in query.filter.call_args.args)
+        assert "session_apply_lease_owner" in filters
+        assert "session_apply_locked_at" in filters
+
+    def test_expired_durable_session_commit_is_never_applied(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 1,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "commit": MagicMock(),
+        }
+        with patch(
+            "app.services.worker.conversation_service.apply_staged_session",
+        ) as apply_session, patch.object(
+            worker, "_finish_expired_session_commit", return_value=False,
+        ) as finish_expired:
+            assert worker._apply_session_commit_item(item) is False
+
+        apply_session.assert_not_called()
+        finish_expired.assert_called_once()
+
+    def test_redis_deadline_rejection_is_terminal_not_retryable(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 1,
+            "deadline_reached": False,
+            "lease_owner": "claim-1",
+            "commit": MagicMock(),
+        }
+        with patch(
+            "app.services.worker.conversation_service.apply_staged_session",
+            side_effect=SessionCommitDeadlineExceeded("expired"),
+        ), patch.object(
+            worker, "_finish_expired_session_commit", return_value=False,
+        ) as finish_expired, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as retry:
+            assert worker._apply_session_commit_item(item) is False
+
+        finish_expired.assert_called_once()
+        retry.assert_not_called()
+
+    def test_expired_commit_already_applied_finishes_database_checkpoint(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "payload_available": True,
+            "commit": MagicMock(),
+        }
+        with patch(
+            "app.services.worker.conversation_service.is_staged_session_applied",
+            return_value=True,
+        ), patch.object(
+            worker, "_mark_session_commit_applied", return_value=True,
+        ) as applied, patch.object(
+            worker, "_mark_session_commit_terminal",
+        ) as terminal:
+            assert worker._finish_expired_session_commit(
+                item, RuntimeError("deadline"),
+            ) is True
+
+        applied.assert_called_once_with(42, "claim-1")
+        terminal.assert_not_called()
+
+    def test_expired_commit_verification_failure_is_fail_closed(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "payload_available": True,
+            "commit": MagicMock(),
+        }
+        with patch(
+            "app.services.worker.conversation_service.is_staged_session_applied",
+            side_effect=ConnectionError("redis unavailable"),
+        ), patch.object(
+            worker, "_mark_session_commit_terminal", return_value=True,
+        ) as terminal, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as retry:
+            assert worker._finish_expired_session_commit(
+                item, RuntimeError("deadline"),
+            ) is False
+
+        assert terminal.call_args.kwargs["error_code"] == "session_commit_deadline"
+        assert "could not be verified" in str(terminal.call_args.kwargs["error"])
+        retry.assert_not_called()
+
+    def test_expired_save_without_payload_does_not_read_redis(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "payload_available": False,
+            "commit": MagicMock(operation="save", payload=None),
+        }
+        with patch(
+            "app.services.worker.conversation_service.is_staged_session_applied",
+        ) as is_applied, patch.object(
+            worker, "_mark_session_commit_terminal", return_value=True,
+        ) as terminal:
+            assert worker._finish_expired_session_commit(
+                item, RuntimeError("deadline"),
+            ) is False
+
+        is_applied.assert_not_called()
+        assert terminal.call_args.kwargs["error_code"] == "session_commit_deadline"
+
+    def test_expired_reconcile_terminalizes_when_redis_lock_is_unavailable(
+        self, worker,
+    ):
+        item = {
+            "event_id": 42,
+            "userid": "u1",
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "commit": MagicMock(),
+        }
+        lease = MagicMock()
+        lease.__bool__.return_value = False
+        lease.unavailable = True
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lease
+        lock_context.__exit__.return_value = False
+
+        with patch.object(
+            worker, "_claim_session_commits", return_value=[item],
+        ), patch(
+            "app.services.worker.user_lock", return_value=lock_context,
+        ), patch.object(
+            worker, "_mark_session_commit_terminal", return_value=True,
+        ) as terminal, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as retry, patch.object(
+            worker, "_apply_session_commit_item",
+        ) as apply_commit:
+            assert worker.reconcile_sessions_once(limit=1) == 1
+
+        assert terminal.call_args.kwargs["error_code"] == "session_commit_deadline"
+        assert "Redis user lock was unavailable" in str(
+            terminal.call_args.kwargs["error"],
+        )
+        retry.assert_not_called()
+        apply_commit.assert_not_called()
+
+    def test_expired_reconcile_retries_when_user_lock_is_busy(self, worker):
+        item = {
+            "event_id": 42,
+            "userid": "u1",
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "commit": MagicMock(),
+        }
+        lease = MagicMock()
+        lease.__bool__.return_value = False
+        lease.unavailable = False
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lease
+        lock_context.__exit__.return_value = False
+
+        with patch.object(
+            worker, "_claim_session_commits", return_value=[item],
+        ), patch(
+            "app.services.worker.user_lock", return_value=lock_context,
+        ), patch.object(
+            worker, "_mark_session_commit_terminal",
+        ) as terminal, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as retry, patch.object(
+            worker, "_apply_session_commit_item",
+        ) as apply_commit:
+            assert worker.reconcile_sessions_once(limit=1) == 1
+
+        retry.assert_called_once()
+        assert str(retry.call_args.args[1]) == "user lock busy"
+        terminal.assert_not_called()
+        apply_commit.assert_not_called()
+
+    def test_expired_reconcile_terminalizes_when_lock_verification_is_unavailable(
+        self, worker,
+    ):
+        item = {
+            "event_id": 42,
+            "userid": "u1",
+            "attempts": 2,
+            "deadline_reached": True,
+            "lease_owner": "claim-1",
+            "commit": MagicMock(),
+        }
+        lease = MagicMock()
+        lease.__bool__.return_value = True
+        lease.assert_owned = MagicMock(
+            side_effect=UserLockUnavailable("redis down"),
+        )
+        lock_context = MagicMock()
+        lock_context.__enter__.return_value = lease
+        lock_context.__exit__.return_value = False
+
+        with patch.object(
+            worker, "_claim_session_commits", return_value=[item],
+        ), patch(
+            "app.services.worker.user_lock", return_value=lock_context,
+        ), patch.object(
+            worker, "_mark_session_commit_terminal", return_value=True,
+        ) as terminal, patch.object(
+            worker, "_mark_session_commit_retry",
+        ) as retry, patch.object(
+            worker, "_apply_session_commit_item",
+        ) as apply_commit:
+            assert worker.reconcile_sessions_once(limit=1) == 1
+
+        assert terminal.call_args.kwargs["error_code"] == "session_commit_deadline"
+        assert isinstance(terminal.call_args.kwargs["error"], UserLockUnavailable)
+        retry.assert_not_called()
+        apply_commit.assert_not_called()
+
+    def test_terminal_session_commit_closes_outbox_and_delivery_gates(self, worker):
+        db = MagicMock()
+        row = MagicMock(id=42)
+        prepared = MagicMock(status="prepared")
+        sent = MagicMock(status="sent")
+        pending_outbox = MagicMock(
+            status="pending", recommendation_delivery_id="delivery-1",
+        )
+        sending_outbox = MagicMock(
+            status="sending", recommendation_delivery_id="delivery-1",
+        )
+
+        with patch.object(
+            worker,
+            "_lock_outboxes_for_event",
+            return_value=[pending_outbox, sending_outbox],
+        ) as lock_outboxes, patch.object(
+            worker, "_lock_deliveries_by_id", return_value=[prepared, sent],
+        ) as lock_deliveries, patch(
+            "app.services.recommendation_delivery_service.purge_delivery_content",
+        ) as purge:
+            worker._terminalize_session_commit_locked(
+                db,
+                row,
+                error_code="session_commit_deadline",
+                error=RuntimeError("deadline"),
+            )
+
+        assert prepared.status == "permanent_failed"
+        assert prepared.last_error_code == "session_commit_deadline"
+        lock_outboxes.assert_called_once_with(db, 42)
+        lock_deliveries.assert_called_once_with(db, ["delivery-1"])
+        assert purge.call_args_list == [call(prepared), call(sent)]
+        db.flush.assert_called_once()
+        assert pending_outbox.status == "dead_letter"
+        assert pending_outbox.locked_at is None
+        assert pending_outbox.next_attempt_at is None
+        assert "session_commit_deadline" in pending_outbox.last_error
+        assert sending_outbox.status == "dead_letter"
+        assert "ambiguous provider outcome" in sending_outbox.last_error
+        assert row.status == "dead_letter"
+        assert row.session_payload is None
 
     @patch("app.services.worker.SessionLocal")
     @patch("app.services.worker.message_router")
@@ -576,6 +1029,25 @@ class TestSendErrorHandling:
 # ---------------------------------------------------------------------------
 
 class TestTransactionalOutbox:
+    def test_claim_sql_locks_only_outer_outbox_rows(self):
+        db = Session()
+        query = _build_outbox_claim_query(
+            db,
+            WecomOutboundOutbox.status == "pending",
+            limit=5,
+        )
+
+        sql = " ".join(str(query.statement.compile(
+            dialect=mysql.dialect(),
+        )).lower().split())
+        outer_from = sql.split(" where ", 1)[0]
+
+        assert outer_from.endswith("from wecom_outbound_outbox")
+        assert " join " not in outer_from
+        assert sql.count("exists (select") >= 3
+        assert "order by wecom_outbound_outbox.id" in sql
+        assert sql.endswith("for update skip locked")
+
     def test_stage_outbox_preserves_reply_order_and_metadata(self, worker):
         from app.models import WecomOutboundOutbox
 

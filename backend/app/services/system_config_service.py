@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -27,6 +28,17 @@ from app.services.visibility_policy import (
 )
 
 LOCKED_RECOMMENDATION_KEYS = {"match.max_candidates", "match.top_n"}
+_LIFECYCLE_INT_RANGES = {
+    "ttl.job.days": (1, 3650),
+    "ttl.job.candidate.days": (1, 365),
+    "ttl.resume.days": (1, 3650),
+    "ttl.resume.candidate.days": (1, 365),
+    "ttl.hard_delete.delay_days": (0, 3650),
+}
+_CANONICAL_RESUME_TTL_KEYS = {
+    "ttl.resume.days",
+    "ttl.resume.candidate.days",
+}
 from app.services.admin_log_service import write_admin_log
 
 
@@ -40,6 +52,7 @@ DANGER_KEYS = {
 # 不允许通过 admin 接口暴露的 key 前缀（防止 .env 秘钥泄漏）
 _HIDDEN_KEYS: set[str] = set(LOCKED_RECOMMENDATION_KEYS)
 _HIDDEN_KEYS.add(VISIBILITY_POLICY_KEY)
+_HIDDEN_KEYS.add("resume.replacement.rollout.allowlist")
 
 
 def list_grouped(db: Session) -> dict:
@@ -93,7 +106,20 @@ def update(
         raise BusinessException(40401, f"配置项 {key} 不存在")
 
     effective_type = value_type_override or item.value_type
+    if key in _LIFECYCLE_INT_RANGES and effective_type != "int":
+        raise BusinessException(40101, f"{key} 的 value_type 必须为 int")
     _validate_value(effective_type, new_value)
+    if key in _LIFECYCLE_INT_RANGES:
+        lower, upper = _LIFECYCLE_INT_RANGES[key]
+        if key in _CANONICAL_RESUME_TTL_KEYS and (
+            not isinstance(new_value, str)
+            or re.fullmatch(r"[0-9]+", new_value) is None
+            or str(int(new_value)) != new_value
+        ):
+            raise BusinessException(40101, f"{key} 必须是规范 ASCII 十进制整数")
+        value = int(new_value)
+        if not lower <= value <= upper:
+            raise BusinessException(40101, f"{key} 必须在 {lower} 到 {upper} 之间")
 
     before = {
         "config_value": item.config_value,

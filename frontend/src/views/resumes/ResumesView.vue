@@ -35,6 +35,12 @@
           <el-option label="已通过" value="passed" />
           <el-option label="已驳回" value="rejected" />
         </el-select>
+        <el-select v-model="filters.lifecycle_scope" placeholder="生命周期" clearable style="width: 120px">
+          <el-option label="在线" value="active" />
+          <el-option label="候选" value="candidate" />
+          <el-option label="历史" value="history" />
+          <el-option label="全部" value="all" />
+        </el-select>
         <el-input v-model="filters.owner_userid" placeholder="发布人 userid" clearable style="width: 160px" />
         <el-date-picker
           v-model="createdRange"
@@ -81,6 +87,11 @@
           </el-tag>
         </template>
       </el-table-column>
+      <el-table-column label="生命周期" width="90">
+        <template #default="{ row }">
+          <ResumeLifecycleBadge :resume="row" />
+        </template>
+      </el-table-column>
       <el-table-column label="到期" width="130">
         <template #default="{ row }">
           <span :class="`jb-${ttlLevel(row.expires_at)}-text`">
@@ -110,6 +121,7 @@
 import { ref, watch } from 'vue'
 import PageTable from '@/components/PageTable.vue'
 import ResumeDetailDrawer from './components/ResumeDetailDrawer.vue'
+import ResumeLifecycleBadge from './components/ResumeLifecycleBadge.vue'
 import { fetchResumes, exportResumes } from '@/api/resumes'
 import { usePageTable } from '@/composables/usePageTable'
 import { useDownload } from '@/composables/useDownload'
@@ -126,6 +138,7 @@ const { state, filters, load, setPage, setSize, setSort, applyFilters, resetFilt
       expected_cities: '',
       expected_job_categories: '',
       audit_status: '',
+      lifecycle_scope: '',
       owner_userid: '',
       created_from: '',
       created_to: '',
@@ -163,6 +176,7 @@ function openDetail(row) {
   currentId.value = row.id
   detailVisible.value = true
 }
+
 
 load()
 </script>

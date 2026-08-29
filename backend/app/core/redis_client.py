@@ -44,6 +44,42 @@ def get_redis() -> redis.Redis:
     return redis.Redis(connection_pool=_get_pool())
 
 
+REQUIRED_DURABILITY_POLICY = {
+    "maxmemory-policy": "noeviction",
+    "appendonly": "yes",
+    "appendfsync": "always",
+}
+
+
+class RedisDurabilityPolicyError(RuntimeError):
+    """Raised when Redis cannot safely hold revocation fences."""
+
+
+class SessionCommitDeadlineExceeded(RuntimeError):
+    """Raised before Redis writes when a durable commit deadline has passed."""
+
+
+def validate_redis_durability_policy(
+    client: redis.Redis | None = None,
+) -> dict[str, str]:
+    """Validate the Redis persistence and eviction settings used by fences."""
+    redis_client = client or get_redis()
+    actual: dict[str, str] = {}
+    mismatches: list[str] = []
+    for name, expected in REQUIRED_DURABILITY_POLICY.items():
+        configured = redis_client.config_get(name).get(name)
+        value = "" if configured is None else str(configured).lower()
+        actual[name] = value
+        if value != expected:
+            mismatches.append(f"{name}={value or '<missing>'} (expected {expected})")
+
+    if mismatches:
+        raise RedisDurabilityPolicyError(
+            "Redis durability policy is unsafe: " + "; ".join(mismatches)
+        )
+    return actual
+
+
 # ---------------------------------------------------------------------------
 # 会话状态操作
 # ---------------------------------------------------------------------------
@@ -56,6 +92,9 @@ RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX = (
 RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX = "recommendation:session:target:"
 RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX = (
     "recommendation:session:indexes:"
+)
+RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY = (
+    "recommendation:session:revoked_indexes"
 )
 
 
@@ -108,9 +147,10 @@ def save_session(userid: str, session: dict) -> None:
     r = get_redis()
     r.eval(
         _SAVE_SESSION_WITH_INDEXES_SCRIPT,
-        2,
+        3,
         f"{SESSION_PREFIX}{userid}",
         f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),
         userid,
@@ -119,12 +159,37 @@ def save_session(userid: str, session: dict) -> None:
 
 
 _SAVE_SESSION_WITH_INDEXES_SCRIPT = """
-redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
 local registry = KEYS[2]
+local revoked_indexes = KEYS[3]
 local userid = ARGV[3]
 local ttl = tonumber(ARGV[1])
 local new_indexes = cjson.decode(ARGV[4])
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+require_set_or_none(revoked_indexes, 'revocation_fence')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+for _, index_key in ipairs(new_indexes) do
+    require_set_or_none(index_key, 'new_index')
+    if redis.call('SISMEMBER', revoked_indexes, index_key) == 1 then
+        error('SESSION_INDEX_REVOKED key=' .. index_key)
+    end
+end
+redis.call('SETEX', KEYS[1], ARGV[1], ARGV[2])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -144,10 +209,27 @@ return 1
 """
 
 _DELETE_SESSION_WITH_INDEXES_SCRIPT = """
-redis.call('DEL', KEYS[1])
 local registry = KEYS[2]
 local userid = ARGV[1]
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+redis.call('DEL', KEYS[1])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -174,11 +256,43 @@ if current then
 elseif expected ~= 0 and ARGV[5] ~= '1' then
     return 0
 end
-redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 local registry = KEYS[3]
+local revoked_indexes = KEYS[4]
 local userid = ARGV[6]
 local new_indexes = cjson.decode(ARGV[7])
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+require_set_or_none(revoked_indexes, 'revocation_fence')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+for _, index_key in ipairs(new_indexes) do
+    require_set_or_none(index_key, 'new_index')
+    if redis.call('SISMEMBER', revoked_indexes, index_key) == 1 then
+        error('SESSION_INDEX_REVOKED key=' .. index_key)
+    end
+end
+if ARGV[8] ~= '' then
+    local now = redis.call('TIME')
+    local now_epoch = tonumber(now[1]) + tonumber(now[2]) / 1000000
+    if now_epoch >= tonumber(ARGV[8]) then
+        return -2
+    end
+end
+redis.call('SETEX', KEYS[1], ARGV[2], ARGV[3])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -214,10 +328,34 @@ else
         return 0
     end
 end
-redis.call('DEL', KEYS[1])
 local registry = KEYS[3]
 local userid = ARGV[3]
-local old_indexes = redis.call('SMEMBERS', registry)
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+    return key_type
+end
+local registry_type = require_set_or_none(registry, 'registry')
+local old_indexes = {}
+if registry_type == 'set' then
+    old_indexes = redis.call('SMEMBERS', registry)
+end
+for _, index_key in ipairs(old_indexes) do
+    require_set_or_none(index_key, 'existing_index')
+end
+if ARGV[4] ~= '' then
+    local now = redis.call('TIME')
+    local now_epoch = tonumber(now[1]) + tonumber(now[2]) / 1000000
+    if now_epoch >= tonumber(ARGV[4]) then
+        return -2
+    end
+end
+redis.call('DEL', KEYS[1])
 for _, index_key in ipairs(old_indexes) do
     redis.call('SREM', index_key, userid)
     if redis.call('SCARD', index_key) == 0 then
@@ -229,6 +367,103 @@ return 1
 """
 
 
+_FENCE_SESSION_INDEXES_SCRIPT = """
+local fence = KEYS[1]
+local function require_set_or_none(key, role)
+    local key_type = redis.call('TYPE', key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE ' .. role ..
+            ' key=' .. key .. ' type=' .. key_type
+        )
+    end
+end
+require_set_or_none(fence, 'revocation_fence')
+for _, index_key in ipairs(ARGV) do
+    require_set_or_none(index_key, 'revoked_index')
+end
+for _, index_key in ipairs(ARGV) do
+    redis.call('SADD', fence, index_key)
+end
+local members = {}
+local seen = {}
+for _, index_key in ipairs(ARGV) do
+    for _, userid in ipairs(redis.call('SMEMBERS', index_key)) do
+        if not seen[userid] then
+            seen[userid] = true
+            table.insert(members, userid)
+        end
+    end
+end
+return members
+"""
+
+
+_REMOVE_SESSION_INDEX_MEMBERS_SCRIPT = """
+local registry = KEYS[1]
+local userid = ARGV[1]
+local registry_type = redis.call('TYPE', registry)['ok']
+if registry_type ~= 'none' and registry_type ~= 'set' then
+    error(
+        'SESSION_INDEX_WRONGTYPE registry' ..
+        ' key=' .. registry .. ' type=' .. registry_type
+    )
+end
+for index = 2, #ARGV do
+    local index_key = ARGV[index]
+    local key_type = redis.call('TYPE', index_key)['ok']
+    if key_type ~= 'none' and key_type ~= 'set' then
+        error(
+            'SESSION_INDEX_WRONGTYPE revoked_index' ..
+            ' key=' .. index_key .. ' type=' .. key_type
+        )
+    end
+end
+for index = 2, #ARGV do
+    redis.call('SREM', ARGV[index], userid)
+    redis.call('SREM', registry, ARGV[index])
+end
+return 1
+"""
+
+
+def fence_recommendation_session_indexes(
+    index_keys: list[str],
+    *,
+    client: redis.Redis | None = None,
+    fence_key: str = RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+) -> set[str]:
+    """Fence revoked reverse indexes and return their current session owners."""
+    if not index_keys:
+        return set()
+    members = (client or get_redis()).eval(
+        _FENCE_SESSION_INDEXES_SCRIPT,
+        1,
+        fence_key,
+        *sorted(set(index_keys)),
+    )
+    return {
+        value.decode() if isinstance(value, bytes) else str(value)
+        for value in members
+    }
+
+
+def remove_recommendation_session_index_members(
+    userid: str,
+    index_keys: list[str],
+) -> None:
+    """Remove one session from revoked indexes without deleting whole keys."""
+    if not index_keys:
+        return
+    get_redis().eval(
+        _REMOVE_SESSION_INDEX_MEMBERS_SCRIPT,
+        1,
+        f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        userid,
+        *sorted(set(index_keys)),
+    )
+
+
 def save_session_if_version(
     userid: str,
     session: dict,
@@ -236,6 +471,7 @@ def save_session_if_version(
     lock_fence: tuple[str, Any] | None = None,
     *,
     allow_missing: bool = False,
+    deadline_epoch: Any = None,
 ) -> bool:
     """原子保存 session；仅当前版本等于 ``expected_version`` 时成功。
 
@@ -247,10 +483,11 @@ def save_session_if_version(
     lock_key, lock_token = lock_fence or ("__no_user_lock_fence__", "")
     result = r.eval(
         _SAVE_SESSION_CAS_SCRIPT,
-        3,
+        4,
         f"{SESSION_PREFIX}{userid}",
         lock_key,
         f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}",
+        RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
         int(expected_version),
         SESSION_TTL,
         json.dumps(session, ensure_ascii=False),
@@ -258,9 +495,12 @@ def save_session_if_version(
         "1" if allow_missing else "0",
         userid,
         json.dumps(recommendation_session_index_keys(session)),
+        "" if deadline_epoch is None else str(deadline_epoch),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session commit")
+    if int(result) == -2:
+        raise SessionCommitDeadlineExceeded("durable session commit deadline exceeded")
     return bool(result)
 
 
@@ -280,6 +520,8 @@ def delete_session_if_version(
     userid: str,
     expected_version: int,
     lock_fence: tuple[str, Any] | None = None,
+    *,
+    deadline_epoch: Any = None,
 ) -> bool:
     """仅当 session 版本和用户锁 owner 都匹配时原子删除。"""
     r = get_redis()
@@ -293,9 +535,12 @@ def delete_session_if_version(
         int(expected_version),
         lock_token,
         userid,
+        "" if deadline_epoch is None else str(deadline_epoch),
     )
     if int(result) == -1:
         raise UserLockLost("user lock fence rejected session delete")
+    if int(result) == -2:
+        raise SessionCommitDeadlineExceeded("durable session commit deadline exceeded")
     return bool(result)
 
 
@@ -381,6 +626,10 @@ class UserLockLost(RuntimeError):
     """用户锁已丢失；当前处理结果不得继续提交。"""
 
 
+class UserLockUnavailable(UserLockLost):
+    """Redis unavailable while acquiring or verifying the user lock."""
+
+
 @dataclass
 class UserLockLease:
     acquired: bool
@@ -389,19 +638,25 @@ class UserLockLease:
     lock_id: str
     lock_key: str | None = None
     token: Any = None
+    unavailable: bool = False
 
     def __bool__(self) -> bool:
         return self.acquired
 
     def assert_owned(self) -> None:
         """提交副作用前验证租约仍属于当前处理者。"""
+        if self.unavailable:
+            raise UserLockUnavailable(
+                f"user lock service unavailable: lock_id={self.lock_id}",
+            )
         if not self.acquired or self.lost_event.is_set():
             raise UserLockLost(f"user lock lease lost: lock_id={self.lock_id}")
         try:
             owned = self.lock.owned()
         except redis.exceptions.RedisError as exc:
+            self.unavailable = True
             self.lost_event.set()
-            raise UserLockLost(
+            raise UserLockUnavailable(
                 f"unable to verify user lock: lock_id={self.lock_id}",
             ) from exc
         if not owned:
@@ -428,7 +683,7 @@ def current_user_lock_fence() -> tuple[str, Any] | None:
 def _renew_user_lock(
     lock,
     stop_event: threading.Event,
-    lost_event: threading.Event,
+    lease: UserLockLease,
     lock_id: str,
 ) -> None:
     """在消息处理期间续租用户锁，避免慢 LLM 调用超过固定租约。
@@ -441,10 +696,15 @@ def _renew_user_lock(
         try:
             if not lock.extend(LOCK_TTL, replace_ttl=True):
                 logger.error("user_lock renewal returned false: lock_id=%s", lock_id)
-                lost_event.set()
+                lease.lost_event.set()
                 return
-        except (redis.exceptions.LockError, redis.exceptions.RedisError):
-            lost_event.set()
+        except redis.exceptions.LockError:
+            lease.lost_event.set()
+            logger.exception("user_lock renewal lost ownership: lock_id=%s", lock_id)
+            return
+        except redis.exceptions.RedisError:
+            lease.unavailable = True
+            lease.lost_event.set()
             logger.exception("user_lock renewal failed: lock_id=%s", lock_id)
             return
 
@@ -478,7 +738,14 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[UserLockLease, None, 
         # Worker 会尝试重入队；若重入队同样失败，则把 durable event 标成
         # processing 交给启动恢复。
         logger.exception("user_lock acquire failed: lock_id=%s", lock_id)
-        yield UserLockLease(False, lock, threading.Event(), lock_id, lock_key)
+        yield UserLockLease(
+            False,
+            lock,
+            threading.Event(),
+            lock_id,
+            lock_key,
+            unavailable=True,
+        )
         return
     stop_renewal = threading.Event()
     lost_event = threading.Event()
@@ -488,7 +755,7 @@ def user_lock(userid: str, timeout: int = 10) -> Generator[UserLockLease, None, 
     if acquired:
         renewal_thread = threading.Thread(
             target=_renew_user_lock,
-            args=(lock, stop_renewal, lost_event, lock_id),
+            args=(lock, stop_renewal, lease, lock_id),
             name="user-lock-renewal",
             daemon=True,
         )
@@ -567,6 +834,82 @@ def save_undo(target_type: str, target_id: int | str, payload: dict, ttl: int = 
     r = get_redis()
     key = f"{UNDO_PREFIX}{target_type}:{target_id}"
     r.setex(key, ttl, json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def get_undo(target_type: str, target_id: int | str) -> dict | None:
+    """读取 Undo 快照但不消费，用于执行前的生命周期门禁。"""
+    data = get_redis().get(f"{UNDO_PREFIX}{target_type}:{target_id}")
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def get_undo_snapshot(
+    target_type: str, target_id: int | str,
+) -> tuple[dict, str] | None:
+    """Return the parsed Undo payload together with its exact Redis value."""
+    data = get_redis().get(f"{UNDO_PREFIX}{target_type}:{target_id}")
+    if not data:
+        return None
+    try:
+        return json.loads(data), str(data)
+    except Exception:
+        return None
+
+
+_CONSUME_UNDO_IF_UNCHANGED_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+if current ~= ARGV[1] then
+    return -1
+end
+redis.call('DEL', KEYS[1])
+return 1
+"""
+
+_VALIDATE_UNDO_UNCHANGED_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if not current then
+    return 0
+end
+if current ~= ARGV[1] then
+    return -1
+end
+return 1
+"""
+
+
+def validate_undo_unchanged(
+    target_type: str, target_id: int | str, expected_value: str,
+) -> str:
+    """Validate the exact snapshot without consuming it before DB commit."""
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    result = int(get_redis().eval(
+        _VALIDATE_UNDO_UNCHANGED_SCRIPT,
+        1,
+        key,
+        expected_value,
+    ))
+    return {1: "unchanged", 0: "missing", -1: "changed"}.get(result, "changed")
+
+
+def consume_undo_if_unchanged(
+    target_type: str, target_id: int | str, expected_value: str,
+) -> str:
+    """Atomically consume only the exact Undo snapshot already validated."""
+    key = f"{UNDO_PREFIX}{target_type}:{target_id}"
+    result = int(get_redis().eval(
+        _CONSUME_UNDO_IF_UNCHANGED_SCRIPT,
+        1,
+        key,
+        expected_value,
+    ))
+    return {1: "consumed", 0: "missing", -1: "changed"}.get(result, "changed")
 
 
 def pop_undo(target_type: str, target_id: int | str) -> dict | None:

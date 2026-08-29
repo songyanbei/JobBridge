@@ -51,6 +51,14 @@ _COMMAND_MAP: dict[str, str] = {
     "帮我招人": "switch_to_worker",
     "切到找工人": "switch_to_worker",
     "/续期": "renew_job",
+    "/更新岗位": "update_job",
+    "更新岗位": "update_job",
+    "修改岗位": "update_job",
+    "重新发布岗位": "update_job",
+    "/更新简历": "update_resume",
+    "更新简历": "update_resume",
+    "修改简历": "update_resume",
+    "重新提交简历": "update_resume",
     "续期": "renew_job",
     "延期": "renew_job",
     "/下架": "delist_job",
@@ -782,6 +790,58 @@ def _normalize_int_field(value, *, lo: int | None = None, hi: int | None = None)
     return v
 
 
+_EDUCATION_REQUIRED_ALIASES = {
+    "不限": "不限",
+    "学历不限": "不限",
+    "初中": "初中",
+    "初中以上": "初中",
+    "初中及以上": "初中",
+    "高中": "高中",
+    "高中以上": "高中",
+    "高中及以上": "高中",
+    "中专": "中专",
+    "中专以上": "中专",
+    "中专及以上": "中专",
+    "大专": "大专及以上",
+    "大专以上": "大专及以上",
+    "大专及以上": "大专及以上",
+}
+
+_EMPLOYMENT_TYPE_ALIASES = {
+    "厂家直招": "厂家直招",
+    "工厂直招": "厂家直招",
+    "直招": "厂家直招",
+    "劳务派遣": "劳务派遣",
+    "派遣": "劳务派遣",
+    "中介代招": "中介代招",
+    "中介招聘": "中介代招",
+}
+
+_CONTRACT_TYPE_ALIASES = {
+    "长期合同": "长期合同",
+    "长期": "长期合同",
+    "短期合同": "短期合同",
+    "短期": "短期合同",
+    "劳务关系": "劳务关系",
+}
+
+
+def _normalize_education_required(value) -> str | None:
+    """Map common threshold wording to the Job education enum."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith("学历"):
+        text = text[:-2].strip()
+    return _EDUCATION_REQUIRED_ALIASES.get(text)
+
+
+def _normalize_job_enum(value, aliases: dict[str, str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return aliases.get(value.strip())
+
+
 def _coerce_field_value(field: str, value, *, force_list: bool):
     """按字段语义把单个 value 规整成最终类型。
 
@@ -827,6 +887,12 @@ def _coerce_field_value(field: str, value, *, force_list: bool):
         return _normalize_int_field(value, lo=_AGE_MIN, hi=_AGE_MAX)
     if field in {"salary_floor_monthly", "salary_ceiling_monthly", "salary_expect_floor_monthly"}:
         return _normalize_int_field(value, lo=_SALARY_MIN, hi=_SALARY_MAX)
+    if field == "education_required":
+        return _normalize_education_required(value)
+    if field == "employment_type":
+        return _normalize_job_enum(value, _EMPLOYMENT_TYPE_ALIASES)
+    if field == "contract_type":
+        return _normalize_job_enum(value, _CONTRACT_TYPE_ALIASES)
 
     max_lengths = {
         "hiring_company": 128,
@@ -914,6 +980,16 @@ def _normalize_structured_data(data: dict, role: str, intent: str) -> dict:
             else:
                 logger.warning(
                     "intent_service: drop invalid int field=%s raw=%r", key, raw,
+                )
+            continue
+
+        if key in {"education_required", "employment_type", "contract_type"}:
+            coerced = _coerce_field_value(key, raw, force_list=False)
+            if coerced is not None:
+                out[key] = coerced
+            else:
+                logger.warning(
+                    "intent_service: drop invalid closed enum field=%s raw=%r", key, raw,
                 )
             continue
 

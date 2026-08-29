@@ -1,15 +1,33 @@
 """Redis 集成测试（需要真实 Redis）。"""
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
+from redis.exceptions import ResponseError
 
+from app.services import conversation_service
+from app.services import message_router
+from app.services import upload_service
+from app.services.worker import Worker
+from app.db import SessionLocal
+from app.models import Job, MediaAssetLifecycle, Resume, User
+from app.schemas.conversation import SessionState
+from app.wecom.callback import WeComMessage
 from app.core.redis_client import (
+    RedisDurabilityPolicyError,
+    SessionCommitDeadlineExceeded,
     get_redis,
     get_session,
     save_session,
     save_session_if_version,
     delete_session,
+    delete_session_if_version,
     check_msg_duplicate,
     check_rate_limit,
     enqueue_message,
@@ -19,8 +37,408 @@ from app.core.redis_client import (
     UserLockLost,
     QUEUE_INCOMING,
     RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX,
+    RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX,
+    RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
     RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX,
+    consume_undo_if_unchanged,
+    fence_recommendation_session_indexes,
+    get_undo,
+    get_undo_snapshot,
+    remove_recommendation_session_index_members,
+    save_undo,
+    validate_redis_durability_policy,
 )
+
+
+def test_empty_replacement_draft_deadline_survives_real_redis_round_trip():
+    userid = "integration-empty-replacement-deadline"
+    started_at = datetime(2026, 8, 14, 9, 30, tzinfo=timezone.utc)
+    conversation_service.clear_session(userid)
+    try:
+        session = SessionState(
+            role="factory",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="replace",
+            pending_target_id=42,
+            pending_target_version=7,
+            pending_operation_id="8e36fe0d-84cc-4274-8b10-c36ec62af7ad",
+            active_flow="upload_collecting",
+        )
+        upload_service.initialize_pending_upload_window(session, now=started_at)
+
+        conversation_service.save_session(userid, session)
+        restored = conversation_service.load_session(userid)
+
+        assert restored is not None
+        assert restored.pending_upload == {}
+        assert restored.pending_started_at == started_at.isoformat()
+        assert restored.pending_updated_at == started_at.isoformat()
+        assert datetime.fromisoformat(restored.pending_expires_at) == (
+            started_at + timedelta(minutes=10)
+        )
+        assert restored.pending_target_id == 42
+        assert restored.pending_operation_id == session.pending_operation_id
+    finally:
+        conversation_service.clear_session(userid)
+
+
+def test_expired_image_draft_is_rejected_before_media_refresh_and_cleared():
+    token = uuid4().hex
+    userid = f"integration-expired-image-{token}"
+    object_key = f"images/{userid}/old.jpg"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    media_id = None
+    try:
+        media = MediaAssetLifecycle(
+            object_key=object_key,
+            owner_userid=userid,
+            operation_id="expired-image-draft",
+            state="pending",
+            draft_expires_at=datetime.utcnow() - timedelta(seconds=1),
+        )
+        db.add(media)
+        db.commit()
+        media_id = media.id
+        before_count = db.query(MediaAssetLifecycle).count()
+
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="create",
+            pending_upload={"city": "苏州市", "job_category": "电子厂"},
+            pending_upload_media_ids=[media_id],
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        conversation_service.save_session(userid, session)
+
+        worker = Worker.__new__(Worker)
+        worker._wecom_client = MagicMock()
+        msg = WeComMessage(
+            msg_id=f"expired-image-{token}",
+            from_user=userid,
+            msg_type="image",
+            media_id="wecom-expired-image",
+        )
+        worker._download_and_attach_image(msg)
+
+        worker._wecom_client.download_media.assert_not_called()
+        assert db.query(MediaAssetLifecycle).count() == before_count
+        assert msg.expired_upload_draft is True
+        replies = message_router._handle_image(
+            msg, SimpleNamespace(role="factory"), db,
+        )
+        db.commit()
+
+        assert replies[0].content == message_router.PENDING_EXPIRED_REPLY
+        db.refresh(media)
+        assert media.state == "delete_pending"
+        restored = conversation_service.load_session(userid)
+        assert restored is not None
+        assert restored.pending_upload_intent is None
+        assert restored.pending_upload_media_ids == []
+        assert restored.active_flow == "idle"
+    finally:
+        conversation_service.clear_session(userid)
+        if media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == media_id,
+            ).delete(synchronize_session=False)
+            db.commit()
+        db.close()
+
+
+def test_queued_image_after_expiry_cannot_mutate_previous_active_job():
+    token = uuid4().hex
+    userid = f"integration-expired-queue-{token}"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    job_id = None
+    queued_media_id = None
+    attached_media_id = None
+    try:
+        db.add(User(external_userid=userid, role="factory"))
+        db.flush()
+        old_key = f"images/{userid}/old.jpg"
+        old_job = Job(
+            owner_userid=userid,
+            city="苏州市",
+            job_category="电子厂",
+            salary_floor_monthly=5500,
+            pay_type="月薪",
+            headcount=10,
+            raw_text="old active job",
+            audit_status="passed",
+            activated_at=datetime.utcnow() - timedelta(days=1),
+            expires_at=datetime.utcnow() + timedelta(days=30),
+            images=[old_key],
+        )
+        db.add(old_job)
+        db.commit()
+        job_id = old_job.id
+        original_version = old_job.version
+
+        session = SessionState(
+            role="factory",
+            active_flow="upload_collecting",
+            current_intent="upload_job",
+            pending_upload_intent="upload_job",
+            pending_upload_mode="replace",
+            pending_target_id=job_id,
+            pending_target_version=original_version,
+            pending_operation_id=f"expired-{token[:20]}",
+            pending_upload={"city": "苏州市"},
+            pending_expires_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat(),
+        )
+        conversation_service.save_session(userid, session)
+
+        first = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"first-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="expired-first",
+                expired_upload_draft=True,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        queued_media = MediaAssetLifecycle(
+            object_key=f"images/{userid}/queued.jpg",
+            owner_userid=userid,
+            operation_id=f"queued-{token[:20]}",
+            state="pending",
+            draft_expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        db.add(queued_media)
+        db.flush()
+        queued_media_id = queued_media.id
+        second = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"second-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="queued-second",
+                image_url=f"images/{userid}/queued.jpg",
+                media_lifecycle_id=queued_media_id,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        db.commit()
+
+        db.refresh(old_job)
+        assert first[0].content == message_router.PENDING_EXPIRED_REPLY
+        assert second[0].content == message_router.IMAGE_RECEIVED_NON_UPLOAD
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+        db.refresh(queued_media)
+        assert queued_media.state == "delete_pending"
+        restored = conversation_service.load_session(userid)
+        assert restored is not None
+        assert restored.current_intent == "upload_job"
+        assert restored.attachment_target_id is None
+
+        attached_media = MediaAssetLifecycle(
+            object_key=old_key,
+            owner_userid=userid,
+            operation_id=f"attached-{token[:20]}",
+            state="attached",
+            entity_type="job",
+            entity_id=job_id,
+            draft_expires_at=None,
+        )
+        db.add(attached_media)
+        db.flush()
+        attached_media_id = attached_media.id
+        duplicate_feedback = upload_service.attach_image(
+            external_userid=userid,
+            image_key=old_key,
+            session=SessionState(
+                role="factory",
+                attachment_target_type="job",
+                attachment_target_id=job_id,
+            ),
+            db=db,
+            media_lifecycle_id=attached_media_id,
+        )
+        db.commit()
+
+        db.refresh(attached_media)
+        db.refresh(old_job)
+        assert "已附加" in duplicate_feedback
+        assert attached_media.state == "attached"
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+
+        replay_session = conversation_service.load_session(userid)
+        assert replay_session is not None
+        replay_session.active_flow = "upload_collecting"
+        replay_session.pending_upload_intent = "upload_job"
+        replay_session.pending_upload = {"city": "苏州市"}
+        replay_session.pending_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+        ).isoformat()
+        conversation_service.save_session(userid, replay_session)
+        replay = message_router._handle_image(
+            WeComMessage(
+                msg_id=f"attached-replay-{token}",
+                from_user=userid,
+                msg_type="image",
+                media_id="attached-replay",
+                image_url=old_key,
+                media_lifecycle_id=attached_media_id,
+            ),
+            SimpleNamespace(role="factory"),
+            db,
+        )
+        db.commit()
+
+        db.refresh(attached_media)
+        db.refresh(old_job)
+        assert replay[0].content == message_router.PENDING_EXPIRED_REPLY
+        assert attached_media.state == "attached"
+        assert old_job.images == [old_key]
+        assert old_job.version == original_version
+    finally:
+        conversation_service.clear_session(userid)
+        db.rollback()
+        if queued_media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == queued_media_id,
+            ).delete(synchronize_session=False)
+        if attached_media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == attached_media_id,
+            ).delete(synchronize_session=False)
+        if job_id is not None:
+            db.query(Job).filter(Job.id == job_id).delete(synchronize_session=False)
+        db.query(User).filter(User.external_userid == userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+        db.close()
+
+
+def test_rejected_resume_attachment_target_cannot_accept_queued_image():
+    token = uuid4().hex
+    userid = f"integration-rejected-resume-{token}"
+    conversation_service.clear_session(userid)
+    db = SessionLocal()
+    resume_id = None
+    media_id = None
+    try:
+        db.add(User(external_userid=userid, role="worker"))
+        db.flush()
+        resume = Resume(
+            owner_userid=userid,
+            expected_cities=["苏州市"],
+            expected_job_categories=["电子厂"],
+            salary_expect_floor_monthly=5000,
+            gender="男",
+            age=30,
+            accept_long_term=True,
+            accept_short_term=False,
+            raw_text="active resume",
+            audit_status="passed",
+            expires_at=datetime.utcnow() + timedelta(days=30),
+            images=[f"images/{userid}/old.jpg"],
+        )
+        db.add(resume)
+        db.commit()
+        resume_id = resume.id
+        original_images = list(resume.images)
+        original_version = resume.version
+
+        conversation_service.save_session(
+            userid,
+            SessionState(
+                role="worker",
+                attachment_target_type="resume",
+                attachment_target_id=resume_id,
+            ),
+        )
+
+        resume.audit_status = "rejected"
+        resume.audit_reason = "admin rejected"
+        db.commit()
+
+        media = MediaAssetLifecycle(
+            object_key=f"images/{userid}/queued.jpg",
+            owner_userid=userid,
+            operation_id=f"rejected-{token[:20]}",
+            state="pending",
+            draft_expires_at=datetime.utcnow() + timedelta(minutes=10),
+        )
+        db.add(media)
+        db.flush()
+        media_id = media.id
+
+        session = conversation_service.load_session(userid)
+        assert session is not None
+        feedback = upload_service.attach_image(
+            external_userid=userid,
+            image_key=media.object_key,
+            session=session,
+            db=db,
+            media_lifecycle_id=media_id,
+        )
+        db.commit()
+
+        db.refresh(resume)
+        db.refresh(media)
+        assert "未找到正在处理" in feedback
+        assert resume.images == original_images
+        assert resume.version == original_version
+        assert media.state == "delete_pending"
+    finally:
+        conversation_service.clear_session(userid)
+        db.rollback()
+        if media_id is not None:
+            db.query(MediaAssetLifecycle).filter(
+                MediaAssetLifecycle.id == media_id,
+            ).delete(synchronize_session=False)
+        if resume_id is not None:
+            db.query(Resume).filter(Resume.id == resume_id).delete(
+                synchronize_session=False,
+            )
+        db.query(User).filter(User.external_userid == userid).delete(
+            synchronize_session=False,
+        )
+        db.commit()
+        db.close()
+
+
+def test_real_undo_compare_and_delete_preserves_replacement_snapshot():
+    target_id = "integration-undo-cas"
+    key = f"undo_action:job:{target_id}"
+    redis_client = get_redis()
+    redis_client.delete(key)
+    try:
+        first = {"action": "edit", "before": {"version": 1}}
+        replacement = {"action": "edit", "before": {"version": 2}}
+        save_undo("job", target_id, first)
+        snapshot = get_undo_snapshot("job", target_id)
+        assert snapshot is not None
+        _, token = snapshot
+
+        save_undo("job", target_id, replacement)
+
+        assert consume_undo_if_unchanged("job", target_id, token) == "changed"
+        assert get_undo("job", target_id) == replacement
+        replacement_snapshot = get_undo_snapshot("job", target_id)
+        assert replacement_snapshot is not None
+        assert consume_undo_if_unchanged(
+            "job", target_id, replacement_snapshot[1],
+        ) == "consumed"
+        assert get_undo("job", target_id) is None
+    finally:
+        redis_client.delete(key)
 
 
 def test_real_user_lock_lease_renews_beyond_original_ttl(monkeypatch):
@@ -72,8 +490,162 @@ class TestRedisConnection:
         r = get_redis()
         assert r.ping()
 
+    def test_durability_policy_matches_fence_requirements(self):
+        assert validate_redis_durability_policy() == {
+            "maxmemory-policy": "noeviction",
+            "appendonly": "yes",
+            "appendfsync": "always",
+        }
+
+
+    @pytest.mark.parametrize(
+        ("operation", "payload"),
+        [
+            ("", None),
+            ("unknown", None),
+            (None, None),
+            ("save", None),
+            ("save", {}),
+        ],
+    )
+    def test_real_applied_check_rejects_invalid_empty_session_commits(
+        self, operation, payload,
+    ):
+        userid = "integration-invalid-staged-session"
+        delete_session(userid)
+        commit = conversation_service.StagedSessionCommit(
+            userid=userid,
+            operation=operation,
+            expected_version=0,
+            payload=payload,
+        )
+
+        assert conversation_service.is_staged_session_applied(commit) is False
+
+    @pytest.mark.parametrize(
+        ("name", "unsafe_value", "safe_value"),
+        [
+            ("maxmemory-policy", "allkeys-lru", "noeviction"),
+            ("appendfsync", "everysec", "always"),
+        ],
+    )
+    def test_durability_policy_rejects_live_unsafe_config(
+        self,
+        name,
+        unsafe_value,
+        safe_value,
+    ):
+        r = get_redis()
+        original = r.config_get(name)[name]
+        assert original == safe_value
+        try:
+            r.config_set(name, unsafe_value)
+            with pytest.raises(RedisDurabilityPolicyError, match=name):
+                validate_redis_durability_policy(r)
+        finally:
+            r.config_set(name, original)
+
+        assert validate_redis_durability_policy(r)[name] == safe_value
+
 
 class TestSessionOperations:
+    @staticmethod
+    def _redis_epoch(offset=0):
+        seconds, micros = get_redis().time()
+        return f"{seconds + micros / 1000000 + offset:.6f}"
+
+    def test_session_commit_before_deadline_can_write(self):
+        userid = "integration-session-deadline-before"
+        delete_session(userid)
+        try:
+            assert save_session_if_version(
+                userid,
+                {"session_version": 1},
+                0,
+                deadline_epoch=self._redis_epoch(offset=2),
+            )
+            assert get_session(userid)["session_version"] == 1
+        finally:
+            delete_session(userid)
+
+    @pytest.mark.parametrize("offset", [0, -1])
+    @pytest.mark.parametrize("operation", ["save", "delete"])
+    def test_session_commit_at_or_after_deadline_writes_nothing(
+        self,
+        offset,
+        operation,
+    ):
+        userid = f"integration-session-deadline-{operation}-{offset}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        old_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:deadline-old"
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:deadline-new"
+        r = get_redis()
+        r.delete(session_key, registry_key, old_index, new_index)
+        save_session(userid, {
+            "session_version": 1,
+            "candidate_snapshot": {
+                "direction": "search_worker",
+                "candidate_ids": ["deadline-old"],
+            },
+        })
+        before = (
+            r.get(session_key),
+            r.smembers(registry_key),
+            r.smembers(old_index),
+            r.exists(new_index),
+        )
+        try:
+            with pytest.raises(SessionCommitDeadlineExceeded):
+                if operation == "save":
+                    save_session_if_version(
+                        userid,
+                        {
+                            "session_version": 2,
+                            "candidate_snapshot": {
+                                "direction": "search_worker",
+                                "candidate_ids": ["deadline-new"],
+                            },
+                        },
+                        1,
+                        deadline_epoch=self._redis_epoch(offset=offset),
+                    )
+                else:
+                    delete_session_if_version(
+                        userid,
+                        1,
+                        deadline_epoch=self._redis_epoch(offset=offset),
+                    )
+
+            assert (
+                r.get(session_key),
+                r.smembers(registry_key),
+                r.smembers(old_index),
+                r.exists(new_index),
+            ) == before
+        finally:
+            r.delete(session_key, registry_key, old_index, new_index)
+
+    def test_session_commit_waiting_past_deadline_is_rejected(self):
+        userid = "integration-session-deadline-waiting"
+        r = get_redis()
+        delete_session(userid)
+        deadline = self._redis_epoch(offset=0.03)
+        try:
+            r.execute_command("CLIENT", "PAUSE", 100, "ALL")
+            started = time.monotonic()
+            with pytest.raises(SessionCommitDeadlineExceeded):
+                save_session_if_version(
+                    userid,
+                    {"session_version": 1},
+                    0,
+                    deadline_epoch=deadline,
+                )
+            assert time.monotonic() - started >= 0.03
+            assert get_session(userid) is None
+        finally:
+            delete_session(userid)
+
     def test_save_and_get(self):
         save_session("test_user_001", {"role": "worker", "intent": "search_job"})
         data = get_session("test_user_001")
@@ -149,6 +721,424 @@ class TestSessionOperations:
         finally:
             delete_session(userid)
             assert userid not in r.smembers(target_9)
+
+    @pytest.mark.parametrize(
+        ("operation", "wrong_role"),
+        [
+            ("save", "registry"),
+            ("save", "existing_index"),
+            ("save", "new_index"),
+            ("cas_save", "registry"),
+            ("cas_save", "existing_index"),
+            ("cas_save", "new_index"),
+            ("delete", "registry"),
+            ("delete", "existing_index"),
+            ("cas_delete", "registry"),
+            ("cas_delete", "existing_index"),
+        ],
+    )
+    def test_all_session_index_scripts_preflight_wrong_types(
+        self,
+        operation,
+        wrong_role,
+    ):
+        userid = f"integration-wrong-type-{operation}-{wrong_role}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        existing_index = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}old-{userid}"
+        )
+        candidate_id = f"new-{userid}"
+        new_index = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:{candidate_id}"
+        )
+        keys = (session_key, registry_key, existing_index, new_index)
+        r = get_redis()
+        r.delete(*keys)
+        original = json.dumps({"role": "old", "session_version": 1})
+        r.set(session_key, original)
+        if wrong_role == "registry":
+            r.set(registry_key, "not-a-set")
+        else:
+            r.sadd(registry_key, existing_index)
+            if wrong_role == "existing_index":
+                r.set(existing_index, "not-a-set")
+            else:
+                r.sadd(existing_index, userid)
+                r.set(new_index, "not-a-set")
+
+        payload = {
+            "role": "new",
+            "session_version": 2,
+            "candidate_snapshot": {
+                "direction": "search_worker",
+                "candidate_ids": [candidate_id],
+            },
+        }
+
+        def _snapshot():
+            snapshot = {}
+            for key in keys:
+                key_type = r.type(key)
+                if key_type == "string":
+                    content = r.get(key)
+                elif key_type == "set":
+                    content = sorted(r.smembers(key))
+                else:
+                    content = None
+                snapshot[key] = (key_type, content, r.pttl(key))
+            return snapshot
+
+        before = _snapshot()
+        try:
+            with pytest.raises(
+                ResponseError,
+                match=f"SESSION_INDEX_WRONGTYPE {wrong_role}",
+            ):
+                if operation == "save":
+                    save_session(userid, payload)
+                elif operation == "cas_save":
+                    save_session_if_version(userid, payload, 1)
+                elif operation == "delete":
+                    delete_session(userid)
+                else:
+                    delete_session_if_version(userid, 1)
+
+            assert _snapshot() == before
+        finally:
+            r.delete(*keys)
+
+    @pytest.mark.parametrize("operation", ["cas_save", "cas_delete"])
+    def test_cas_scripts_do_not_write_after_malformed_session_json(
+        self,
+        operation,
+    ):
+        userid = f"integration-malformed-session-{operation}"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        existing_index = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}old-{userid}"
+        )
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:{userid}"
+        keys = (session_key, registry_key, existing_index, new_index)
+        r = get_redis()
+        r.delete(*keys)
+        r.set(session_key, "{malformed-json")
+        r.sadd(registry_key, existing_index)
+        r.sadd(existing_index, userid)
+        try:
+            with pytest.raises(ResponseError):
+                if operation == "cas_save":
+                    save_session_if_version(userid, {
+                        "session_version": 2,
+                        "candidate_snapshot": {
+                            "direction": "search_worker",
+                            "candidate_ids": [userid],
+                        },
+                    }, 1)
+                else:
+                    delete_session_if_version(userid, 1)
+
+            assert r.get(session_key) == "{malformed-json"
+            assert r.smembers(registry_key) == {existing_index}
+            assert r.smembers(existing_index) == {userid}
+            assert r.exists(new_index) == 0
+        finally:
+            r.delete(*keys)
+
+    def test_cas_session_indexes_preserve_state_on_stale_or_lost_fence(self):
+        userid = "integration-cas-index-lifecycle"
+        session_key = f"session:{userid}"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        old_index = f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}cas-old"
+        new_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:cas-new"
+        stale_index = (
+            f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:cas-stale"
+        )
+        lock_key = "lock:integration-cas-index-lifecycle"
+        keys = (
+            session_key,
+            registry_key,
+            old_index,
+            new_index,
+            stale_index,
+            lock_key,
+        )
+        r = get_redis()
+        r.delete(*keys)
+        try:
+            save_session(userid, {
+                "session_version": 1,
+                "history": [{"delivery_id": "cas-old"}],
+            })
+            assert save_session_if_version(userid, {
+                "session_version": 2,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["cas-new"],
+                },
+            }, 1)
+            assert r.exists(old_index) == 0
+            assert r.smembers(registry_key) == {new_index}
+            assert r.smembers(new_index) == {userid}
+            committed = r.get(session_key)
+
+            assert save_session_if_version(userid, {
+                "session_version": 3,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["cas-stale"],
+                },
+            }, 1) is False
+            assert r.get(session_key) == committed
+            assert r.smembers(registry_key) == {new_index}
+            assert r.exists(stale_index) == 0
+
+            r.set(lock_key, "new-owner")
+            with pytest.raises(UserLockLost):
+                save_session_if_version(
+                    userid,
+                    {"session_version": 3},
+                    2,
+                    lock_fence=(lock_key, "old-owner"),
+                )
+            assert delete_session_if_version(userid, 1) is False
+            with pytest.raises(UserLockLost):
+                delete_session_if_version(
+                    userid,
+                    2,
+                    lock_fence=(lock_key, "old-owner"),
+                )
+            assert r.get(session_key) == committed
+            assert r.smembers(registry_key) == {new_index}
+            assert r.smembers(new_index) == {userid}
+
+            assert delete_session_if_version(userid, 2) is True
+            assert r.exists(session_key, registry_key, new_index) == 0
+        finally:
+            r.delete(*keys)
+
+    def test_revocation_fence_rejects_new_and_cas_session_writes(self):
+        userid = "integration-revocation-existing"
+        rejected_userid = "integration-revocation-rejected"
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:revoked"
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+        delete_session(userid)
+        delete_session(rejected_userid)
+        try:
+            payload = {
+                "session_version": 1,
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["revoked"],
+                },
+            }
+            save_session(userid, payload)
+            assert fence_recommendation_session_indexes([index_key]) == {userid}
+
+            with pytest.raises(ResponseError, match="SESSION_INDEX_REVOKED"):
+                save_session(rejected_userid, payload)
+            assert get_session(rejected_userid) is None
+
+            with pytest.raises(ResponseError, match="SESSION_INDEX_REVOKED"):
+                save_session_if_version(userid, {
+                    **payload,
+                    "session_version": 2,
+                }, 1)
+            assert get_session(userid)["session_version"] == 1
+
+            assert save_session_if_version(
+                userid,
+                {"session_version": 2},
+                1,
+            )
+            remove_recommendation_session_index_members(userid, [index_key])
+            assert r.exists(index_key) == 0
+        finally:
+            delete_session(userid)
+            delete_session(rejected_userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+
+    def test_revoked_member_cleanup_updates_index_and_registry_atomically(self):
+        userid = "integration-revocation-stale-member"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:stale"
+        r = get_redis()
+        r.delete(registry_key, index_key)
+        r.sadd(registry_key, index_key)
+        r.sadd(index_key, userid)
+        try:
+            remove_recommendation_session_index_members(userid, [index_key])
+            assert r.exists(registry_key) == 0
+            assert r.exists(index_key) == 0
+        finally:
+            r.delete(registry_key, index_key)
+
+    def test_revocation_fence_preflights_all_indexes_before_writing(self):
+        valid_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:valid"
+        wrong_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:wrong"
+        r = get_redis()
+        r.srem(
+            RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+            valid_index,
+            wrong_index,
+        )
+        r.delete(valid_index, wrong_index)
+        r.sadd(valid_index, "existing-user")
+        r.set(wrong_index, "not-a-set")
+        try:
+            with pytest.raises(
+                ResponseError,
+                match="SESSION_INDEX_WRONGTYPE revoked_index",
+            ):
+                fence_recommendation_session_indexes([
+                    valid_index,
+                    wrong_index,
+                ])
+
+            assert r.smembers(valid_index) == {"existing-user"}
+            assert r.get(wrong_index) == "not-a-set"
+            assert not r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                valid_index,
+            )
+            assert not r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                wrong_index,
+            )
+        finally:
+            r.delete(valid_index, wrong_index)
+            r.srem(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                valid_index,
+                wrong_index,
+            )
+
+    def test_revoked_member_cleanup_preflights_before_removing_any_member(self):
+        userid = "integration-revocation-remove-preflight"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        valid_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:remove-ok"
+        wrong_index = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:remove-wrong"
+        r = get_redis()
+        r.delete(registry_key, valid_index, wrong_index)
+        r.sadd(registry_key, valid_index, wrong_index)
+        r.sadd(valid_index, userid)
+        r.set(wrong_index, "not-a-set")
+        try:
+            with pytest.raises(
+                ResponseError,
+                match="SESSION_INDEX_WRONGTYPE revoked_index",
+            ):
+                remove_recommendation_session_index_members(
+                    userid,
+                    [valid_index, wrong_index],
+                )
+
+            assert r.smembers(registry_key) == {valid_index, wrong_index}
+            assert r.smembers(valid_index) == {userid}
+            assert r.get(wrong_index) == "not-a-set"
+        finally:
+            r.delete(registry_key, valid_index, wrong_index)
+
+    def test_concurrent_save_is_observed_or_rejected_by_revocation_fence(self):
+        index_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:race"
+        userids = [f"integration-revocation-race-{index}" for index in range(12)]
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+        for userid in userids:
+            delete_session(userid)
+        barrier = threading.Barrier(len(userids) + 1)
+
+        def _save(userid):
+            barrier.wait()
+            try:
+                save_session(userid, {
+                    "session_version": 1,
+                    "candidate_snapshot": {
+                        "direction": "search_worker",
+                        "candidate_ids": ["race"],
+                    },
+                })
+                return userid, "saved"
+            except ResponseError as exc:
+                assert "SESSION_INDEX_REVOKED" in str(exc)
+                return userid, "rejected"
+
+        try:
+            with ThreadPoolExecutor(max_workers=len(userids)) as executor:
+                futures = [executor.submit(_save, userid) for userid in userids]
+                barrier.wait()
+                fenced_members = fence_recommendation_session_indexes([index_key])
+                results = dict(future.result() for future in futures)
+
+            for userid, result in results.items():
+                if result == "saved":
+                    assert userid in fenced_members
+                else:
+                    assert get_session(userid) is None
+        finally:
+            for userid in userids:
+                delete_session(userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, index_key)
+
+    def test_real_session_scrub_fences_and_rewrites_all_indexes(self):
+        from app.services.recommendation_privacy_service import (
+            REDACTED_PLACEHOLDER,
+            TargetRef,
+            scrub_recommendation_sessions,
+        )
+
+        userid = "integration-revocation-scrub"
+        delivery_key = (
+            f"{RECOMMENDATION_SESSION_DELIVERY_INDEX_PREFIX}scrub-delivery"
+        )
+        target_key = f"{RECOMMENDATION_SESSION_TARGET_INDEX_PREFIX}resume:42"
+        registry_key = f"{RECOMMENDATION_SESSION_INDEX_REGISTRY_PREFIX}{userid}"
+        revoked_keys = [delivery_key, target_key]
+        r = get_redis()
+        r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, *revoked_keys)
+        delete_session(userid)
+        try:
+            save_session(userid, {
+                "session_version": 1,
+                "history": [{
+                    "role": "assistant",
+                    "content": "sensitive recommendation",
+                    "delivery_id": "scrub-delivery",
+                }],
+                "shown_items": ["42"],
+                "candidate_snapshot": {
+                    "direction": "search_worker",
+                    "candidate_ids": ["42"],
+                },
+            })
+
+            assert scrub_recommendation_sessions(
+                ["scrub-delivery"],
+                [TargetRef("resume", 42)],
+            ) == 1
+
+            session = get_session(userid)
+            assert session["session_version"] == 2
+            assert session["history"][0] == {
+                "role": "assistant",
+                "content": REDACTED_PLACEHOLDER,
+            }
+            assert session["shown_items"] == []
+            assert session["candidate_snapshot"] is None
+            assert r.exists(registry_key, delivery_key, target_key) == 0
+            assert r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                delivery_key,
+            )
+            assert r.sismember(
+                RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY,
+                target_key,
+            )
+        finally:
+            delete_session(userid)
+            r.srem(RECOMMENDATION_SESSION_REVOCATION_FENCE_KEY, *revoked_keys)
 
 
 class TestDedup:

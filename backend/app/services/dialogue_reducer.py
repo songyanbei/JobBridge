@@ -256,6 +256,15 @@ def _resolve_merge_policy(
     if not has_old:
         return "replace", None
 
+    # A repeated, normalized city is not an ambiguity. This commonly happens
+    # when a user searches the same city again after a prior turn; asking
+    # whether to replace or add would render the same city twice.
+    if field == "city":
+        old_values = old_value if isinstance(old_value, list) else [old_value]
+        new_values = new_value if isinstance(new_value, list) else [new_value]
+        if set(old_values) == set(new_values):
+            return "replace", None
+
     # 3) 有旧值 + hint=unknown / 缺失 → 走 schema 声明的 default_merge
     schema_policy = slot_schema.default_merge_policy(frame, field, has_old)
     if schema_policy in ("replace", "add"):
@@ -472,6 +481,44 @@ def _apply_single_direction_role_guard(
     )
 
 
+_FACTORY_POSTING_PATTERN = re.compile(
+    r"(?:发布|发.{0,16}(?:岗位|职位|工作))"
+    r"|(?:招|招聘)\s*(?:[0-9零一二三四五六七八九十百千万两]+)\s*(?:个|人|名)"
+)
+
+
+def _apply_factory_posting_guard(
+    parse_result: DialogueParseResult,
+    role: str,
+    raw_text: str,
+) -> DialogueParseResult:
+    """Recognize an unambiguous factory posting sentence despite frame drift.
+
+    This is intentionally narrower than the role-direction guard: only search
+    acts containing a posting verb or an explicit numeric headcount are moved
+    into the job-upload flow. Phrases such as ``找工人``/``招工人`` without a
+    headcount remain candidate searches.
+    """
+    if (
+        role != "factory"
+        or parse_result.dialogue_act
+        not in {"start_search", "modify_search", "answer_missing_slot"}
+        or not raw_text.strip()
+        or not _FACTORY_POSTING_PATTERN.search(raw_text)
+    ):
+        return parse_result
+
+    slots = dict(parse_result.slots_delta or {})
+    if "salary_ceiling_monthly" in slots:
+        slots.setdefault("salary_floor_monthly", slots.pop("salary_ceiling_monthly"))
+    logger.info("dialogue_v2_factory_posting_guard: search -> job_upload")
+    return parse_result.model_copy(update={
+        "dialogue_act": "start_upload",
+        "frame_hint": "job_upload",
+        "slots_delta": slots,
+    })
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -489,6 +536,9 @@ def reduce(
     raw_text 用于 awaiting tie-break 裸值，以及 broker 明确主客体句式的方向护栏；
     后者不处理模糊表达，也不改变 dialogue_act。
     """
+    parse_result = _apply_factory_posting_guard(
+        parse_result, role, raw_text,
+    )
     parse_result = _apply_single_direction_role_guard(
         parse_result, role, raw_text,
     )
@@ -737,7 +787,9 @@ def _reduce_main(
 
     # 4.3 决定 resolved_merge_policy（仅对 accepted 中存在的 key）
     old_criteria = (
-        {} if broker_direction_switch else dict(session.search_criteria or {})
+        {}
+        if broker_direction_switch or resolved_frame in {"job_upload", "resume_upload"}
+        else dict(session.search_criteria or {})
     )
     resolved_policy: dict[str, str] = {}
     final_criteria = dict(old_criteria)

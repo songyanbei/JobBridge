@@ -24,6 +24,7 @@ from app.models import (
     RecommendationDelivery,
     RecommendationRequest,
     RecommendationSearchAttempt,
+    Resume,
     WecomOutboundOutbox,
 )
 from app.schemas.recommendation import (
@@ -331,6 +332,87 @@ _LLM_STATUSES = frozenset(get_args(LlmAttemptStatus))
 _MAX_CANDIDATE_IDS = 50
 
 
+class RecommendationTargetStale(RuntimeError):
+    """Stable fail-closed result for a target invalidated after search."""
+
+    code = "recommendation_target_stale"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+def _resume_target_ids(
+    ctx: Mapping[str, Any], fact: Mapping[str, Any],
+) -> list[int]:
+    """Return every Resume id that the transaction is about to persist."""
+    ids: set[int] = set()
+    for item in ctx.get("items") or []:
+        if not isinstance(item, Mapping) or item.get("target_type") != "resume":
+            continue
+        value = _optional_int(item.get("target_id"))
+        if value is not None and value > 0:
+            ids.add(value)
+    if str(fact.get("direction") or ctx.get("direction") or "") == "search_worker":
+        served_top_ids = _persisted_id_strings(fact.get("served_top_ids") or [])
+        candidate_ids, precision_pool_ids = _attempt_persisted_id_lists(
+            fact, candidate_fallback=served_top_ids,
+        )
+        collections = [
+            served_top_ids,
+            candidate_ids,
+            precision_pool_ids,
+            _persisted_id_strings(fact.get("shadow_top_ids") or []),
+        ]
+        for raw_attempt in fact.get("additional_attempts") or []:
+            if isinstance(raw_attempt, Mapping):
+                collections.extend(_attempt_persisted_id_lists(raw_attempt))
+        for values in collections:
+            for raw in values:
+                value = _optional_int(raw)
+                if value is not None and value > 0:
+                    ids.add(value)
+    return sorted(ids)
+
+
+def lock_and_validate_recommendation_targets(
+    db: Session,
+    *,
+    ctx: Mapping[str, Any],
+    fact: Mapping[str, Any],
+    now: datetime,
+) -> list[int]:
+    """Linearize Resume recommendation persistence against delist/expiry.
+
+    Lock ordering is the canonical ascending Resume id order.  The caller must
+    invoke this before writing request, attempt, delivery, outbox or a durable
+    session patch and retain the locks until its transaction commits.
+    """
+    target_ids = _resume_target_ids(ctx, fact)
+    if not target_ids:
+        return []
+    moment = to_naive_utc(now)
+    rows = (
+        db.query(Resume)
+        .populate_existing()
+        .filter(Resume.id.in_(target_ids))
+        .order_by(Resume.id)
+        .with_for_update()
+        .all()
+    )
+    if [int(row.id) for row in rows] != target_ids or any(
+        row.audit_status != "passed"
+        or row.activated_at is None
+        or row.candidate_expires_at is not None
+        or row.deleted_at is not None
+        or row.delist_reason is not None
+        or row.expires_at is None
+        or row.expires_at <= moment
+        for row in rows
+    ):
+        raise RecommendationTargetStale()
+    return target_ids
+
+
 def _enum(value: Any, allowed: frozenset[str], default: str) -> str:
     text = str(value or "").strip()
     return text if text in allowed else default
@@ -354,6 +436,27 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _persisted_id_strings(values: Any, *, limit: int | None = None) -> list[str]:
+    """Normalize an ID collection exactly once for both locking and storage."""
+    normalized = [str(value) for value in (values or [])]
+    return normalized if limit is None else normalized[:limit]
+
+
+def _attempt_persisted_id_lists(
+    attempt: Mapping[str, Any], *, candidate_fallback: list[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return the two Resume-bearing collections persisted for an attempt."""
+    candidate_ids = _persisted_id_strings(
+        attempt.get("candidate_ids") or candidate_fallback or [],
+        limit=_MAX_CANDIDATE_IDS,
+    )
+    precision_pool_ids = _persisted_id_strings(
+        attempt.get("precision_pool_ids") or [],
+        limit=_MAX_CANDIDATE_IDS,
+    )
+    return candidate_ids, precision_pool_ids
 
 
 def _criteria_digest(
@@ -451,7 +554,7 @@ def _persist_request_facts(
         else ctx.get("strategy_version_id")
     )
 
-    served_top_ids = [str(value) for value in (fact.get("served_top_ids") or [])]
+    served_top_ids = _persisted_id_strings(fact.get("served_top_ids") or [])
     if not served_top_ids:
         served_top_ids = [
             str(item.get("target_id")) for item in items if item.get("target_id") is not None
@@ -504,9 +607,9 @@ def _persist_request_facts(
     # §9.4：show_more 复用创建快照那次 request 的 served attempt，不建新候选池。
     served_attempt_id = parent.served_attempt_id if is_show_more and parent else None
     if served_attempt_id is None:
-        candidate_ids = [
-            str(value) for value in (fact.get("candidate_ids") or served_top_ids)
-        ][:_MAX_CANDIDATE_IDS]
+        candidate_ids, precision_pool_ids = _attempt_persisted_id_lists(
+            fact, candidate_fallback=served_top_ids,
+        )
         attempt_kind = _enum(
             fact.get("attempt_kind"),
             _ATTEMPT_KINDS,
@@ -528,9 +631,7 @@ def _persist_request_facts(
             scoring_time_utc=to_naive_utc(_as_datetime(fact.get("scoring_time_utc")) or now),
             candidate_count=int(fact.get("candidate_count", len(candidate_ids)) or 0),
             candidate_ids=candidate_ids,
-            precision_pool_ids=[
-                str(value) for value in (fact.get("precision_pool_ids") or [])
-            ][:_MAX_CANDIDATE_IDS],
+            precision_pool_ids=precision_pool_ids,
             result_count=len(items),
             is_zero_result=not candidate_ids,
             strategy_version_id=strategy_version_id,
@@ -557,9 +658,9 @@ def _persist_request_facts(
             if not isinstance(raw_attempt, Mapping):
                 continue
             extra = dict(raw_attempt)
-            extra_candidate_ids = [
-                str(value) for value in (extra.get("candidate_ids") or [])
-            ][:_MAX_CANDIDATE_IDS]
+            extra_candidate_ids, extra_precision_pool_ids = (
+                _attempt_persisted_id_lists(extra)
+            )
             extra_kind = _enum(
                 extra.get("attempt_kind"),
                 _ATTEMPT_KINDS,
@@ -583,11 +684,7 @@ def _persist_request_facts(
                     extra.get("candidate_count", len(extra_candidate_ids)) or 0,
                 ),
                 candidate_ids=extra_candidate_ids,
-                precision_pool_ids=[
-                    str(value) for value in (
-                        extra.get("precision_pool_ids") or []
-                    )
-                ][:_MAX_CANDIDATE_IDS],
+                precision_pool_ids=extra_precision_pool_ids,
                 result_count=int(
                     extra.get("result_count", len(extra_candidate_ids)) or 0,
                 ),
@@ -662,6 +759,10 @@ def prepare_delivery(
     # §9.4：同一入站消息的第 N 个推荐决策必须有不同的 request_index，否则撞唯一键。
     request_index = fact.get("request_index")
     request_index = reply_index if request_index is None else int(request_index)
+
+    lock_and_validate_recommendation_targets(
+        db, ctx=ctx, fact=fact, now=moment,
+    )
 
     _persist_request_facts(
         db,
@@ -745,6 +846,9 @@ def persist_request_fact_only(
     )[:64]
     request_index = fact.get("request_index")
     request_index = reply_index if request_index is None else int(request_index)
+    lock_and_validate_recommendation_targets(
+        db, ctx={}, fact=fact, now=moment,
+    )
     _persist_request_facts(
         db,
         request_id=request_id,

@@ -7,20 +7,97 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import event
+from sqlalchemy.orm import Session, SessionTransaction
 
+from app.config import settings
 from app.llm.base import IntentResult
 from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
-from app.models import Job, Resume, SystemConfig
+from app.models import Job, Resume
 from app.services import audit_service, conversation_service
+from app.services.lifecycle_config_service import get_job_ttl_days, get_resume_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
+from app.tasks.common import log_event
 
 # 单条记录最多挂载图片数（与 system_config.upload.max_images 对齐）
 _MAX_IMAGES_PER_RECORD = 5
 
 logger = logging.getLogger(__name__)
+
+_PENDING_FIRST_PUBLISH_EVENTS = "job_first_publish_pending_events"
+
+
+def _transaction_contains(
+    transaction: SessionTransaction | None,
+    ancestor: SessionTransaction,
+) -> bool:
+    while transaction is not None:
+        if transaction is ancestor:
+            return True
+        transaction = transaction.parent
+    return False
+
+
+@event.listens_for(Session, "after_commit")
+def _emit_committed_first_publish_events(db: Session) -> None:
+    if db.in_nested_transaction():
+        return
+    pending = db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, [])
+    for _, fields in pending:
+        try:
+            log_event("job_candidate_created", **fields)
+        except Exception:
+            logger.exception("job_candidate_created telemetry failed")
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _discard_rolled_back_first_publish_events(
+    db: Session,
+    previous_transaction: SessionTransaction,
+) -> None:
+    pending = db.info.get(_PENDING_FIRST_PUBLISH_EVENTS, [])
+    remaining = [
+        item for item in pending
+        if not _transaction_contains(item[0], previous_transaction)
+    ]
+    if remaining:
+        db.info[_PENDING_FIRST_PUBLISH_EVENTS] = remaining
+    else:
+        db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, None)
+
+
+@event.listens_for(Session, "after_transaction_end")
+def _discard_abandoned_first_publish_events(
+    db: Session,
+    transaction: SessionTransaction,
+) -> None:
+    if transaction.parent is None and not db.in_transaction():
+        db.info.pop(_PENDING_FIRST_PUBLISH_EVENTS, None)
+
+
+def _emit_first_publish_candidate_after_commit(
+    db: Session,
+    *,
+    job_id: int,
+    audit_status: str,
+    source_msg_id: str | None,
+    owner_userid: str,
+) -> None:
+    transaction = db.get_nested_transaction() or db.get_transaction()
+    if transaction is None:
+        raise RuntimeError("first_publish_event_requires_transaction")
+    db.info.setdefault(_PENDING_FIRST_PUBLISH_EVENTS, []).append((
+        transaction,
+        {
+            "job_id": job_id,
+            "candidate_kind": "first_publish",
+            "audit_status": audit_status,
+            "source_message_id": source_msg_id or "",
+            "user_hash": identifier_hash(owner_userid),
+        },
+    ))
 
 # 必填字段的中文展示名（用于生成追问文案）
 _FIELD_DISPLAY_NAMES = {
@@ -42,6 +119,24 @@ MAX_FOLLOW_UP_ROUNDS = 2
 PENDING_UPLOAD_TTL_MINUTES = 10
 
 
+def initialize_pending_upload_window(
+    session: SessionState,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Start the fixed upload deadline once, including for an empty draft."""
+    if session.pending_started_at:
+        return
+    started_at = now or datetime.now(timezone.utc)
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    session.pending_started_at = started_at.isoformat()
+    session.pending_updated_at = started_at.isoformat()
+    session.pending_expires_at = (
+        started_at + timedelta(minutes=PENDING_UPLOAD_TTL_MINUTES)
+    ).isoformat()
+
+
 def _save_pending_upload(
     session: SessionState,
     intent: str,
@@ -54,14 +149,12 @@ def _save_pending_upload(
     raw_text 为当前轮用户原文（非已拼接结果）。函数会去重追加到
     pending_raw_text_parts；与最后一条相同则跳过，避免重复合并。
     """
+    session.attachment_target_type = None
+    session.attachment_target_id = None
     now = datetime.now(timezone.utc)
     # 固定窗口：expires_at = created_at + 10 分钟，subsequent 轮次只更新 updated_at。
     # 避免用户用 chitchat 间歇性"续命"陈旧草稿（spec §3.4 / §9.4）。
-    if not session.pending_started_at:
-        session.pending_started_at = now.isoformat()
-        session.pending_expires_at = (
-            now + timedelta(minutes=PENDING_UPLOAD_TTL_MINUTES)
-        ).isoformat()
+    initialize_pending_upload_window(session, now=now)
     session.pending_updated_at = now.isoformat()
 
     # 合并结构化字段（新值覆盖旧值）。
@@ -111,11 +204,29 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_updated_at = None
     session.pending_expires_at = None
     session.pending_raw_text_parts = []
+    session.pending_upload_mode = "create"
+    session.pending_target_id = None
+    session.pending_target_version = None
+    session.pending_operation_id = None
+    session.pending_rollout_cohort = None
+    session.pending_rollout_revision = None
+    session.pending_upload_media_ids = []
+    session.attachment_target_type = None
+    session.attachment_target_id = None
     session.follow_up_rounds = 0
     session.failed_patch_rounds = 0
     session.conflict_followup_rounds = 0
     session.pending_interruption = None
     session.active_flow = "idle"
+
+
+def abandon_pending_upload(session: SessionState, db: Session) -> None:
+    """将草稿媒体交给持久化删除任务后清空会话。"""
+    if session.pending_upload_media_ids:
+        from app.services.job_media_service import mark_delete_pending
+        mark_delete_pending(db, list(session.pending_upload_media_ids))
+        db.flush()
+    clear_pending_upload(session)
 
 
 def is_pending_upload_expired(session: SessionState) -> bool:
@@ -128,7 +239,7 @@ def is_pending_upload_expired(session: SessionState) -> bool:
        可能产生 naive 字符串，比较前必须归一化。
     """
     if not session.pending_expires_at:
-        return False
+        return bool(session.pending_upload_intent)
     try:
         expires = datetime.fromisoformat(session.pending_expires_at)
         if expires.tzinfo is None:
@@ -158,6 +269,7 @@ def process_upload(
     image_keys: list[str],
     session: SessionState,
     db: Session,
+    source_msg_id: str | None = None,
 ) -> UploadResult:
     """上传编排主入口。"""
     entity_type = _resolve_entity_type(intent_result.intent, user_ctx.role)
@@ -167,8 +279,21 @@ def process_upload(
             reply_text="无法确定您要发布的内容类型，请重新描述。",
         )
 
+    if entity_type == "resume":
+        from app.services.resume_cutover_service import assert_resume_writes_allowed
+
+        assert_resume_writes_allowed()
+
     required = JOB_REQUIRED_FIELDS if entity_type == "job" else RESUME_REQUIRED_FIELDS
-    data = intent_result.structured_data
+    # Providers occasionally return free-form compensation text (for example
+    # "底薪+提成") for the ENUM-backed pay_type slot. Normalize before required
+    # field validation and persistence so malformed values cannot abort upload.
+    # The original wording remains in final_raw_text/description for audit.
+    data = dict(intent_result.structured_data or {})
+    if entity_type == "job":
+        normalized_pay_type = _normalize_pay_type(data.get("pay_type"), raw_text)
+        if normalized_pay_type is not None:
+            data["pay_type"] = normalized_pay_type
 
     # 检查缺失必填字段
     missing = _check_required_fields(data, required)
@@ -208,10 +333,61 @@ def process_upload(
         db=db,
     )
 
+    if (
+        entity_type == "job"
+        and not settings.job_replacement_enabled
+        and (
+            session.pending_upload_mode == "replace"
+            or audit_result.status != "passed"
+        )
+    ):
+        logger.warning(
+            "job_candidate_creation_blocked lifecycle rollout disabled "
+            "owner=%s mode=%s audit_status=%s",
+            identifier_hash(user_ctx.external_userid),
+            session.pending_upload_mode,
+            audit_result.status,
+        )
+        return UploadResult(
+            success=False,
+            reply_text="岗位发布功能暂不可用，请稍后再试。",
+        )
+
     # 入库（带审核结果）
-    if entity_type == "job":
+    if entity_type in {"job", "resume"} and session.pending_upload_mode == "replace":
+        if not (
+            session.pending_target_id
+            and session.pending_target_version
+            and session.pending_operation_id
+        ):
+            raise RuntimeError("replacement_session_context_incomplete")
+        if entity_type == "resume" and not (
+            session.pending_rollout_cohort == "enabled"
+            and session.pending_rollout_revision is not None
+        ):
+            raise RuntimeError("resume_replacement_assignment_context_incomplete")
+        if entity_type == "job":
+            from app.services.job_replace_service import create_replacement_candidate
+            target_kw = {"target_job_id": session.pending_target_id}
+        else:
+            from app.services.resume_replace_service import create_replacement_candidate
+            target_kw = {"target_resume_id": session.pending_target_id}
+        _, entity = create_replacement_candidate(
+            db,
+            owner_userid=user_ctx.external_userid,
+            **target_kw,
+            expected_version=session.pending_target_version,
+            operation_id=session.pending_operation_id,
+            source_msg_id=source_msg_id or session.pending_operation_id,
+            complete_data=data,
+            raw_text=final_raw_text,
+            media_ids=list(session.pending_upload_media_ids),
+            audit_result=audit_result,
+        )
+    elif entity_type == "job":
         entity = _create_job(
             data, user_ctx, audit_result, ttl_days, final_raw_text, image_keys, db,
+            media_ids=list(session.pending_upload_media_ids),
         )
     else:
         entity = _create_resume(
@@ -222,9 +398,29 @@ def process_upload(
     audit_service.write_audit_log_for_result(
         entity_type, entity.id, audit_result, db,
     )
+    if (
+        entity_type == "job"
+        and session.pending_upload_mode != "replace"
+        and entity.audit_status in {"pending", "rejected"}
+        and entity.activated_at is None
+    ):
+        _emit_first_publish_candidate_after_commit(
+            db,
+            job_id=entity.id,
+            audit_status=entity.audit_status,
+            source_msg_id=source_msg_id,
+            owner_userid=user_ctx.external_userid,
+        )
 
     # Stage A：入库成功后清 pending（含 follow_up_rounds 重置）
     clear_pending_upload(session)
+    if (
+        entity.audit_status == "passed"
+        and entity.expires_at is not None
+        and entity.deleted_at is None
+    ):
+        session.attachment_target_type = entity_type
+        session.attachment_target_id = entity.id
 
     # 根据审核状态生成回复
     reply = _audit_status_reply(audit_result.status, entity_type)
@@ -242,12 +438,13 @@ def attach_image(
     image_key: str,
     session: SessionState,
     db: Session,
+    media_lifecycle_id: int | None = None,
 ) -> str:
     """将已保存的图片 key 附加到用户当前上传流程的实体上。
 
     Phase 4 新增：图片下载由 Worker 完成后，message_router 调用本方法
-    把图片挂到最近一条未过期的岗位/简历上（由 session.current_intent 和用户
-    角色共同决定实体类型）。不做 OCR，不参与字段抽取。
+    草稿存活时挂到 durable 草稿媒体集合；草稿结束后仅挂到会话中
+    记录的精确激活实体 ID。不做 OCR，不参与字段抽取。
 
     Args:
         external_userid: 上传者 external_userid
@@ -259,36 +456,79 @@ def attach_image(
         用户可读的反馈文案（成功 / 找不到实体 / 数量超限）
     """
     if not image_key:
+        discard_unattached_media(db, media_lifecycle_id)
         return "图片保存失败，请稍后重试。"
 
-    # Stage C1（spec §2.10）：pending_upload_intent 优先 —
-    # 草稿存活时（无论 active_flow 是 upload_collecting 还是 upload_conflict）
-    # 都按 origin intent 决定实体类型；回落 current_intent 兼容旧 session（C2 删除回落）。
     if session.pending_upload_intent:
-        entity_type = _attach_target_entity_type(session.pending_upload_intent)
-    else:
-        entity_type = _attach_target_entity_type(session.current_intent)
+        if media_lifecycle_id is None:
+            return "图片保存失败，请稍后重试。"
+        if media_lifecycle_id in session.pending_upload_media_ids:
+            kind = "岗位" if _attach_target_entity_type(session.pending_upload_intent) == "job" else "简历"
+            return f"图片已加入新{kind}草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+        if len(session.pending_upload_media_ids) >= _MAX_IMAGES_PER_RECORD:
+            discard_unattached_media(db, media_lifecycle_id)
+            return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
+        session.pending_upload_media_ids.append(media_lifecycle_id)
+        kind = "岗位" if _attach_target_entity_type(session.pending_upload_intent) == "job" else "简历"
+        return f"图片已加入新{kind}草稿（第 {len(session.pending_upload_media_ids)} 张）。"
+
+    entity_type = session.attachment_target_type
+    target_id = session.attachment_target_id
+    if (
+        entity_type not in {"job", "resume"}
+        or type(target_id) is not int
+        or target_id <= 0
+    ):
+        discard_unattached_media(db, media_lifecycle_id)
+        return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"
 
     model_cls = Job if entity_type == "job" else Resume
-    now = datetime.now(timezone.utc)
-    record = db.query(model_cls).filter(
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    target_filters = [
+        model_cls.id == target_id,
         model_cls.owner_userid == external_userid,
-        model_cls.deleted_at.is_(None),
-        model_cls.expires_at > now,
-    ).order_by(model_cls.created_at.desc()).first()
+    ]
+    if entity_type == "resume":
+        from app.services.resume_mutation_service import online_resume_filters
+
+        target_filters.extend(online_resume_filters(now=now))
+    else:
+        target_filters.extend((
+            model_cls.audit_status == "passed",
+            model_cls.deleted_at.is_(None),
+            model_cls.delist_reason.is_(None),
+            model_cls.expires_at > now,
+        ))
+    record = (
+        db.query(model_cls)
+        .filter(*target_filters)
+        .with_for_update()
+        .first()
+    )
 
     if record is None:
+        discard_unattached_media(db, media_lifecycle_id)
         return "图片已收到，但未找到正在处理的上传记录；请先用文字发布岗位/简历，再补充图片。"
 
     # 追加到 images JSON 数组（去重 + 数量上限）
     images = list(record.images) if record.images else []
     if image_key in images:
+        discard_unattached_media(db, media_lifecycle_id)
         return "该图片已附加，无需重复发送。"
     if len(images) >= _MAX_IMAGES_PER_RECORD:
+        discard_unattached_media(db, media_lifecycle_id)
         return f"图片数量已达上限（{_MAX_IMAGES_PER_RECORD} 张），无法再添加。"
 
+    if media_lifecycle_id is not None:
+        from app.services.job_media_service import attach_media
+        [image_key] = attach_media(
+            db, [media_lifecycle_id], entity_type, record.id,
+            owner_userid=external_userid,
+        )
     images.append(image_key)
     record.images = images
+    from app.services.job_mutation_service import increment_version
+    increment_version(record)
     db.flush()
 
     kind = "岗位" if entity_type == "job" else "简历"
@@ -297,6 +537,16 @@ def attach_image(
         identifier_hash(external_userid), entity_type, record.id, len(images),
     )
     return f"图片已附加到您最近一条{kind}信息（第 {len(images)} 张）。"
+
+
+def discard_unattached_media(db: Session, media_lifecycle_id: int | None) -> None:
+    """已下载但未挂载的媒体立即进入 durable 删除队列。"""
+    if media_lifecycle_id is None:
+        return
+    from app.services.job_media_service import discard_pending_media
+
+    discard_pending_media(db, media_lifecycle_id)
+    db.flush()
 
 
 def _attach_target_entity_type(current_intent: str | None) -> str:
@@ -334,6 +584,32 @@ def _check_required_fields(data: dict, required: frozenset) -> list[str]:
         elif isinstance(val, (list, str)) and len(val) == 0:
             missing.append(f)
     return missing
+
+
+_JOB_PAY_TYPES = frozenset(("月薪", "时薪", "计件"))
+
+
+def _normalize_pay_type(value, raw_text: str = "") -> str | None:
+    """Map free-form compensation wording to the job pay_type ENUM."""
+    raw_value = "" if value is None else str(value).strip()
+    combined = f"{raw_value} {raw_text or ''}"
+    if not raw_value:
+        if "时薪" in combined:
+            return "时薪"
+        if "计件" in combined:
+            return "计件"
+        if any(marker in combined for marker in ("月薪", "底薪", "月结", "按月")):
+            return "月薪"
+        return None
+    if raw_value in _JOB_PAY_TYPES:
+        return raw_value
+    if "时薪" in combined or "按小时" in combined:
+        return "时薪"
+    if "计件" in combined or "件薪" in combined:
+        return "计件"
+    # "底薪+提成" and other free-form monthly compensation map to 月薪;
+    # final_raw_text still retains the original wording.
+    return "月薪"
 
 
 def _generate_followup_text(missing: list[str], frame: str | None = None) -> str:
@@ -378,16 +654,9 @@ def _infer_upload_frame(missing: list[str]) -> str | None:
 
 def _read_ttl_days(entity_type: str, db: Session) -> int:
     """从 system_config 读取 TTL 天数。"""
-    key = f"ttl.{entity_type}.days"
-    config = db.query(SystemConfig).filter(
-        SystemConfig.config_key == key,
-    ).first()
-    if config:
-        try:
-            return int(config.config_value)
-        except (ValueError, TypeError):
-            pass
-    return 30  # 默认 30 天
+    if entity_type == "job":
+        return get_job_ttl_days(db)
+    return get_resume_ttl_days(db)
 
 
 def _extract_scalar(data: dict, key: str, default: str = "") -> str:
@@ -406,9 +675,13 @@ def _create_job(
     raw_text: str,
     image_keys: list[str],
     db: Session,
+    media_ids: list[int] | None = None,
 ) -> Job:
     """创建岗位记录。"""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    from app.services.job_activation_service import activate_job
+    from app.services.lifecycle_config_service import get_job_candidate_ttl_days
+
     job = Job(
         owner_userid=user_ctx.external_userid,
         hiring_company=_extract_scalar(data, "hiring_company", "") or None,
@@ -421,12 +694,14 @@ def _create_job(
         is_long_term=data.get("is_long_term", True),
         raw_text=raw_text,
         description=data.get("description") or raw_text,
-        images=image_keys or None,
-        audit_status=audit_result.status,
+        images=None,
+        audit_status="pending" if audit_result.status == "passed" else audit_result.status,
         audit_reason=audit_result.reason or None,
         audited_by="system",
         audited_at=now,
-        expires_at=now + timedelta(days=ttl_days),
+        expires_at=None,
+        activated_at=None,
+        candidate_expires_at=now + timedelta(days=get_job_candidate_ttl_days(db)),
         # 可选软匹配字段
         district=data.get("district"),
         address=_extract_scalar(data, "address", "") or None,
@@ -454,6 +729,14 @@ def _create_job(
     )
     db.add(job)
     db.flush()
+    if media_ids:
+        from app.services.job_media_service import attach_media
+        job.images = attach_media(
+            db, media_ids, "job", job.id,
+            owner_userid=user_ctx.external_userid,
+        )
+    if audit_result.status == "passed":
+        activate_job(db, job, now=now)
     return job
 
 
@@ -467,7 +750,11 @@ def _create_resume(
     db: Session,
 ) -> Resume:
     """创建简历记录。"""
-    now = datetime.now(timezone.utc)
+    from app.services.lifecycle_config_service import get_resume_candidate_ttl_days
+    from app.services.resume_activation_service import activate_resume
+    from app.services.resume_mutation_service import utc_now_naive
+
+    now = utc_now_naive()
     resume = Resume(
         owner_userid=user_ctx.external_userid,
         expected_cities=data.get("expected_cities", []),
@@ -480,11 +767,13 @@ def _create_resume(
         raw_text=raw_text,
         description=data.get("description") or raw_text,
         images=image_keys or None,
-        audit_status=audit_result.status,
+        audit_status="pending" if audit_result.status == "passed" else audit_result.status,
         audit_reason=audit_result.reason or None,
         audited_by="system",
         audited_at=now,
-        expires_at=now + timedelta(days=ttl_days),
+        activated_at=None,
+        expires_at=None,
+        candidate_expires_at=now + timedelta(days=get_resume_candidate_ttl_days(db)),
         # 可选软匹配字段
         expected_districts=data.get("expected_districts"),
         height=data.get("height"),
@@ -504,6 +793,8 @@ def _create_resume(
     )
     db.add(resume)
     db.flush()
+    if audit_result.status == "passed":
+        activate_resume(db, resume, now=now)
     return resume
 
 

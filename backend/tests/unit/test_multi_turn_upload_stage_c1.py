@@ -849,8 +849,7 @@ class TestBrokerDirectionDuringCollecting:
 class TestAttachImageActiveFlowPriority:
     def test_active_flow_collecting_used_first(self):
         """active_flow=upload_collecting + pending_upload_intent=upload_job
-        即使 current_intent='command' 也要挂到 Job（不回落 current_intent）。"""
-        from app.models import Job
+        即使 current_intent='command' 也只挂到 durable 草稿（不回落旧 Job）。"""
         session = SessionState(
             role="factory",
             active_flow="upload_collecting",
@@ -862,14 +861,14 @@ class TestAttachImageActiveFlowPriority:
 
         feedback = upload_service.attach_image(
             external_userid="u1", image_key="key",
-            session=session, db=db,
+            session=session, db=db, media_lifecycle_id=17,
         )
-        assert db.query.call_args.args[0] is Job
-        assert "正在处理" in feedback or "已收到" in feedback
+        assert session.pending_upload_media_ids == [17]
+        db.query.assert_not_called()
+        assert "新岗位草稿" in feedback
 
-    def test_fallback_to_current_intent_when_no_active_flow(self):
-        """旧 session：无 active_flow，但 current_intent=upload_resume 仍能挂载到 Resume。"""
-        from app.models import Resume
+    def test_current_intent_without_exact_target_is_not_attachable(self):
+        """旧 session 没有精确目标时不得再猜测最近记录。"""
         session = SessionState(
             role="worker",
             active_flow=None,
@@ -878,11 +877,12 @@ class TestAttachImageActiveFlowPriority:
         db = MagicMock()
         db.query.return_value.filter.return_value.order_by.return_value.first.return_value = None
 
-        upload_service.attach_image(
+        feedback = upload_service.attach_image(
             external_userid="u1", image_key="key",
             session=session, db=db,
         )
-        assert db.query.call_args.args[0] is Resume
+        assert "未找到正在处理" in feedback
+        db.query.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1050,9 @@ class TestImageAttachWithPollutedCurrentIntent:
             active_flow="upload_conflict",
             pending_upload_intent="upload_job",
             pending_upload={"city": "北京市"},
+            pending_expires_at=(
+                datetime.now(timezone.utc) + timedelta(minutes=10)
+            ).isoformat(),
             current_intent="chitchat",  # 被污染
             pending_interruption={
                 "intent": "search_worker",
@@ -1077,7 +1080,6 @@ class TestAttachImageInternalUsesPendingIntentFirst:
     不再依赖 active_flow == upload_collecting；覆盖 conflict 期挂图。"""
 
     def test_pending_intent_wins_over_current_intent_in_conflict(self):
-        from app.models import Job
         session = SessionState(
             role="factory",
             active_flow="upload_conflict",  # 不是 upload_collecting
@@ -1089,11 +1091,11 @@ class TestAttachImageInternalUsesPendingIntentFirst:
 
         feedback = upload_service.attach_image(
             external_userid="u1", image_key="key",
-            session=session, db=db,
+            session=session, db=db, media_lifecycle_id=23,
         )
-        # 路由到 Job 而不是 Resume（Resume 是 fallback）
-        assert db.query.call_args.args[0] is Job
-        assert "正在处理" in feedback or "已收到" in feedback
+        assert session.pending_upload_media_ids == [23]
+        db.query.assert_not_called()
+        assert "新岗位草稿" in feedback
 
 
 # ---------------------------------------------------------------------------

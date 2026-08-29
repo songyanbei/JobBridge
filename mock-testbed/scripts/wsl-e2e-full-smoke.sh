@@ -29,7 +29,8 @@ echo "==> [0] 清场（删 fullsmoke_* 历史 + Redis FLUSHDB）"
 cleanup_mock_data
 
 # 重 seed wm_mock 用户（FLUSHDB 不影响 MySQL）
-docker exec -i jobbridge-mysql mysql -ujobbridge -pjobbridge jobbridge \
+docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 \
+    -ujobbridge -pjobbridge jobbridge \
     < "$ROOT/mock-testbed/sql/seed_mock_users.sql" 2>&1 | grep -v "Warning" || true
 
 cat > "$BACKEND/.env" <<EOF

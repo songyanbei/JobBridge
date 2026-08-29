@@ -40,6 +40,7 @@ def test_user_lock_does_not_start_renewal_when_not_acquired(monkeypatch):
     with patch.object(redis_client, "get_redis", return_value=fake_redis):
         with redis_client.user_lock("u1", timeout=0) as acquired:
             assert bool(acquired) is False
+            assert acquired.unavailable is False
             time.sleep(0.02)
 
     fake_lock.extend.assert_not_called()
@@ -57,6 +58,35 @@ def test_lease_rejects_commit_after_renewal_loss():
     lock.owned.assert_not_called()
 
 
+def test_lease_classifies_redis_verification_failure_as_unavailable():
+    lost = redis_client.threading.Event()
+    lock = MagicMock()
+    lock.owned.side_effect = redis_client.redis.exceptions.ConnectionError("down")
+    lease = redis_client.UserLockLease(True, lock, lost, "abc")
+
+    with pytest.raises(redis_client.UserLockUnavailable):
+        lease.assert_owned()
+
+    assert lease.unavailable is True
+    assert lost.is_set()
+
+
+def test_lease_classifies_redis_renewal_failure_as_unavailable(monkeypatch):
+    monkeypatch.setattr(redis_client, "LOCK_RENEW_INTERVAL_SECONDS", 0.01)
+    fake_lock = MagicMock()
+    fake_lock.acquire.return_value = True
+    fake_lock.extend.side_effect = redis_client.redis.exceptions.ConnectionError("down")
+    fake_redis = MagicMock()
+    fake_redis.lock.return_value = fake_lock
+
+    with patch.object(redis_client, "get_redis", return_value=fake_redis):
+        with redis_client.user_lock("u1", timeout=0) as lease:
+            time.sleep(0.03)
+            assert lease.unavailable is True
+            with pytest.raises(redis_client.UserLockUnavailable):
+                lease.assert_owned()
+
+
 def test_user_lock_acquire_redis_error_degrades_to_not_acquired():
     fake_lock = MagicMock()
     fake_lock.acquire.side_effect = redis_client.redis.exceptions.ConnectionError("down")
@@ -66,6 +96,7 @@ def test_user_lock_acquire_redis_error_degrades_to_not_acquired():
     with patch.object(redis_client, "get_redis", return_value=fake_redis):
         with redis_client.user_lock("u1", timeout=0) as lease:
             assert not lease
+            assert lease.unavailable is True
 
 
 def test_user_lock_release_redis_error_does_not_escape():

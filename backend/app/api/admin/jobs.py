@@ -17,6 +17,8 @@ from app.core.responses import ok, paged
 from app.models import AdminUser, User
 from app.schemas.job import JobRead
 from app.services import job_admin_service
+from app.services.job_replace_service import REPLACEMENT_CANCEL_REASON_MAX_LENGTH
+from app.services.storage_reference_service import storage_urls_for_response
 
 router = APIRouter(prefix="/admin/jobs", tags=["admin-jobs"])
 
@@ -52,9 +54,11 @@ def _enrich_with_owner(db: _Session, jobs: list) -> dict[str, dict]:
     }
 
 
-def _job_to_dict(job, owner_map: dict[str, dict]) -> dict:
+def _job_to_dict(job, owner_map: dict[str, dict], projection: dict | None = None) -> dict:
     item = JobRead.model_validate(job).model_dump(mode="json")
+    item["images"] = storage_urls_for_response(item.get("images"))
     item.update(owner_map.get(job.owner_userid, {}))
+    item.update(projection or {})
     return item
 
 
@@ -75,6 +79,19 @@ class ExtendRequest(BaseModel):
 
 class RestoreRequest(BaseModel):
     version: int = Field(..., ge=1)
+
+
+class ReplacementRetryRequest(BaseModel):
+    old_job_version: int = Field(..., ge=1)
+    reason: str = Field(..., min_length=1, max_length=200)
+
+
+class ReplacementCancelRequest(BaseModel):
+    reason: str = Field(
+        default="operator_cancelled",
+        min_length=1,
+        max_length=REPLACEMENT_CANCEL_REASON_MAX_LENGTH,
+    )
 
 
 def _collect_filters(
@@ -109,6 +126,7 @@ def list_jobs(
     expires_to: datetime | None = None,
     salary_min: int | None = None,
     salary_max: int | None = None,
+    lifecycle_scope: str | None = Query(None, description="active / candidate / history / all"),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     sort: str = "created_at:desc",
@@ -120,9 +138,14 @@ def list_jobs(
         owner_userid, created_from, created_to, expires_from, expires_to,
         salary_min, salary_max,
     )
-    rows, total = job_admin_service.list_jobs(db, filters, page, size, sort)
+    rows, total = job_admin_service.list_jobs(
+        db, filters, page, size, sort, lifecycle_scope=lifecycle_scope,
+    )
     owner_map = _enrich_with_owner(db, rows)
-    return paged([_job_to_dict(r, owner_map) for r in rows], total, page, size)
+    projections = job_admin_service.replacement_projections(db, rows)
+    return paged([
+        _job_to_dict(r, owner_map, projections.get(r.id)) for r in rows
+    ], total, page, size)
 
 
 @router.get("/export", summary="岗位导出 CSV")
@@ -140,6 +163,7 @@ def export_jobs(
     expires_to: datetime | None = None,
     salary_min: int | None = None,
     salary_max: int | None = None,
+    lifecycle_scope: str | None = Query(None, description="active / candidate / history / all"),
     sort: str = "created_at:desc",
     db: Session = Depends(get_db),
     _: AdminUser = Depends(require_admin),
@@ -149,27 +173,37 @@ def export_jobs(
         owner_userid, created_from, created_to, expires_from, expires_to,
         salary_min, salary_max,
     )
-    rows = job_admin_service.export_rows(db, filters, sort)
+    rows = job_admin_service.export_rows(
+        db, filters, sort, lifecycle_scope=lifecycle_scope,
+    )
     owner_map = _enrich_with_owner(db, rows)
+    projections = job_admin_service.replacement_projections(db, rows)
     headers = [
         "id", "owner_userid", "owner_company", "owner_contact_person", "owner_phone",
         "hiring_company", "city", "district", "address", "contact_person", "phone", "job_category",
         "salary_floor_monthly", "salary_ceiling_monthly", "pay_type",
         "headcount", "gender_required", "age_min", "age_max", "is_long_term",
-        "audit_status", "audit_reason", "delist_reason",
-        "created_at", "expires_at", "version",
+        "audit_status", "audit_reason", "delist_reason", "activated_at",
+        "candidate_expires_at", "replacement_id", "replacement_review_outcome",
+        "replacement_lifecycle_status", "replacement_closed_reason",
+        "replaces_job_id", "replaced_by_job_id", "created_at", "expires_at", "version",
     ]
     body = []
     for r in rows:
         ow = owner_map.get(r.owner_userid, {})
+        rp = projections.get(r.id, {})
         body.append([
             r.id, r.owner_userid,
             ow.get("owner_company"), ow.get("owner_contact_person"), ow.get("owner_phone"),
             r.hiring_company, r.city, r.district, r.address, r.contact_person, r.phone, r.job_category,
             r.salary_floor_monthly, r.salary_ceiling_monthly, r.pay_type,
             r.headcount, r.gender_required, r.age_min, r.age_max, r.is_long_term,
-            r.audit_status, r.audit_reason, r.delist_reason,
-            r.created_at, r.expires_at, r.version,
+            r.audit_status, r.audit_reason, r.delist_reason, r.activated_at,
+            r.candidate_expires_at, rp.get("replacement_id"),
+            rp.get("replacement_review_outcome"), rp.get("replacement_lifecycle_status"),
+            rp.get("replacement_closed_reason"), rp.get("replaces_job_id"),
+            rp.get("replaced_by_job_id"),
+            r.created_at, r.expires_at.isoformat() if r.expires_at else None, r.version,
         ])
     data = rows_to_csv_bytes(headers, body)
     filename = f"jobs_{datetime.now().strftime('%Y%m%d%H%M')}.csv"
@@ -186,7 +220,8 @@ def get_job(
 ):
     job = job_admin_service.get_job(db, job_id)
     owner_map = _enrich_with_owner(db, [job])
-    return ok(_job_to_dict(job, owner_map))
+    projection = job_admin_service.replacement_projections(db, [job]).get(job.id)
+    return ok(_job_to_dict(job, owner_map, projection))
 
 
 @router.put("/{job_id}", summary="岗位编辑（带 version 乐观锁）")
@@ -198,7 +233,8 @@ def update_job(
 ):
     job = job_admin_service.update_job(db, job_id, req.version, req.fields, current.username)
     owner_map = _enrich_with_owner(db, [job])
-    return ok(_job_to_dict(job, owner_map))
+    projection = job_admin_service.replacement_projections(db, [job]).get(job.id)
+    return ok(_job_to_dict(job, owner_map, projection))
 
 
 @router.post("/{job_id}/delist", summary="岗位下架")
@@ -231,4 +267,43 @@ def restore_job(
     current: AdminUser = Depends(require_admin),
 ):
     job_admin_service.restore(db, job_id, req.version, current.username)
+    return ok()
+
+
+@router.post("/replacements/{replacement_id}/retry", summary="重试岗位替换激活")
+def retry_replacement(
+    replacement_id: int,
+    req: ReplacementRetryRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    from app.services.job_replace_service import retry_activation
+
+    activated = retry_activation(
+        db,
+        replacement_id,
+        req.old_job_version,
+        operator=current.username,
+        reason=req.reason,
+    )
+    db.commit()
+    return ok({"activated": activated})
+
+
+@router.post("/replacements/{replacement_id}/cancel", summary="取消岗位替换候选")
+def cancel_replacement(
+    replacement_id: int,
+    req: ReplacementCancelRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    from app.services.job_replace_service import cancel_candidate
+
+    cancel_candidate(
+        db,
+        replacement_id,
+        operator=current.username,
+        reason=req.reason,
+    )
+    db.commit()
     return ok()

@@ -336,13 +336,13 @@ class TestConfig:
 
 class TestSSE:
     def test_returns_event_stream_content_type(self, client, fakeredis_conn):
-        # 只读 header；不消费 body（否则会永远阻塞）
-        with client.stream(
-            "GET",
-            "/mock/wework/sse",
-            params={"external_userid": "wm_mock_worker_001"},
-        ) as r:
-            assert r.status_code == 200
-            assert r.headers["content-type"].startswith("text/event-stream")
-            assert r.headers.get("x-accel-buffering") == "no"
-            assert r.headers.get("cache-control") == "no-cache"
+        # TestClient buffers streaming responses until completion.  Inspect the
+        # response object directly so this finite header contract test does not
+        # wait on the intentionally unbounded SSE body.
+        import asyncio
+        import routes
+
+        response = asyncio.run(routes.mock_sse("wm_mock_worker_001"))
+        assert response.media_type == "text/event-stream"
+        assert response.headers.get("x-accel-buffering") == "no"
+        assert response.headers.get("cache-control") == "no-cache"

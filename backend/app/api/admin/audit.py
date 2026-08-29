@@ -30,6 +30,9 @@ def _serialize_queue_item(item) -> dict:
         "locked_by": item.locked_by,
         "created_at": obj.created_at.isoformat() if obj.created_at else None,
         "version": int(obj.version or 0),
+        "replacement_id": item.replacement_id,
+        "replacement_review_outcome": item.replacement_review_outcome,
+        "replacement_lifecycle_status": item.replacement_lifecycle_status,
     }
 
 
