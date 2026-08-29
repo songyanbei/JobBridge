@@ -40,6 +40,7 @@ class MockWecomInboundEvent(Base):
         autoincrement=True,
     )
     msg_id = Column(String(64), nullable=False, unique=True)
+    turn_id = Column(String(36), nullable=False, unique=True)
     from_userid = Column(String(64), nullable=False)
     msg_type = Column(
         Enum(

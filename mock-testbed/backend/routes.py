@@ -15,6 +15,7 @@
 import json
 import secrets
 import time
+import uuid
 from urllib.parse import urlencode
 
 import redis
@@ -237,8 +238,10 @@ def mock_inbound(payload: dict, db: Session = Depends(get_db)) -> dict:
         pass
 
     # 8. DB L2 幂等 + 写 wecom_inbound_event
+    turn_id = str(uuid.uuid4())
     event = MockWecomInboundEvent(
         msg_id=msg_id,
+        turn_id=turn_id,
         from_userid=from_userid,
         msg_type=enum_type,
         media_id=media_id,
@@ -257,6 +260,7 @@ def mock_inbound(payload: dict, db: Session = Depends(get_db)) -> dict:
     # 9. 入队（payload 字段必须和主后端 webhook.py:193-201 完全一致）
     queue_msg = {
         "msg_id": msg_id,
+        "turn_id": turn_id,
         "from_userid": from_userid,
         "msg_type": enum_type,
         "content": content,
