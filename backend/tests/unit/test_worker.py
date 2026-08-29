@@ -25,6 +25,7 @@ from app.schemas.conversation import ReplyMessage, SessionState
 from app.services.worker import (
     MAX_RETRY,
     MAX_SEND_RETRY,
+    QUEUE_INCOMING,
     QUEUE_SEND_RETRY,
     SEND_RETRY_BACKOFFS,
     Worker,
@@ -1211,6 +1212,27 @@ class TestSendRetryQueue:
 # ---------------------------------------------------------------------------
 
 class TestStartupRecovery:
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.SessionLocal")
+    def test_inbound_dispatcher_requeues_only_accepted_events(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        accepted = MagicMock(
+            id=7, msg_id="m-accepted", turn_id="turn-7", from_userid="u1",
+            msg_type="text", content_brief="hello", media_id=None,
+            retry_count=0, created_at=None,
+        )
+        query = db.query.return_value.filter.return_value.order_by.return_value.limit.return_value
+        query.all.return_value = [accepted]
+        mock_factory.return_value = db
+
+        assert worker._dispatch_received_events_once() == 1
+        payload = json.loads(mock_enq.call_args.args[0])
+        assert payload["inbound_event_id"] == 7
+        assert payload["turn_id"] == "turn-7"
+        assert mock_enq.call_args.args[1] == QUEUE_INCOMING
+
     @patch("app.services.worker.enqueue_message")
     @patch("app.services.worker.SessionLocal")
     def test_requeues_processing_rows(self, mock_factory, mock_enq, worker):

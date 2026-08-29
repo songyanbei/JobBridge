@@ -1,12 +1,12 @@
 """企微 Webhook 入口（Phase 4）。
 
 严格处理顺序（方案 §12.5 + phase4-main §3.1）：
-    验签 → 解密 → 解析 → 幂等检查 → 限流检查 → 写 inbound_event → 入队 → 返回 200
+    验签 → 解密 → 解析 → 幂等检查 → 写 inbound_event → 限流检查 → 入队 → 返回 200
 
 设计约束：
 - 绝对不同步调用 message_router / service / LLM
 - 端到端响应 < 100ms
-- 被限流消息不写入 wecom_inbound_event（不消耗存储）
+- 被限流消息写入 wecom_inbound_event 并以终态审计，不进入业务 Worker
 - 限流参数从 system_config 读取（带内存缓存）
 - 解密失败仍返回 200（避免企微重试），只返回 403 给签名失败
 """
@@ -296,6 +296,7 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
             media_id=media_id,
             content_brief=brief,
             status="received",
+            rate_limit_decision="accepted",
         )
         db.add(event)
         db.commit()
