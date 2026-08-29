@@ -407,15 +407,18 @@ def parse_dialogue_response(raw: str) -> DialogueParseResult:
         logger.warning("DialogueParse: top-level value is not a dict")
         raise LLMParseError("dialogue_not_a_dict")
 
-    dialogue_act = data.get("dialogue_act", "chitchat")
+    schema_version = data.get("schema_version")
+    if schema_version is not None and schema_version != "dialogue.v1":
+        raise LLMParseError(f"dialogue_unsupported_schema:{schema_version}")
+
+    dialogue_act = data.get("dialogue_act")
     if not isinstance(dialogue_act, str) or dialogue_act not in VALID_DIALOGUE_ACTS:
-        logger.warning("DialogueParse: unknown dialogue_act '%s', falling back to chitchat",
-                       dialogue_act)
-        dialogue_act = "chitchat"
+        logger.warning("DialogueParse: unknown dialogue_act '%s'", dialogue_act)
+        raise LLMParseError("dialogue_unknown_act")
 
     frame_hint = data.get("frame_hint", "none")
     if not isinstance(frame_hint, str) or frame_hint not in VALID_FRAME_HINTS:
-        frame_hint = "none"
+        raise LLMParseError("dialogue_unknown_frame")
 
     slots_delta = data.get("slots_delta", {})
     if not isinstance(slots_delta, dict):
@@ -453,10 +456,11 @@ def parse_dialogue_response(raw: str) -> DialogueParseResult:
     conflict_action = data.get("conflict_action")
     if conflict_action is not None:
         if not isinstance(conflict_action, str) or conflict_action not in VALID_CONFLICT_ACTIONS:
-            conflict_action = None
-    # 仅在 resolve_conflict 时保留 conflict_action，其它情况强制清空
-    if dialogue_act != "resolve_conflict":
-        conflict_action = None
+            raise LLMParseError("dialogue_invalid_conflict_action")
+
+    relaxation_response = data.get("relaxation_response")
+    if relaxation_response is not None and relaxation_response not in {"accept", "reject"}:
+        raise LLMParseError("dialogue_invalid_relaxation_response")
 
     try:
         return DialogueParseResult(
@@ -467,6 +471,7 @@ def parse_dialogue_response(raw: str) -> DialogueParseResult:
             needs_clarification=needs_clar,
             confidence=confidence,
             conflict_action=conflict_action,
+            relaxation_response=relaxation_response,
             raw_response=raw,
         )
     except Exception as exc:
