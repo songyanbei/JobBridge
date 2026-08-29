@@ -219,14 +219,17 @@ _DIALOGUE_V1_SLOTS = {
 }
 
 
-def _profile_slots(profile: str) -> set[str]:
-    """Resolve slot keys from the active Profile Schema when available."""
+def _profile_slots(profile: str, frame: str) -> set[str]:
+    """Resolve slot keys for the active profile and frame.
+
+    Frame-flat schemas are intentional: a slot valid for resume upload must not
+    become valid merely because it happens to share a name with another frame.
+    """
+    if profile != "recruitment.job":
+        return set()
     try:
         from app.dialogue import slot_schema
-        return set().union(
-            *(slot_schema.fields_for(frame) for frame in
-              ("job_search", "candidate_search", "job_upload", "resume_upload"))
-        )
+        return set(slot_schema.fields_for(frame))
     except Exception:
         return set(_DIALOGUE_V1_SLOTS)
 
@@ -260,6 +263,9 @@ def adapt_dialogue_parse(
     else:
         raise TypeError(f"unsupported dialogue parse type: {type(value).__name__}")
 
+    if effective_profile != "recruitment.job":
+        raise ValueError(f"unsupported dialogue profile: {effective_profile!r}")
+
     act = data.get("dialogue_act")
     if act not in _DIALOGUE_V1_ACTS:
         raise ValueError(f"unknown dialogue_act: {act!r}")
@@ -269,7 +275,7 @@ def adapt_dialogue_parse(
     slots = data.get("slots_delta") or {}
     if not isinstance(slots, dict):
         raise ValueError("slots_delta must be an object")
-    known_slots = _profile_slots(effective_profile)
+    known_slots = _profile_slots(effective_profile, frame)
     unknown = sorted(str(k) for k in slots if k not in known_slots)
     if unknown:
         raise ValueError(f"unknown dialogue slots: {', '.join(unknown)}")
