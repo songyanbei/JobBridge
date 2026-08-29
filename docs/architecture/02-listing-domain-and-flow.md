@@ -28,16 +28,14 @@ listing_detail_item
 ### 1.1 公共生命周期
 
 ```text
-draft
-  -> pending_review
-  -> published
+draft -> pending_review -> published
   -> expired / delisted
 
 pending_review -> rejected
 rejected -> draft（允许修改后重新提交）
 ```
 
-所有状态迁移必须由服务端 Policy 和事务执行，不能由模型直接指定。
+不存在 `draft -> published` 的模型或客户端旁路。首期所有新发布信息必须经过 `pending_review`；只有审核服务（人工通过，或经运营配置明确允许的服务端自动审核规则）可以将其变为 `published`。自动审核也必须满足：服务端策略命中、角色权限已校验、审核结果和规则版本写入审计、业务写入使用幂等键，并在同一事务中更新状态和 Outbox。LLM、Skill 和 MCP 调用方不能直接指定 `published`。
 
 ### 1.2 推荐卡片
 
@@ -134,6 +132,18 @@ moderation_policy: secondhand_default
 contact_policy: authenticated_only
 ```
 
+其中 `user` 是新增的平台普通用户角色，不等同于当前招聘角色。现有会话角色 `worker/factory/broker` 保持不变；`admin` 只存在于后台 JWT，不进入企微对话。普通用户由企微身份首次识别时创建/补全，Session 必须持久化 `actor_role=user`，后台账号管理和审计日志按同一用户主键关联。二手物品试点的最小权限矩阵为：
+
+| 角色 | 发布二手物品 | 搜索二手物品 | 联系发布者 | 招聘能力 |
+|---|---:|---:|---:|---:|
+| `user` | 是 | 是 | 是（按策略脱敏） | 否（默认） |
+| `worker` | 否（首期） | 否（首期） | 否 | 沿用现有招聘权限 |
+| `factory` | 否（首期） | 否（首期） | 否 | 沿用现有招聘权限 |
+| `broker` | 否（首期） | 否（首期） | 否 | 沿用现有招聘权限 |
+| `admin` | 仅后台管理 | 仅后台查询 | 仅后台操作 | 不走企微 Flow |
+
+新增普通用户角色需要同步更新 ActorContext、Session schema、权限策略、用户初始化、后台用户筛选和审计维度；不能由模型在消息中临时把现有角色改成 `user`。
+
 ## 3. 统一状态机
 
 ```text
@@ -209,6 +219,31 @@ Profile Schema + Authorization
 - 服务端根据 actor、角色、黑名单和审核状态决定是否脱敏；
 - 联系行为写入事件和审计日志；
 - 用户删除和信息过期时同步清理可见性和附件引用。
+
+### 6.1 联系动作最小安全契约
+
+`ListingCard.contact_action` 只携带不透明的 `contact_request_id`，不携带手机号、微信号或可猜测的实体 ID。用户点击/回复“联系”后，必须由 `ContactDomainService` 在执行时重新鉴权：
+
+1. 根据 `contact_request_id` 读取当前 Listing、事实源版本和 owner；
+2. 校验 actor 已认证、未被封禁，Listing 当前为 `published` 且未过期/下架；
+3. 按 Profile 的 `contact_policy` 校验 viewer 角色、双方关系、频控和黑名单；
+4. 通过后签发一次性、短期、不可预测的 opaque token（建议 TTL 60 秒，绑定 `actor_id + listing_ref + action + nonce`）；
+5. token 只能兑换一次，Listing 下架、用户封禁、策略变更或 TTL 到期时立即失效；
+6. 记录成功和失败结果、拒绝原因、策略版本、token id、actor、listing_ref 和 trace_id。
+
+频控由服务端执行，首期默认按 `actor + listing` 每 10 分钟最多 3 次、按 actor 每日最多 30 次，具体值可由后台配置；不能由模型、Skill 或 MCP 请求参数覆盖。
+
+### 6.2 phone 字段保护
+
+Job/Resume 的明文 phone 只允许出现在受保护的 Contact 存储中：
+
+- 数据库加密存储，应用层按权限解密；
+- 不写入搜索索引、向量库、LLM Prompt、Skill、`ListingCard`、Outbox payload 或普通 `ConversationLog.content`；
+- 对话和 Outbox 只保存 `contact_request_id/contact_token_id` 及脱敏结果；
+- 管理后台默认只显示脱敏值，管理员明文查看必须二次授权并写审计；
+- 企微出站只发送服务端生成的联系结果，不允许将原始 phone 交给模型生成文本。
+
+LLM 只能理解用户的“联系/不联系”表达，Skill 只能指导话术，MCP 只能转发受控的 contact action；三者都不能决定是否展示联系方式。最终授权、短期 token、频控、撤销和明文解密全部由 Contact Domain Service 完成。
 
 ## 7. 知识库/向量检索的正确定位
 

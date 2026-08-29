@@ -12,7 +12,32 @@
 - 每个阶段具备独立验收和回退开关；
 - 新功能不得继续膨胀 `message_router.py`。
 
-## 2. 目标代码结构
+## 2. 首期数据迁移方案
+
+首期招聘不新增公共 `listing` 事实表，采用 Facade：
+
+```text
+recruitment.job:{job.id}       -> jobs（事实源）
+recruitment.resume:{resume.id} -> resumes（事实源）
+```
+
+Phase 0 的数据库迁移为 `jobs`、`resumes` 增加 `aggregate_version`（历史行回填为 1）；之后所有 Service 更新必须在同一事务内按行锁/CAS 递增版本。`domain_outbox_event` 的完整字段和消费者恢复语义以 [01 架构总览 §5.1](01-architecture-overview.md) 为准。
+
+新 Listing Runtime 的读写都经 Facade 调用现有岗位/简历 Service；不对现有业务表和新表做双写。每次旧表事务同时写 `domain_outbox_event`，Indexer 以 `event_id` 幂等更新搜索索引。事件的字段、状态、lease、重试和 DLQ 契约以 [01 架构总览 §5.1](01-architecture-overview.md) 为准；索引落后或不可用时回退旧 SQL，查询返回前仍重新校验状态、审核、权限和有效期。
+
+旧 `Job/Resume Service` 必须把创建、字段更新、审核状态变化、过期、下架和删除统一收口到同一个事务 helper：先更新事实源并递增 `aggregate_version`，再插入对应 `domain_outbox_event`。任何绕过 Service 的后台脚本、定时任务或数据修复都必须调用同一 helper，否则不得宣布索引一致性完成。
+
+二手物品试点才新增 `listing` + `listing_detail_item`，该领域以新表为事实源，使用 `secondhand.item:{listing.id}` 作为不透明引用。不能用裸数字 ID 跨领域关联。
+
+回填和切换要求：
+
+1. 按主键分页回填索引，保存 checkpoint，可暂停和重跑；
+2. 回填结束后执行数量、状态、抽样字段和权限过滤校验；
+3. 先 shadow read 比较旧 SQL 与新索引结果，再按 Profile/用户灰度；
+4. 招聘回滚只切换读取/执行路由，旧表不需要数据回滚；
+5. 二手回滚停止新写入和对外读取，保留数据供后台核查，不做破坏性删除。
+
+## 3. 目标代码结构
 
 ```text
 backend/app/
@@ -52,13 +77,15 @@ backend/app/
 
 现有 `search_service`、`upload_service`、`dialogue_reducer/applier` 可以先通过 adapter 接入，不要求一次完成物理搬迁。
 
-## 3. 分阶段计划
+## 4. 分阶段计划
 
 ### Phase 0：基线和回放集（1 周）
 
 - 冻结岗位、简历、找岗位、找工人的 golden cases；
 - 记录 legacy/v2 行为差异；
 - 固化角色权限、后台 API 和幂等测试；
+- 修正当前“限流通知在 `wecom_inbound_event` 前直接丢弃”的实现：扩展该表的 `turn_id` 和 `rate_limit_decision` 字段；正常消息保持 `status=received`，限流消息写入审计后使用 `status=done, rate_limit_decision=rate_limited`；
+- 保持旧 Worker 可识别的 status 闭集 `received/processing/session_pending/done/failed/dead_letter`；Redis 队列故障由 dispatcher 扫描 `status=received AND rate_limit_decision=accepted` 补投；
 - 增加模型、Skill、Profile 和 schema 版本日志。
 
 ### Phase 1：协议和状态（1~2 周）
@@ -73,7 +100,9 @@ backend/app/
 - 抽取通用草稿、字段收集、确认、取消、过期、搜索快照；
 - 实现 Profile Registry；
 - 实现 `ListingCard` 和公共回复渲染器；
-- 不改变现有岗位/简历表和后台接口。
+- 以现有岗位/简历表为事实源，不做招聘业务双写；
+- 同事务写 `domain_outbox_event`，构建索引同步链路；
+- 新 Session 生成 legacy compatibility projection，支持回退读取。
 
 ### Phase 3：搜索迁移（1~2 周）
 
@@ -101,7 +130,36 @@ backend/app/
 - 稳定后 legacy 降为 fallback；
 - 只有存在多个外部客户端时才远程化 MCP。
 
-## 4. 测试设计
+## 5. 回滚和进行中请求处理
+
+### 5.1 路由回滚
+
+新 Runtime 通过 `listing_runtime_enabled`、Profile 和用户灰度开关控制。触发停止条件后：
+
+1. 停止把新消息分配给新 Runtime；
+2. 允许已开始的 turn 在 30 秒内完成；
+3. 超时 turn 由 `wecom_inbound_event` lease 恢复，先查询 `action_execution` 再决定是否重试；
+4. 新消息转给 `legacy_router_adapter`；
+5. 记录回滚事件、原因、版本和影响范围。
+
+### 5.2 Session 兼容
+
+新 Session 使用版本化结构，但招聘灰度期间必须维护 legacy compatibility projection：
+
+- 新 Runtime 提交状态时同步生成旧字段映射；
+- legacy 读取不到新字段时由 adapter 从旧字段恢复；
+- 只允许招聘 Profile 做该兼容投影；
+- 二手 Profile 不回退到招聘 Session，停写后由后台处理。
+
+### 5.3 数据和 Outbox 兼容
+
+- 招聘业务事实仍在 `jobs/resumes`，已提交动作无需反向回滚；
+- `action_execution` 记录是写动作唯一执行凭据；
+- 已提交 Outbox 不因路由回滚而取消，发送器继续按唯一键重试；
+- 未提交事务整体回滚，不产生半成品；
+- 索引事件可重复消费，最终以事实源版本覆盖旧文档。
+
+## 6. 测试设计
 
 ### 4.1 单元和契约测试
 
@@ -111,7 +169,7 @@ backend/app/
 - Session CAS 和版本冲突；
 - MCP Tool 输入、错误码和幂等；
 - 搜索分页、快照、脱敏和卡片渲染；
-- Inbox/Outbox/retry/dead-letter。
+- `wecom_inbound_event`/Outbox/retry/dead-letter。
 
 ### 4.2 对话回放
 
@@ -136,7 +194,7 @@ backend/app/
 - 新领域仅通过 Profile、Schema、字典、索引和 Skill 接入；
 - 公共状态、幂等、审计和推荐卡片逻辑可复用。
 
-## 5. 管理后台兼容
+## 7. 管理后台兼容
 
 后台不改成 Agent，也不由 MCP 取代 Admin API。继续保留：
 
@@ -150,12 +208,14 @@ backend/app/
 
 只增加兼容字段，例如 `profile`、`listing_type`、`trace_id`、`skill_version`，不改变现有页面路径和核心交互。
 
-## 6. 上线门槛
+## 8. 上线门槛
 
 - 关键权限和高风险操作测试 100% 通过；
 - 写操作重复执行不产生重复实体；
 - LLM 不可用时命令、草稿恢复和后台仍可用；
 - 新旧路径可按用户回退；
 - 每次运行可追踪模型、Skill、Profile、Tool 和状态版本；
-- Inbox backlog、Outbox 失败和死信都有告警；
+- `wecom_inbound_event` backlog、Outbox 失败和死信都有告警；
 - 二手试点不引入招聘行为回归。
+
+具体数值门槛和停止条件以 [04 可靠性与性能](04-reliability-performance-and-observability.md) 为准；没有达到门槛时只允许 shadow 或小范围灰度，不允许扩大生产流量。

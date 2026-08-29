@@ -33,26 +33,73 @@ LLM 处理自然语言的不确定性；领域服务、权限、审核、数据�
 
 ## 3. 结构化语义协议
 
-建议将现有 `DialogueParseResult` 统一为稳定版本：
+首期协议沿用当前 `backend/app/llm/base.py` 的 Dialogue v1 闭集，不能在重构中丢失冲突和放宽确认分支：
 
 ```python
 class DialogueParseResult(BaseModel):
     schema_version: Literal["dialogue.v1"] = "dialogue.v1"
-    act: Literal[
-        "start_publish", "answer_missing_slot", "modify_listing",
-        "start_search", "modify_search", "show_more", "confirm",
-        "cancel", "reset", "contact", "report", "chitchat"
+    dialogue_act: Literal[
+        "start_search",
+        "modify_search",
+        "answer_missing_slot",
+        "show_more",
+        "start_upload",
+        "cancel",
+        "reset",
+        "resolve_conflict",
+        "respond_relaxation_offer",
+        "chitchat",
     ]
-    profile_hint: str | None = None
+    frame_hint: Literal[
+        "job_search",
+        "candidate_search",
+        "job_upload",
+        "resume_upload",
+        "none",
+    ] = "none"
     slots_delta: dict[str, object] = Field(default_factory=dict)
-    slot_ops: dict[str, Literal["add", "replace", "remove", "unknown"]] = Field(
+    merge_hint: dict[str, Literal["replace", "add", "remove", "unknown"]] = Field(
         default_factory=dict
     )
-    confidence: float = Field(ge=0, le=1)
     needs_clarification: bool = False
+    confidence: float = Field(ge=0, le=1)
+    conflict_action: Literal[
+        "cancel_draft", "resume_pending_upload", "proceed_with_new"
+    ] | None = None
+    relaxation_response: Literal["accept", "reject"] | None = None
 ```
 
-`slots_delta` 只是候选理解结果。服务端必须根据当前 Session、Profile Schema、字典、角色和 Policy 重新归一化。
+字段约束：`conflict_action` 只有 `dialogue_act=resolve_conflict` 时允许出现；`relaxation_response` 只有 `dialogue_act=respond_relaxation_offer` 时允许出现。`slots_delta` 和 `merge_hint` 只是候选理解结果，必须经过当前 Session、Profile Schema、字典、角色和 Policy Reducer。
+
+### 3.1 旧版兼容映射
+
+旧 `IntentResult` 继续作为输入兼容层，不能直接进入 Runtime：
+
+| 旧 IntentResult | Dialogue v1 |
+|---|---|
+| `search_job` | `dialogue_act=start_search`, `frame_hint=job_search` |
+| `search_worker` | `dialogue_act=start_search`, `frame_hint=candidate_search` |
+| `upload_job` | `dialogue_act=start_upload`, `frame_hint=job_upload` |
+| `upload_resume` | `dialogue_act=start_upload`, `frame_hint=resume_upload` |
+| `upload_and_search` | `start_upload`，由服务端 Action 记录后续搜索，不由模型拆成新协议 |
+| `follow_up` | 根据当前 awaiting 状态映射为 `answer_missing_slot` 或 `modify_search` |
+| `show_more` | `show_more` |
+| `command: cancel/reset` | `cancel` / `reset`，显式命令优先跳过 LLM |
+| `upload_conflict` | `resolve_conflict` + `conflict_action` |
+| `relaxation answer` | `respond_relaxation_offer` + `relaxation_response` |
+| `chitchat` | `chitchat` |
+
+缺失或非法字段进入 schema fallback，不静默丢弃；解析失败时使用规则/legacy parser。未来新增 `contact`、`report` 等动作必须发布 `dialogue.v2`，并提供 v1 到 v2 的双向兼容映射和回放集。
+
+### 3.2 文档协议与当前代码的兼容边界
+
+当前代码中的 `backend/app/llm/base.py::DialogueParseResult` 尚未包含 `schema_version`；文档中的 `schema_version` 是目标内部协议字段，不要求旧 Provider 在第一天返回。兼容规则固定如下：
+
+1. Provider 返回没有 `schema_version` 的 JSON 时，兼容适配器在完成 v1 闭集校验后补成 `dialogue.v1`；该补值只存在于 Runtime 内部，不回写旧 Provider。
+2. Provider 明确返回未知 `schema_version`、未知 `dialogue_act`、未知 `frame_hint` 或非法的冲突/放宽枚举时，视为解析失败，保留脱敏后的 `raw_response`，走规则/legacy parser，不猜测映射。
+3. 顶层语义字段采用 strict validation；`slots_delta` 的 key 必须由当前 Profile Schema 识别。未知 slot 不进入 Session 或 Tool，记录 `unknown_slot` 并生成澄清/legacy fallback。
+4. 解析失败、schema 校验失败和 fallback 原因都写入 conversation/tool trace；原始响应只用于受控调试，按现有对话日志 TTL 和隐私策略保存。
+5. 旧 `IntentResult` 只允许通过上一节映射表进入 Dialogue v1，不能将旧字段直接拼接成 Action；实现阶段先保留 `DialogueParseResult` 旧 DTO，再增加内部版本化 wrapper，避免一次改动破坏现有 Provider。
 
 ## 4. Skill 设计
 
