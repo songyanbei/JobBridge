@@ -59,7 +59,7 @@ def write_admin_log(
 ) -> AuditLog:
     """写入 audit_log。
 
-    - target_type: job / resume / user / system（不在枚举内会被规范到 user，system 临时映射为 user + 备注）
+    - target_type: job / resume / user / system / recommendation_strategy（未知类型规范到 user）
     - snapshot 统一 {"before": ..., "after": ...}
     - 调用方负责 commit
     """
@@ -68,7 +68,8 @@ def write_admin_log(
     if action not in _ALLOWED_ACTIONS:
         raise ValueError(f"无效的 audit action: {action}")
 
-    # target_type 非枚举值（如 system）时，规范到 user 并在 reason 中备注
+    # ``system`` is a first-class audit target used by readiness checks; only
+    # truly unknown target types are normalized to ``user``.
     effective_target_type = target_type if target_type in _ALLOWED_TARGET_TYPES else "user"
     effective_reason = reason
     if target_type not in _ALLOWED_TARGET_TYPES:
