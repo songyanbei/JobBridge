@@ -232,6 +232,22 @@ class Settings(BaseSettings):
     job_search_facade_rollout_percentage: int = 0
     job_search_facade_timeout_ms: int = 5000
 
+    @field_validator("job_search_facade_rollout_percentage", mode="after")
+    @classmethod
+    def _valid_job_search_facade_rollout(cls, value: int) -> int:
+        value = int(value)
+        if not 0 <= value <= 100:
+            raise ValueError("job_search_facade_rollout_percentage must be between 0 and 100")
+        return value
+
+    @field_validator("job_search_facade_timeout_ms", mode="after")
+    @classmethod
+    def _valid_job_search_facade_timeout(cls, value: int) -> int:
+        value = int(value)
+        if value <= 0:
+            raise ValueError("job_search_facade_timeout_ms must be positive")
+        return value
+
     # ---- 数据库 MySQL ----
     db_host: str = "localhost"
     db_port: int = 3306

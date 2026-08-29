@@ -10,6 +10,7 @@ import hashlib
 import logging
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,6 +19,7 @@ from app.schemas.conversation import SessionState
 from app.schemas.search import ListingCard, SearchCriteriaPatch
 from app.services.search_permission import check_search_permission
 from app.services.user_service import UserContext
+from app.tasks.common import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,9 @@ def scrub_listing_text(value: str | None) -> str:
 class SearchTurn:
     raw_query: str = ""
     user_msg_id: str | None = None
+    snapshot_id: str | None = None
+    page_number: int | None = None
+    page_size: int | None = None
 
 
 @dataclass
@@ -161,19 +166,64 @@ class JobSearchFacade:
     profile = "recruitment.job"
     version = "job-search-facade.v1"
 
-    def __init__(self, db=None, *, enabled: bool | None = None, legacy_service=None):
+    def __init__(self, db=None, *, enabled: bool | None = None, legacy_service=None,
+                 rollout_percentage: int | None = None, timeout_ms: int | None = None):
         self.db = db
+        self._forced_enabled = enabled is not None
         self.enabled = bool(getattr(settings, "job_search_facade_enabled", False)) if enabled is None else bool(enabled)
+        self.rollout_percentage = (
+            int(getattr(settings, "job_search_facade_rollout_percentage", 0))
+            if rollout_percentage is None else max(0, min(100, int(rollout_percentage)))
+        )
+        self.timeout_ms = (
+            int(getattr(settings, "job_search_facade_timeout_ms", 5000))
+            if timeout_ms is None else max(1, int(timeout_ms))
+        )
         self.legacy_service = legacy_service
 
-    def _legacy_search(self, actor, criteria, session, turn, db):
+    def _rollout_reason(self, actor: UserContext) -> str | None:
+        if not self.enabled:
+            return "disabled"
+        if self._forced_enabled:
+            return None
+        percentage = self.rollout_percentage
+        if percentage <= 0:
+            return "out_of_bucket"
+        if percentage >= 100:
+            return None
+        digest = hashlib.sha256(str(actor.external_userid or "").encode()).hexdigest()
+        try:
+            bucket = int(digest[:8], 16) % 100
+        except (TypeError, ValueError):
+            return "out_of_bucket"
+        return None if bucket < percentage else "out_of_bucket"
+
+    @staticmethod
+    def _record_fallback(reason: str, *, action: str, actor: UserContext, turn: Any = None) -> None:
+        _, msg_id = _turn_values(turn) if turn is not None else ("", None)
+        log_event(
+            "facade_fallback", direction="search_job", action=action,
+            reason=reason, user_msg_id=msg_id,
+            external_userid_hash=hashlib.sha256(str(actor.external_userid or "").encode()).hexdigest()[:12],
+        )
+
+    def _legacy_search(self, actor, criteria, session, turn, db, **kwargs):
         service = self.legacy_service
         if service is None:
             from app.services import search_service as service
         raw_query, msg_id = _turn_values(turn)
-        return service.search_jobs(criteria, raw_query, session, actor, db, user_msg_id=msg_id)
+        try:
+            return service.search_jobs(criteria, raw_query, session, actor, db, user_msg_id=msg_id, **kwargs)
+        except TypeError as exc:
+            # Mixed-version providers may not yet expose experience_flags.
+            # Retry only for an unexpected-keyword signature error; provider
+            # TypeErrors from inside the implementation must still fail open.
+            message = str(exc)
+            if not kwargs or "unexpected keyword argument" not in message:
+                raise
+            return service.search_jobs(criteria, raw_query, session, actor, db, user_msg_id=msg_id)
 
-    def search_jobs_v1(self, actor: UserContext, criteria: dict, session: SessionState, turn: SearchTurn | dict | Any, db=None) -> FacadeResult:
+    def search_jobs_v1(self, actor: UserContext, criteria: dict, session: SessionState, turn: SearchTurn | dict | Any, db=None, *, experience_flags=None) -> FacadeResult:
         db = db or self.db
         if actor.role != "worker" or session.profile != self.profile:
             raise PermissionError("job search facade requires worker/recruitment.job")
@@ -185,14 +235,27 @@ class JobSearchFacade:
             from app.services.search_permission import denied_search_response
             result, outcome = denied_search_response(decision)
             return FacadeResult(result, outcome, [], used_facade=False, fallback_reason=decision.reason_code)
+        rollout_reason = self._rollout_reason(actor)
         try:
-            result, outcome = self._legacy_search(actor, dict(criteria or {}), session, turn, db)
-            if not self.enabled:
-                return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="disabled")
+            started = time.perf_counter()
+            result, outcome = self._legacy_search(
+                actor, dict(criteria or {}), session, turn, db,
+                experience_flags=experience_flags,
+            )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            if rollout_reason:
+                self._record_fallback(rollout_reason, action="search", actor=actor, turn=turn)
+                return FacadeResult(result, outcome, [], used_facade=False, fallback_reason=rollout_reason)
+            if elapsed_ms > self.timeout_ms:
+                self._record_fallback("timeout", action="search", actor=actor, turn=turn)
+                return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="timeout")
             cards = self.cards_for_snapshot(actor, session, db, result)
+            if not isinstance(cards, list):
+                raise TypeError("facade_card_schema_invalid")
             return FacadeResult(result, outcome, cards)
         except Exception as exc:
             logger.exception("job search facade failed; caller should use legacy", exc_info=True)
+            self._record_fallback(type(exc).__name__, action="search", actor=actor, turn=turn)
             raise RuntimeError("job_search_facade_failed") from exc
 
     search = search_jobs_v1
@@ -204,7 +267,7 @@ class JobSearchFacade:
         conversation_service.replace_criteria(session, criteria)
         return self.search_jobs_v1(actor, criteria, session, turn, db=db)
 
-    def show_more(self, actor, session, turn=None, db=None) -> FacadeResult:
+    def show_more(self, actor, session, turn=None, db=None, *, experience_flags=None) -> FacadeResult:
         """Page the existing snapshot; never rerun the full candidate ranking."""
         service = self.legacy_service
         if service is None:
@@ -213,7 +276,13 @@ class JobSearchFacade:
         if actor.role != "worker" or session.profile != self.profile:
             raise PermissionError("job search facade requires worker/recruitment.job")
         before = len(session.shown_items)
-        raw_result, outcome = service.show_more(session, actor, db)
+        rollout_reason = self._rollout_reason(actor)
+        raw_result, outcome = service.show_more(
+            session, actor, db, experience_flags=experience_flags,
+        )
+        if rollout_reason:
+            self._record_fallback(rollout_reason, action="show_more", actor=actor, turn=turn)
+            return FacadeResult(raw_result, outcome, [], used_facade=False, fallback_reason=rollout_reason)
         if self.enabled:
             try:
                 cards = self.cards_for_snapshot(
@@ -231,7 +300,7 @@ class JobSearchFacade:
         return FacadeResult(raw_result, outcome, cards, used_facade=self.enabled,
                             fallback_reason=None if self.enabled else "disabled")
 
-    def relax_search(self, actor, session, turn, step: str, db=None, *, confirmed: bool = False) -> FacadeResult:
+    def relax_search(self, actor, session, turn, step: str, db=None, *, confirmed: bool = False, experience_flags=None) -> FacadeResult:
         """Execute exactly one pre-approved relaxation step."""
         if not confirmed:
             raise PermissionError("relaxation requires explicit confirmation")
@@ -249,15 +318,19 @@ class JobSearchFacade:
             raise PermissionError("relaxation criteria context does not match session")
         from app.services import search_service
         db = db or self.db
+        rollout_reason = self._rollout_reason(actor)
         raw_query, msg_id = _turn_values(turn)
         result, outcome = search_service.execute_relaxed_search(
             dict(pending["original_criteria"]), step,
             direction="search_job", raw_query=raw_query, session=session,
             user_ctx=actor, db=db, user_msg_id=msg_id,
+            experience_flags=experience_flags,
         )
-        cards = self.cards_for_snapshot(actor, session, db, result) if self.enabled else []
-        return FacadeResult(result, outcome, cards, used_facade=self.enabled,
-                            fallback_reason=None if self.enabled else "disabled")
+        if rollout_reason:
+            self._record_fallback(rollout_reason, action="relax_search", actor=actor, turn=turn)
+            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason=rollout_reason)
+        cards = self.cards_for_snapshot(actor, session, db, result)
+        return FacadeResult(result, outcome, cards, used_facade=True)
 
     def cards_for_snapshot(self, actor, session, db, result, *, page_ids: list[str] | None = None) -> list[ListingCard]:
         from app.services import permission_service, search_service

@@ -112,6 +112,29 @@ def test_facade_legacy_adapter_preserves_result_and_adds_cards(monkeypatch):
     legacy.search_jobs.assert_called_once()
 
 
+def test_legacy_adapter_retries_only_for_old_signature():
+    result = SimpleNamespace(reply_text="legacy", result_count=0, has_more=False)
+    outcome = SimpleNamespace(direction="search_job")
+
+    class OldProvider:
+        def __init__(self):
+            self.calls = []
+
+        def search_jobs(self, criteria, raw_query, session, actor, db, user_msg_id=None):
+            self.calls.append(user_msg_id)
+            return result, outcome
+
+    provider = OldProvider()
+    facade = JobSearchFacade(MagicMock(), enabled=False, legacy_service=provider)
+    response = facade.search_jobs_v1(
+        _worker(), {}, SessionState(role="worker"),
+        SearchTurn("苏州岗位", "m-old"), db=MagicMock(),
+        experience_flags=SimpleNamespace(),
+    )
+    assert response.result is result
+    assert provider.calls == ["m-old"]
+
+
 def test_facade_rejects_non_worker_or_wrong_profile():
     facade = JobSearchFacade(MagicMock(), enabled=True, legacy_service=MagicMock())
     with pytest.raises(PermissionError):
