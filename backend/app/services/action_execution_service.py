@@ -26,6 +26,10 @@ class ActionExecutionConflict(ValueError):
     """The same idempotency key was reused with a different request."""
 
 
+class ActionExecutionStateError(ValueError):
+    """A durable row contains a status outside the v1 state machine."""
+
+
 @dataclass(frozen=True)
 class ActionClaim:
     """Outcome of a durable claim/read operation."""
@@ -88,7 +92,9 @@ def _state_for_row(row: ActionExecution, now: datetime) -> ActionState:
         if row.lease_until is None or row.lease_until >= now:
             return "in_progress"
         return "acquired"
-    return "acquired"
+    # Never interpret schema drift/corruption as permission to execute.  A
+    # caller may surface this for operator repair, but must not run the action.
+    raise ActionExecutionStateError(f"unknown_action_status:{row.status!r}")
 
 
 def claim_action_execution(
@@ -212,6 +218,7 @@ def finalize_action_execution(
 __all__ = [
     "ActionClaim",
     "ActionExecutionConflict",
+    "ActionExecutionStateError",
     "claim_action_execution",
     "finalize_action_execution",
     "read_action_execution",

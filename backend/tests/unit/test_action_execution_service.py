@@ -10,10 +10,12 @@ from sqlalchemy.orm import sessionmaker
 from app.models import ActionExecution
 from app.services.action_execution_service import (
     ActionExecutionConflict,
+    ActionExecutionStateError,
     claim_action_execution,
     finalize_action_execution,
     read_action_execution,
 )
+import app.services.action_execution_service as action_service
 
 
 @compiles(mysql.TINYINT, "sqlite")
@@ -206,3 +208,26 @@ def test_finalize_requires_current_owner_and_live_fence(db):
     )
     row = read_action_execution(db, "turn-7", "listing.search")
     assert row.status == "started"
+
+
+def test_unknown_status_fails_closed_without_claiming(db, monkeypatch):
+    row = ActionExecution(
+        turn_id="turn-8",
+        action_name="listing.search",
+        status="started",
+        lease_owner="old-worker",
+        lease_until=_at(30),
+        fencing_token=7,
+    )
+    # Simulate a row read from a drifted database.  MySQL/SQLAlchemy Enum
+    # normally rejects such a value during hydration, so inject it after load.
+    row.status = "corrupt"
+    monkeypatch.setattr(action_service, "read_action_execution", lambda *args, **kwargs: row)
+
+    with pytest.raises(ActionExecutionStateError, match="unknown_action_status"):
+        claim_action_execution(
+            db, "turn-8", "listing.search", "worker-b", now=_at(1),
+        )
+
+    assert row.status == "corrupt"
+    assert row.lease_owner == "old-worker"
