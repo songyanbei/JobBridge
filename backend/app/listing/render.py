@@ -44,3 +44,5 @@ def render_listing_cards(cards: Iterable[ListingCard], *, has_more: bool = False
 
 
 render_cards = render_listing_cards
+render_listing_card_text = render_listing_card
+render_listing_cards_text = render_listing_cards

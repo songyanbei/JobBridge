@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -49,6 +50,10 @@ _CARD_FORBIDDEN_NAMES = {
     "phone", "mobile", "telephone", "wechat", "weixin", "wx",
     "sql", "query", "raw_sql", "internal_sql", "owner_userid",
 }
+_CARD_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_CARD_WECHAT_RE = re.compile(
+    r"(?i)(?:微信|wechat|weixin|wx(?:号|id)?)[\s:：_-]*[a-z][-_a-z0-9]{5,19}"
+)
 
 
 class ListingCard(BaseModel):
@@ -90,6 +95,15 @@ class ListingCard(BaseModel):
                 nested = {str(key).lower() for key in value}
                 if nested & _CARD_FORBIDDEN_NAMES:
                     raise ValueError("ListingCard contains a forbidden nested field")
+        searchable = " ".join(
+            str(value) for value in (
+                self.title, self.body_summary, self.location_text,
+                self.contact_action, self.explanation,
+                *self.attributes.values(),
+            ) if value is not None
+        )
+        if _CARD_PHONE_RE.search(searchable) or _CARD_WECHAT_RE.search(searchable):
+            raise ValueError("ListingCard contains contact PII")
         return self
 
 

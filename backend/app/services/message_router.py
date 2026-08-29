@@ -1909,6 +1909,7 @@ def _handle_show_more(
         user_ctx, direction=direction, emit_log=True,
     )
     _start_recommendation_clock()
+    shown_before = len(session.shown_items)
     result, outcome = search_service.show_more(
         session, user_ctx, db, experience_flags=experience_flags,
     )
@@ -1916,7 +1917,10 @@ def _handle_show_more(
         try:
             from app.listing.search import JobSearchFacade
             facade = JobSearchFacade(db, enabled=True)
-            cards = facade.cards_for_snapshot(user_ctx, session, db, result)
+            cards = facade.cards_for_snapshot(
+                user_ctx, session, db, result,
+                page_ids=list(session.shown_items[shown_before:]),
+            )
             _render_facade_cards(result, cards)
         except Exception as exc:
             # Snapshot paging itself already completed through the legacy
@@ -2677,13 +2681,18 @@ def _run_search(
         try:
             from app.listing.search import JobSearchFacade, SearchTurn
 
+            shown_before = len(session.shown_items)
             facade_response = JobSearchFacade(db, enabled=True).search_jobs_v1(
                 user_ctx, composed, session,
                 SearchTurn(raw_query=raw_query, user_msg_id=user_msg_id), db=db,
             )
             result, outcome = facade_response.result, facade_response.outcome
             if facade_response.used_facade and facade_response.cards:
-                _render_facade_cards(result, facade_response.cards)
+                page_cards = JobSearchFacade(db, enabled=True).cards_for_snapshot(
+                    user_ctx, session, db, result,
+                    page_ids=list(session.shown_items[shown_before:]),
+                )
+                _render_facade_cards(result, page_cards)
                 log_event("job_search_facade_served", facade_version=JobSearchFacade.version)
         except Exception as exc:
             log_event("facade_fallback", direction="search_job", reason=type(exc).__name__)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,19 @@ from app.services.search_permission import check_search_permission
 from app.services.user_service import UserContext
 
 logger = logging.getLogger(__name__)
+
+_PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_WECHAT_RE = re.compile(
+    r"(?i)(微信|wechat|weixin|wx(?:号|id)?)[\s:：_-]*([a-z][-_a-z0-9]{5,19})"
+)
+
+
+def scrub_listing_text(value: str | None) -> str:
+    """Remove common phone/WeChat forms before text enters a public card."""
+    text = str(value or "")
+    text = _PHONE_RE.sub("[联系方式已隐藏]", text)
+    text = _WECHAT_RE.sub("联系方式已隐藏", text)
+    return text
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,19 @@ class FacadeResult:
     @property
     def reply_text(self) -> str:
         return str(getattr(self.result, "reply_text", ""))
+
+
+class LegacySearchAdapter:
+    """Named adapter for dependency-injecting the existing search service."""
+
+    def __init__(self, service=None):
+        self.service = service
+
+    def search_jobs(self, criteria, raw_query, session, actor, db, **kwargs):
+        service = self.service
+        if service is None:
+            from app.services import search_service as service
+        return service.search_jobs(criteria, raw_query, session, actor, db, **kwargs)
 
 
 def _turn_values(turn: SearchTurn | dict | Any) -> tuple[str, str | None]:
@@ -109,7 +136,7 @@ def _job_card(job: dict, actor: UserContext, snapshot_id: str | None, explanatio
         listing_id=listing_ref,
         listing_ref=listing_ref,
         title=title,
-        body_summary=str(job.get("description") or "").strip()[:300],
+        body_summary=scrub_listing_text(str(job.get("description") or "").strip()[:300]),
         location_text=location,
         attributes=attrs,
         contact_action="回复“联系”获取进一步沟通入口",
@@ -158,13 +185,51 @@ class JobSearchFacade:
 
     search = search_jobs_v1
 
-    def cards_for_snapshot(self, actor, session, db, result) -> list[ListingCard]:
+    def modify_search(self, actor, patches, session, turn, db=None) -> FacadeResult:
+        """Apply an explicit criteria patch, invalidate the old snapshot, search."""
+        from app.services import conversation_service
+        criteria = apply_criteria_patch(session.search_criteria, patches)
+        conversation_service.replace_criteria(session, criteria)
+        return self.search_jobs_v1(actor, criteria, session, turn, db=db)
+
+    def show_more(self, actor, session, turn=None, db=None) -> FacadeResult:
+        """Page the existing snapshot; never rerun the full candidate ranking."""
+        from app.services import search_service
+        db = db or self.db
+        if actor.role != "worker" or session.profile != self.profile:
+            raise PermissionError("job search facade requires worker/recruitment.job")
+        before = len(session.shown_items)
+        raw_result, outcome = search_service.show_more(session, actor, db)
+        cards = self.cards_for_snapshot(
+            actor, session, db, raw_result,
+            page_ids=list(session.shown_items[before:]),
+        ) if self.enabled else []
+        return FacadeResult(raw_result, outcome, cards, used_facade=self.enabled,
+                            fallback_reason=None if self.enabled else "disabled")
+
+    def relax_search(self, actor, session, turn, step: str, db=None, *, confirmed: bool = False) -> FacadeResult:
+        """Execute exactly one pre-approved relaxation step."""
+        if not confirmed:
+            raise PermissionError("relaxation requires explicit confirmation")
+        from app.services import search_service
+        db = db or self.db
+        raw_query, msg_id = _turn_values(turn)
+        result, outcome = search_service.execute_relaxed_search(
+            dict(session.last_criteria or session.search_criteria), step,
+            direction="search_job", raw_query=raw_query, session=session,
+            user_ctx=actor, db=db, user_msg_id=msg_id,
+        )
+        cards = self.cards_for_snapshot(actor, session, db, result) if self.enabled else []
+        return FacadeResult(result, outcome, cards, used_facade=self.enabled,
+                            fallback_reason=None if self.enabled else "disabled")
+
+    def cards_for_snapshot(self, actor, session, db, result, *, page_ids: list[str] | None = None) -> list[ListingCard]:
         from app.services import permission_service, search_service
         snapshot = session.candidate_snapshot
         if snapshot is None:
             return []
         count = int(getattr(result, "result_count", 0) or 0)
-        ids = list(session.shown_items or [])[-count:] if count else []
+        ids = list(page_ids if page_ids is not None else (list(session.shown_items or [])[-count:] if count else []))
         jobs = search_service._validate_job_ids(ids, db)
         dicts = search_service._jobs_to_dicts(jobs, db)
         visibility = search_service._visibility_snapshot(db, "search_job", actor.role)
@@ -178,4 +243,7 @@ def search_jobs_v1(actor, criteria, session, turn, db=None, **kwargs) -> FacadeR
     return JobSearchFacade(db, **kwargs).search_jobs_v1(actor, criteria, session, turn, db=db)
 
 
-__all__ = ["FacadeResult", "JobSearchFacade", "SearchTurn", "apply_criteria_patch", "search_jobs_v1"]
+__all__ = [
+    "FacadeResult", "JobSearchFacade", "LegacySearchAdapter", "SearchTurn",
+    "apply_criteria_patch", "scrub_listing_text", "search_jobs_v1",
+]
