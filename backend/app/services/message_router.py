@@ -85,6 +85,12 @@ def _job_search_facade_enabled(user_ctx: UserContext) -> bool:
     return bucket < percentage
 
 
+def _job_search_facade_fallback_reason(user_ctx: UserContext) -> str:
+    if not getattr(_settings_module, "job_search_facade_enabled", False):
+        return "disabled"
+    return "out_of_bucket"
+
+
 def _render_facade_cards(result, cards) -> None:
     """Replace legacy PII-bearing text only after a valid card projection."""
     if not cards:
@@ -1324,18 +1330,48 @@ def _route_v2_relaxation_response(
         )
 
         _start_recommendation_clock()
-        new_result, new_outcome = _search_service.execute_relaxed_search(
-            original_criteria,
-            step,
-            direction=direction,
-            raw_query=persisted_raw_query,
-            session=session,
-            user_ctx=user_ctx,
-            db=db,
-            user_msg_id=persisted_user_msg_id,
-            experience_flags=experience_flags,
-            original_visible_count=original_visible_count,
-        )
+        if direction == "search_job" and _job_search_facade_enabled(user_ctx):
+            try:
+                from app.listing.search import JobSearchFacade, SearchTurn
+                facade_response = JobSearchFacade(db, enabled=True).relax_search(
+                    user_ctx, session,
+                    SearchTurn(
+                        raw_query=persisted_raw_query,
+                        user_msg_id=persisted_user_msg_id,
+                        snapshot_id=getattr(session.candidate_snapshot, "snapshot_id", None),
+                    ),
+                    step, db=db, confirmed=True,
+                    experience_flags=experience_flags,
+                )
+                new_result, new_outcome = facade_response.result, facade_response.outcome
+                if facade_response.used_facade:
+                    _render_facade_cards(new_result, facade_response.cards)
+            except Exception as exc:
+                log_event(
+                    "facade_fallback", direction="search_job", action="relax_search",
+                    reason=type(exc).__name__, user_msg_id=persisted_user_msg_id,
+                )
+                new_result, new_outcome = _search_service.execute_relaxed_search(
+                    original_criteria, step, direction=direction,
+                    raw_query=persisted_raw_query, session=session, user_ctx=user_ctx,
+                    db=db, user_msg_id=persisted_user_msg_id,
+                    experience_flags=experience_flags,
+                    original_visible_count=original_visible_count,
+                )
+        else:
+            if direction == "search_job":
+                log_event(
+                    "facade_fallback", direction="search_job", action="relax_search",
+                    reason=_job_search_facade_fallback_reason(user_ctx),
+                    user_msg_id=persisted_user_msg_id,
+                )
+            new_result, new_outcome = _search_service.execute_relaxed_search(
+                original_criteria, step, direction=direction,
+                raw_query=persisted_raw_query, session=session, user_ctx=user_ctx,
+                db=db, user_msg_id=persisted_user_msg_id,
+                experience_flags=experience_flags,
+                original_visible_count=original_visible_count,
+            )
 
         # 二阶段 reducer
         parse_stub = DialogueParseResult(
@@ -1915,10 +1951,17 @@ def _handle_show_more(
             facade = JobSearchFacade(db, enabled=True)
             facade_response = facade.show_more(
                 user_ctx, session,
-                SearchTurn(raw_query=msg.content or "", user_msg_id=msg.msg_id), db=db,
+                SearchTurn(
+                    raw_query=msg.content or "", user_msg_id=msg.msg_id,
+                    snapshot_id=getattr(session.candidate_snapshot, "snapshot_id", None),
+                    page_number=len(session.shown_items) // 3 + 1,
+                    page_size=3,
+                ),
+                db=db, experience_flags=experience_flags,
             )
             result, outcome = facade_response.result, facade_response.outcome
-            _render_facade_cards(result, facade_response.cards)
+            if facade_response.used_facade:
+                _render_facade_cards(result, facade_response.cards)
         except Exception as exc:
             # Snapshot paging itself already completed through the legacy
             # service; a projection failure must not lose that response.
@@ -1927,6 +1970,12 @@ def _handle_show_more(
                 session, user_ctx, db, experience_flags=experience_flags,
             )
     else:
+        if direction == "search_job":
+            log_event(
+                "facade_fallback", direction="search_job", action="show_more",
+                reason=_job_search_facade_fallback_reason(user_ctx),
+                user_msg_id=msg.msg_id,
+            )
         result, outcome = search_service.show_more(
             session, user_ctx, db, experience_flags=experience_flags,
         )
@@ -2685,18 +2734,14 @@ def _run_search(
         try:
             from app.listing.search import JobSearchFacade, SearchTurn
 
-            shown_before = len(session.shown_items)
             facade_response = JobSearchFacade(db, enabled=True).search_jobs_v1(
                 user_ctx, composed, session,
                 SearchTurn(raw_query=raw_query, user_msg_id=user_msg_id), db=db,
+                experience_flags=experience_flags,
             )
             result, outcome = facade_response.result, facade_response.outcome
             if facade_response.used_facade and facade_response.cards:
-                page_cards = JobSearchFacade(db, enabled=True).cards_for_snapshot(
-                    user_ctx, session, db, result,
-                    page_ids=list(session.shown_items[shown_before:]),
-                )
-                _render_facade_cards(result, page_cards)
+                _render_facade_cards(result, facade_response.cards)
                 log_event("job_search_facade_served", facade_version=JobSearchFacade.version)
         except Exception as exc:
             log_event("facade_fallback", direction="search_job", reason=type(exc).__name__)
@@ -2706,6 +2751,11 @@ def _run_search(
                 experience_flags=experience_flags,
             )
     elif direction == "search_job":
+        log_event(
+            "facade_fallback", direction="search_job", action="search",
+            reason=_job_search_facade_fallback_reason(user_ctx),
+            user_msg_id=user_msg_id,
+        )
         result, outcome = search_service.search_jobs(
             composed, raw_query, session, user_ctx, db,
             user_msg_id=user_msg_id,

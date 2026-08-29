@@ -234,3 +234,56 @@ def test_facade_show_more_projection_failure_does_not_repeat_snapshot_consume(mo
     assert response.used_facade is False
     assert response.fallback_reason == "card_projection_failed"
     service.show_more.assert_called_once()
+
+
+def test_show_more_passes_experience_flags_to_legacy_provider_with_compatibility():
+    result = SimpleNamespace(reply_text="page", result_count=0, has_more=False)
+    outcome = SimpleNamespace(direction="search_job")
+
+    class OldProvider:
+        def __init__(self):
+            self.calls = 0
+
+        def show_more(self, session, actor, db):
+            self.calls += 1
+            return result, outcome
+
+    provider = OldProvider()
+    facade = JobSearchFacade(MagicMock(), enabled=False, legacy_service=provider)
+    response = facade.show_more(
+        _worker(), SessionState(role="worker"), SearchTurn("更多", "m-more"),
+        db=MagicMock(), experience_flags=SimpleNamespace(soft_preference_ranking=True),
+    )
+    assert response.result is result
+    assert response.used_facade is False
+    assert response.fallback_reason == "disabled"
+    assert provider.calls == 1
+
+
+def test_relax_search_passes_experience_flags_to_old_provider(monkeypatch):
+    result = SimpleNamespace(reply_text="relaxed", result_count=0, has_more=False)
+    outcome = SimpleNamespace(direction="search_job")
+    captured = {}
+
+    def old_execute(criteria, step, *, direction, raw_query, session, user_ctx, db, user_msg_id=None):
+        captured.update(criteria=criteria, step=step, user_msg_id=user_msg_id)
+        return result, outcome
+
+    monkeypatch.setattr("app.services.search_service.execute_relaxed_search", old_execute)
+    facade = JobSearchFacade(MagicMock(), enabled=False)
+    session = SessionState(
+        role="worker", search_criteria={"city": ["苏州"]},
+        last_criteria={"city": ["苏州"]},
+        pending_relaxation={
+            "direction": "search_job", "step": "relax_salary_10pct",
+            "original_criteria": {"city": ["苏州"]},
+        },
+    )
+    response = facade.relax_search(
+        _worker(), session, SearchTurn("确认", "m-relax"),
+        "relax_salary_10pct", db=MagicMock(), confirmed=True,
+        experience_flags=SimpleNamespace(),
+    )
+    assert response.result is result
+    assert response.used_facade is False
+    assert captured == {"criteria": {"city": ["苏州"]}, "step": "relax_salary_10pct", "user_msg_id": "m-relax"}

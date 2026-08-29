@@ -223,6 +223,16 @@ class JobSearchFacade:
                 raise
             return service.search_jobs(criteria, raw_query, session, actor, db, user_msg_id=msg_id)
 
+    @staticmethod
+    def _call_with_optional_flags(call, *args, experience_flags=None, **kwargs):
+        """Call mixed-version search providers without masking internal TypeErrors."""
+        try:
+            return call(*args, experience_flags=experience_flags, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return call(*args, **kwargs)
+
     def search_jobs_v1(self, actor: UserContext, criteria: dict, session: SessionState, turn: SearchTurn | dict | Any, db=None, *, experience_flags=None) -> FacadeResult:
         db = db or self.db
         if actor.role != "worker" or session.profile != self.profile:
@@ -277,8 +287,10 @@ class JobSearchFacade:
             raise PermissionError("job search facade requires worker/recruitment.job")
         before = len(session.shown_items)
         rollout_reason = self._rollout_reason(actor)
-        raw_result, outcome = service.show_more(
-            session, actor, db, experience_flags=experience_flags,
+        raw_query, msg_id = _turn_values(turn) if turn is not None else ("", None)
+        raw_result, outcome = self._call_with_optional_flags(
+            service.show_more, session, actor, db,
+            experience_flags=experience_flags,
         )
         if rollout_reason:
             self._record_fallback(rollout_reason, action="show_more", actor=actor, turn=turn)
@@ -291,6 +303,7 @@ class JobSearchFacade:
                 )
             except Exception:
                 logger.exception("listing card projection failed after snapshot paging")
+                self._record_fallback("card_projection_failed", action="show_more", actor=actor, turn=turn)
                 return FacadeResult(
                     raw_result, outcome, [], used_facade=False,
                     fallback_reason="card_projection_failed",
@@ -320,7 +333,8 @@ class JobSearchFacade:
         db = db or self.db
         rollout_reason = self._rollout_reason(actor)
         raw_query, msg_id = _turn_values(turn)
-        result, outcome = search_service.execute_relaxed_search(
+        result, outcome = self._call_with_optional_flags(
+            search_service.execute_relaxed_search,
             dict(pending["original_criteria"]), step,
             direction="search_job", raw_query=raw_query, session=session,
             user_ctx=actor, db=db, user_msg_id=msg_id,
@@ -329,7 +343,11 @@ class JobSearchFacade:
         if rollout_reason:
             self._record_fallback(rollout_reason, action="relax_search", actor=actor, turn=turn)
             return FacadeResult(result, outcome, [], used_facade=False, fallback_reason=rollout_reason)
-        cards = self.cards_for_snapshot(actor, session, db, result)
+        try:
+            cards = self.cards_for_snapshot(actor, session, db, result)
+        except Exception as exc:
+            self._record_fallback(type(exc).__name__, action="relax_search", actor=actor, turn=turn)
+            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="card_projection_failed")
         return FacadeResult(result, outcome, cards, used_facade=True)
 
     def cards_for_snapshot(self, actor, session, db, result, *, page_ids: list[str] | None = None) -> list[ListingCard]:
