@@ -68,6 +68,32 @@ from app.wecom.callback import WeComMessage
 logger = logging.getLogger(__name__)
 
 
+def _job_search_facade_enabled(user_ctx: UserContext) -> bool:
+    """Return the fail-closed worker rollout decision for the listing facade."""
+    if user_ctx.role != "worker" or not getattr(_settings_module, "job_search_facade_enabled", False):
+        return False
+    percentage = max(0, min(100, int(getattr(_settings_module, "job_search_facade_rollout_percentage", 0))))
+    if percentage <= 0:
+        return False
+    if percentage >= 100:
+        return True
+    digest = userid_hash(user_ctx.external_userid)
+    try:
+        bucket = int(digest[:8], 16) % 100
+    except (TypeError, ValueError):
+        return False
+    return bucket < percentage
+
+
+def _render_facade_cards(result, cards) -> None:
+    """Replace legacy PII-bearing text only after a valid card projection."""
+    if not cards:
+        return
+    from app.listing.render import render_listing_cards
+    result.reply_text = render_listing_cards(cards, has_more=bool(getattr(result, "has_more", False)))
+    result.listing_cards = list(cards)
+
+
 def _experience_flags_for(
     user_ctx: UserContext,
     *,
@@ -1804,9 +1830,14 @@ def _handle_follow_up(
     if full_criteria:
         conversation_service.replace_criteria(session, full_criteria)
     else:
-        conversation_service.merge_criteria_patch(
-            session, intent_result.criteria_patch or [],
+        # Phase 3: consume the closed criteria patch contract explicitly.  The
+        # resulting full snapshot is then applied through the existing session
+        # helper so snapshot invalidation/version semantics stay centralized.
+        from app.listing.search import apply_criteria_patch
+        patched = apply_criteria_patch(
+            session.search_criteria, intent_result.criteria_patch or [],
         )
+        conversation_service.replace_criteria(session, patched)
 
     # Phase 1：消费 awaiting 字段（无论从 LLM 还是裸值兜底来）
     accepted_keys: list[str] = []
@@ -1881,6 +1912,16 @@ def _handle_show_more(
     result, outcome = search_service.show_more(
         session, user_ctx, db, experience_flags=experience_flags,
     )
+    if direction == "search_job" and _job_search_facade_enabled(user_ctx):
+        try:
+            from app.listing.search import JobSearchFacade
+            facade = JobSearchFacade(db, enabled=True)
+            cards = facade.cards_for_snapshot(user_ctx, session, db, result)
+            _render_facade_cards(result, cards)
+        except Exception as exc:
+            # Snapshot paging itself already completed through the legacy
+            # service; a projection failure must not lose that response.
+            log_event("facade_fallback", direction="search_job", action="show_more", reason=type(exc).__name__)
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
@@ -2629,8 +2670,29 @@ def _run_search(
         user_ctx, direction=direction, emit_log=True,
     )
     composed = _apply_default_criteria(criteria, session, user_ctx, db, direction)
-    # Phase 5 §5.0：search_jobs/search_workers 现返回 tuple[SearchResult, SearchOutcome]
-    if direction == "search_job":
+    # Phase 2: worker -> recruitment.job may use the structured facade.  The
+    # facade delegates to this same legacy service and is strictly fail-open to
+    # the legacy result when disabled, out of bucket, or structurally invalid.
+    if direction == "search_job" and _job_search_facade_enabled(user_ctx):
+        try:
+            from app.listing.search import JobSearchFacade, SearchTurn
+
+            facade_response = JobSearchFacade(db, enabled=True).search_jobs_v1(
+                user_ctx, composed, session,
+                SearchTurn(raw_query=raw_query, user_msg_id=user_msg_id), db=db,
+            )
+            result, outcome = facade_response.result, facade_response.outcome
+            if facade_response.used_facade and facade_response.cards:
+                _render_facade_cards(result, facade_response.cards)
+                log_event("job_search_facade_served", facade_version=JobSearchFacade.version)
+        except Exception as exc:
+            log_event("facade_fallback", direction="search_job", reason=type(exc).__name__)
+            result, outcome = search_service.search_jobs(
+                composed, raw_query, session, user_ctx, db,
+                user_msg_id=user_msg_id,
+                experience_flags=experience_flags,
+            )
+    elif direction == "search_job":
         result, outcome = search_service.search_jobs(
             composed, raw_query, session, user_ctx, db,
             user_msg_id=user_msg_id,

@@ -150,7 +150,7 @@ class JobSearchFacade:
             result, outcome = self._legacy_search(actor, dict(criteria or {}), session, turn, db)
             if not self.enabled:
                 return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="disabled")
-            cards = self._cards_from_snapshot(actor, session, db, result)
+            cards = self.cards_for_snapshot(actor, session, db, result)
             return FacadeResult(result, outcome, cards)
         except Exception as exc:
             logger.exception("job search facade failed; caller should use legacy", exc_info=True)
@@ -158,7 +158,7 @@ class JobSearchFacade:
 
     search = search_jobs_v1
 
-    def _cards_from_snapshot(self, actor, session, db, result) -> list[ListingCard]:
+    def cards_for_snapshot(self, actor, session, db, result) -> list[ListingCard]:
         from app.services import permission_service, search_service
         snapshot = session.candidate_snapshot
         if snapshot is None:
@@ -170,6 +170,8 @@ class JobSearchFacade:
         visibility = search_service._visibility_snapshot(db, "search_job", actor.role)
         visible = permission_service.filter_jobs_batch(dicts, actor.role, visibility)
         return [_job_card(job, actor, snapshot.snapshot_id) for job in visible]
+
+    _cards_from_snapshot = cards_for_snapshot
 
 
 def search_jobs_v1(actor, criteria, session, turn, db=None, **kwargs) -> FacadeResult:
