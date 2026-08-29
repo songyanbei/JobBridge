@@ -6,6 +6,7 @@ import pytest
 
 from app.listing.render import render_listing_card, render_listing_cards
 from app.listing.search import JobSearchFacade, SearchTurn, apply_criteria_patch, scrub_listing_text
+from app.listing.search import FacadeResult
 from app.schemas.conversation import CandidateSnapshot, SessionState
 from app.schemas.search import ListingCard
 from app.services.user_service import UserContext
@@ -79,6 +80,8 @@ def test_apply_criteria_patch_is_explicit_and_deterministic():
     assert result == {"city": ["苏州", "成都"], "salary_floor_monthly": 7000}
     with pytest.raises(Exception):
         apply_criteria_patch({}, [{"op": "replace", "field": "city", "value": "苏州"}])
+    with pytest.raises(ValueError):
+        apply_criteria_patch({}, [{"op": "update", "field": "owner_userid", "value": "bad"}])
 
 
 def test_facade_legacy_adapter_preserves_result_and_adds_cards(monkeypatch):
@@ -143,5 +146,68 @@ def test_relax_search_requires_confirmation_and_uses_original_criteria(monkeypat
         captured["step"] = step
         return SimpleNamespace(reply_text="legacy", result_count=0, has_more=False), SimpleNamespace(direction="search_job")
     monkeypatch.setattr("app.services.search_service.execute_relaxed_search", execute)
+    session.pending_relaxation = {
+        "direction": "search_job", "step": "relax_salary_10pct",
+        "original_criteria": {"city": ["苏州"], "salary_floor_monthly": 6000},
+    }
     facade.relax_search(_worker(), session, SearchTurn("苏州岗位"), "relax_salary_10pct", db=MagicMock(), confirmed=True)
     assert captured == {"criteria": {"city": ["苏州"], "salary_floor_monthly": 6000}, "step": "relax_salary_10pct"}
+
+
+def test_relax_search_rejects_unregistered_step_or_pending_context(monkeypatch):
+    facade = JobSearchFacade(MagicMock(), enabled=False)
+    session = SessionState(
+        role="worker", search_criteria={"city": ["苏州"]},
+        pending_relaxation={
+            "direction": "search_job", "step": "relax_salary_10pct",
+            "original_criteria": {"city": ["苏州"]},
+        },
+    )
+    with pytest.raises(ValueError):
+        facade.relax_search(_worker(), session, SearchTurn(), "drop_salary", db=MagicMock(), confirmed=True)
+    session.pending_relaxation["original_criteria"] = {"city": ["成都"]}
+    with pytest.raises(PermissionError):
+        facade.relax_search(_worker(), session, SearchTurn(), "relax_salary_10pct", db=MagicMock(), confirmed=True)
+
+
+def test_router_show_more_uses_facade_action_when_enabled(monkeypatch):
+    from app.services import message_router
+    from app.wecom.callback import WeComMessage
+    session = SessionState(
+        role="worker",
+        candidate_snapshot=CandidateSnapshot(candidate_ids=["1"], direction="search_job"),
+        shown_items=[],
+    )
+    raw_result = SimpleNamespace(reply_text="cards", result_count=0, has_more=False)
+    raw_outcome = SimpleNamespace(direction="search_job", snapshot_exhausted=False,
+                                  initial_count=0, final_count=0, desired_count=3,
+                                  applied_relax_step=None, soft_pref_hits={})
+    facade_result = FacadeResult(raw_result, raw_outcome, [], used_facade=True)
+    facade = MagicMock()
+    facade.show_more.return_value = facade_result
+    monkeypatch.setattr(message_router, "_job_search_facade_enabled", lambda user: True)
+    monkeypatch.setattr(message_router, "_post_search_dispatch", lambda **kwargs: [])
+    monkeypatch.setattr("app.listing.search.JobSearchFacade", lambda *args, **kwargs: facade)
+    legacy_more = MagicMock(side_effect=AssertionError("router bypassed facade"))
+    monkeypatch.setattr(message_router.search_service, "show_more", legacy_more)
+    replies = message_router._handle_show_more(
+        WeComMessage(msg_id="m-more", from_user="worker-1", content="更多"),
+        _worker(), session, MagicMock(),
+    )
+    assert replies == []
+    facade.show_more.assert_called_once()
+
+
+def test_facade_show_more_projection_failure_does_not_repeat_snapshot_consume(monkeypatch):
+    legacy_result = SimpleNamespace(reply_text="legacy page", result_count=1, has_more=False)
+    outcome = SimpleNamespace(direction="search_job")
+    service = MagicMock()
+    service.show_more.return_value = (legacy_result, outcome)
+    facade = JobSearchFacade(MagicMock(), enabled=True, legacy_service=service)
+    session = SessionState(role="worker", shown_items=["1"])
+    monkeypatch.setattr(facade, "cards_for_snapshot", MagicMock(side_effect=RuntimeError("projection")))
+    response = facade.show_more(_worker(), session, db=MagicMock())
+    assert response.result is legacy_result
+    assert response.used_facade is False
+    assert response.fallback_reason == "card_projection_failed"
+    service.show_more.assert_called_once()

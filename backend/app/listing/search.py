@@ -21,6 +21,16 @@ from app.services.user_service import UserContext
 
 logger = logging.getLogger(__name__)
 
+JOB_SEARCH_CRITERIA_FIELDS = frozenset({
+    "city", "job_category", "salary_floor_monthly", "salary_ceiling_monthly",
+    "is_long_term", "gender_required", "age", "provide_meal", "provide_housing",
+    "shift_pattern", "pay_type", "employment_type", "accept_couple",
+    "accept_student", "accept_minority",
+})
+RELAXATION_STEPS = frozenset({
+    "relax_salary_10pct", "broaden_job_category", "drop_optional_filters",
+})
+
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _WECHAT_RE = re.compile(
     r"(?i)(微信|wechat|weixin|wx(?:号|id)?)[\s:：_-]*([a-z][-_a-z0-9]{5,19})"
@@ -78,6 +88,8 @@ def apply_criteria_patch(criteria: dict, patches: list[SearchCriteriaPatch | dic
     current = dict(criteria or {})
     for raw in patches or []:
         patch = raw if isinstance(raw, SearchCriteriaPatch) else SearchCriteriaPatch.model_validate(raw)
+        if patch.field not in JOB_SEARCH_CRITERIA_FIELDS:
+            raise ValueError("unsupported recruitment.job search field")
         if patch.op == "update":
             current[patch.field] = patch.value
         elif patch.op == "remove":
@@ -194,16 +206,28 @@ class JobSearchFacade:
 
     def show_more(self, actor, session, turn=None, db=None) -> FacadeResult:
         """Page the existing snapshot; never rerun the full candidate ranking."""
-        from app.services import search_service
+        service = self.legacy_service
+        if service is None:
+            from app.services import search_service as service
         db = db or self.db
         if actor.role != "worker" or session.profile != self.profile:
             raise PermissionError("job search facade requires worker/recruitment.job")
         before = len(session.shown_items)
-        raw_result, outcome = search_service.show_more(session, actor, db)
-        cards = self.cards_for_snapshot(
-            actor, session, db, raw_result,
-            page_ids=list(session.shown_items[before:]),
-        ) if self.enabled else []
+        raw_result, outcome = service.show_more(session, actor, db)
+        if self.enabled:
+            try:
+                cards = self.cards_for_snapshot(
+                    actor, session, db, raw_result,
+                    page_ids=list(session.shown_items[before:]),
+                )
+            except Exception:
+                logger.exception("listing card projection failed after snapshot paging")
+                return FacadeResult(
+                    raw_result, outcome, [], used_facade=False,
+                    fallback_reason="card_projection_failed",
+                )
+        else:
+            cards = []
         return FacadeResult(raw_result, outcome, cards, used_facade=self.enabled,
                             fallback_reason=None if self.enabled else "disabled")
 
@@ -211,11 +235,23 @@ class JobSearchFacade:
         """Execute exactly one pre-approved relaxation step."""
         if not confirmed:
             raise PermissionError("relaxation requires explicit confirmation")
+        if step not in RELAXATION_STEPS:
+            raise ValueError("unsupported relaxation step")
+        pending = dict(session.pending_relaxation or {})
+        if (
+            pending.get("direction", "search_job") != "search_job"
+            or pending.get("step") != step
+            or not isinstance(pending.get("original_criteria"), dict)
+        ):
+            raise PermissionError("relaxation is not pending for this step")
+        expected = dict(session.last_criteria or session.search_criteria or {})
+        if pending["original_criteria"] != expected:
+            raise PermissionError("relaxation criteria context does not match session")
         from app.services import search_service
         db = db or self.db
         raw_query, msg_id = _turn_values(turn)
         result, outcome = search_service.execute_relaxed_search(
-            dict(session.last_criteria or session.search_criteria), step,
+            dict(pending["original_criteria"]), step,
             direction="search_job", raw_query=raw_query, session=session,
             user_ctx=actor, db=db, user_msg_id=msg_id,
         )

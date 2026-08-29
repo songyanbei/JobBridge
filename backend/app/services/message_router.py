@@ -1909,23 +1909,27 @@ def _handle_show_more(
         user_ctx, direction=direction, emit_log=True,
     )
     _start_recommendation_clock()
-    shown_before = len(session.shown_items)
-    result, outcome = search_service.show_more(
-        session, user_ctx, db, experience_flags=experience_flags,
-    )
     if direction == "search_job" and _job_search_facade_enabled(user_ctx):
         try:
-            from app.listing.search import JobSearchFacade
+            from app.listing.search import JobSearchFacade, SearchTurn
             facade = JobSearchFacade(db, enabled=True)
-            cards = facade.cards_for_snapshot(
-                user_ctx, session, db, result,
-                page_ids=list(session.shown_items[shown_before:]),
+            facade_response = facade.show_more(
+                user_ctx, session,
+                SearchTurn(raw_query=msg.content or "", user_msg_id=msg.msg_id), db=db,
             )
-            _render_facade_cards(result, cards)
+            result, outcome = facade_response.result, facade_response.outcome
+            _render_facade_cards(result, facade_response.cards)
         except Exception as exc:
             # Snapshot paging itself already completed through the legacy
             # service; a projection failure must not lose that response.
             log_event("facade_fallback", direction="search_job", action="show_more", reason=type(exc).__name__)
+            result, outcome = search_service.show_more(
+                session, user_ctx, db, experience_flags=experience_flags,
+            )
+    else:
+        result, outcome = search_service.show_more(
+            session, user_ctx, db, experience_flags=experience_flags,
+        )
     # Stage C1：show_more 后若快照仍存活则保持 search_active；否则降为 idle
     if session.candidate_snapshot is not None:
         session.active_flow = "search_active"
