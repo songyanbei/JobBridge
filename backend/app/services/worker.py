@@ -92,6 +92,7 @@ AUX_QUEUE_BATCH_SIZE = 100
 RECOVERY_SCAN_INTERVAL_SECONDS = 30
 RECOVERY_RECEIVED_STALE_SECONDS = 10
 RECOVERY_PROCESSING_STALE_SECONDS = 180
+DISPATCHER_LEASE_SECONDS = 180
 OUTBOX_SENDING_STALE_SECONDS = 180
 OUTBOX_CLAIM_BATCH_SIZE = 20
 OUTBOX_MAX_ATTEMPTS = 5
@@ -391,16 +392,30 @@ class Worker:
         """
         db = SessionLocal()
         try:
+            lease_due = or_(
+                WecomInboundEvent.dispatcher_lease_owner.is_(None),
+                WecomInboundEvent.dispatcher_lease_expires_at <= func.now(6),
+            )
             rows = (
                 db.query(WecomInboundEvent)
                 .filter(
                     WecomInboundEvent.status == "received",
                     WecomInboundEvent.rate_limit_decision == "accepted",
+                    lease_due,
                 )
                 .order_by(WecomInboundEvent.id)
+                .with_for_update(skip_locked=True)
                 .limit(AUX_QUEUE_BATCH_SIZE)
                 .all()
             )
+            for row in rows:
+                row.dispatcher_lease_owner = self._lease_owner
+                row.dispatcher_lease_expires_at = func.timestampadd(
+                    text("SECOND"), DISPATCHER_LEASE_SECONDS, func.now(6),
+                )
+            # The lease must be durable before Redis I/O. A second dispatcher
+            # therefore skips these rows even while the first one is enqueueing.
+            db.commit()
             dispatched = 0
             for row in rows:
                 try:
@@ -414,6 +429,7 @@ class Worker:
                         "worker: inbound dispatcher enqueue failed event_id=%s",
                         row.id,
                     )
+                    self._release_dispatcher_lease(row.id)
             return dispatched
         except Exception:
             db.rollback()
@@ -2591,9 +2607,31 @@ class Worker:
                 # 与 created_at 的 MySQL CURRENT_TIMESTAMP 使用同一数据库时钟，
                 # 避免容器 UTC 与 DB Asia/Shanghai 混写后 queue latency 变成 -8h。
                 "worker_started_at": func.now(6),
+                "dispatcher_lease_owner": None,
+                "dispatcher_lease_expires_at": None,
             })
         except Exception:
             logger.exception("worker: mark_event_processing failed id=%s", event_id)
+
+    def _release_dispatcher_lease(self, event_id: Any) -> None:
+        """Release a failed enqueue claim so the next scan can retry promptly."""
+        if not event_id:
+            return
+        db = SessionLocal()
+        try:
+            db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == event_id,
+                WecomInboundEvent.dispatcher_lease_owner == self._lease_owner,
+            ).update({
+                "dispatcher_lease_owner": None,
+                "dispatcher_lease_expires_at": None,
+            })
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("worker: release dispatcher lease failed id=%s", event_id)
+        finally:
+            db.close()
 
     def _mark_event_done(self, db: Session, event_id: Any) -> None:
         if not event_id:

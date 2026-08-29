@@ -1223,15 +1223,60 @@ class TestStartupRecovery:
             msg_type="text", content_brief="hello", media_id=None,
             retry_count=0, created_at=None,
         )
-        query = db.query.return_value.filter.return_value.order_by.return_value.limit.return_value
+        query = (
+            db.query.return_value.filter.return_value.order_by.return_value
+            .with_for_update.return_value.limit.return_value
+        )
         query.all.return_value = [accepted]
         mock_factory.return_value = db
 
         assert worker._dispatch_received_events_once() == 1
+        assert accepted.dispatcher_lease_owner == worker._lease_owner
+        assert accepted.dispatcher_lease_expires_at is not None
+        db.commit.assert_called_once()
         payload = json.loads(mock_enq.call_args.args[0])
         assert payload["inbound_event_id"] == 7
         assert payload["turn_id"] == "turn-7"
         assert mock_enq.call_args.args[1] == QUEUE_INCOMING
+
+    @patch("app.services.worker.SessionLocal")
+    @patch("app.services.worker.enqueue_message", side_effect=RuntimeError("redis down"))
+    def test_inbound_dispatcher_releases_lease_when_enqueue_fails(
+        self, mock_enq, mock_factory, worker,
+    ):
+        db = MagicMock()
+        row = MagicMock(
+            id=8, msg_id="m-lost", turn_id="turn-8", from_userid="u1",
+            msg_type="text", content_brief="hello", media_id=None,
+            retry_count=0, created_at=None,
+        )
+        query = (
+            db.query.return_value.filter.return_value.order_by.return_value
+            .with_for_update.return_value.limit.return_value
+        )
+        query.all.return_value = [row]
+        mock_factory.return_value = db
+
+        assert worker._dispatch_received_events_once() == 0
+        # The scan commits the claim, then the failure path uses a separate
+        # conditional update/commit to make the row immediately retryable.
+        assert db.commit.call_count >= 2
+        assert mock_enq.called
+
+    @patch("app.services.worker.enqueue_message")
+    @patch("app.services.worker.SessionLocal")
+    def test_dispatcher_claim_query_uses_skip_locked_and_lease_predicate(
+        self, mock_factory, mock_enq, worker,
+    ):
+        db = MagicMock()
+        query = db.query.return_value.filter.return_value.order_by.return_value
+        locked = query.with_for_update
+        locked.return_value.limit.return_value.all.return_value = []
+        mock_factory.return_value = db
+
+        assert worker._dispatch_received_events_once() == 0
+        locked.assert_called_once_with(skip_locked=True)
+        db.commit.assert_called_once()
 
     @patch("app.services.worker.enqueue_message")
     @patch("app.services.worker.SessionLocal")

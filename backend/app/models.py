@@ -777,6 +777,12 @@ class WecomInboundEvent(Base):
     rate_limited_at = sa.Column(
         mysql.DATETIME(fsp=6), nullable=True, comment="限流决策时间",
     )
+    dispatcher_lease_owner = sa.Column(
+        sa.String(64), nullable=True, comment="入站 dispatcher 当前 owner",
+    )
+    dispatcher_lease_expires_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=True, comment="入站 dispatcher lease 到期时间",
+    )
     retry_count = sa.Column(mysql.TINYINT(unsigned=True), nullable=False, server_default=sa.text("0"), comment="已重试次数")
     session_operation = sa.Column(sa.String(8), nullable=True)
     session_expected_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
@@ -807,6 +813,10 @@ class WecomInboundEvent(Base):
         sa.Index("idx_status_time", "status", "created_at"),
         sa.Index(
             "idx_inbound_dispatch", "status", "rate_limit_decision", "created_at", "id",
+        ),
+        sa.Index(
+            "idx_inbound_dispatch_lease",
+            "status", "rate_limit_decision", "dispatcher_lease_expires_at", "id",
         ),
         sa.Index("idx_status_worker_started", "status", "worker_started_at"),
         sa.Index("idx_status_worker_finished", "status", "worker_finished_at"),
