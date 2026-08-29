@@ -29,6 +29,10 @@ JobBridge 的目标架构是：
 | [04 可靠性与性能](04-reliability-performance-and-observability.md) | 幂等、队列、出站、性能、安全、观测 | 后端、运维、测试 |
 | [05 迁移、测试与后台](05-migration-testing-and-admin.md) | 代码迁移、回放测试、灰度、后台兼容 | 项目管理、研发、测试、运营 |
 | [06 开源项目选型](06-open-source-reference-and-selection.md) | Rasa、LangGraph、Dify、MCP 等调研 | 架构、技术决策 |
+| [07 总体改造路线图](07-overall-migration-roadmap.md) | 完整架构目标、阶段依赖、迁移边界和总体验收 | 架构、项目负责人、研发、测试、运维 |
+| [08 求职搜索 v1 实施方案](08-job-search-v1-implementation-plan.md) | 首版求职搜索的详细实施、代码范围、测试和灰度 | 后端、AI、测试、运维 |
+
+阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，最后以 08 作为当前首个可执行交付切片。08 仅覆盖求职者找岗位，不代表岗位发布、简历发布、双向招聘或二手物品已经完成。
 
 ## 当前系统基线
 
