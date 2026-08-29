@@ -72,6 +72,82 @@ def _fake_plaintext(content="你好", msg_id="m1", from_user="u1", msg_type="tex
 
 
 class TestReceiveCallback:
+    def test_durable_acceptance_orders_db_before_rate_limit_and_redis(self, client):
+        state = {}
+        order = []
+
+        def insert(msg):
+            order.append("db")
+            state.update(status="received", rate_limit_decision="accepted")
+            return 42
+
+        def rate(_userid, **_kwargs):
+            order.append("rate")
+            return True
+
+        def enqueue(*_args):
+            order.append("redis")
+
+        with (
+            patch("app.api.webhook.verify_signature", return_value=True),
+            patch("app.api.webhook.decrypt_message", return_value=_fake_plaintext()),
+            patch("app.api.webhook.check_msg_duplicate", return_value=False),
+            patch("app.api.webhook._insert_inbound_event", side_effect=insert),
+            patch("app.api.webhook.check_rate_limit", side_effect=rate),
+            patch("app.api.webhook.enqueue_message", side_effect=enqueue),
+        ):
+            response = client.post(
+                "/webhook/wecom",
+                params={"msg_signature": "s", "timestamp": "t", "nonce": "n"},
+                content=_FAKE_XML,
+            )
+
+        assert response.status_code == 200
+        assert order == ["db", "rate", "redis"]
+        assert state == {"status": "received", "rate_limit_decision": "accepted"}
+
+    def test_redis_enqueue_failure_keeps_durable_received_event_recoverable(self, client):
+        state = {}
+
+        def insert(_msg):
+            state.update(status="received", rate_limit_decision="accepted", id=42)
+            return 42
+
+        with (
+            patch("app.api.webhook.verify_signature", return_value=True),
+            patch("app.api.webhook.decrypt_message", return_value=_fake_plaintext()),
+            patch("app.api.webhook.check_msg_duplicate", return_value=False),
+            patch("app.api.webhook._insert_inbound_event", side_effect=insert),
+            patch("app.api.webhook.check_rate_limit", return_value=True),
+            patch("app.api.webhook.enqueue_message", side_effect=RuntimeError("redis down")),
+        ):
+            response = client.post(
+                "/webhook/wecom",
+                params={"msg_signature": "s", "timestamp": "t", "nonce": "n"},
+                content=_FAKE_XML,
+            )
+
+        assert response.status_code == 200
+        assert state["status"] == "received"
+        assert state["rate_limit_decision"] == "accepted"
+
+    def test_db_unavailable_returns_retryable_non_2xx(self, client):
+        with (
+            patch("app.api.webhook.verify_signature", return_value=True),
+            patch("app.api.webhook.decrypt_message", return_value=_fake_plaintext()),
+            patch("app.api.webhook.check_msg_duplicate", return_value=False),
+            patch("app.api.webhook.SessionLocal", side_effect=RuntimeError("mysql unavailable")),
+            patch("app.api.webhook.enqueue_message") as enqueue,
+        ):
+            response = client.post(
+                "/webhook/wecom",
+                params={"msg_signature": "s", "timestamp": "t", "nonce": "n"},
+                content=_FAKE_XML,
+            )
+
+        assert response.status_code == 503
+        enqueue.assert_not_called()
+
     @patch("app.api.webhook.verify_signature", return_value=False)
     def test_post_bad_signature_returns_403(self, mock_verify, client):
         resp = client.post(

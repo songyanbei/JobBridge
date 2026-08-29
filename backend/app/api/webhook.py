@@ -286,8 +286,12 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
     brief = _build_brief(msg)
     media_id = msg.media_id or None
 
-    db = SessionLocal()
+    db = None
     try:
+        # Include session construction in the guarded section: a pool/connect
+        # failure is itself a durable-acceptance failure and must become a
+        # retryable 503 at the endpoint boundary.
+        db = SessionLocal()
         event = WecomInboundEvent(
             msg_id=msg.msg_id,
             turn_id=str(uuid.uuid4()),
@@ -305,6 +309,8 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         return event.id
     except IntegrityError:
         # UNIQUE(msg_id) 撞库 → 幂等兜底（L2）
+        if db is None:
+            return None
         db.rollback()
         logger.info("webhook: inbound_event duplicate msg_id=%s (L2 idempotency)", msg.msg_id)
         existing = db.query(WecomInboundEvent).filter(
@@ -315,11 +321,13 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
             msg._durable_existing = True
         return existing.id if existing else None
     except Exception:
-        db.rollback()
+        if db is not None:
+            db.rollback()
         logger.exception("webhook: insert inbound_event failed msg_id=%s", msg.msg_id)
         return None
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def _mark_rate_limited(event_id: int, *, rule: str) -> bool:
@@ -344,7 +352,8 @@ def _mark_rate_limited(event_id: int, *, rule: str) -> bool:
         logger.exception("webhook: mark rate-limited event failed id=%s", event_id)
         return False
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def _local_rate_limit_allow(userid: str, *, window: int, max_count: int) -> bool:
