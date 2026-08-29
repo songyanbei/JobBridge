@@ -41,6 +41,10 @@ class CandidateSnapshot(BaseModel):
 class SessionState(BaseModel):
     """Redis 会话状态，key = session:{external_userid}，TTL 30 分钟。"""
     role: str = Field(..., description="用户角色 worker/factory/broker")
+    # Versioned Dialogue/Session metadata.  Defaults preserve read compatibility
+    # with Redis payloads written before Phase 1.
+    schema_version: str = Field(default="dialogue.v1", description="Dialogue schema version")
+    profile: str = Field(default="recruitment.job", description="Active domain profile")
     current_intent: str | None = Field(default=None, description="当前意图")
     search_criteria: dict = Field(default_factory=dict, description="跨轮次累积 merge 的检索条件")
     candidate_snapshot: CandidateSnapshot | None = Field(default=None, description="检索快照")
@@ -150,6 +154,31 @@ class SessionState(BaseModel):
         default=None,
         description="受限两动作计划的第二动作：{raw_text, created_at, expires_at}",
     )
+    # Materialized compatibility payload for legacy readers.  It is refreshed by
+    # conversation_service.save_session and ignored by old consumers.
+    legacy_projection: dict = Field(default_factory=dict, description="Legacy session projection")
+
+    def get_legacy_projection(self) -> dict:
+        """Return the stable pre-Phase-1 session shape."""
+        fields = (
+            "role", "current_intent", "search_criteria", "candidate_snapshot",
+            "shown_items", "history", "updated_at", "session_version",
+            "broker_direction", "follow_up_rounds", "pending_upload",
+            "pending_upload_intent", "awaiting_field", "pending_started_at",
+            "pending_updated_at", "pending_expires_at", "pending_raw_text_parts",
+            "pending_upload_mode", "pending_target_id", "pending_target_version",
+            "pending_operation_id", "pending_rollout_cohort", "pending_rollout_revision",
+            "pending_upload_media_ids", "attachment_target_type", "attachment_target_id",
+            "active_flow", "last_intent", "pending_interruption", "failed_patch_rounds",
+            "last_criteria", "conflict_followup_rounds", "awaiting_fields",
+            "awaiting_frame", "awaiting_expires_at", "pending_relaxation", "pending_action",
+        )
+        payload = self.model_dump(mode="json", exclude={"legacy_projection"})
+        return {key: payload.get(key) for key in fields if key in payload}
+
+    # Naming used by adapters outside the schema module.
+    def to_legacy_projection(self) -> dict:
+        return self.get_legacy_projection()
 
 
 class CriteriaPatch(BaseModel):

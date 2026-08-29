@@ -91,7 +91,11 @@ def load_session(userid: str) -> SessionState | None:
     data = redis_get_session(userid)
     if data is None:
         return None
+    # Pydantic defaults supply dialogue.v1/recruitment.job for legacy payloads;
+    # retain any explicit values and only materialize a missing projection.
     session = SessionState(**data)
+    if not session.legacy_projection:
+        session.legacy_projection = session.get_legacy_projection()
     if session.active_flow is None:
         session.active_flow = _derive_active_flow(session)
     _self_heal_active_flow(session)
@@ -161,7 +165,22 @@ def _self_heal_active_flow(session: SessionState) -> None:
 def create_session(userid: str, role: str) -> SessionState:
     """创建新的空 session。"""
     now = datetime.now(timezone.utc).isoformat()
-    return SessionState(role=role, updated_at=now, active_flow="idle")
+    return SessionState(
+        role=role,
+        schema_version="dialogue.v1",
+        profile="recruitment.job",
+        updated_at=now,
+        active_flow="idle",
+    )
+
+
+def legacy_projection(session: SessionState) -> dict:
+    """Return the compatibility shape consumed by legacy routing code."""
+    return session.get_legacy_projection()
+
+
+# Explicit adapter name for callers migrating from the old flat session DTO.
+project_session_for_legacy = legacy_projection
 
 
 def save_session(userid: str, session: SessionState) -> None:
@@ -179,10 +198,11 @@ def save_session(userid: str, session: SessionState) -> None:
                 "session version changed inside staged worker turn",
             )
         session.updated_at = datetime.now(timezone.utc).isoformat()
-        payload = session.model_copy(
-            update={"session_version": target_version},
-        ).model_dump(mode="json")
+        projected = session.model_copy(update={"session_version": target_version})
+        payload = projected.model_dump(mode="json")
+        payload["legacy_projection"] = projected.get_legacy_projection()
         session.session_version = target_version
+        session.legacy_projection = session.get_legacy_projection()
         stage.operation = "save"
         stage.payload = payload
         return
@@ -190,9 +210,9 @@ def save_session(userid: str, session: SessionState) -> None:
     session.updated_at = datetime.now(timezone.utc).isoformat()
     expected_version = session.session_version
     next_version = expected_version + 1
-    payload = session.model_copy(update={"session_version": next_version}).model_dump(
-        mode="json",
-    )
+    projected = session.model_copy(update={"session_version": next_version})
+    payload = projected.model_dump(mode="json")
+    payload["legacy_projection"] = projected.get_legacy_projection()
     if not redis_save_session_if_version(
         userid, payload, expected_version,
         lock_fence=current_user_lock_fence(),
@@ -206,6 +226,7 @@ def save_session(userid: str, session: SessionState) -> None:
             f"session version changed while processing (expected={expected_version})",
         )
     session.session_version = next_version
+    session.legacy_projection = session.get_legacy_projection()
 
 
 def clear_session(userid: str) -> None:

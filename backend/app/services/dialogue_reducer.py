@@ -178,6 +178,8 @@ class DialogueDecision(BaseModel):
         "ask_clarification",
         "paginate_no_more",
     ] = "none"
+    # Deterministic, non-PII explanation of reducer choices for replay/observability.
+    decision_trace: list[dict] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -524,7 +526,7 @@ def _apply_factory_posting_guard(
 # ---------------------------------------------------------------------------
 
 
-def reduce(
+def _reduce_impl(
     parse_result: DialogueParseResult,
     session: SessionState,
     role: str,
@@ -536,6 +538,17 @@ def reduce(
     raw_text 用于 awaiting tie-break 裸值，以及 broker 明确主客体句式的方向护栏；
     后者不处理模糊表达，也不改变 dialogue_act。
     """
+    # Phase 1 profile guard: the worker search runtime is scoped to the
+    # recruitment.job profile.  Never allow a mismatched Session to reach a
+    # search Action; callers can safely fall back to legacy routing.
+    if role == "worker" and getattr(session, "profile", "recruitment.job") != "recruitment.job":
+        return DialogueDecision(
+            dialogue_act="chitchat",
+            resolved_frame="none",
+            route_intent="chitchat",
+            clarification={"kind": "profile_mismatch", "profile": getattr(session, "profile", None)},
+        )
+
     parse_result = _apply_factory_posting_guard(
         parse_result, role, raw_text,
     )
@@ -627,6 +640,31 @@ def reduce(
 
     # 4) start_upload / answer_missing_slot / start_search / modify_search 主路径
     return _reduce_main(parse_result, session, role, raw_text=raw_text)
+
+
+def reduce(
+    parse_result: DialogueParseResult,
+    session: SessionState,
+    role: str,
+    *,
+    raw_text: str = "",
+) -> DialogueDecision:
+    """Pure reducer wrapper that attaches a deterministic decision trace."""
+    decision = _reduce_impl(parse_result, session, role, raw_text=raw_text)
+    trace = [
+        {"event": "reduce", "profile": getattr(session, "profile", "recruitment.job"),
+         "schema_version": getattr(session, "schema_version", "dialogue.v1"),
+         "role": role, "dialogue_act": decision.dialogue_act,
+         "resolved_frame": decision.resolved_frame},
+    ]
+    if decision.accepted_slots_delta:
+        trace.append({"event": "criteria_accept", "fields": sorted(decision.accepted_slots_delta)})
+    if decision.resolved_merge_policy:
+        trace.append({"event": "criteria_merge", "policies": dict(decision.resolved_merge_policy)})
+    if decision.clarification:
+        trace.append({"event": "clarification", "kind": decision.clarification.get("kind")})
+    trace.append({"event": "state_transition", "transition": decision.state_transition})
+    return decision.model_copy(update={"decision_trace": trace})
 
 
 def _reduce_respond_relaxation_offer(
