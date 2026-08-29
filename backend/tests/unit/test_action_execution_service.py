@@ -125,6 +125,21 @@ def test_expired_started_claim_is_reclaimed_with_incremented_fence(db):
     assert row.result_digest == "new"
 
 
+def test_started_lease_at_exact_deadline_is_reclaimable(db):
+    first = claim_action_execution(
+        db, "turn-2-exact", "listing.search", "worker-a",
+        lease_seconds=10, now=_at(),
+    )
+    db.commit()
+
+    takeover = claim_action_execution(
+        db, "turn-2-exact", "listing.search", "worker-b",
+        lease_seconds=10, now=_at(10),
+    )
+    assert takeover.acquired is True
+    assert takeover.fencing_token == first.fencing_token + 1
+
+
 def test_succeeded_retry_replays_saved_result_without_reclaim(db):
     claim = claim_action_execution(
         db, "turn-3", "listing.search", "worker-a", lease_seconds=30, now=_at(),

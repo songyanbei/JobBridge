@@ -89,7 +89,7 @@ def _state_for_row(row: ActionExecution, now: datetime) -> ActionState:
         # A malformed started row with no deadline is not provably expired;
         # never let a recovery worker steal it.  The operator/reconciler can
         # repair such rows explicitly.
-        if row.lease_until is None or row.lease_until >= now:
+        if row.lease_until is None or row.lease_until > now:
             return "in_progress"
         return "acquired"
     # Never interpret schema drift/corruption as permission to execute.  A
