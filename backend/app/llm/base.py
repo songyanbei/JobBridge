@@ -6,7 +6,7 @@
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -176,6 +176,107 @@ class DialogueParseResult(BaseModel):
                 f"dialogue_act='respond_relaxation_offer', got {self.dialogue_act!r}"
             )
         return self
+
+
+class VersionedDialogueParse(BaseModel):
+    """Internal, versioned envelope for Dialogue v1.
+
+    Providers may still return the historical ``DialogueParseResult`` without a
+    schema marker.  The adapter below adds the marker only inside the runtime;
+    provider DTOs and their wire contracts remain unchanged.
+    """
+
+    schema_version: Literal["dialogue.v1"] = "dialogue.v1"
+    result: DialogueParseResult
+    profile: str = "recruitment.job"
+    unknown_slots: list[str] = Field(default_factory=list)
+
+    @property
+    def dialogue_act(self) -> str:
+        return self.result.dialogue_act
+
+    def model_dump_result(self) -> dict[str, Any]:
+        return self.result.model_dump(mode="json")
+
+
+# Public alias used by adapters/tests while keeping the descriptive name above.
+DialogueV1Parse = VersionedDialogueParse
+
+
+_DIALOGUE_V1_ACTS = {
+    "start_search", "modify_search", "answer_missing_slot", "show_more",
+    "start_upload", "cancel", "reset", "resolve_conflict",
+    "respond_relaxation_offer", "chitchat",
+}
+_DIALOGUE_V1_FRAMES = {
+    "job_search", "candidate_search", "job_upload", "resume_upload", "none",
+}
+_DIALOGUE_V1_SLOTS = {
+    "city", "job_category", "salary_floor_monthly", "salary_ceiling_monthly",
+    "shift_pattern", "employment_type", "experience_years", "education",
+    "gender", "age", "name", "phone", "description", "job_title",
+    "years_experience", "expected_salary", "work_years", "skill_tags",
+}
+
+
+def _profile_slots(profile: str) -> set[str]:
+    """Resolve slot keys from the active Profile Schema when available."""
+    try:
+        from app.dialogue import slot_schema
+        return set().union(
+            *(slot_schema.fields_for(frame) for frame in
+              ("job_search", "candidate_search", "job_upload", "resume_upload"))
+        )
+    except Exception:
+        return set(_DIALOGUE_V1_SLOTS)
+
+
+def adapt_dialogue_parse(
+    value: DialogueParseResult | VersionedDialogueParse | dict[str, Any],
+    *,
+    profile: str = "recruitment.job",
+) -> VersionedDialogueParse:
+    """Validate a provider result at the v1 boundary.
+
+    Missing ``schema_version`` is the sole compatibility case.  Unknown top
+    level protocol values and unknown slots are rejected so callers can record a
+    fallback and invoke the legacy parser.  No input object is mutated.
+    """
+    if isinstance(value, VersionedDialogueParse):
+        if value.schema_version != "dialogue.v1":
+            raise ValueError(f"unsupported dialogue schema: {value.schema_version}")
+        data = value.result.model_dump(mode="python")
+        effective_profile = value.profile or profile
+    elif isinstance(value, DialogueParseResult):
+        data = value.model_dump(mode="python")
+        effective_profile = profile
+    elif isinstance(value, dict):
+        raw = dict(value)
+        schema = raw.pop("schema_version", "dialogue.v1")
+        if schema != "dialogue.v1":
+            raise ValueError(f"unsupported dialogue schema: {schema}")
+        data = raw
+        effective_profile = profile
+    else:
+        raise TypeError(f"unsupported dialogue parse type: {type(value).__name__}")
+
+    act = data.get("dialogue_act")
+    if act not in _DIALOGUE_V1_ACTS:
+        raise ValueError(f"unknown dialogue_act: {act!r}")
+    frame = data.get("frame_hint", "none")
+    if frame not in _DIALOGUE_V1_FRAMES:
+        raise ValueError(f"unknown frame_hint: {frame!r}")
+    slots = data.get("slots_delta") or {}
+    if not isinstance(slots, dict):
+        raise ValueError("slots_delta must be an object")
+    known_slots = _profile_slots(effective_profile)
+    unknown = sorted(str(k) for k in slots if k not in known_slots)
+    if unknown:
+        raise ValueError(f"unknown dialogue slots: {', '.join(unknown)}")
+    parse = DialogueParseResult.model_validate(data)
+    return VersionedDialogueParse(
+        schema_version="dialogue.v1", result=parse, profile=effective_profile,
+    )
 
 
 class RerankResult(BaseModel):

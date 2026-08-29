@@ -13,7 +13,7 @@ import time
 from app.config import settings
 from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.llm import get_intent_extractor
-from app.llm.base import IntentResult
+from app.llm.base import IntentResult, adapt_dialogue_parse
 from app.llm.prompts import (
     DIALOGUE_PROMPT_VERSION,
     INTENT_PROMPT_VERSION,
@@ -1280,6 +1280,11 @@ def _classify_dialogue_v2(
         current_criteria=current_criteria,
         session_hint=session_hint,
     )
+    # Provider compatibility boundary: old providers return an unversioned
+    # DialogueParseResult; invalid schema/act/frame/slot values fail closed and
+    # are handled by classify_dialogue's legacy fallback.
+    parse_envelope = adapt_dialogue_parse(parse, profile="recruitment.job")
+    parse = parse_envelope.result
     # phased-plan §2.3 三类事件之一：先发 parse 再发 decision，解耦观测维度
     _emit_dialogue_v2_parse(parse, user_msg_id=user_msg_id, mode=mode)
     decision = _reduce(parse, session, role, raw_text=text)

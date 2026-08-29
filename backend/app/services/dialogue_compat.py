@@ -9,11 +9,87 @@ from __future__ import annotations
 
 import logging
 
-from app.llm.base import IntentResult
+from app.llm.base import (
+    IntentResult,
+    DialogueParseResult,
+    VersionedDialogueParse,
+)
 from app.schemas.conversation import SessionState
 from app.services.dialogue_reducer import DialogueDecision
 
 logger = logging.getLogger(__name__)
+
+
+def intent_to_dialogue_v1(
+    intent: IntentResult,
+    session: SessionState | None = None,
+    *,
+    profile: str = "recruitment.job",
+) -> VersionedDialogueParse:
+    """Explicitly map the legacy IntentResult into the closed v1 protocol.
+
+    This is the only supported bridge from the legacy DTO to Runtime.  Unknown
+    intents, commands, or payload shapes fail closed so callers can use the
+    legacy route rather than guessing an Action.
+    """
+    name = intent.intent
+    data = dict(intent.structured_data or {})
+    frame = "none"
+    act: str
+    slots: dict = {}
+    if name == "search_job":
+        act, frame, slots = "start_search", "job_search", data
+    elif name == "search_worker":
+        act, frame, slots = "start_search", "candidate_search", data
+    elif name in {"upload_job", "upload_and_search"}:
+        act, frame, slots = "start_upload", "job_upload", data
+    elif name == "upload_resume":
+        act, frame, slots = "start_upload", "resume_upload", data
+    elif name == "show_more":
+        act = "show_more"
+    elif name == "chitchat":
+        act = "chitchat"
+    elif name == "follow_up":
+        awaiting = bool(session and getattr(session, "awaiting_fields", []))
+        act = "answer_missing_slot" if awaiting else "modify_search"
+        frame = (
+            "job_search" if not session or getattr(session, "role", "worker") == "worker"
+            else "candidate_search"
+        )
+        slots = data
+    elif name == "command":
+        command = str(data.get("command", "")).lower()
+        if command in {"cancel", "cancel_pending", "abort"}:
+            act = "cancel"
+        elif command in {"reset", "reset_search"}:
+            act = "reset"
+        else:
+            raise ValueError(f"unsupported legacy command: {command!r}")
+    elif name in {"upload_conflict", "resolve_conflict"}:
+        act = "resolve_conflict"
+        action = data.get("conflict_action") or data.get("action")
+        if action not in {"cancel_draft", "resume_pending_upload", "proceed_with_new"}:
+            raise ValueError("legacy conflict result lacks a valid conflict_action")
+        data = {"conflict_action": action}
+    elif name in {"relaxation_answer", "respond_relaxation_offer"}:
+        act = "respond_relaxation_offer"
+        response = data.get("relaxation_response") or data.get("response")
+        if response not in {"accept", "reject"}:
+            raise ValueError("legacy relaxation result lacks accept/reject")
+        data = {"relaxation_response": response}
+    else:
+        raise ValueError(f"unsupported legacy intent: {name!r}")
+
+    parse = DialogueParseResult(
+        dialogue_act=act,
+        frame_hint=frame,
+        slots_delta=slots,
+        confidence=float(intent.confidence or 0.0),
+        raw_response=intent.raw_response or "",
+        **({"conflict_action": data["conflict_action"]} if act == "resolve_conflict" else {}),
+        **({"relaxation_response": data["relaxation_response"]} if act == "respond_relaxation_offer" else {}),
+    )
+    return VersionedDialogueParse(schema_version="dialogue.v1", result=parse, profile=profile)
 
 
 def decision_to_intent_result(
