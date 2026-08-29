@@ -16,11 +16,13 @@ import json
 import logging
 import threading
 import time
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi import status as http_status
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
@@ -69,6 +71,9 @@ _LOCAL_CONFIG_FALLBACK: dict[str, int] = {
 _LOCAL_CONFIG_LOCK = threading.Lock()
 _CONFIG_CACHE_UNAVAILABLE_UNTIL = 0.0
 _CONFIG_CACHE_RETRY_SECONDS = 5.0
+_RATE_LIMIT_RULE = "rate_limit.v1"
+_LOCAL_RATE_LIMIT_STATE: dict[str, list[float]] = {}
+_LOCAL_RATE_LIMIT_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -195,33 +200,14 @@ def _accept_message(msg: WeComMessage, start_ts: float) -> Response:
         # Redis 不可用 → 靠下面 inbound_event UNIQUE(msg_id) 兜底
         logger.exception("webhook: check_msg_duplicate failed (degraded to L2)")
 
-    # 6. 限流检查（窗口参数从 system_config 读，带缓存）
+    # 6. Durable inbox first.  The event is intentionally accepted before the
+    # rate-limit decision so a rejected message remains auditable and replayable.
     if not msg.from_user:
         logger.warning("webhook: msg without from_user, msg_id=%s", msg.msg_id)
         return _success_response()
 
-    window, max_count = _get_rate_limit_params()
-    try:
-        allowed = check_rate_limit(msg.from_user, window=window, max_count=max_count)
-    except Exception:
-        logger.exception("webhook: check_rate_limit failed (fail-open)")
-        allowed = True
-
-    if not allowed:
-        logger.info(
-            "webhook: rate-limited user_hash=%s",
-            identifier_hash(msg.from_user),
-        )
-        _async_rate_limit_notify(msg.from_user)
-        # 被限流的消息不写 inbound_event，不入队
-        return _success_response()
-
-    # 7. 写 wecom_inbound_event
     inbound_event_id = _insert_inbound_event(msg)
     if inbound_event_id is None:
-        # Do not acknowledge a message that has neither a durable event nor a
-        # recoverable queue identity. A non-2xx response lets WeCom retry; the
-        # stale Redis dedup marker is explicitly checked against DB above.
         logger.error(
             "webhook: durable acceptance failed, request upstream retry msg_id=%s",
             msg.msg_id,
@@ -231,10 +217,37 @@ def _accept_message(msg: WeComMessage, start_ts: float) -> Response:
             status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
             media_type="text/plain",
         )
+    if getattr(msg, "_durable_existing", False):
+        # A Redis outage can race a duplicate DB insert. Reuse the original
+        # event and do not run the limiter or emit a second notice.
+        return _success_response()
+
+    # 7. 限流检查（窗口参数从 system_config 读，带缓存）
+    window, max_count = _get_rate_limit_params()
+    try:
+        allowed = check_rate_limit(msg.from_user, window=window, max_count=max_count)
+    except Exception:
+        logger.warning("webhook: check_rate_limit failed, use local conservative limiter", exc_info=True)
+        allowed = _local_rate_limit_allow(msg.from_user, window=window, max_count=max_count)
+
+    if not allowed:
+        logger.info(
+            "webhook: rate-limited user_hash=%s",
+            identifier_hash(msg.from_user),
+        )
+        if not _mark_rate_limited(inbound_event_id, rule=_RATE_LIMIT_RULE):
+            return Response(
+                content="temporary failure",
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                media_type="text/plain",
+            )
+        _async_rate_limit_notify(msg.from_user)
+        return _success_response()
 
     # 8. 入队
     queue_msg = {
         "msg_id": msg.msg_id,
+        "turn_id": getattr(msg, "turn_id", ""),
         "from_userid": msg.from_user,
         "msg_type": msg.msg_type,
         "content": msg.content,
@@ -277,6 +290,7 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
     try:
         event = WecomInboundEvent(
             msg_id=msg.msg_id,
+            turn_id=str(uuid.uuid4()),
             from_userid=msg.from_user or "",
             msg_type=enum_type,
             media_id=media_id,
@@ -286,6 +300,7 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         db.add(event)
         db.commit()
         db.refresh(event)
+        msg.turn_id = event.turn_id
         return event.id
     except IntegrityError:
         # UNIQUE(msg_id) 撞库 → 幂等兜底（L2）
@@ -294,6 +309,9 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         existing = db.query(WecomInboundEvent).filter(
             WecomInboundEvent.msg_id == msg.msg_id,
         ).first()
+        if existing:
+            msg.turn_id = existing.turn_id or ""
+            msg._durable_existing = True
         return existing.id if existing else None
     except Exception:
         db.rollback()
@@ -301,6 +319,43 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         return None
     finally:
         db.close()
+
+
+def _mark_rate_limited(event_id: int, *, rule: str) -> bool:
+    """Record a terminal, auditable rate-limit decision."""
+    db = SessionLocal()
+    try:
+        updated = db.query(WecomInboundEvent).filter(
+            WecomInboundEvent.id == int(event_id),
+            WecomInboundEvent.status == "received",
+            WecomInboundEvent.rate_limit_decision == "accepted",
+        ).update({
+            "status": "done",
+            "rate_limit_decision": "rate_limited",
+            "rate_limit_rule": rule,
+            "rate_limited_at": func.now(6),
+            "worker_finished_at": func.now(6),
+        })
+        db.commit()
+        return updated == 1
+    except Exception:
+        db.rollback()
+        logger.exception("webhook: mark rate-limited event failed id=%s", event_id)
+        return False
+    finally:
+        db.close()
+
+
+def _local_rate_limit_allow(userid: str, *, window: int, max_count: int) -> bool:
+    """Bounded process-local limiter used only while Redis is unavailable."""
+    now = time.monotonic()
+    cutoff = now - max(1, int(window))
+    with _LOCAL_RATE_LIMIT_LOCK:
+        recent = [ts for ts in _LOCAL_RATE_LIMIT_STATE.get(userid, []) if ts > cutoff]
+        allowed = len(recent) < max(1, int(max_count))
+        recent.append(now)
+        _LOCAL_RATE_LIMIT_STATE[userid] = recent[-max(1, int(max_count)) :]
+        return allowed
 
 
 def _inbound_event_exists(msg_id: str) -> bool:

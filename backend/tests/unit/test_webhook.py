@@ -4,7 +4,7 @@
 重点验证：
 - 验签成功/失败
 - 幂等短路不入队
-- 被限流不写 inbound_event 不入队
+- 被限流写入 inbound_event 审计但不入业务队列
 - Happy path 写 inbound_event + 入队
 - 解密失败返回 200（避免企微重试）
 - 端到端响应时间（这里只做接口行为，性能在集成测试里）
@@ -141,6 +141,7 @@ class TestReceiveCallback:
         mock_insert.assert_called_once()
         mock_enq.assert_called_once()
 
+    @patch("app.api.webhook._mark_rate_limited", return_value=True)
     @patch("app.api.webhook._async_rate_limit_notify")
     @patch("app.api.webhook.enqueue_message")
     @patch("app.api.webhook._insert_inbound_event", return_value=42)
@@ -150,7 +151,7 @@ class TestReceiveCallback:
     @patch("app.api.webhook.verify_signature", return_value=True)
     def test_post_rate_limited_no_inbound_event_no_enqueue(
         self, mock_verify, mock_decrypt, mock_dup, mock_rate,
-        mock_insert, mock_enq, mock_notify, client,
+        mock_insert, mock_enq, mock_notify, mock_mark, client,
     ):
         mock_decrypt.return_value = _fake_plaintext()
         resp = client.post(
@@ -160,9 +161,10 @@ class TestReceiveCallback:
         )
         assert resp.status_code == 200
         assert resp.text == "success"
-        mock_insert.assert_not_called()
+        mock_insert.assert_called_once()
         mock_enq.assert_not_called()
         mock_notify.assert_called_once()
+        mock_mark.assert_called_once_with(42, rule="rate_limit.v1")
 
 
 class TestRateLimitNotify:

@@ -88,6 +88,7 @@ SEND_RETRY_BACKOFFS = [60, 120, 300]  # 秒，指数退避
 MAX_SEND_RETRY = 3
 CONVERSATION_LOG_TTL_DAYS = 30
 AUX_QUEUE_EVERY_MESSAGES = 10
+AUX_QUEUE_BATCH_SIZE = 100
 RECOVERY_SCAN_INTERVAL_SECONDS = 30
 RECOVERY_RECEIVED_STALE_SECONDS = 10
 RECOVERY_PROCESSING_STALE_SECONDS = 180
@@ -351,6 +352,11 @@ class Worker:
         )
         self._aux_threads = [
             self._start_interval_thread(
+                "inbound-event-dispatcher",
+                self._dispatch_received_events_once,
+                RECOVERY_SCAN_INTERVAL_SECONDS,
+            ),
+            self._start_interval_thread(
                 "delivery-dispatcher",
                 lambda: recommendation_delivery_dispatcher.run_once(self),
                 recommendation_delivery_dispatcher.SCAN_INTERVAL_SECONDS,
@@ -374,6 +380,47 @@ class Worker:
         for thread in self._aux_threads:
             thread.join(timeout=AUX_LOOP_INTERVAL_SECONDS * 4)
         self._aux_threads = []
+
+    def _dispatch_received_events_once(self) -> int:
+        """Reconcile accepted durable inbox rows whose Redis enqueue was lost.
+
+        The inbox row remains ``received`` until the normal Worker claims it;
+        therefore a Redis outage never turns into an acknowledged, invisible
+        message. Duplicate queue payloads are harmless because processing has
+        a terminal durable-event gate.
+        """
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(WecomInboundEvent)
+                .filter(
+                    WecomInboundEvent.status == "received",
+                    WecomInboundEvent.rate_limit_decision == "accepted",
+                )
+                .order_by(WecomInboundEvent.id)
+                .limit(AUX_QUEUE_BATCH_SIZE)
+                .all()
+            )
+            dispatched = 0
+            for row in rows:
+                try:
+                    enqueue_message(
+                        json.dumps(_inbound_event_to_queue_msg(row), ensure_ascii=False),
+                        QUEUE_INCOMING,
+                    )
+                    dispatched += 1
+                except Exception:
+                    logger.exception(
+                        "worker: inbound dispatcher enqueue failed event_id=%s",
+                        row.id,
+                    )
+            return dispatched
+        except Exception:
+            db.rollback()
+            logger.exception("worker: inbound dispatcher scan failed")
+            return 0
+        finally:
+            db.close()
 
     # -----------------------------------------------------------------------
     # 启动自检
@@ -429,6 +476,12 @@ class Worker:
                 return
             claimed: list[tuple[str, dict]] = []
             for row in rows:
+                # Keep the legacy recovery query shape/status contract. Rows
+                # explicitly marked rate_limited are terminal and must never
+                # enter the business queue; pre-migration rows have no
+                # decision value and remain recoverable as accepted.
+                if getattr(row, "rate_limit_decision", None) == "rate_limited":
+                    continue
                 claimed.append((row.msg_id, _inbound_event_to_queue_msg(row)))
                 # Commit the durable claim before touching Redis. If the process
                 # dies after this commit, the processing-stale branch recovers it
@@ -2858,6 +2911,7 @@ def _build_wecom_message(msg_data: dict) -> WeComMessage:
         content=msg_data.get("content") or "",
         media_id=msg_data.get("media_id") or "",
         create_time=int(msg_data.get("create_time") or 0),
+        turn_id=msg_data.get("turn_id") or "",
     )
 
 
@@ -2879,6 +2933,7 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
 
     return {
         "msg_id": row.msg_id,
+        "turn_id": row.turn_id if isinstance(row.turn_id, str) else "",
         "from_userid": row.from_userid,
         "msg_type": raw_type,
         "content": content,

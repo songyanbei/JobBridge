@@ -24,6 +24,7 @@ class WeComMessage:
     content: str = ""
     media_id: str = ""
     create_time: int = 0
+    turn_id: str = ""
     image_url: str = ""
     media_lifecycle_id: int | None = None
     expired_upload_draft: bool = False
