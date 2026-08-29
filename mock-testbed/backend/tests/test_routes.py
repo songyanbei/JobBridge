@@ -178,10 +178,12 @@ class TestInbound:
         queue_msg = json.loads(queued[0])
         # 字段契约：必须与主后端 webhook.py:193-201 完全一致
         assert set(queue_msg.keys()) == {
-            "msg_id", "from_userid", "msg_type", "content",
+            "msg_id", "turn_id", "from_userid", "msg_type", "content",
             "media_id", "create_time", "inbound_event_id",
         }
         assert queue_msg["msg_id"] == "mock_msgid_xyz"
+        assert isinstance(queue_msg["turn_id"], str)
+        assert len(queue_msg["turn_id"]) == 36
         assert queue_msg["from_userid"] == "wm_mock_worker_001"
         assert queue_msg["msg_type"] == "text"
         assert queue_msg["content"] == "hello"

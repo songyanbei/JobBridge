@@ -142,7 +142,7 @@ def test_demo_reset_seed_enables_broker_search_in_both_directions():
 
 class TestQueuePayloadContract:
     """主后端 backend/app/api/webhook.py:193-201 的入队字段集合：
-       msg_id / from_userid / msg_type / content / media_id /
+       msg_id / turn_id / from_userid / msg_type / content / media_id /
        create_time / inbound_event_id
     """
 
@@ -162,11 +162,13 @@ class TestQueuePayloadContract:
         assert len(queued) == 1
         queue_msg = json_lib.loads(queued[0])
         assert set(queue_msg.keys()) == {
-            "msg_id", "from_userid", "msg_type", "content",
+            "msg_id", "turn_id", "from_userid", "msg_type", "content",
             "media_id", "create_time", "inbound_event_id",
         }
         # 严格检查类型
         assert isinstance(queue_msg["msg_id"], str)
+        assert isinstance(queue_msg["turn_id"], str)
+        assert len(queue_msg["turn_id"]) == 36
         assert isinstance(queue_msg["from_userid"], str)
         assert isinstance(queue_msg["msg_type"], str)
         assert isinstance(queue_msg["content"], str)
