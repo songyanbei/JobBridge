@@ -820,7 +820,55 @@ class WecomInboundEvent(Base):
 
 
 # ============================================================================
-# 13. WecomOutboundOutbox 企微出站事务箱
+# 13. ActionExecution Action 幂等执行凭据（Job Search v1）
+# ============================================================================
+
+class ActionExecution(Base):
+    """Durable idempotency and lease/fencing record for one turn action.
+
+    ``turn_id`` + ``action_name`` is the stable idempotency key.  A worker may
+    only finalize a started row while it still owns both the lease and its
+    fencing token; retries reuse the same row and saved result digests.
+    """
+
+    __tablename__ = "action_execution"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    turn_id = sa.Column(sa.String(36), nullable=False, comment="不可变入站轮次 ID")
+    action_name = sa.Column(sa.String(64), nullable=False, comment="稳定 Action 名称")
+    status = sa.Column(
+        sa.Enum(
+            "started", "succeeded", "failed_retryable", "failed_terminal",
+            name="action_execution_status",
+        ),
+        nullable=False,
+        server_default="started",
+        comment="Action 执行状态",
+    )
+    request_digest = sa.Column(mysql.CHAR(64), nullable=True, comment="规范化请求 SHA-256")
+    result_digest = sa.Column(mysql.CHAR(64), nullable=True, comment="结果/快照 SHA-256")
+    lease_owner = sa.Column(sa.String(64), nullable=True, comment="当前 Worker owner")
+    lease_until = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=True, comment="当前 lease 到期时间；过期后才可抢占",
+    )
+    fencing_token = sa.Column(
+        mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("1"),
+        comment="每次过期抢占递增的 fencing token",
+    )
+    created_at = sa.Column(
+        mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"),
+    )
+    finished_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint("turn_id", "action_name", name="uk_action_execution_turn_action"),
+        sa.Index("idx_action_execution_claim", "status", "lease_until", "id"),
+        sa.Index("idx_action_execution_turn", "turn_id", "id"),
+    )
+
+
+# ============================================================================
+# 14. WecomOutboundOutbox 企微出站事务箱
 # ============================================================================
 
 class WecomOutboundOutbox(Base):
