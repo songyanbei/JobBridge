@@ -256,6 +256,20 @@ def activate_replacement_locked(
         db, "resume", old.id, reason="replaced", operation_id=relation.operation_id,
     )
     db.flush()
+    try:
+        from app.services.domain_outbox_service import append_domain_event
+        for target, event_type, tombstone in (
+            (old, "resume.replaced", True), (candidate, "resume.updated", False),
+        ):
+            append_domain_event(
+                db, aggregate_type="resume", aggregate_id=int(target.id),
+                aggregate_version=int(getattr(target, "aggregate_version", None) or target.version),
+                event_type=event_type,
+                payload={"resume_id": int(target.id), "status": "replaced" if tombstone else "candidate", "reason": "replacement"},
+                tombstone=tombstone,
+            )
+    except Exception:
+        logger.exception("resume domain event append failed")
     return True
 
 

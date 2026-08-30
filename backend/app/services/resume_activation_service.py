@@ -14,6 +14,16 @@ from app.services.resume_mutation_service import (
 )
 
 
+def _domain_outbox_available(db: Session | None) -> bool:
+    if db is None:
+        return False
+    try:
+        from sqlalchemy import inspect
+        return bool(inspect(db.connection() if db.in_transaction() else db.bind).has_table("domain_outbox_event"))
+    except Exception:
+        return False
+
+
 def activate_resume(
     db: Session,
     resume: Resume,
@@ -41,4 +51,12 @@ def activate_resume(
     resume.delist_reason = None
     increment_resume_version(resume)
     db.flush()
+    if _domain_outbox_available(db) and getattr(resume, "id", None) is not None:
+        from app.services.domain_outbox_service import append_domain_event
+        append_domain_event(
+            db, aggregate_type="resume", aggregate_id=int(resume.id),
+            aggregate_version=int(getattr(resume, "aggregate_version", None) or resume.version),
+            event_type="resume.published",
+            payload={"resume_id": int(resume.id), "status": "published", "reason": "activation"},
+        )
     return resume

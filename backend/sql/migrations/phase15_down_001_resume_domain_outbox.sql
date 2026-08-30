@@ -1,0 +1,3 @@
+-- Phase 15 rollback is stop-write/stop-consumer only. Retain resume facts and
+-- domain_outbox_event rows; dropping columns requires an approved maintenance
+-- window after all binaries stop referencing aggregate_version.
