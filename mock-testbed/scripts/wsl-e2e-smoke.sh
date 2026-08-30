@@ -3,7 +3,8 @@
 # 验证完整链路 + 真实 LLM 调用
 set -euo pipefail
 
-ROOT=/mnt/d/work/JobBridge/.claude/worktrees/romantic-proskuriakova-bdc75a
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 VENV=/tmp/mock-testbed-venv
 BACKEND="$ROOT/mock-testbed/backend"
 
@@ -99,7 +100,15 @@ docker exec jobbridge-mysql mysql -uroot -proot -se \
 echo ""
 
 echo "--- Worker 日志 LLM 相关行（最后 30 行 grep）---"
-docker logs --tail 200 jobbridge-worker-1 2>&1 | grep -iE "qwen|dashscope|llm|intent|send_text|MOCK-WEWORK|ERROR" | tail -20
+WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-v1-worker-1' --format '{{.Names}}' | head -1)"
+if [ -z "$WORKER_CONTAINER" ]; then
+    WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-worker-1' --format '{{.Names}}' | head -1)"
+fi
+if [ -n "$WORKER_CONTAINER" ]; then
+    docker logs --tail 200 "$WORKER_CONTAINER" 2>&1 | grep -iE "qwen|dashscope|llm|intent|send_text|MOCK-WEWORK|ERROR" | tail -20
+else
+    echo "⚠️ 未找到 worker 容器，跳过 worker 日志"
+fi
 
 # 8. 收尾
 echo ""

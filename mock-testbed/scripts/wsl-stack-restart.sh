@@ -3,7 +3,8 @@
 # 通过 .env (env_file) 注入到 app + worker 容器
 set -euo pipefail
 
-ROOT=/mnt/d/work/JobBridge/.claude/worktrees/romantic-proskuriakova-bdc75a
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT"
 
 # 用主项目名 jobbridge 复用已有的 jobbridge_mysql_data / jobbridge_redis_data 等 volume
@@ -37,8 +38,18 @@ echo "--- jobbridge-app 关键 env ---"
 docker exec jobbridge-app env 2>/dev/null | grep -E "^(APP_ENV|MOCK_WEWORK|LLM_API_KEY|LLM_API_BASE|LLM_PROVIDER|LLM_INTENT_MODEL)=" | sort
 echo ""
 echo "--- jobbridge-worker 关键 env ---"
-docker exec jobbridge-worker-1 env 2>/dev/null | grep -E "^(APP_ENV|MOCK_WEWORK|LLM_API_KEY|LLM_API_BASE|LLM_PROVIDER|LLM_INTENT_MODEL)=" | sort \
-  || docker exec "$(docker ps --filter name=worker --format '{{.Names}}' | head -1)" env 2>/dev/null | grep -E "^(APP_ENV|MOCK_WEWORK|LLM_API_KEY|LLM_API_BASE|LLM_PROVIDER|LLM_INTENT_MODEL)=" | sort
+WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-v1-worker-1' --format '{{.Names}}' | head -1)"
+if [ -z "$WORKER_CONTAINER" ]; then
+  WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-worker-1' --format '{{.Names}}' | head -1)"
+fi
+if [ -z "$WORKER_CONTAINER" ]; then
+  WORKER_CONTAINER="$(docker ps --filter 'name=worker' --format '{{.Names}}' | head -1)"
+fi
+if [ -n "$WORKER_CONTAINER" ]; then
+  docker exec "$WORKER_CONTAINER" env 2>/dev/null | grep -E "^(APP_ENV|MOCK_WEWORK|LLM_API_KEY|LLM_API_BASE|LLM_PROVIDER|LLM_INTENT_MODEL)=" | sort
+else
+  echo "⚠️ 未找到 worker 容器，跳过 worker env"
+fi
 
 echo ""
 echo "==> 容器最终状态"
@@ -46,7 +57,9 @@ docker compose -p "$PROJ" -f docker-compose.prod.yml -f docker-compose.demo.yml 
 
 echo ""
 echo "==> Worker 启动后的日志（最后 20 行）"
-docker logs --tail 20 "$(docker ps --filter name=worker --format '{{.Names}}' | head -1)" 2>&1 | tail -20
+if [ -n "$WORKER_CONTAINER" ]; then
+  docker logs --tail 20 "$WORKER_CONTAINER" 2>&1 | tail -20
+fi
 
 echo ""
 echo "✅ 完成"

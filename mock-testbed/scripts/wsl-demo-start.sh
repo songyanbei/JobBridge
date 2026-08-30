@@ -3,7 +3,8 @@
 # 后端走 WSL-local /tmp/mock-testbed-venv（已装），前端首次会 npm install
 set -e
 
-ROOT=/mnt/d/work/JobBridge/.claude/worktrees/romantic-proskuriakova-bdc75a
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 VENV=/tmp/mock-testbed-venv
 BACKEND="$ROOT/mock-testbed/backend"
 FRONTEND="$ROOT/mock-testbed/frontend"

@@ -5,7 +5,8 @@
 #                → [MOCK-WEWORK] → Redis pubsub → SSE 帧
 set -euo pipefail
 
-ROOT=/mnt/d/work/JobBridge/.claude/worktrees/romantic-proskuriakova-bdc75a
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 VENV=/tmp/mock-testbed-venv
 BACKEND="$ROOT/mock-testbed/backend"
 LOG_DIR=/tmp/mock-testbed-stress-logs
@@ -214,9 +215,20 @@ echo "queue:dead_letter     = $(docker exec jobbridge-redis redis-cli LLEN queue
 
 echo ""
 echo "--- Worker 日志 LLM 调用统计 ---"
-LLM_CALLS=$(docker logs --tail 500 jobbridge-worker-1 2>&1 | grep -c "POST https://dashscope.aliyuncs.com" || true)
-MOCK_CALLS=$(docker logs --tail 500 jobbridge-worker-1 2>&1 | grep -c "MOCK-WEWORK\] short-circuit" || true)
-ERR_CALLS=$(docker logs --tail 500 jobbridge-worker-1 2>&1 | grep -cE "ERROR|TIMEOUT|41004|enqueue retry" || true)
+WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-v1-worker-1' --format '{{.Names}}' | head -1)"
+if [ -z "$WORKER_CONTAINER" ]; then
+    WORKER_CONTAINER="$(docker ps --filter 'name=jobbridge-worker-1' --format '{{.Names}}' | head -1)"
+fi
+if [ -n "$WORKER_CONTAINER" ]; then
+    LLM_CALLS=$(docker logs --tail 500 "$WORKER_CONTAINER" 2>&1 | grep -c "POST https://dashscope.aliyuncs.com" || true)
+    MOCK_CALLS=$(docker logs --tail 500 "$WORKER_CONTAINER" 2>&1 | grep -c "MOCK-WEWORK\] short-circuit" || true)
+    ERR_CALLS=$(docker logs --tail 500 "$WORKER_CONTAINER" 2>&1 | grep -cE "ERROR|TIMEOUT|41004|enqueue retry" || true)
+else
+    echo "⚠️ 未找到 worker 容器，跳过 worker 日志统计"
+    LLM_CALLS=0
+    MOCK_CALLS=0
+    ERR_CALLS=0
+fi
 echo "LLM 调用次数:           $LLM_CALLS"
 echo "MOCK-WEWORK 拦截次数:   $MOCK_CALLS"
 echo "错误/重试次数:          $ERR_CALLS"
