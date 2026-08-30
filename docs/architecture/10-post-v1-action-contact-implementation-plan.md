@@ -8,11 +8,11 @@
 
 | 工作流 | 当前进度 | 验证证据 | 尚未完成 |
 |---|---|---|---|
-| A：Action Execution | A0-A4 工程实现完成；Worker 已在 Router 前完成单次 parse、claim，成功后 finalize，重复 turn 走结果引用 replay | S3 核心回归通过；Worker 定向回归 `72 passed`；Action preflight 通过 | 生产 `on` 灰度、7 天观察窗口、legacy 退出审批 |
-| B：Contact/PII | B0-B4 工程实现完成；opaque request、一次性 grant、频控/撤销/审计、加密字段、ContactDelivery/Outbox 和回填均已落地 | PII verify `ready_for_freeze=true`；权限/可见性/观测集合通过；无明文 PII 进入 Prompt、Card、Log、Outbox | Contact 生产 on 灰度、旧明文列清理审批、长期 SLO 观察 |
-| C：灰度/恢复 | C1/C4 观测与回滚脚本完成，C2 故障矩阵自动化完成；legacy fallback 保留 | C2 故障矩阵 `9/9 passed`；WSL smoke/full-smoke 通过 | 连续 14 天 Action/Contact on 指标和共同签字 |
+| A：Action Execution | A0-A4 工程实现完成；Worker 已在 Router 前完成单次 parse、claim，成功后 finalize，重复 turn 走结果引用 replay | S3 核心回归通过；Action/Worker 定向集合通过；Action preflight 通过 | 生产 `on` 灰度、7 天观察窗口、legacy 退出审批 |
+| B：Contact/PII | B0-B4 工程实现完成；搜索卡片真实创建 ContactRequest；显式“联系”入口完成 authorize -> issue grant -> redeem；ContactDelivery/Outbox 按类型投递 | PII verify `ready_for_freeze=true`；Contact/权限/可见性/观测集合通过；WSL contact-on 对话 smoke 通过；无明文 PII 进入 Prompt、Card、Log、Outbox | Contact 生产 on 灰度、旧明文列清理审批、长期 SLO 观察 |
+| C：灰度/恢复 | C1/C4 观测与回滚脚本完成，C2 故障矩阵自动化完成；legacy fallback 保留 | C2 故障矩阵 `9/9 passed`；WSL 常规对话 smoke `13/13` 通过；Contact-on 模拟链路通过 | 连续 14 天 Action/Contact on 指标和共同签字 |
 
-本轮联合回归：S3 核心集合 `201 passed`，S2 搜索/翻页/Replay/权限集合 `216 passed`。全量 unit 的剩余失败属于既有 Phase 11/Phase 3 manifest/visibility 范围，不影响本次 S2/S3 验收结论。
+本轮联合回归：S2/S3 核心集合 `128 passed`。全量 unit `2426 passed`；剩余 8 例属于既有 Phase 11 manifest checksum、Phase 11 resume visibility 和 Phase 3 job visibility 基线失败，不影响本次 S2/S3 核心验收结论，但在全仓绿灯前仍需另立基线修复任务。
 
 第 3-5 节各小节中的“当前代码现状”保留为方案编写时的实施前基线，用于追踪设计差异；实时完成度以本节和各节状态说明为准。
 
@@ -76,7 +76,7 @@ S4 只有在以下条件全部满足，并由后端、运维、安全/合规和�
 - 明确 action 类型：`search_job`、`show_more_job`、`relax_job`，后续可扩展但不允许自由字符串分支。
 - 成功 replay 必须验证引用完整性和 actor/turn 绑定；缺引用进入 terminal/人工修复，不重新执行。
 
-**当前代码现状**
+**实施前基线（已完成替换）**
 
 `ActionExecution` 只有 `result_digest`；推荐事实已经有 `request_id/snapshot_id`，但 Action 与它们没有外键或关联。`worker.py` 的 Session CAS 晚于 DB commit（见 09 审计）。当前 `message_router.process` 内部还会调用 `classify_intent/classify_dialogue`，所以若 Gateway 另行解析而不传递 parse，会形成一次 turn 两次解析。
 
@@ -346,7 +346,7 @@ legacy 与 on 的 golden case 差异只允许出现在已批准文案范围内�
 
 **当前代码现状**
 
-`backend/app/listing/search.py` 通过 `_opaque_contact_id` 生成可预测关联的 hash ID；`ListingCard` 只有 `contact_request_id`；没有 Contact Service 或 token 兑换 API。
+原基线是通过 `_opaque_contact_id` 生成 hash ID，尚无 Contact Service。当前实现已改为真实 SQLAlchemy Session 下由 `ContactService.create_contact_request()` 持久化 request；Router 的显式“联系”分支会按当前搜索快照重新校验岗位并执行 authorize -> issue grant -> redeem。
 
 **目标行为**
 
@@ -356,7 +356,7 @@ Card 只含 opaque request；Contact Service 是唯一能读取/解密联系方�
 
 - 新增 `backend/app/listing/contact.py`：`create_contact_request`、`authorize_contact`、`issue_one_time_grant`、`redeem_grant`、`revoke_grant`、`audit_contact_event`。
 - 新增 `backend/app/schemas/contact.py`：输入/输出 DTO 只允许 opaque IDs、token metadata 和受控 contact channel。
-- `backend/app/listing/search.py`：改为调用 request ID factory；保留字段名 `contact_request_id`，不生成 phone。
+- `backend/app/listing/search.py`：真实 Session 下调用 Contact Service 创建 request；保留字段名 `contact_request_id`，不生成 phone。
 - `backend/app/listing/render.py`、`backend/app/services/recommendation_delivery_service.py`、`backend/app/services/worker.py`：增加静态 PII 断言/投影过滤。
 
 **数据库/配置改动**
@@ -389,7 +389,7 @@ Contact mode off 时兑换成功率为 0 且无明文 fallback；服务端能定
 
 phone、微信号及联系人敏感值使用 AEAD 加密，密钥版本化、可轮换；索引只允许不可逆 digest（仅用于精确匹配/迁移核对），禁止全文索引。
 
-**当前代码现状**
+**实施前基线（已完成替换）**
 
 `User.phone`、`Job.phone`、`contact_person` 是 VARCHAR 明文；推荐 delivery content 已有 AES-GCM 辅助，但未覆盖事实源 PII。
 
@@ -438,7 +438,7 @@ Contact Service 读取加密列并在授权内存中解密；普通 ORM 查询�
 
 **当前代码现状**
 
-没有 token API、撤销表或 contact rate limit；visibility policy 只参与搜索投影。现有 `WecomOutboundOutbox` 只有 nullable `recommendation_delivery_id`，其 claim/lock/status 逻辑默认按推荐 delivery 处理，没有 `contact_delivery_id` 或通用 delivery kind。
+原基线没有 token API 和 Contact Outbox 分支。当前实现已增加 `contact_delivery_id`，Worker discovery/claim/send/recovery 全部按 ContactDelivery 独立分支处理，platform_request 使用固定无 PII 模板，真实联系方式仍 fail-closed 要求 ciphertext。
 
 **目标行为**
 

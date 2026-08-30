@@ -40,7 +40,8 @@ JobBridge 的目标架构是：
 
 - 求职搜索 v1 的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限与脱敏测试已完成；实现和代码审查在 `codex/unified-listing-flow-architecture` 分支完成。
 - WSL 生产编排、mock 企业微信测试台、页面多轮对话、Action replay、Contact/PII 和执行日志核验已通过；详细记录见 [08 首版详细实施方案](08-job-search-v1-implementation-plan.md) 与 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md)。
-- S3 A/B/C 工程闭环已落地：ActionGateway/claim/finalize/replay、Contact 一次性 grant/delivery、PII 加密回填、Outbox 分流、kill switch 和 C2 故障矩阵均已有代码与测试；PII verify 返回 `ready_for_freeze=true`。
+- S3 A/B/C 工程闭环已落地：ActionGateway/claim/finalize/replay、ContactRequest 真实持久化、对话“联系”入口的 authorize -> issue grant -> redeem、ContactDelivery/Outbox 分流、PII 加密回填、kill switch 和 C2 故障矩阵均已有代码与测试；PII verify 返回 `ready_for_freeze=true`。
+- S2/S3 收口回归已完成：核心集合 `128 passed`；全量 unit `2426 passed`，剩余 8 例为既有 Phase 3/11 可见性和 Phase 11 manifest checksum 基线失败，未纳入本轮 S2/S3 通过口径。WSL 最新镜像已重建，常规对话 smoke 13/13 通过；临时 `contact_service_mode=on` 的真实“欢迎 -> 搜索 -> 联系 -> ContactDelivery 出站”模拟通过，测试数据已清理。
 - 当前默认配置仍保持 `action_execution_mode=off`、Contact `off`、legacy/fallback 优先；这是发布策略，不代表删除或绕过已实现代码。
 - 尚未完成的是生产 on 灰度、连续观察窗口和 legacy 退出签字；在这些门禁完成前不启动 S4 岗位发布。Action 审计的更新结论见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
 

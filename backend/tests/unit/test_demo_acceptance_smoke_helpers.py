@@ -199,7 +199,7 @@ def test_cleanup_mysql_smoke_data_deletes_user_owned_rows(monkeypatch):
         "contact_access_audit", "contact_delivery", "contact_grant", "contact_request", "audit_log",
         "resume", "job", "user",
     }
-    assert len(calls["statements"]) == 10
+    assert len(calls["statements"]) == 11
     assert calls["committed"] is True
     assert calls["closed"] is True
 
