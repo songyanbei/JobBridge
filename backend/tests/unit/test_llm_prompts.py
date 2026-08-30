@@ -27,7 +27,7 @@ class TestIntentPrompt:
         prompt = prompts.INTENT_SYSTEM_PROMPT
         for field_name in (
             "address", "accept_couple", "employment_type", "contract_type",
-            "hiring_company", "contact_person", "phone",
+            "hiring_company", "contact_available", "contact_placeholder",
         ):
             assert field_name in prompt
 

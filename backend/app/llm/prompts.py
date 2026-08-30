@@ -86,8 +86,8 @@ INTENT_SYSTEM_PROMPT = """\
 - district (str)：区县
 - address (str)：岗位详细工作地址（街道+门牌）
 - hiring_company (str)：实际招聘工厂名；中介代发时不能用中介公司名代替
-- contact_person (str)：岗位联系人（岗位级覆盖）
-- phone (str)：岗位联系电话（岗位级覆盖）
+- contact_available (bool)：是否存在可通过 Contact 请求获取的联系方式
+- contact_placeholder (str)：联系方式占位文案；搜索/推荐输出不得包含明文联系人、电话或微信号
 - salary_ceiling_monthly (int)：月综合收入上限
 - provide_meal (bool)：包吃
 - provide_housing (bool)：包住
@@ -104,6 +104,8 @@ INTENT_SYSTEM_PROMPT = """\
 - age (int)：年龄
 
 字段使用约束（务必遵守，**违反会导致检索召回为 0**）：
+- 搜索、推荐、follow_up 和普通对话输出属于非受控路径：不得输出或复述 phone、wechat、contact_person 等明文；仅使用 contact_available=true/false 与安全占位文案。
+- phone/contact_person 仅可在上传岗位的受控 Contact 提取环节使用，随后必须加密保存；不得进入索引、Card、rerank candidates、日志或 outbox。
 - 搜索 / follow_up（intent ∈ {{search_job, search_worker, follow_up}}）：城市一律落到 city，工种一律落到 job_category，**禁止使用 expected_cities / expected_job_categories**（即便用户角色是 broker、即便在找工人）。两者均为 list[str]，单值也存列表。
 - 上传简历（intent=upload_resume）：城市落到 expected_cities，工种落到 expected_job_categories，list[str]。
 - 上传岗位（intent ∈ {{upload_job, upload_and_search}}）：城市落到 city（标量 str），工种落到 job_category（标量 str）。
@@ -176,8 +178,8 @@ structured_data**表达本轮抽取到的字段，**不要再用 op 语义**。
 {{"intent": "search_job", "structured_data": {{"city": ["苏州市"], "job_category": ["电子厂"], "salary_floor_monthly": 5000, "provide_meal": true, "provide_housing": true}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.92}}
 
 示例2 - 厂家发布岗位:
-用户消息: "华星电子苏州吴中区木渎镇金山路88号招普工30人，厂家直招，月薪5500-6500，联系人张经理13800138000，包吃住，两班倒，接受夫妻工，签长期合同"
-{{"intent": "upload_job", "structured_data": {{"hiring_company": "华星电子", "city": "苏州市", "district": "吴中区", "address": "木渎镇金山路88号", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "contact_person": "张经理", "phone": "13800138000", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
+用户消息: "华星电子苏州吴中区木渎镇金山路88号招普工30人，厂家直招，月薪5500-6500，联系人<受控联系人><受控联系电话>，包吃住，两班倒，接受夫妻工，签长期合同"
+{{"intent": "upload_job", "structured_data": {{"hiring_company": "华星电子", "city": "苏州市", "district": "吴中区", "address": "木渎镇金山路88号", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "contact_person": "<受控提取>", "phone": "<受控提取>", "provide_meal": true, "provide_housing": true, "shift_pattern": "两班倒", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "criteria_patch": [], "missing_fields": [], "confidence": 0.95}}
 
 示例3 - 厂家发布岗位并顺便找工人:
 用户消息: "我们苏州工业园区招电子厂普工20人，5500-6500包吃住，顺便帮我找几个合适的工人"
@@ -415,8 +417,8 @@ _DIALOGUE_PARSE_PROMPT_V2_TEMPLATE = """\
 {{"dialogue_act": "start_search", "frame_hint": "job_search", "slots_delta": {{"city": ["苏州市"], "job_category": ["技工"]}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
 
 示例 21（factory 提交包含可选字段的完整岗位）：
-用户消息：华星电子在苏州招30人，厂家直招，接受夫妻工，签长期合同，地址兴吴路88号，联系人张经理13800138000，月薪5500-6500
-{{"dialogue_act": "start_upload", "frame_hint": "job_upload", "slots_delta": {{"hiring_company": "华星电子", "city": "苏州市", "address": "兴吴路88号", "contact_person": "张经理", "phone": "13800138000", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
+用户消息：华星电子在苏州招30人，厂家直招，接受夫妻工，签长期合同，地址兴吴路88号，联系人<受控联系人><受控联系电话>，月薪5500-6500
+{{"dialogue_act": "start_upload", "frame_hint": "job_upload", "slots_delta": {{"hiring_company": "华星电子", "city": "苏州市", "address": "兴吴路88号", "contact_person": "<受控提取>", "phone": "<受控提取>", "job_category": "电子厂", "headcount": 30, "salary_floor_monthly": 5500, "salary_ceiling_monthly": 6500, "pay_type": "月薪", "accept_couple": true, "employment_type": "厂家直招", "contract_type": "长期合同"}}, "merge_hint": {{}}, "needs_clarification": false, "confidence": 0.95, "conflict_action": null}}
 """
 
 

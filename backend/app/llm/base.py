@@ -214,8 +214,13 @@ _DIALOGUE_V1_FRAMES = {
 _DIALOGUE_V1_SLOTS = {
     "city", "job_category", "salary_floor_monthly", "salary_ceiling_monthly",
     "shift_pattern", "employment_type", "experience_years", "education",
-    "gender", "age", "name", "phone", "description", "job_title",
+    "gender", "age", "name", "description", "job_title",
     "years_experience", "expected_salary", "work_years", "skill_tags",
+}
+_DIALOGUE_V1_UPLOAD_SLOTS = _DIALOGUE_V1_SLOTS | {
+    # Controlled upload extraction only.  These keys are never valid for
+    # search/follow-up frames and are encrypted before persistence.
+    "contact_person", "phone",
 }
 
 
@@ -231,6 +236,8 @@ def _profile_slots(profile: str, frame: str) -> set[str]:
         from app.dialogue import slot_schema
         return set(slot_schema.fields_for(frame))
     except Exception:
+        if frame == "job_upload":
+            return set(_DIALOGUE_V1_UPLOAD_SLOTS)
         return set(_DIALOGUE_V1_SLOTS)
 
 

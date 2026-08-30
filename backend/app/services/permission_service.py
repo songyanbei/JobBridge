@@ -20,8 +20,11 @@ _JOB_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
     "address": ("address", "address_source"),
     "benefits": ("provide_meal", "provide_housing"),
     "shift": ("shift_pattern", "work_hours"),
-    "contact_person": ("contact_person", "contact_source"),
-    "phone": ("phone", "phone_source", "phone_placeholder"),
+    # Sensitive contact values are never projected into search cards.  The
+    # policy fields remain as compatibility identifiers, but map to the safe
+    # availability/placeholder representation.
+    "contact_person": ("contact_available", "contact_placeholder"),
+    "phone": ("contact_available", "contact_placeholder"),
     "publisher_company": ("publisher_company",),
 }
 
@@ -31,7 +34,7 @@ _RESUME_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
     "expected_job_categories": ("expected_job_categories",),
     "salary_expectation": ("salary_expect_floor_monthly",),
     "expected_cities": ("expected_cities",),
-    "phone": ("phone", "phone_placeholder"),
+    "phone": ("contact_available", "contact_placeholder"),
 }
 
 
@@ -109,10 +112,10 @@ def filter_resume_for_role(
     candidate = dict(resume_data)
     if owner_user:
         candidate["display_name"] = owner_user.get("display_name") or "求职者"
-        candidate["phone"] = owner_user.get("phone") or None
+        candidate["contact_available"] = bool(owner_user.get("contact_available"))
     else:
         candidate["display_name"] = "求职者"
-        candidate["phone"] = None
+        candidate["contact_available"] = False
 
     if effective_policy is None:
         return {"id": resume_data.get("id")}
@@ -123,8 +126,7 @@ def filter_resume_for_role(
     visible_fields = _effective_visible_fields(
         effective_policy, VisibilityScene.CANDIDATE_SEARCH, role,
     )
-    if "phone" in visible_fields and not candidate.get("phone"):
-        candidate["phone_placeholder"] = "联系方式待补充"
+    candidate["contact_placeholder"] = "联系方式需通过联系请求获取"
     return _project_visible_candidate(
         candidate, visible_fields, _RESUME_CANDIDATE_KEYS,
     )

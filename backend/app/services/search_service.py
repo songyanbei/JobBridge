@@ -9,6 +9,7 @@ import json
 import hashlib
 import logging
 import math
+import re
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -2875,6 +2876,31 @@ def _normalized_optional_text(value) -> str | None:
     return normalized or None
 
 
+_CONTACT_PLACEHOLDER = "联系方式需通过联系请求获取"
+_CONTACT_TEXT_RE = re.compile(
+    r"(?i)(?:1\d{10}|wxid_[a-z0-9_-]+|(?:联系人|联系电话|手机|电话|微信|wechat)\s*[:：]?\s*[^\s，。,；;]+)"
+)
+
+
+def _redact_contact_text(value) -> str:
+    """Redact obvious contact literals embedded in user-authored text."""
+    if value is None:
+        return ""
+    return _CONTACT_TEXT_RE.sub("[联系方式已隐藏]", str(value))
+
+
+def _has_contact_ciphertext(entity) -> bool:
+    """Check contact availability without reading legacy plaintext columns."""
+    return any(
+        bool(getattr(entity, field, None))
+        for field in (
+            "phone_ciphertext",
+            "contact_person_ciphertext",
+            "wechat_ciphertext",
+        )
+    )
+
+
 def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
     """将 Job ORM 对象转为字典列表，补充关联用户信息。"""
     if not jobs:
@@ -2899,7 +2925,7 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             "provide_housing": j.provide_housing,
             "shift_pattern": j.shift_pattern,
             "work_hours": j.work_hours,
-            "description": j.description,
+            "description": _redact_contact_text(j.description),
             "created_at": str(j.created_at) if j.created_at else "",
             "owner_userid": j.owner_userid,
             # recommendation-v1 inputs: §6.4 quality fields and the §6.3.4 soft
@@ -2935,30 +2961,6 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             address = None
             address_source = "none"
 
-        publisher_contact = _normalized_optional_text(user_data.get("contact_person"))
-        job_contact = _normalized_optional_text(getattr(j, "contact_person", None))
-        if job_contact:
-            contact_person = job_contact
-            contact_source = "job_override"
-        elif publisher_contact:
-            contact_person = publisher_contact
-            contact_source = "publisher_fallback"
-        else:
-            contact_person = None
-            contact_source = "none"
-
-        publisher_phone = _normalized_optional_text(user_data.get("phone"))
-        job_phone = _normalized_optional_text(getattr(j, "phone", None))
-        if job_phone:
-            phone = job_phone
-            phone_source = "job_override"
-        elif publisher_phone:
-            phone = publisher_phone
-            phone_source = "publisher_fallback"
-        else:
-            phone = None
-            phone_source = "none"
-
         d.update({
             "hiring_company": hiring_company,
             "hiring_company_source": hiring_company_source,
@@ -2966,11 +2968,12 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
             "company": hiring_company,
             "address": address,
             "address_source": address_source,
-            "contact_person": contact_person,
-            "contact_source": contact_source,
-            "phone": phone,
-            "phone_source": phone_source,
-            "phone_placeholder": "联系方式待补充" if phone is None else None,
+            # Contact data is available only through the controlled grant
+            # flow.  Search/index/card payloads never carry plaintext PII.
+            "contact_available": _has_contact_ciphertext(j) or bool(
+                user_data.get("contact_available")
+            ),
+            "contact_placeholder": _CONTACT_PLACEHOLDER,
         })
         result.append(d)
     return result
@@ -3015,8 +3018,7 @@ def _build_users_map(user_ids: list[str], db: Session) -> dict[str, dict]:
             "display_name": u.display_name,
             "company": u.company,
             "address": u.address,
-            "contact_person": u.contact_person,
-            "phone": u.phone,
+            "contact_available": _has_contact_ciphertext(u),
         }
         for u in users
     }
@@ -3148,14 +3150,10 @@ def _format_job_results(
         ):
             lines.append(f"   🏢 发布主体：{publisher_company}")
 
-        contact_person = j.get("contact_person")
-        if contact_person:
-            lines.append(f"   👤 联系人：{contact_person}")
-        phone = j.get("phone")
-        if phone:
-            lines.append(f"   📞 联系电话：{phone}")
-        elif j.get("phone_placeholder"):
-            lines.append(f"   📞 {j['phone_placeholder']}")
+        if j.get("contact_available"):
+            lines.append(f"   📞 {_CONTACT_PLACEHOLDER}")
+        elif j.get("contact_placeholder"):
+            lines.append(f"   📞 {j['contact_placeholder']}")
         for reason_line in (reason_lines_by_id or {}).get(str(j.get("id", "")), []):
             lines.append(reason_line)
 
@@ -3213,12 +3211,10 @@ def _format_resume_results(
         for reason_line in (reason_lines_by_id or {}).get(str(r.get("id", "")), []):
             lines.append(reason_line)
 
-        phone = r.get("phone")
-        placeholder = r.get("phone_placeholder")
-        if phone:
-            lines.append(f"   📞 联系电话：{phone}")
-        elif placeholder:
-            lines.append(f"   📞 {placeholder}")
+        if r.get("contact_available"):
+            lines.append(f"   📞 {_CONTACT_PLACEHOLDER}")
+        elif r.get("contact_placeholder"):
+            lines.append(f"   📞 {r['contact_placeholder']}")
 
         exp = r.get("work_experience", "")
         if exp:
