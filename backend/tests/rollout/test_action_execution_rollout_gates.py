@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from app.tasks import worker_monitor
 from scripts import action_contact_chaos
 from scripts import action_execution_preflight
+from scripts import legacy_exit_gate
 
 
 def _lock(acquired: bool = True):
@@ -75,3 +76,40 @@ def test_c2_chaos_scenario_is_repeatable_and_selectable():
     assert first["passed"] is True
     assert second["passed"] is True
     assert first["results"][0]["events"] == second["results"][0]["events"]
+
+
+def _legacy_evidence(days: int = 14) -> dict[str, object]:
+    return {
+        "action_on_coverage": [99.5] * days,
+        "replay_recovery_success_rate": [99.95] * days,
+        "duplicate_provider_calls": [0] * days,
+        "contact_pii_leaks": [0] * days,
+        "contact_token_replays": [0] * days,
+        "golden_diffs_approved": True,
+        "legacy_compatibility": True,
+        "pending_action_count": 0,
+        "pending_session_count": 0,
+        "pending_outbox_count": 0,
+        "rollback_drill_passed": True,
+    }
+
+
+def test_c3_legacy_exit_requires_full_fourteen_day_evidence():
+    report = legacy_exit_gate.evaluate(_legacy_evidence())
+    assert report["eligible_to_propose_rfc"] is True
+
+    evidence = _legacy_evidence()
+    evidence["action_on_coverage"] = [99.5] * 13 + [98.9]
+    blocked = legacy_exit_gate.evaluate(evidence)
+    assert blocked["eligible_to_propose_rfc"] is False
+    assert any(item["code"] == "action_coverage" and not item["passed"] for item in blocked["findings"])
+
+
+def test_c3_legacy_exit_blocks_unapproved_diffs_and_pending_facts():
+    evidence = _legacy_evidence()
+    evidence["golden_diffs_approved"] = False
+    evidence["pending_outbox_count"] = 1
+    report = legacy_exit_gate.evaluate(evidence)
+    assert report["eligible_to_propose_rfc"] is False
+    blocked_codes = {item["code"] for item in report["findings"] if not item["passed"]}
+    assert {"golden_diffs_approved", "pending_outbox_count"} <= blocked_codes
