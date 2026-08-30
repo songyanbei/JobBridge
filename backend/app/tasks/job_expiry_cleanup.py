@@ -45,6 +45,22 @@ def expire_locked_batch(db, *, now: datetime, batch_size: int = BATCH_SIZE) -> l
             continue
         expired_ids.append(job_id)
         ensure_job_cleanup_task(db, job_id, reason="expired")
+        # Keep lifecycle events atomic with the expiry update when the S4
+        # outbox model is available; mixed fleets simply continue via SQL.
+        try:
+            from app.services.domain_outbox_service import append_event
+            job_version = db.execute(text("SELECT version FROM `job` WHERE id=:id"), {"id": job_id}).scalar()
+            append_event(
+                db,
+                aggregate_type="job",
+                aggregate_id=job_id,
+                aggregate_version=int(job_version or 1),
+                event_type="job.expired",
+                reason="expired",
+                tombstone=True,
+            )
+        except (ImportError, TypeError):
+            pass
     db.commit()
     return expired_ids
 

@@ -25,6 +25,7 @@ from app.schemas.contact import (
     ContactRequestView,
     ContactResponse,
 )
+from app.services.job_lifecycle_service import contact_version_is_current
 
 CONTACT_UNAVAILABLE_MESSAGE = "暂时无法提供联系方式，请稍后重试。"
 CONTACT_PLATFORM_REQUEST_MESSAGE = "联系请求已提交，请通过平台联系对方。"
@@ -393,3 +394,22 @@ issue_one_time_grant = ContactService.issue_one_time_grant
 redeem_grant = ContactService.redeem_grant
 revoke_grant = ContactService.revoke_grant
 audit_contact_event = ContactService.audit_contact_event
+
+
+def is_listing_version_current(listing: Any, listing_version: int | None) -> bool:
+    """Validate an opaque Contact reference against the current listing version."""
+    if getattr(listing, "__tablename__", "") == "job" or hasattr(listing, "delist_reason"):
+        return contact_version_is_current(listing, listing_version)
+    current = getattr(listing, "version", None)
+    return listing_version is not None and current is not None and int(current) == int(listing_version)
+
+
+def assert_listing_version_current(listing: Any, listing_version: int | None) -> None:
+    if not is_listing_version_current(listing, listing_version):
+        raise ValueError("contact_listing_version_invalid")
+
+
+def contact_reference(listing_type: str, listing_id: int, listing_version: int) -> dict[str, Any]:
+    if listing_type not in {"job", "resume"}:
+        raise ValueError("unsupported_listing_type")
+    return {"listing_type": listing_type, "listing_id": int(listing_id), "listing_version": int(listing_version)}
