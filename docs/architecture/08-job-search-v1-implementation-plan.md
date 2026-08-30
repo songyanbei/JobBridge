@@ -6,13 +6,13 @@
 
 ## 实施状态（2026-08-30）
 
-**工程实施与代码审查：已完成（本轮范围）。** Phase 0-3 以及 Phase 5 中纳入本轮交付的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限/脱敏和观测测试均已落地，并按独立提交节点提交；Phase 4 的独立 Contact Domain Service/明文兑换仍未实现。
+**工程实施与代码审查：已完成（本轮范围）。** Phase 0-3 以及 Phase 5 中纳入本轮交付的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限/脱敏和观测测试均已落地，并按独立提交节点提交。原 Phase 4 Contact 前置差距已在 S3 后续实施中补齐，详见 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md)。
 
 **部署与端到端验证：已完成。** WSL 中 MySQL、Redis、App、Worker、Nginx 已启动且 `/ready` 返回 200；mock-testbed 接口 smoke 为 8/8，mock-testbed 单测为 42 passed；模拟页面已验证求职者多轮条件修改、`更多`、放宽提示、`/帮助`、招聘者查询、SSE 出站、重复消息去重和身份前缀守卫。最近 30 分钟入站事件全部 `done`，出站全部 `sent`，PII 查询命中 0，Redis 队列无积压。
 
 **发布边界：保持 legacy/fallback 优先。** 当前 Search Facade rollout 默认关闭，实际执行日志显示 `execution_mode=off`、`served_assignment=legacy`，异常时仍按设计记录 `facade_fallback` 并回到 legacy；本轮不宣称生产全量切换完成。
 
-**保留限制：** `action_execution` 的 schema、lease/fencing helper 和审计契约已完成，但尚未接入真实搜索生产调用链。由于当前 DB 提交与 Redis Session CAS 为两阶段恢复边界，本轮没有做半接入；详见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+**保留限制：** ActionGateway、claim/finalize、结果引用、parse artifact 和 replay 已接入 Worker 搜索路径并通过契约回归；生产默认仍为 `action_execution_mode=off`，尚未进行 on 灰度和完整观察窗口。DB 提交与 Redis Session CAS 仍是两阶段恢复边界，详见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
 
 ## 1. v1 目标和成功定义
 
@@ -370,5 +370,5 @@ v1 只读 `jobs` 及关联用户/字典表，不创建公共 `listing` 表，不
 
 ### 6.2 尚未宣称完成
 
-- `action_execution` 尚未接入真实搜索调用链，因此当前日志中的搜索执行事实仍以推荐请求/尝试、Session、Outbox 和 `facade_fallback` 记录为准；接入前必须先完成 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md) 中的结果引用和事务边界设计。
-- Search Facade、Contact 和 Dialogue v1 的生产 rollout 默认仍为 0%；扩大灰度、生产 SLO 观察窗口和真实历史语料评估不属于本轮本地 WSL 验收结论。
+- 生产 rollout 默认仍为 0%（Action、Contact、Search Facade/Dialogue v1）；扩大灰度、生产 SLO 观察窗口、连续 14 天 legacy 退出指标和真实历史语料评估不属于本轮本地 WSL 验收结论。
+- 岗位发布、简历发布、双向招聘、二手领域和 S4 后续流程仍未实现；S3 完成不等于后续领域阶段完成。

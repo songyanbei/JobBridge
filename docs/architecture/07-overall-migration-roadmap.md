@@ -1,6 +1,6 @@
 # 07 总体改造路线图
 
-> 状态：实施路线草案（以当前代码和 01-06 架构文档为基线）  
+> 状态：实施路线与验收记录（S2/S3 工程闭环已完成；生产 rollout 和 S4 仍受门禁约束）
 > 范围：招聘双向流程、二手物品试点，以及后续多渠道/检索基础设施演进。  
 > 原则：适配器先行、只读先行、每阶段可观测/可回滚；本文不把规划能力当作已实现能力。
 
@@ -46,8 +46,8 @@ JobBridge 的最终形态是“统一 Listing Flow + 领域 Profile + Skill 驱�
 | Session | [`schemas/conversation.py`](../../backend/app/schemas/conversation.py) 已有 `SessionState`、搜索条件、候选快照、awaiting、冲突和放宽字段；`conversation_service.py` 已有 TTL/CAS 辅助 | 需要版本化 schema、`profile`、legacy compatibility projection 和统一 reducer 状态机 |
 | 搜索 | [`search_service.py`](../../backend/app/services/search_service.py) 已有 SQL 硬过滤、LLM rerank、快照 `show_more`、零结果放宽、推荐实验和 legacy fallback；`search_permission.py`/visibility policy 已参与过滤 | 需要 `listing.search` Facade、结构化 `ListingCard`、版本化快照/outbox 索引链路，并保持旧 SQL 行为可回退 |
 | 上传/审核 | [`upload_service.py`](../../backend/app/services/upload_service.py) 已有草稿、字段校验、敏感词/LLM 审核、岗位/简历入库和图片附件生命周期 | 需要统一 Listing Flow 和 Action 幂等；不能把上传迁移误写成已完成的公共 Listing 发布 |
-| 数据与事件 | `Job`/`Resume` 已有 `version`、审核/有效期字段；`WecomInboundEvent` status 闭集和 `WecomOutboundOutbox` 已存在 | 尚未按目标契约普遍维护 `aggregate_version`、`domain_outbox_event`、删除 tombstone、Action lease/fencing |
-| 联系与隐私 | 当前岗位/用户模型存在联系人/电话字段，搜索侧已有部分可见性策略和脱敏投影 | 尚未形成独立 Contact Domain Service 的重鉴权、短 token、频控、撤销、PII 存储和审计闭环 |
+| 数据与事件 | `Job`/`Resume` 已有 `version`、审核/有效期字段；S2/S3 已落地 Action lease/fencing、结果引用、parse artifact、Contact delivery Outbox；入站/出站 status 闭集保持不变 | 全域 `aggregate_version`/`domain_outbox_event`/删除 tombstone 仍属于 S4-S7；Action/Contact 生产 on 观察窗口待完成 |
+| 联系与隐私 | Contact Domain Service、一次性 grant/delivery、频控/撤销/审计、PII ciphertext 和回填脚本已落地；迁移 verify 为 `ready_for_freeze=true` | 生产 Contact on 灰度、旧明文列清理审批和长期观察窗口尚未完成；默认仍 feature-off |
 | 管理后台 | Vue 3/Element Plus 后台已覆盖账号、岗位、简历、审核、配置、看板 | 只增加 profile/trace/version 等兼容字段，不改 `/admin/*` 路径和核心交互 |
 
 ## 3. 目标分层与阶段依赖
@@ -59,7 +59,7 @@ S1 Dialogue v1 + Session/Reducer
    ↓
 S2 求职搜索 v1（worker -> job） ──→ S3 联系方式/隐私
    ↓                                  ↓
-S4 岗位发布（factory/broker） ────────┘
+   └──→ v1 后续 Action/Contact/灰度门禁 ──→ S4 岗位发布（factory/broker）
    ↓
 S5 简历发布 + 双向招聘（job/resume）
    ↓
@@ -68,7 +68,7 @@ S6 二手物品试点（普通 user）
 S7 多渠道 / 远程 MCP / 大规模检索
 ```
 
-S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全量切换时通过 adapter 接入。S3 的联系入口可在 S2 输出 opaque request，但实际明文兑换必须在 S3 完成。S4/S5 依赖稳定的审核、Action 幂等和 outbox；S6 不得反向改写招聘事实源；S7 必须由容量和复用需求触发。
+S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全量切换时通过 adapter 接入。S3 的联系入口可在 S2 输出 opaque request，但实际明文兑换必须在 S3 完成。S2 完成后，Action Execution 的生产接入、Contact/PII 闭环、灰度演练和 legacy 退出门禁按 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md) 执行；该方案完成前不得启动 S4。S4/S5 依赖稳定的审核、Action 幂等和 outbox；S6 不得反向改写招聘事实源；S7 必须由容量和复用需求触发。
 
 ## 4. 分阶段路线图
 
@@ -123,7 +123,7 @@ S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全�
 
 ### S2：求职搜索首版（worker 搜索 job）
 
-> 状态（2026-08-30）：工程实现、代码审查、WSL 部署和 mock 页面端到端验证已完成；生产 rollout 保持 legacy/fallback 优先。`action_execution` 尚未接入真实搜索调用链，见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+> 状态（2026-08-30）：S2 工程实现、代码审查、WSL 部署和 mock 页面端到端验证已完成；S3 的 Action/Contact 后续接入也已完成工程闭环。生产 rollout 仍保持 legacy/fallback 优先，详见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md) 和 [10 后续实施方案](10-post-v1-action-contact-implementation-plan.md)。
 
 **前置依赖**：S0 回放/可靠性基线；S1 的 v1 adapter、Session CAS 和 Reducer 可在灰度桶运行。
 
@@ -139,7 +139,7 @@ S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全�
 
 **数据迁移、回滚与验收**
 
-招聘表继续为事实源；可先 shadow read，不要求新旧双写。候选快照沿用 Redis 结构并增加算法/策略版本。按 worker 用户灰度，kill switch 直接回 legacy。普通搜索 P95 ≤5 秒、命令/更多 ≤1.5 秒、搜索无权限/过期泄露为 0；具体实施见 [08 首版详细实施方案](08-job-search-v1-implementation-plan.md)。
+招聘表继续为事实源；可先 shadow read，不要求新旧双写。候选快照沿用 Redis 结构并增加算法/策略版本。按 worker 用户灰度，kill switch 直接回 legacy。普通搜索 P95 ≤5 秒、命令/更多 ≤1.5 秒、搜索无权限/过期泄露为 0；具体实施见 [08 首版详细实施方案](08-job-search-v1-implementation-plan.md)。v1 完成后的 Action Execution 生产接入、搜索/show_more/relaxation replay，以及 Contact/PII 后续实施，不在本阶段直接扩展，统一按 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md) 推进。
 
 **风险与决策点**
 
@@ -149,6 +149,10 @@ S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全�
 ### S3：联系方式与隐私
 
 **前置依赖**：S2 的 Card/contact_request_id 输出、服务端 ActorContext 和审计链路稳定。
+
+> 状态（2026-08-30）：Contact Domain Service、一次性 grant/delivery、频控、撤销、审计、PII 加密回填、Contact Outbox 投递和 C2 故障矩阵已完成实现与验证；Contact 默认仍为 `off`，生产 on 灰度、旧明文列清理审批和长期观察窗口待完成。
+
+**详细实施方案**：本阶段的实现与验收记录统一见 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md) 的 Workstream B/C。
 
 **目标与需求**
 

@@ -1,7 +1,7 @@
 # JobBridge 架构方案文档集
 
 > 版本：v1.0
-> 状态：架构基线；求职搜索 v1 已完成工程实施与 WSL 验证，尚未进行生产全量切换
+> 状态：架构基线；S2 求职搜索与 S3 Action/Contact 工程实施、审查、WSL 和 mock 验证已完成，尚未进行生产全量切换
 > 适用范围：企业微信文字机器人，以及未来扩展到二手物品、房屋、服务等分类信息场景。
 
 ## 目标
@@ -31,15 +31,18 @@ JobBridge 的目标架构是：
 | [06 开源项目选型](06-open-source-reference-and-selection.md) | Rasa、LangGraph、Dify、MCP 等调研 | 架构、技术决策 |
 | [07 总体改造路线图](07-overall-migration-roadmap.md) | 完整架构目标、阶段依赖、迁移边界和总体验收 | 架构、项目负责人、研发、测试、运维 |
 | [08 求职搜索 v1 实施方案](08-job-search-v1-implementation-plan.md) | 首版求职搜索的详细实施、代码范围、测试和灰度 | 后端、AI、测试、运维 |
+| [09 求职搜索 v1 Action Execution 审计](09-job-search-v1-action-execution-audit.md) | v1 Action 幂等、事务边界和生产接入前风险审计 | 架构、后端、测试、运维 |
+| [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md) | Action Execution 生产接入、Contact/PII 闭环、灰度演练和 S4 前置门禁 | 架构、后端、AI、测试、运维、安全 |
 
-阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，最后以 08 作为当前首个可执行交付切片。08 仅覆盖求职者找岗位，不代表岗位发布、简历发布、双向招聘或二手物品已经完成。
+阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，接着阅读 08 了解求职搜索 v1，阅读 09 了解 Action Execution 审计闭环，最后阅读 10 的 A/B/C 落地记录和 S4 前置门禁。08 仅覆盖求职者找岗位；S4 仍需等待生产观察窗口和退出审批。
 
 ## 当前实施状态
 
 - 求职搜索 v1 的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限与脱敏测试已完成；实现和代码审查在 `codex/unified-listing-flow-architecture` 分支完成。
-- WSL 生产编排、mock 企业微信测试台、页面多轮对话和执行日志核验已通过；详细记录见 [08 求职搜索 v1 首版详细实施方案](08-job-search-v1-implementation-plan.md)。
-- 当前默认配置保持 legacy/fallback 优先，Search Facade rollout 仍为关闭状态；这属于可回滚发布策略，不代表删除或绕过 v1 代码。
-- `action_execution` 的通用 schema/lease/fencing 契约已具备，但尚未接入真实搜索生产调用链；该限制和后续入口见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+- WSL 生产编排、mock 企业微信测试台、页面多轮对话、Action replay、Contact/PII 和执行日志核验已通过；详细记录见 [08 首版详细实施方案](08-job-search-v1-implementation-plan.md) 与 [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md)。
+- S3 A/B/C 工程闭环已落地：ActionGateway/claim/finalize/replay、Contact 一次性 grant/delivery、PII 加密回填、Outbox 分流、kill switch 和 C2 故障矩阵均已有代码与测试；PII verify 返回 `ready_for_freeze=true`。
+- 当前默认配置仍保持 `action_execution_mode=off`、Contact `off`、legacy/fallback 优先；这是发布策略，不代表删除或绕过已实现代码。
+- 尚未完成的是生产 on 灰度、连续观察窗口和 legacy 退出签字；在这些门禁完成前不启动 S4 岗位发布。Action 审计的更新结论见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
 
 ## 当前系统基线
 
