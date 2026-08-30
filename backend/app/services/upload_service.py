@@ -336,6 +336,76 @@ class JobConfirmation:
     status: str = "awaiting_confirmation"
 
 
+@dataclass(frozen=True)
+class ResumeConfirmation:
+    operation_id: str
+    confirmation_nonce: str
+    draft_digest: str
+    fields: dict
+    status: str = "awaiting_confirmation"
+
+
+def _resume_draft_digest(fields: dict) -> str:
+    payload = json.dumps(fields, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def create_resume_draft(
+    owner_userid: str,
+    fields: dict | None = None,
+    *, operation_id: str | None = None,
+    source_msg_id: str | None = None,
+    session: SessionState | None = None,
+) -> dict:
+    """Create an in-session resume draft without exposing sensitive fields."""
+    from app.listing.resume_profile import RESUME_PROFILE
+    operation_id = operation_id or str(uuid.uuid4())
+    existing = dict(session.pending_upload or {}) if session is not None and session.pending_operation_id == operation_id else {}
+    values = {**existing, **(fields or {})}
+    missing = list(RESUME_PROFILE.missing_hard_fields(values))
+    if session is not None:
+        _save_pending_upload(session, "upload_resume", values, missing, "")
+        session.pending_operation_id = operation_id
+    return {"owner_userid": owner_userid, "operation_id": operation_id, "source_msg_id": source_msg_id, "fields": RESUME_PROFILE.redact(values), "_all_fields": values, "missing_fields": missing, "digest": _resume_draft_digest(values), "status": "ready" if not missing else "collecting"}
+
+
+def update_resume_draft(draft: dict, patch: dict | None = None, *, session: SessionState | None = None, source_msg_id: str | None = None) -> dict:
+    from app.listing.resume_profile import RESUME_PROFILE
+    values = dict(draft.get("_all_fields") or draft.get("fields") or {})
+    values.update(patch or {})
+    missing = list(RESUME_PROFILE.missing_hard_fields(values))
+    if session is not None:
+        _save_pending_upload(session, "upload_resume", values, missing, "")
+        session.pending_operation_id = draft.get("operation_id")
+    return {**draft, "fields": RESUME_PROFILE.redact(values), "_all_fields": values, "missing_fields": missing, "digest": _resume_draft_digest(values), "source_msg_id": source_msg_id or draft.get("source_msg_id"), "status": "ready" if not missing else "collecting"}
+
+
+def prepare_resume_confirmation(session: SessionState, *, operation_id: str | None = None) -> ResumeConfirmation:
+    from app.listing.resume_profile import RESUME_PROFILE
+    fields = dict(session.pending_upload or {})
+    missing = RESUME_PROFILE.missing_hard_fields(fields)
+    if missing:
+        raise ValueError("draft_missing_fields:" + ",".join(missing))
+    operation = operation_id or session.pending_operation_id or str(uuid.uuid4())
+    digest = _resume_draft_digest(fields)
+    nonce = session.pending_confirmation_nonce if session.pending_confirmation_digest == digest and session.pending_confirmation_nonce else str(uuid.uuid4())
+    session.pending_operation_id = operation
+    session.pending_confirmation_nonce = nonce
+    session.pending_confirmation_digest = digest
+    session.pending_action = {"action_name": "confirm_resume", "operation_id": operation, "confirmation_nonce": nonce, "draft_digest": digest}
+    return ResumeConfirmation(operation, nonce, digest, RESUME_PROFILE.redact(fields))
+
+
+def confirm_resume_draft(session: SessionState, *, confirmation_nonce: str, draft_digest: str) -> ResumeConfirmation:
+    expected = prepare_resume_confirmation(session)
+    if confirmation_nonce != expected.confirmation_nonce:
+        raise ValueError("confirmation_nonce_mismatch")
+    if draft_digest != expected.draft_digest:
+        raise ValueError("draft_digest_mismatch")
+    session.pending_action = {**(session.pending_action or {}), "confirmed": True}
+    return ResumeConfirmation(expected.operation_id, expected.confirmation_nonce, expected.draft_digest, expected.fields, status="confirmed")
+
+
 def prepare_job_confirmation(session: SessionState, *, operation_id: str | None = None) -> JobConfirmation:
     """Create/reuse a confirmation nonce for the current complete draft."""
     fields = normalize_job_fields(session.pending_upload)
