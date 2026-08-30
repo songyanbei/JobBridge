@@ -35,11 +35,19 @@ def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, 
         "tombstone": bool(tombstone),
     }
     try:
-        from app.services.domain_outbox_service import append_event
+        from app.services.domain_outbox_service import append_domain_event
     except ImportError:
         db.info.setdefault("pending_job_lifecycle_events", []).append(payload)
         return
-    append_event(db, **payload)
+    append_domain_event(
+        db,
+        aggregate_type="job",
+        aggregate_id=int(job.id),
+        aggregate_version=int(job.version or 1),
+        event_type=event_type,
+        payload={"reason": reason} if reason else {},
+        tombstone=tombstone,
+    )
 
 
 def transition_job(
