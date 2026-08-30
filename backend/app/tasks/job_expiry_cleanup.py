@@ -7,6 +7,7 @@ from typing import Callable
 
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy.orm import Session as OrmSession
 
 from app.db import SessionLocal
 from app.services.target_cleanup_service import ensure_job_cleanup_task
@@ -48,6 +49,11 @@ def expire_locked_batch(db, *, now: datetime, batch_size: int = BATCH_SIZE) -> l
         # Keep lifecycle events atomic with the expiry update when the S4
         # outbox model is available; mixed fleets simply continue via SQL.
         try:
+            # Legacy unit fixtures and mixed-version workers may pass a mock
+            # DB/session without the Phase14 outbox table.  Do not issue extra
+            # reads in that compatibility path.
+            if not isinstance(db, OrmSession):
+                continue
             from app.services.domain_outbox_service import append_domain_event
             job_version = db.execute(text("SELECT version FROM `job` WHERE id=:id"), {"id": job_id}).scalar()
             append_domain_event(
