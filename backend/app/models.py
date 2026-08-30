@@ -186,6 +186,90 @@ class Job(Base):
     )
 
 
+# ============================================================================
+# Contact B0: opaque requests, one-time grants and privacy-safe audit
+# ============================================================================
+
+class ContactRequest(Base):
+    """Server-owned contact entry point. No contact value is stored here."""
+
+    __tablename__ = "contact_request"
+
+    request_id = sa.Column(sa.String(64), primary_key=True)
+    actor_id = sa.Column(sa.String(64), nullable=False)
+    listing_ref = sa.Column(sa.String(200), nullable=False)
+    action = sa.Column(sa.String(32), nullable=False, server_default="request_contact")
+    request_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    nonce_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    listing_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    policy_version = sa.Column(sa.String(64), nullable=True)
+    status = sa.Column(sa.Enum("pending", "authorized", "revoked", "expired", name="contact_request_status"), nullable=False, server_default="pending")
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoke_reason = sa.Column(sa.String(64), nullable=True)
+    trace_id = sa.Column(sa.String(64), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (
+        sa.Index("idx_contact_request_actor", "actor_id", "created_at", "request_id"),
+        sa.Index("idx_contact_request_listing", "listing_ref", "status", "expires_at"),
+    )
+
+
+class ContactGrant(Base):
+    """Hashed, short-lived, single-use credential; token is never persisted."""
+
+    __tablename__ = "contact_grant"
+
+    grant_id = sa.Column(sa.String(64), primary_key=True)
+    request_id = sa.Column(sa.String(64), sa.ForeignKey("contact_request.request_id", ondelete="RESTRICT"), nullable=False)
+    actor_id = sa.Column(sa.String(64), nullable=False)
+    listing_ref = sa.Column(sa.String(200), nullable=False)
+    action = sa.Column(sa.String(32), nullable=False)
+    token_hash = sa.Column(mysql.CHAR(64), nullable=False, unique=True)
+    nonce_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    listing_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
+    policy_version = sa.Column(sa.String(64), nullable=True)
+    status = sa.Column(sa.Enum("issued", "used", "revoked", "expired", name="contact_grant_status"), nullable=False, server_default="issued")
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    used_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoke_reason = sa.Column(sa.String(64), nullable=True)
+    trace_id = sa.Column(sa.String(64), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (
+        sa.Index("idx_contact_grant_actor", "actor_id", "created_at", "grant_id"),
+        sa.Index("idx_contact_grant_due", "status", "expires_at", "grant_id"),
+        sa.Index("idx_contact_grant_request", "request_id", "status"),
+    )
+
+
+class ContactAccessAudit(Base):
+    """Append-only contact decision log. Values are hashes/reason codes only."""
+
+    __tablename__ = "contact_access_audit"
+
+    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    event_id = sa.Column(sa.String(36), nullable=False, unique=True)
+    event_type = sa.Column(sa.String(32), nullable=False)
+    outcome = sa.Column(sa.String(32), nullable=False)
+    reason_code = sa.Column(sa.String(64), nullable=False)
+    actor_hash = sa.Column(mysql.CHAR(64), nullable=True)
+    listing_hash = sa.Column(mysql.CHAR(64), nullable=True)
+    request_id = sa.Column(sa.String(64), nullable=True)
+    grant_id = sa.Column(sa.String(64), nullable=True)
+    trace_id = sa.Column(sa.String(64), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (
+        sa.Index("idx_contact_audit_trace", "trace_id", "created_at"),
+        sa.Index("idx_contact_audit_actor", "actor_hash", "created_at"),
+        sa.Index("idx_contact_audit_request", "request_id", "created_at"),
+    )
+
+
 class JobReplacement(Base):
     __tablename__ = "job_replacement"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
