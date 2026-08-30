@@ -62,6 +62,7 @@ from app.schemas.conversation import ReplyMessage
 from app.services import (
     action_gateway,
     action_execution_service,
+    action_parse_artifact_service,
     conversation_service,
     message_router,
     recommendation_shadow_service,
@@ -761,6 +762,22 @@ class Worker:
                     percentage > 0 and int(identifier_hash(userid)[:8], 16) % 100 < percentage
                 )
                 if mode == "on" and in_bucket and envelope.is_supported:
+                    if envelope.parse_ref and envelope.parse_payload and envelope.parse_digest:
+                        try:
+                            action_parse_artifact_service.persist_parse_artifact(
+                                db, parse_ref=envelope.parse_ref, turn_id=envelope.turn_id,
+                                actor_userid=userid, payload=envelope.parse_payload,
+                                parse_digest_value=envelope.parse_digest,
+                                classifier_version=envelope.classifier_version,
+                                session_version=envelope.session_version,
+                                schema_version=envelope.parse_schema_version or action_parse_artifact_service.PARSE_SCHEMA_VERSION,
+                                expires_at=envelope.parse_expires_at,
+                                retention_seconds=int(getattr(settings, "action_parse_artifact_retention_seconds", 86400)),
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                            return "action_parse_artifact_missing"
                     action_claim = action_execution_service.claim_action_execution(
                         db, envelope.turn_id, envelope.action_name, self._lease_owner,
                         request_digest=envelope.request_digest,
@@ -777,6 +794,17 @@ class Worker:
                                 db, envelope.turn_id, envelope.action_name,
                                 actor_userid=userid,
                             )
+                            replay_row = action_execution_service.read_action_execution(
+                                db, envelope.turn_id, envelope.action_name,
+                            )
+                            if replay_row is not None and replay_row.parse_ref:
+                                artifact = action_parse_artifact_service.read_parse_artifact(
+                                    db, replay_row.parse_ref, turn_id=envelope.turn_id,
+                                    actor_userid=userid, parse_digest_value=replay_row.parse_digest,
+                                    schema_version=replay_row.parse_version or action_parse_artifact_service.PARSE_SCHEMA_VERSION,
+                                )
+                                if artifact is None:
+                                    return "action_replay_terminal"
                         except Exception:
                             return "action_replay_terminal"
                         if inbound_event_id:
@@ -790,6 +818,23 @@ class Worker:
                     action_context = envelope
                 elif mode in {"on", "shadow"}:
                     # Keep the same parse for compatible legacy routing; no claim.
+                    if envelope.parse_ref and envelope.parse_payload and envelope.parse_digest:
+                        try:
+                            action_parse_artifact_service.persist_parse_artifact(
+                                db, parse_ref=envelope.parse_ref, turn_id=envelope.turn_id,
+                                actor_userid=userid, payload=envelope.parse_payload,
+                                parse_digest_value=envelope.parse_digest,
+                                classifier_version=envelope.classifier_version,
+                                session_version=envelope.session_version,
+                                schema_version=envelope.parse_schema_version or action_parse_artifact_service.PARSE_SCHEMA_VERSION,
+                                expires_at=envelope.parse_expires_at,
+                                retention_seconds=int(getattr(settings, "action_parse_artifact_retention_seconds", 86400)),
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                            if mode == "on":
+                                return "action_parse_artifact_missing"
                     action_context = envelope
 
             # 图片：Worker 层下载存 storage 并回填 image_url
