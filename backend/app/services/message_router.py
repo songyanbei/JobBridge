@@ -873,9 +873,13 @@ def _handle_text(
     elif session.active_flow == "search_active":
         replies = _route_search_active(
             intent_result, msg, user_ctx, session, db,
+            action_context=action_context,
         )
     else:
-        replies = _route_idle(intent_result, msg, user_ctx, session, db)
+        replies = _route_idle(
+            intent_result, msg, user_ctx, session, db,
+            action_context=action_context,
+        )
 
     # 把出站回复写入 history（只记第一条，避免历史爆炸）
     replies = _finalize_action_plan_replies(replies)
