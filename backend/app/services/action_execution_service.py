@@ -155,6 +155,35 @@ def load_replay_reference(
     return ref
 
 
+def mark_replay_started(
+    db: Session, turn_id: str, action_name: str, *, now: datetime | None = None,
+) -> bool:
+    """Record a replay attempt atomically; this helper performs no business work."""
+    now_value = _naive_utc(now)
+    available = _available_columns(db)
+    if "replay_count" not in available or "last_replayed_at" not in available:
+        return False
+    with db.no_autoflush:
+        updated = db.query(ActionExecution).filter(
+            ActionExecution.turn_id == turn_id,
+            ActionExecution.action_name == action_name,
+            ActionExecution.status == "succeeded",
+        ).update(
+            {"replay_count": ActionExecution.replay_count + 1, "last_replayed_at": now_value},
+            synchronize_session=False,
+        )
+    return updated == 1
+
+
+def mark_replay_finished(
+    db: Session, turn_id: str, action_name: str, *, success: bool = True,
+) -> bool:
+    """Compatibility hook for replay reconciliation; success is intentionally side-effect free."""
+    del success
+    row = read_action_execution(db, turn_id, action_name)
+    return bool(row is not None and row.status == "succeeded")
+
+
 def _naive_utc(value: datetime | None) -> datetime:
     value = value or datetime.now(timezone.utc)
     if value.tzinfo is not None:
@@ -382,4 +411,6 @@ __all__ = [
     "finalize_action_execution",
     "read_action_execution",
     "load_replay_reference",
+    "mark_replay_started",
+    "mark_replay_finished",
 ]
