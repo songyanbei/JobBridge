@@ -270,7 +270,13 @@ class ContactAccessAudit(Base):
 
     __tablename__ = "contact_access_audit"
 
-    id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    # SQLite unit tests need an INTEGER-affinity primary key for rowid
+    # autoincrement; retain MySQL BIGINT UNSIGNED in the production dialect.
+    id = sa.Column(
+        sa.Integer().with_variant(mysql.BIGINT(unsigned=True), "mysql"),
+        primary_key=True,
+        autoincrement=True,
+    )
     event_id = sa.Column(sa.String(36), nullable=False, unique=True)
     event_type = sa.Column(sa.String(32), nullable=False)
     outcome = sa.Column(sa.String(32), nullable=False)

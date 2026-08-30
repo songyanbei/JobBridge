@@ -33,7 +33,7 @@ from app.config import settings as _settings_module
 from app.dialogue import slot_schema
 from app.llm.base import IntentResult
 from app.llm.prompts import PROMPT_VERSION
-from app.models import Resume
+from app.models import ContactRequest, Job, Resume
 from app.schemas.conversation import ReplyMessage, SessionState
 from app.schemas.recommendation import (
     ATTEMPT_KIND_BY_REQUEST_KIND,
@@ -262,6 +262,9 @@ PENDING_ACTION_WAIT_REPLY = "请先完成或取消当前发布流程，再执行
 PENDING_ACTION_EXISTS_REPLY = (
     "当前已经保存了一项下一步，请先执行或回复 /取消下一步，再安排新的组合操作。"
 )
+CONTACT_REQUEST_GUIDANCE_REPLY = "请先搜索岗位，再回复“联系”获取沟通入口。"
+CONTACT_UNAVAILABLE_REPLY = "暂时无法发起联系请求，请稍后重试。"
+_CONTACT_COMMAND_RE = re.compile(r"^联系(?:\s*(\d{1,2}))?$")
 _PENDING_ACTION_TTL_SECONDS = 30 * 60
 _ACTION_PLAN_SPLIT_RE = re.compile(
     r"\s*(?:，|,|；|;)?\s*(?:完成后再|不行再|同时还|另外再|然后|接着|顺便|"
@@ -334,6 +337,115 @@ def _is_relaxation_expired(iso_str: str) -> bool:
         return True
 
 
+def _contact_listing_ref(content: str, session: SessionState) -> str | None:
+    """Resolve an explicit contact command to a job in the current snapshot."""
+    match = _CONTACT_COMMAND_RE.fullmatch((content or "").strip())
+    if match is None or session.profile != "recruitment.job":
+        return None
+    shown = [str(item) for item in (session.shown_items or []) if str(item).strip()]
+    if not shown:
+        return ""
+    ordinal = int(match.group(1) or 0)
+    if ordinal:
+        if ordinal > len(shown):
+            return ""
+        candidate = shown[ordinal - 1]
+    else:
+        candidate = shown[-1]
+    if candidate.startswith("recruitment.job:"):
+        suffix = candidate.rsplit(":", 1)[-1]
+    else:
+        suffix = candidate
+    if not suffix.isdigit() or int(suffix) <= 0:
+        return ""
+    return f"recruitment.job:{int(suffix)}"
+
+
+def _try_handle_contact(
+    content: str,
+    msg: WeComMessage,
+    user_ctx: UserContext,
+    session: SessionState,
+    db: Session,
+    *,
+    inbound_event_id=None,
+) -> list[ReplyMessage] | None:
+    """Run the Contact Service for an explicit ``联系`` turn.
+
+    A successful redeem creates the ContactDelivery and its opaque outbox row
+    in the caller's transaction.  The normal reply is omitted in production
+    so the fixed platform-request delivery is sent exactly once.
+    """
+    listing_ref = _contact_listing_ref(content, session)
+    if listing_ref is None:
+        return None
+    userid = msg.from_user
+    if not listing_ref:
+        return [_reply(userid, CONTACT_REQUEST_GUIDANCE_REPLY, intent="request_contact")]
+
+    try:
+        job_id = int(listing_ref.rsplit(":", 1)[1])
+        job = db.query(Job).filter(Job.id == job_id).first()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if (
+            job is None
+            or job.audit_status != "passed"
+            or job.deleted_at is not None
+            or (job.expires_at is not None and job.expires_at <= now)
+        ):
+            return [_reply(userid, CONTACT_UNAVAILABLE_REPLY, intent="request_contact")]
+
+        request = db.query(ContactRequest).filter(
+            ContactRequest.actor_id == userid,
+            ContactRequest.listing_ref == listing_ref,
+            ContactRequest.status.in_(("pending", "authorized")),
+        ).order_by(ContactRequest.created_at.desc()).first()
+        from app.listing.contact import ContactService
+
+        service = ContactService(db)
+        if request is None:
+            request = service.create_contact_request(
+                userid,
+                listing_ref,
+                listing_version=getattr(job, "version", None),
+                trace_id=msg.turn_id or msg.msg_id,
+                db=db,
+            )
+        request_id = request.request_id
+        grant = service.issue_one_time_grant(
+            request_id,
+            userid,
+            listing_ref,
+            listing_version=getattr(job, "version", None),
+            trace_id=msg.turn_id or msg.msg_id,
+            db=db,
+        )
+        if not hasattr(grant, "grant_id"):
+            return [_reply(userid, CONTACT_UNAVAILABLE_REPLY, intent="request_contact")]
+        result = service.redeem_grant(
+            grant.grant_id,
+            grant.token,
+            userid,
+            trace_id=msg.turn_id or msg.msg_id,
+            inbound_event_id=inbound_event_id,
+            userid=userid,
+            current_listing_version=getattr(job, "version", None),
+            listing_status=getattr(job, "audit_status", None),
+            actor_status=user_ctx.status,
+            db=db,
+        )
+        if result.success and inbound_event_id is not None:
+            return []
+        return [_reply(
+            userid,
+            result.message if result.success else CONTACT_UNAVAILABLE_REPLY,
+            intent="request_contact",
+        )]
+    except Exception:
+        logger.exception("message_router: contact request failed user_hash=%s", userid_hash(userid))
+        return [_reply(userid, CONTACT_UNAVAILABLE_REPLY, intent="request_contact")]
+
+
 def _render_v2_clarification(clarification: dict, session: SessionState) -> str:
     """按 clarification.kind 渲染反问文案。"""
     clar = clarification or {}
@@ -399,7 +511,13 @@ _WELCOME_WORKER = (
 # 公开入口
 # ---------------------------------------------------------------------------
 
-def process(msg: WeComMessage, db: Session, action_context=None) -> list[ReplyMessage]:
+def process(
+    msg: WeComMessage,
+    db: Session,
+    action_context=None,
+    user_context=None,
+    inbound_event_id=None,
+) -> list[ReplyMessage]:
     """消息路由主入口。Worker 调用，返回待发送的回复列表。"""
     userid = msg.from_user
     if not userid:
@@ -407,11 +525,14 @@ def process(msg: WeComMessage, db: Session, action_context=None) -> list[ReplyMe
         return []
 
     # 1. 用户识别 / 注册
-    try:
-        user_ctx = user_service.identify_or_register(userid, db)
-    except Exception as exc:
-        logger.exception("message_router: identify_or_register failed: %s", exc)
-        return [_reply(userid, SYSTEM_BUSY_REPLY)]
+    if user_context is not None:
+        user_ctx = user_context
+    else:
+        try:
+            user_ctx = user_service.identify_or_register(userid, db)
+        except Exception as exc:
+            logger.exception("message_router: identify_or_register failed: %s", exc)
+            return [_reply(userid, SYSTEM_BUSY_REPLY)]
 
     # 2. 状态拦截（blocked / deleted 短路）
     block_text = user_service.check_user_status(user_ctx)
@@ -430,7 +551,13 @@ def process(msg: WeComMessage, db: Session, action_context=None) -> list[ReplyMe
     try:
         mtype = msg.msg_type or ""
         if mtype == "text":
-            return _handle_text(msg, user_ctx, db, action_context=action_context)
+            return _handle_text(
+                msg,
+                user_ctx,
+                db,
+                action_context=action_context,
+                inbound_event_id=inbound_event_id,
+            )
         if mtype == "image":
             return _handle_image(msg, user_ctx, db)
         if mtype == "voice":
@@ -465,6 +592,7 @@ def _handle_text(
     db: Session,
     *,
     action_context=None,
+    inbound_event_id=None,
 ) -> list[ReplyMessage]:
     userid = msg.from_user
     content = (msg.content or "").strip()
@@ -596,6 +724,23 @@ def _handle_text(
 
     # 先把当前用户消息写入 history，再让 LLM 看到完整上下文
     conversation_service.record_history(session, "user", content)
+
+    # Contact is an explicit deterministic command.  It must resolve against
+    # the user's current search snapshot and run the full server-side
+    # authorize -> issue -> redeem flow; it is never delegated to the LLM.
+    contact_replies = _try_handle_contact(
+        content,
+        msg,
+        user_ctx,
+        session,
+        db,
+        inbound_event_id=inbound_event_id,
+    )
+    if contact_replies is not None:
+        if contact_replies:
+            _record_reply_history(session, contact_replies[0])
+        conversation_service.save_session(userid, session)
+        return contact_replies
 
     # 生产降级保护：pending_relaxation 是系统主动给出的二选一上下文。
     # 即使 dialogue_v2_mode=off、provider 超时或 v2 fallback，精确短回答也应完成

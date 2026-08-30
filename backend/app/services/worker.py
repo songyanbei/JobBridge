@@ -56,6 +56,7 @@ from app.models import (
     WecomInboundEvent,
     WecomOutboundOutbox,
     RecommendationDelivery,
+    ContactDelivery,
     User,
 )
 from app.schemas.conversation import ReplyMessage
@@ -67,6 +68,7 @@ from app.services import (
     message_router,
     recommendation_shadow_service,
     search_service,
+    user_service,
     upload_service,
 )
 from app.tasks.common import log_event
@@ -748,10 +750,16 @@ class Worker:
             # The default remains off; legacy turns never create Action rows.
             action_context = None
             action_claim = None
+            preloaded_user_context = None
             mode = getattr(settings, "action_execution_mode", "off")
             if msg.msg_type == "text" and mode in {"on", "shadow"}:
                 gateway = action_gateway.ActionGateway()
-                role = db.query(User.role).filter(User.external_userid == userid).scalar()
+                # The Router normally auto-registers users, but ActionGateway
+                # runs before Router.  Resolve the same registration boundary
+                # here so a first-touch worker can claim a search Action.
+                gateway_user = user_service.identify_or_register(userid, db)
+                preloaded_user_context = gateway_user
+                role = gateway_user.role
                 session_hint = conversation_service.load_session(userid)
                 envelope = gateway.classify(
                     msg, session=session_hint,
@@ -854,7 +862,13 @@ class Worker:
             )
             staged_session = None
             try:
-                replies = message_router.process(msg, db, action_context=action_context)
+                replies = message_router.process(
+                    msg,
+                    db,
+                    action_context=action_context,
+                    user_context=preloaded_user_context,
+                    inbound_event_id=inbound_event_id,
+                )
             finally:
                 submitted_shadow_request_ids.update(
                     recommendation_shadow_service.end_turn_tracking(
@@ -1707,6 +1721,7 @@ class Worker:
                 .with_entities(
                     WecomOutboundOutbox.id,
                     WecomOutboundOutbox.recommendation_delivery_id,
+                    WecomOutboundOutbox.contact_delivery_id,
                 )
                 .all()
             )
@@ -1723,6 +1738,7 @@ class Worker:
             item = self._claim_outbox_candidate(
                 int(candidate[0]),
                 candidate[1],
+                discovered_contact_delivery_id=candidate[2],
                 inbound_event_id=inbound_event_id,
             )
             if item is not None:
@@ -1775,6 +1791,19 @@ class Worker:
                     delivery.status = DELIVERY_UNKNOWN
                     delivery.last_error = stale.last_error
                     delivery.last_error_code = "sending_lease_expired"
+            stale_contacts = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.contact_delivery_id.isnot(None),
+            ).with_for_update(skip_locked=True).all()
+            for stale in stale_contacts:
+                stale.status = "pending"
+                stale.locked_at = None
+                stale.next_attempt_at = now
+                stale.last_error = "contact delivery lease expired; retrying same delivery"
+                delivery = db.get(ContactDelivery, stale.contact_delivery_id)
+                if delivery and delivery.status == "sending":
+                    delivery.status = "retry_wait"
             # outbox 行可能因为历史 SET NULL 或人工干预而丢失，仍然要保证 sending
             # 租约过期的 delivery 收敛到 unknown，而不是永远挂在 sending。
             db.query(RecommendationDelivery).filter(
@@ -1800,6 +1829,7 @@ class Worker:
         outbox_id: int,
         discovered_delivery_id: str | None,
         *,
+        discovered_contact_delivery_id: str | None = None,
         inbound_event_id: Any = None,
     ) -> dict | None:
         db = SessionLocal()
@@ -1840,8 +1870,17 @@ class Worker:
             if row is None:
                 db.rollback()
                 return None
-            if row.recommendation_delivery_id != discovered_delivery_id:
+            if (
+                row.recommendation_delivery_id != discovered_delivery_id
+                or row.contact_delivery_id != discovered_contact_delivery_id
+            ):
                 db.rollback()
+                return None
+            if row.recommendation_delivery_id and row.contact_delivery_id:
+                row.status = "dead_letter"
+                row.locked_at = None
+                row.last_error = "outbox delivery kind conflict"
+                db.commit()
                 return None
 
             content = row.content
@@ -1850,6 +1889,60 @@ class Worker:
                 if content is None:
                     db.commit()
                     return None
+            elif row.contact_delivery_id:
+                from app.listing.contact import (
+                    CONTACT_PLATFORM_REQUEST_MESSAGE,
+                )
+
+                contact_delivery = (
+                    db.query(ContactDelivery)
+                    .populate_existing()
+                    .filter(
+                        ContactDelivery.delivery_id == row.contact_delivery_id,
+                    )
+                    .with_for_update()
+                    .first()
+                )
+                if contact_delivery is None:
+                    row.status = "dead_letter"
+                    row.locked_at = None
+                    row.last_error = "contact delivery missing"
+                    db.commit()
+                    return None
+                if contact_delivery.status in {"sent", "revoked", "expired"}:
+                    row.status = "dead_letter"
+                    row.locked_at = None
+                    row.last_error = (
+                        f"contact delivery not sendable: {contact_delivery.status}"
+                    )
+                    db.commit()
+                    return None
+                if contact_delivery.expires_at <= datetime.now(timezone.utc).replace(tzinfo=None):
+                    contact_delivery.status = "expired"
+                    row.status = "dead_letter"
+                    row.locked_at = None
+                    row.last_error = "contact delivery expired"
+                    db.commit()
+                    return None
+                if contact_delivery.channel == "platform_request":
+                    content = CONTACT_PLATFORM_REQUEST_MESSAGE
+                elif not contact_delivery.content_ciphertext:
+                    row.status = "dead_letter"
+                    row.locked_at = None
+                    row.last_error = "contact delivery payload unavailable"
+                    db.commit()
+                    return None
+                else:
+                    row.status = "dead_letter"
+                    row.locked_at = None
+                    row.last_error = "unsupported contact delivery channel"
+                    db.commit()
+                    return None
+                contact_delivery.status = "sending"
+                contact_delivery.revoked_at = None
+                row.status = "sending"
+                row.locked_at = now
+                row.attempt_count = int(row.attempt_count or 0) + 1
             else:
                 row.status = "sending"
                 row.locked_at = now
@@ -1859,6 +1952,7 @@ class Worker:
                 "userid": row.userid,
                 "content": content or "",
                 "recommendation_delivery_id": row.recommendation_delivery_id,
+                "contact_delivery_id": row.contact_delivery_id,
                 "attempt_count": int(row.attempt_count),
             }
             db.commit()
@@ -2248,6 +2342,37 @@ class Worker:
             self._submit_immediate_impressions()
         return ok
 
+    def _mark_contact_delivery_sent(self, item: dict, response: Any) -> bool:
+        """Commit a ContactDelivery and its opaque outbox row as sent."""
+        delivery_id = item.get("contact_delivery_id")
+        if not delivery_id:
+            return False
+        msgid = response.get("msgid") if isinstance(response, dict) else None
+
+        def _persist(db: Session) -> bool:
+            outbox_updated = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.id == item["id"],
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.contact_delivery_id == delivery_id,
+            ).update({
+                "status": "sent",
+                "provider_msg_id": (str(msgid or ""))[:128] or None,
+                "sent_at": func.now(6),
+                "locked_at": None,
+                "next_attempt_at": None,
+                "last_error": None,
+            }, synchronize_session=False)
+            delivery_updated = db.query(ContactDelivery).filter(
+                ContactDelivery.delivery_id == delivery_id,
+                ContactDelivery.status == "sending",
+            ).update({
+                "status": "sent",
+                "sent_at": func.now(6),
+            }, synchronize_session=False)
+            return outbox_updated == 1 and delivery_updated == 1
+
+        return self._persist_after_send(f"contact_delivery:{delivery_id}", _persist)
+
     def _record_delivery_response(
         self,
         db: Session,
@@ -2337,6 +2462,15 @@ class Worker:
                 self._record_delivery_response(
                     db, delivery_id, response, delivery_values,
                 )
+            contact_delivery_id = item.get("contact_delivery_id")
+            if contact_delivery_id:
+                db.query(ContactDelivery).filter(
+                    ContactDelivery.delivery_id == contact_delivery_id,
+                    ContactDelivery.status == "sending",
+                ).update({
+                    "status": "revoked" if dead else "retry_wait",
+                    "revoke_reason": error_code if dead and terminal else None,
+                }, synchronize_session=False)
             db.commit()
             if dead:
                 self._write_send_failed_audit(
@@ -2403,6 +2537,8 @@ class Worker:
 
         if item.get("recommendation_delivery_id"):
             return self._mark_delivery_sent(item, response)
+        if item.get("contact_delivery_id"):
+            return self._mark_contact_delivery_sent(item, response)
         return self._mark_outbox_sent(
             item["id"],
             response.get("msgid") if isinstance(response, dict) else None,
