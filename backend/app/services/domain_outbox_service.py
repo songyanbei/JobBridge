@@ -55,12 +55,15 @@ def append_domain_event(
         tombstone=1 if tombstone else 0,
         occurred_at=(occurred_at or datetime.now(timezone.utc)).replace(tzinfo=None),
     )
-    db.add(event)
     try:
-        db.flush()
+        # Isolate the uniqueness race in a savepoint.  Rolling back the whole
+        # Session here would discard the caller's business mutation and break
+        # the required fact+event transaction boundary.
+        with db.begin_nested():
+            db.add(event)
+            db.flush()
     except IntegrityError:
         # Duplicate delivery is idempotent; leave the existing row untouched.
-        db.rollback()
         existing = db.query(DomainOutboxEvent).filter_by(
             aggregate_type=str(aggregate_type), aggregate_id=int(aggregate_id),
             aggregate_version=int(aggregate_version), event_type=str(event_type),
