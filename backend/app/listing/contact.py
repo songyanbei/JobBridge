@@ -202,7 +202,7 @@ class ContactService:
         session.flush()
         return ContactGrantMetadata(grant_id=grant.grant_id, token=token, expires_at=grant.expires_at)
 
-    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None) -> ContactResponse:
+    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None, current_listing_version: int | None = None, current_policy_version: str | None = None, listing_status: str | None = None, actor_status: str | None = None) -> ContactResponse:
         """Consume a grant once and create one stable delivery reference."""
         if not self.enabled:
             return self.unavailable()
@@ -218,6 +218,21 @@ class ContactService:
             return ContactResponse(success=False, code="invalid_grant", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.actor_id != str(actor_id):
             self.audit_contact_event("grant_redeem", "denied", "actor_mismatch", actor_id=actor_id, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        # Re-authorize mutable facts while the grant row is locked. Callers
+        # must provide these facts from a fresh listing/actor lookup; omitted
+        # values preserve B0 compatibility but never permit a mismatch.
+        if current_listing_version is not None and grant.listing_version is not None and int(current_listing_version) != int(grant.listing_version):
+            self.audit_contact_event("grant_redeem", "denied", "listing_version_changed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if current_policy_version is not None and grant.policy_version is not None and str(current_policy_version) != str(grant.policy_version):
+            self.audit_contact_event("grant_redeem", "denied", "policy_version_changed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if listing_status is not None and str(listing_status).lower() not in {"active", "passed", "published"}:
+            self.audit_contact_event("grant_redeem", "denied", "listing_not_active", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if actor_status is not None and str(actor_status).lower() in {"blocked", "deleted", "disabled"}:
+            self.audit_contact_event("grant_redeem", "denied", "actor_not_allowed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
             return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.expires_at <= _now():
             grant.status = "expired"

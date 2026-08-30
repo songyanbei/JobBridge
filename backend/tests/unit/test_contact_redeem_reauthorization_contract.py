@@ -1,0 +1,15 @@
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_redeem_rechecks_mutable_listing_policy_and_actor_state():
+    source = (ROOT / "app" / "listing" / "contact.py").read_text(encoding="utf-8")
+    assert "current_listing_version" in source
+    assert "current_policy_version" in source
+    assert "listing_version_changed" in source
+    assert "policy_version_changed" in source
+    assert "listing_not_active" in source
+    assert "actor_not_allowed" in source
+
