@@ -107,13 +107,13 @@ class TestFilterResumeForRole:
         user = {"display_name": "张三", "contact_available": False}
         filtered = filter_resume_for_role(resume, user, "factory", _snapshot("candidate_search", "factory"))
         assert filtered["contact_available"] is False
-        assert filtered["contact_placeholder"] == "联系方式需通过联系请求获取"
+        assert filtered["contact_placeholder"] == "联系方式不完整，请通过联系申请获取"
 
     def test_no_user_data(self):
         resume = _sample_resume()
         filtered = filter_resume_for_role(resume, None, "factory", _snapshot("candidate_search", "factory"))
         assert filtered["contact_available"] is False
-        assert filtered["contact_placeholder"] == "联系方式需通过联系请求获取"
+        assert filtered["contact_placeholder"] == "联系方式不完整，请通过联系申请获取"
 
 
 class TestBatchFiltering:

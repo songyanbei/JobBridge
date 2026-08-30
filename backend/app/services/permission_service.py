@@ -161,7 +161,9 @@ def filter_resume_for_role(
     # Keep the placeholder scoped to the sensitive field that policy exposed;
     # never add a contact marker when phone is hidden by policy.
     if "phone" in visible_fields:
-        candidate["contact_placeholder"] = "联系方式待补充"
+        # Preserve the legacy non-PII wording consumed by admin/search
+        # contracts; the field remains an opaque contact-request prompt.
+        candidate["contact_placeholder"] = "联系方式不完整，请通过联系申请获取"
         candidate["phone_placeholder"] = "联系方式待补充"
     return _project_visible_candidate(
         candidate, visible_fields, _RESUME_CANDIDATE_KEYS,
