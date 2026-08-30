@@ -11,7 +11,7 @@ from app.listing.contact import (
     contact_reference,
     is_listing_version_current,
 )
-from app.services.job_lifecycle_service import contact_version_is_current, transition_job
+from app.services.job_lifecycle_service import _emit, contact_version_is_current, transition_job
 
 
 def _job(**overrides):
@@ -94,6 +94,17 @@ def test_transition_bumps_aggregate_version_for_every_mutation(monkeypatch, acti
     assert job.aggregate_version == 11
     assert append_domain_event.call_args.kwargs["aggregate_version"] == 11
     assert append_domain_event.call_args.kwargs["event_type"] == event_type
+
+
+def test_emit_missing_domain_outbox_table_keeps_legacy_pending_event(monkeypatch):
+    append_domain_event = MagicMock()
+    monkeypatch.setitem(sys.modules, "app.services.domain_outbox_service", SimpleNamespace(append_domain_event=append_domain_event))
+    monkeypatch.setattr("app.services.job_lifecycle_service.inspect", lambda _: SimpleNamespace(has_table=lambda _: False))
+    db = MagicMock(); db.info = {}; db.bind = SimpleNamespace(dialect=SimpleNamespace(name="mysql"))
+    job = _job(id=10, aggregate_version=4)
+    _emit(db, job, "job.delisted", reason="manual_delist", tombstone=True)
+    append_domain_event.assert_not_called()
+    assert db.info["pending_job_lifecycle_events"][0]["aggregate_version"] == 4
 
 
 def test_phase14_media_migration_is_additive():

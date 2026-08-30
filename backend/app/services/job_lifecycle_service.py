@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
@@ -24,6 +25,23 @@ def _bump_versions(job: Job, current_version: int) -> None:
     job.version = int(current_version) + 1
     previous_aggregate = getattr(job, "aggregate_version", None)
     job.aggregate_version = int(previous_aggregate or current_version or 1) + 1
+
+
+def _domain_outbox_available(db: Session | None) -> bool:
+    """Detect the additive event table without disturbing an open transaction."""
+    bind = getattr(db, "bind", None) if db is not None else None
+    if bind is None:
+        return False
+    try:
+        connection = bind
+        if (
+            getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+            and db.in_transaction()
+        ):
+            connection = db.connection()
+        return bool(inspect(connection).has_table("domain_outbox_event"))
+    except Exception:
+        return False
 
 
 def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, tombstone: bool = False) -> None:
@@ -49,6 +67,9 @@ def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, 
     try:
         from app.services.domain_outbox_service import append_domain_event
     except ImportError:
+        db.info.setdefault("pending_job_lifecycle_events", []).append(payload)
+        return
+    if not _domain_outbox_available(db):
         db.info.setdefault("pending_job_lifecycle_events", []).append(payload)
         return
     append_domain_event(
