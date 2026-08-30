@@ -367,8 +367,19 @@ class JobSearchFacade:
             cards = self.cards_for_snapshot(actor, session, db, result)
         except Exception as exc:
             self._record_fallback(type(exc).__name__, action="relax_search", actor=actor, turn=turn)
-            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="card_projection_failed")
-        return FacadeResult(result, outcome, cards, used_facade=True)
+            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="card_projection_failed", action_result_ref={
+                "request_id": getattr(result, "request_id", None),
+                "snapshot_id": getattr(result, "snapshot_id", None),
+                "step": step,
+                "result_schema_version": "relax.v1",
+            })
+        return FacadeResult(result, outcome, cards, used_facade=True, action_result_ref={
+            "request_id": getattr(result, "request_id", None),
+            "snapshot_id": getattr(result, "snapshot_id", None),
+            "step": step,
+            "original_criteria_digest": pending.get("criteria_digest"),
+            "result_schema_version": "relax.v1",
+        })
 
     def cards_for_snapshot(self, actor, session, db, result, *, page_ids: list[str] | None = None) -> list[ListingCard]:
         from app.services import permission_service, search_service

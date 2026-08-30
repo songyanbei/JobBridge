@@ -619,7 +619,7 @@ def _handle_text(
             state_transition=relaxation_transition,
         )
         replies = _route_v2_relaxation_response(
-            decision, msg, user_ctx, session, db,
+            decision, msg, user_ctx, session, db, action_context=action_context,
         )
         replies = _finalize_action_plan_replies(replies)
         if replies:
@@ -762,7 +762,7 @@ def _handle_text(
                         decision, session, msg=msg, intent_result=intent_result, db=db,
                     )
                 replies = _route_v2_relaxation_response(
-                    decision, msg, user_ctx, session, db,
+                    decision, msg, user_ctx, session, db, action_context=action_context,
                 )
                 replies = _finalize_action_plan_replies(replies)
                 if replies:
@@ -892,6 +892,8 @@ def _dispatch_intent(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     """按意图分发到具体 handler。"""
     userid = msg.from_user
@@ -909,7 +911,9 @@ def _dispatch_intent(
         if intent == "follow_up":
             return _handle_follow_up(intent_result, msg, user_ctx, session, db)
         if intent == "show_more":
-            return _handle_show_more(msg, user_ctx, session, db, action_context=action_context)
+            return _handle_show_more(
+                msg, user_ctx, session, db, action_context=action_context,
+            )
         if intent == "chitchat":
             return [_reply(userid, _chitchat_text(user_ctx))]
         # 未知意图兜底
@@ -934,10 +938,15 @@ def _route_idle(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     """idle 状态：复用现有 _dispatch_intent 即可；upload/search handler 内部
     会按需把 active_flow 推进到 upload_collecting / search_active。"""
-    return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+    return _dispatch_intent(
+        intent_result, msg, user_ctx, session, db,
+        action_context=action_context,
+    )
 
 
 def _route_search_active(
@@ -946,6 +955,8 @@ def _route_search_active(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     """search_active 状态（spec §2.8）。
 
@@ -961,12 +972,18 @@ def _route_search_active(
         session.shown_items = []
         # active_flow 暂回 idle，由 upload handler 内部按 missing/success 决定下一步状态
         session.active_flow = "idle"
-        return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+        return _dispatch_intent(
+            intent_result, msg, user_ctx, session, db,
+            action_context=action_context,
+        )
 
     if intent == "chitchat":
         return [_reply(userid, _chitchat_text(user_ctx))]
 
-    return _dispatch_intent(intent_result, msg, user_ctx, session, db)
+    return _dispatch_intent(
+        intent_result, msg, user_ctx, session, db,
+        action_context=action_context,
+    )
 
 
 def _route_command_with_state_guard(
@@ -1256,6 +1273,8 @@ def _route_v2_relaxation_response(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     """Phase 5 §5.2.1.5 执行归属表 / §5.2.3 message_router 行：放宽确认派发。
 
