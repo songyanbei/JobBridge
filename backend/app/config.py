@@ -244,11 +244,43 @@ class Settings(BaseSettings):
     action_show_more_enabled: bool = False
     action_relax_enabled: bool = False
     contact_service_mode: Literal["off", "shadow", "on"] = "off"
+    contact_grant_ttl_seconds: int = 60
+    contact_rate_per_listing_window_seconds: int = 600
+    contact_rate_per_listing_limit: int = 3
+    contact_daily_limit: int = 30
+    contact_delivery_ttl_seconds: int = 300
+    pii_active_key_version: int = 1
+    pii_keyring_ref: str = ""
+    pii_migration_batch_size: int = 100
     action_execution_auto_kill_switch: bool = True
     monitor_action_stale_lease_max_age_seconds: int = 300
     monitor_action_replay_backlog_max_age_seconds: int = 600
     monitor_action_replay_backlog_threshold: int = 0
     monitor_action_missing_reference_threshold: int = 0
+
+    @field_validator(
+        "contact_grant_ttl_seconds",
+        "contact_rate_per_listing_window_seconds",
+        "contact_rate_per_listing_limit",
+        "contact_daily_limit",
+        "contact_delivery_ttl_seconds",
+        "pii_migration_batch_size",
+        mode="after",
+    )
+    @classmethod
+    def _valid_contact_positive_limits(cls, value: int) -> int:
+        value = int(value)
+        if value <= 0:
+            raise ValueError("contact/PII limits must be positive")
+        return value
+
+    @field_validator("pii_active_key_version", mode="after")
+    @classmethod
+    def _valid_pii_key_version(cls, value: int) -> int:
+        value = int(value)
+        if not 1 <= value <= 65535:
+            raise ValueError("pii_active_key_version must be between 1 and 65535")
+        return value
 
     @field_validator("job_search_facade_rollout_percentage", mode="after")
     @classmethod

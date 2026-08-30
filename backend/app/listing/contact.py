@@ -71,13 +71,13 @@ class ContactDecision:
 class ContactService:
     """Server-side contact request/grant state machine."""
 
-    def __init__(self, db: Session | None = None, *, mode: str | None = None, redis_client=None, rate_window_seconds: int = 600, rate_limit: int = 3, daily_limit: int = 30):
+    def __init__(self, db: Session | None = None, *, mode: str | None = None, redis_client=None, rate_window_seconds: int | None = None, rate_limit: int | None = None, daily_limit: int | None = None):
         self.db = db
         self.mode = str(mode if mode is not None else getattr(settings, "contact_service_mode", "off")).lower()
         self.redis_client = redis_client
-        self.rate_window_seconds = max(1, int(rate_window_seconds))
-        self.rate_limit = max(1, int(rate_limit))
-        self.daily_limit = max(1, int(daily_limit))
+        self.rate_window_seconds = max(1, int(rate_window_seconds if rate_window_seconds is not None else getattr(settings, "contact_rate_per_listing_window_seconds", 600)))
+        self.rate_limit = max(1, int(rate_limit if rate_limit is not None else getattr(settings, "contact_rate_per_listing_limit", 3)))
+        self.daily_limit = max(1, int(daily_limit if daily_limit is not None else getattr(settings, "contact_daily_limit", 30)))
 
     @property
     def enabled(self) -> bool:
@@ -234,7 +234,7 @@ class ContactService:
             delivery_id="cd_" + secrets.token_urlsafe(24).rstrip("="), grant_id=grant.grant_id,
             actor_id=grant.actor_id, listing_ref=grant.listing_ref, channel="platform_request",
             content_ciphertext=None, key_version=None, content_hash=None,
-            status="prepared", expires_at=grant.expires_at,
+            status="prepared", expires_at=_now() + timedelta(seconds=max(1, int(getattr(settings, "contact_delivery_ttl_seconds", 300)))),
         )
         session.add(delivery)
         if inbound_event_id is not None:
