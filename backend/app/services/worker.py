@@ -178,6 +178,7 @@ def _build_outbox_claim_query(
     outbox_id: int | None = None,
     limit: int = OUTBOX_CLAIM_BATCH_SIZE,
     lock_rows: bool = True,
+    check_inbound_done: bool = True,
 ):
     earlier = aliased(WecomOutboundOutbox)
     no_earlier_unsent_for_user = ~exists().where(and_(
@@ -194,16 +195,21 @@ def _build_outbox_claim_query(
         earlier_delivery.delivery_order < current_delivery.delivery_order,
         earlier_delivery.status.in_(DELIVERY_ACTIVE_STATUSES),
     ))
-    inbound_done = exists().where(and_(
-        WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
-        WecomInboundEvent.status == "done",
-    ))
-    query = db.query(WecomOutboundOutbox).filter(
+    predicates = [
         due,
         no_earlier_unsent_for_user,
         no_earlier_active_delivery,
-        inbound_done,
-    )
+    ]
+    if check_inbound_done:
+        # Keep this predicate in discovery reads.  Locking reads disable it
+        # for the claim transaction because MySQL may lock/skip the matching
+        # inbound row under FOR UPDATE SKIP LOCKED; the claim path performs a
+        # separate consistent read after locking only the outbox row.
+        predicates.append(exists().where(and_(
+            WecomInboundEvent.id == WecomOutboundOutbox.inbound_event_id,
+            WecomInboundEvent.status == "done",
+        )))
+    query = db.query(WecomOutboundOutbox).filter(*predicates)
     if inbound_event_id:
         query = query.filter(
             WecomOutboundOutbox.inbound_event_id == int(inbound_event_id),
@@ -1863,11 +1869,22 @@ class Worker:
                     inbound_event_id=inbound_event_id,
                     outbox_id=outbox_id,
                     limit=1,
+                    check_inbound_done=False,
                 )
                 .populate_existing()
                 .first()
             )
             if row is None:
+                db.rollback()
+                return None
+            # Validate the source event without extending the outbox lock
+            # scope to the inbound row.  A consistent read remains available
+            # while the dispatcher/worker owns that row's lock.
+            inbound_done = db.query(WecomInboundEvent.id).filter(
+                WecomInboundEvent.id == row.inbound_event_id,
+                WecomInboundEvent.status == "done",
+            ).first()
+            if inbound_done is None:
                 db.rollback()
                 return None
             if (
