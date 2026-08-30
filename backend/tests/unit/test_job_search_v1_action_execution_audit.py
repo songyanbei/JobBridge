@@ -1,4 +1,4 @@
-"""Audit guards for the intentionally-unintegrated v1 action execution contract."""
+"""Audit guards for the v1 action execution integration boundary."""
 
 import inspect
 
@@ -12,13 +12,17 @@ from app.services.action_execution_service import (
 )
 
 
-def test_search_production_modules_do_not_partially_integrate_action_execution():
-    """A partial claim/finalize wrapper would create un-replayable facts."""
-    for module in (worker, message_router, listing_search):
+def test_search_modules_leave_action_lease_to_worker_gateway():
+    """Router and Facade stay side-effect free; Worker owns the lease boundary."""
+    for module in (message_router, listing_search):
         source = inspect.getsource(module)
         assert "action_execution_service" not in source
         assert "claim_action_execution" not in source
         assert "finalize_action_execution" not in source
+
+    worker_source = inspect.getsource(worker)
+    assert "claim_action_execution" in worker_source
+    assert "finalize_action_execution" in worker_source
 
 
 def test_turn_id_reaches_worker_router_message_boundary():
@@ -44,10 +48,13 @@ def test_session_cas_is_after_the_business_db_commit():
     assert db_commit < session_apply
 
 
-def test_action_row_cannot_replay_a_search_snapshot_by_itself():
-    """The current row stores only a digest, which is the replay blocker."""
+def test_action_row_stores_replay_references_without_result_payload():
+    """Replay uses durable references; full result bodies never belong on the row."""
     assert hasattr(ActionExecution, "result_digest")
-    assert not hasattr(ActionExecution, "snapshot_id")
+    assert hasattr(ActionExecution, "snapshot_id")
+    assert hasattr(ActionExecution, "request_id")
+    assert hasattr(ActionExecution, "result_schema_version")
+    assert hasattr(ActionExecution, "replay_count")
     assert not hasattr(ActionExecution, "result_payload")
     assert all(
         callable(function)
