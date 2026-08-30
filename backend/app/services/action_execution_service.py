@@ -28,10 +28,22 @@ SUPPORTED_ACTIONS = frozenset({"search_job", "show_more_job", "relax_job"})
 def _available_columns(db: Session) -> set[str]:
     """Allow mixed-version workers to read/write the pre-A0 table safely."""
     try:
-        bind = db.get_bind()
-        return {column["name"] for column in inspect(bind).get_columns("action_execution")}
+        # Inspect through the Session's active connection. Inspecting the Engine
+        # opens a second transaction; on SQLite in-memory fixtures that can
+        # rollback an uncommitted lease reclaim on the shared connection.
+        connection = db.connection()
+        return {column["name"] for column in inspect(connection).get_columns("action_execution")}
     except Exception:
         return set()
+
+
+def _detach_claim_row(db: Session, row: ActionExecution) -> ActionExecution:
+    """Prevent a caller-held pre-fence ORM object from being autoflushed later."""
+    try:
+        db.expunge(row)
+    except Exception:
+        pass
+    return row
 
 
 class ActionExecutionConflict(ValueError):
@@ -250,7 +262,7 @@ def claim_action_execution(
             row = read_action_execution(db, turn_id, action_name, for_update=True)
             if row is None:
                 raise ActionExecutionStateError("action_insert_readback_missing")
-            return ActionClaim("acquired", row, 1, None)
+            return ActionClaim("acquired", _detach_claim_row(db, row), 1, None)
 
     if request_digest is not None and row.request_digest not in (None, request_digest):
         raise ActionExecutionConflict("request_digest_mismatch")
@@ -259,7 +271,7 @@ def claim_action_execution(
     if state != "acquired":
         return ActionClaim(
             state,
-            row,
+            _detach_claim_row(db, row),
             int(row.fencing_token or 0),
             row.result_digest,
         )
@@ -284,7 +296,7 @@ def claim_action_execution(
     row = read_action_execution(db, turn_id, action_name, for_update=True)
     if row is None:
         raise ActionExecutionStateError("action_reclaim_readback_missing")
-    return ActionClaim("acquired", row, next_token, None)
+    return ActionClaim("acquired", _detach_claim_row(db, row), next_token, None)
 
 
 def finalize_action_execution(
