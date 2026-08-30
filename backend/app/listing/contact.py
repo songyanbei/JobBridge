@@ -244,7 +244,8 @@ class ContactService:
             return ContactResponse(success=False, code="revoked", message=CONTACT_UNAVAILABLE_MESSAGE)
         # ``platform_request`` is a safe, PII-free acknowledgement.  It uses
         # a fixed Worker template and therefore does not need a ciphertext;
-        # channels carrying actual contact values must provide ciphertext.
+        # channels carrying actual contact values must provide ciphertext; the
+        # dispatcher never falls back to legacy phone or WeChat columns.
         now = _now()
         grant.status, grant.used_at = "used", now
         delivery = ContactDelivery(
