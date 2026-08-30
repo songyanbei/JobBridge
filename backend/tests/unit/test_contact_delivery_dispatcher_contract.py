@@ -39,9 +39,14 @@ def test_contact_delivery_migration_uses_mysql_safe_idempotent_kind_triggers():
     assert "trg_outbox_single_delivery_kind_upd" in lowered
     assert "before insert" in lowered
     assert "before update" in lowered
-    assert "signal sqlstate ''45000''" in lowered
-    # Both trigger creation and the optional legacy CHECK drop are guarded by
-    # information_schema lookups, so a run interrupted after ALTER succeeds.
-    assert "information_schema.triggers" in lowered
+    assert "signal sqlstate '45000'" in lowered
+    # The optional legacy CHECK drop remains guarded, while trigger DDL uses
+    # native DROP/CREATE (PREPARE cannot create triggers in MySQL 8, ERROR 1295).
     assert "information_schema.table_constraints" in lowered
     assert "drop check `ck_outbox_single_delivery_kind`" in lowered
+    assert "drop trigger if exists `trg_outbox_single_delivery_kind_ins`" in lowered
+    assert "drop trigger if exists `trg_outbox_single_delivery_kind_upd`" in lowered
+    assert "delimiter $$" in lowered
+    assert "delimiter ;" in lowered
+    trigger_block = lowered.split("drop trigger if exists", 1)[1]
+    assert "prepare stmt" not in trigger_block
