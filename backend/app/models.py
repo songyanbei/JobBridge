@@ -857,6 +857,21 @@ class ActionExecution(Base):
     )
     request_digest = sa.Column(mysql.CHAR(64), nullable=True, comment="规范化请求 SHA-256")
     result_digest = sa.Column(mysql.CHAR(64), nullable=True, comment="结果/快照 SHA-256")
+    action_version = sa.Column(sa.String(32), nullable=False, server_default="v1", comment="Action 契约版本")
+    result_ref_type = sa.Column(sa.String(32), nullable=True, comment="结果引用类型")
+    request_id = sa.Column(sa.String(36), nullable=True, comment="推荐 request 引用")
+    snapshot_id = sa.Column(sa.String(36), nullable=True, comment="最终 snapshot 引用")
+    delivery_ids = sa.Column(sa.JSON, nullable=True, comment="RecommendationDelivery 主键集合")
+    outbox_ids = sa.Column(sa.JSON, nullable=True, comment="Outbox 主键集合")
+    session_commit_id = sa.Column(sa.String(36), nullable=True, comment="durable Session commit 引用")
+    result_schema_version = sa.Column(sa.String(32), nullable=True, comment="结果引用 schema 版本")
+    failure_code = sa.Column(sa.String(64), nullable=True, comment="稳定失败原因码")
+    replay_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    last_replayed_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    parse_ref = sa.Column(sa.String(36), nullable=True, comment="ActionParseArtifact 引用")
+    parse_digest = sa.Column(mysql.CHAR(64), nullable=True, comment="解析产物 SHA-256")
+    parse_version = sa.Column(sa.String(32), nullable=True, comment="解析 schema 版本")
+    parse_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True, comment="解析产物过期时间")
     lease_owner = sa.Column(sa.String(64), nullable=True, comment="当前 Worker owner")
     lease_until = sa.Column(
         mysql.DATETIME(fsp=6), nullable=True, comment="当前 lease 到期时间；过期后才可抢占",
@@ -874,6 +889,31 @@ class ActionExecution(Base):
         sa.UniqueConstraint("turn_id", "action_name", name="uk_action_execution_turn_action"),
         sa.Index("idx_action_execution_claim", "status", "lease_until", "id"),
         sa.Index("idx_action_execution_turn", "turn_id", "id"),
+        sa.Index("idx_action_execution_request_snapshot", "request_id", "snapshot_id"),
+        sa.Index("idx_action_execution_replay", "status", "last_replayed_at", "id"),
+    )
+
+
+class ActionParseArtifact(Base):
+    """PII-free, short-lived parse artifact shared by Gateway and Router."""
+
+    __tablename__ = "action_parse_artifact"
+
+    parse_ref = sa.Column(sa.String(36), primary_key=True)
+    turn_id = sa.Column(sa.String(36), nullable=False)
+    actor_userid = sa.Column(sa.String(64), nullable=False)
+    parse_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    schema_version = sa.Column(sa.String(32), nullable=False)
+    classifier_version = sa.Column(sa.String(64), nullable=False)
+    session_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    payload = sa.Column(sa.JSON, nullable=False)
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("turn_id", "parse_digest", name="uk_action_parse_turn_digest"),
+        sa.Index("idx_action_parse_expires", "expires_at", "parse_ref"),
+        sa.Index("idx_action_parse_turn", "turn_id", "created_at"),
     )
 
 

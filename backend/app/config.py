@@ -232,6 +232,18 @@ class Settings(BaseSettings):
     job_search_facade_rollout_percentage: int = 0
     job_search_facade_timeout_ms: int = 5000
 
+    # Workstream A Action execution remains fail-closed until explicitly rolled out.
+    action_execution_mode: Literal["off", "shadow", "on"] = "off"
+    action_execution_rollout_percentage: int = 0
+    action_execution_lease_seconds: int = 180
+    action_replay_max_attempts: int = 5
+    action_replay_stale_seconds: int = 3600
+    action_parse_cache_ttl_seconds: int = 60
+    action_parse_artifact_retention_seconds: int = 86400
+    action_execution_search_enabled: bool = False
+    action_show_more_enabled: bool = False
+    action_relax_enabled: bool = False
+
     @field_validator("job_search_facade_rollout_percentage", mode="after")
     @classmethod
     def _valid_job_search_facade_rollout(cls, value: int) -> int:
@@ -798,6 +810,59 @@ class Settings(BaseSettings):
     monitor_session_commit_pending_max_age_seconds: int = 300
     monitor_send_retry_threshold: int = 20
     monitor_alert_dedupe_seconds: int = 600
+
+    # Workstream C rollout/observation controls.  These are deliberately
+    # fail-closed: Action execution remains off until an operator enables it.
+    action_execution_mode: Literal["off", "shadow", "on"] = "off"
+    action_execution_rollout_percentage: int = 0
+    action_execution_lease_seconds: int = 300
+    action_replay_max_attempts: int = 5
+    action_replay_stale_seconds: int = 600
+    action_parse_cache_ttl_seconds: int = 60
+    action_parse_artifact_retention_seconds: int = 86400
+    contact_service_mode: Literal["off", "shadow", "on"] = "off"
+    action_execution_auto_kill_switch: bool = True
+    monitor_action_stale_lease_max_age_seconds: int = 300
+    monitor_action_replay_backlog_max_age_seconds: int = 600
+    monitor_action_replay_backlog_threshold: int = 0
+    monitor_action_missing_reference_threshold: int = 0
+
+    @field_validator("action_execution_rollout_percentage", mode="after")
+    @classmethod
+    def _valid_action_rollout(cls, value: int) -> int:
+        value = int(value)
+        if not 0 <= value <= 100:
+            raise ValueError("action_execution_rollout_percentage must be between 0 and 100")
+        return value
+
+    @field_validator(
+        "action_execution_lease_seconds",
+        "action_replay_max_attempts",
+        "action_replay_stale_seconds",
+        "action_parse_cache_ttl_seconds",
+        "action_parse_artifact_retention_seconds",
+        "monitor_action_stale_lease_max_age_seconds",
+        "monitor_action_replay_backlog_max_age_seconds",
+        mode="after",
+    )
+    @classmethod
+    def _valid_action_positive_limits(cls, value: int) -> int:
+        value = int(value)
+        if value <= 0:
+            raise ValueError("action observation limits must be positive")
+        return value
+
+    @field_validator(
+        "monitor_action_replay_backlog_threshold",
+        "monitor_action_missing_reference_threshold",
+        mode="after",
+    )
+    @classmethod
+    def _valid_action_thresholds(cls, value: int) -> int:
+        value = int(value)
+        if value < 0:
+            raise ValueError("action observation thresholds must be non-negative")
+        return value
 
     @property
     def is_development(self) -> bool:
