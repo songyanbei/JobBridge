@@ -1522,4 +1522,9 @@ def _bootstrap_field_constants_from_schema() -> None:
     g["_SEARCH_FIELD_REMAP"] = _ss.search_synonyms()
 
 
+def classify_for_action_gateway(**kwargs):
+    """Single-parse adapter shared by ActionGateway and the Router."""
+    return classify_dialogue(**kwargs)
+
+
 _bootstrap_field_constants_from_schema()
