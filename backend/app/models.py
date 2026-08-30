@@ -227,8 +227,8 @@ class ContactRequest(Base):
     revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     revoke_reason = sa.Column(sa.String(64), nullable=True)
     trace_id = sa.Column(sa.String(64), nullable=True)
-    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
-    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6OnUpdate(), server_onupdate=_CurrentTimestamp6())
 
     __table_args__ = (
         sa.Index("idx_contact_request_actor", "actor_id", "created_at", "request_id"),
@@ -256,7 +256,7 @@ class ContactGrant(Base):
     revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     revoke_reason = sa.Column(sa.String(64), nullable=True)
     trace_id = sa.Column(sa.String(64), nullable=True)
-    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
 
     __table_args__ = (
         sa.Index("idx_contact_grant_actor", "actor_id", "created_at", "grant_id"),
@@ -280,7 +280,7 @@ class ContactAccessAudit(Base):
     request_id = sa.Column(sa.String(64), nullable=True)
     grant_id = sa.Column(sa.String(64), nullable=True)
     trace_id = sa.Column(sa.String(64), nullable=True)
-    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
 
     __table_args__ = (
         sa.Index("idx_contact_audit_trace", "trace_id", "created_at"),
@@ -307,7 +307,7 @@ class ContactDelivery(Base):
     revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     revoke_reason = sa.Column(sa.String(64), nullable=True)
     sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
-    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
 
     __table_args__ = (
         sa.Index("idx_contact_delivery_due", "status", "expires_at", "delivery_id"),
