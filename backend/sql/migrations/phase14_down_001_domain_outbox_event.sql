@@ -1,0 +1,3 @@
+-- Phase 14 rollback: stop event consumers and retain facts/events by default.
+-- Physical DROP is intentionally omitted; removal requires backup, checksum and
+-- operator approval after all binaries no longer reference the additive schema.

@@ -193,6 +193,12 @@ class Job(Base):
         mysql.INTEGER(unsigned=True), nullable=False,
         server_default=sa.text("1"), comment="乐观锁版本号",
     )
+    # Phase 14 monotonic fact-source version. Kept alongside legacy version
+    # during the additive migration window.
+    aggregate_version = sa.Column(
+        mysql.BIGINT(unsigned=True), nullable=False,
+        server_default=sa.text("1"), comment="领域聚合版本号",
+    )
     extra = sa.Column(MutableDict.as_mutable(sa.JSON), nullable=True, comment="扩展字段（§7.6）")
 
     __table_args__ = (
@@ -202,6 +208,31 @@ class Job(Base):
         sa.Index("idx_job_candidate_expiry", "audit_status", "candidate_expires_at"),
         sa.Index("idx_filter_hot", "city", "job_category", "is_long_term", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary", "salary_floor_monthly"),
+    )
+
+
+# Phase 14: versioned domain events emitted with fact-source writes.
+class DomainOutboxEvent(Base):
+    """Versioned, privacy-safe domain event for fact-source changes."""
+    __tablename__ = "domain_outbox_event"
+
+    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    aggregate_type = sa.Column(sa.String(32), nullable=False)
+    aggregate_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    aggregate_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
+    event_type = sa.Column(sa.String(64), nullable=False)
+    payload = sa.Column(sa.JSON, nullable=False)
+    payload_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    trace_id = sa.Column(sa.String(64), nullable=True)
+    occurred_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+    tombstone = sa.Column(sa.Boolean, nullable=False, server_default=sa.text("0"))
+    status = sa.Column(sa.Enum("pending", "processing", "published", "dead_letter", name="domain_outbox_status"), nullable=False, server_default="pending")
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
+
+    __table_args__ = (
+        sa.UniqueConstraint("aggregate_type", "aggregate_id", "aggregate_version", "event_type", name="uq_domain_outbox_versioned_event"),
+        sa.Index("idx_domain_outbox_pending", "status", "occurred_at", "id"),
+        sa.Index("idx_domain_outbox_aggregate", "aggregate_type", "aggregate_id", "aggregate_version"),
     )
 
 

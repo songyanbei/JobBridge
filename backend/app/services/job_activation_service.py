@@ -13,6 +13,16 @@ def activate_job(db: Session, job: Job, now: datetime | None = None) -> Job:
     job.expires_at = now + timedelta(days=get_job_ttl_days(db))
     job.candidate_expires_at = None
     job.version = int(job.version or 0) + 1
-    if db is not None:
+    job.aggregate_version = int(getattr(job, "aggregate_version", None) or job.version or 1) + 1
+    if db is not None and getattr(job, "id", None) is not None:
         db.flush()
+        from app.services.domain_outbox_service import append_domain_event
+        append_domain_event(
+            db,
+            aggregate_type="job",
+            aggregate_id=int(job.id),
+            aggregate_version=int(job.aggregate_version),
+            event_type="job.published",
+            payload={"job_id": int(job.id), "status": "published", "reason": "activation"},
+        )
     return job
