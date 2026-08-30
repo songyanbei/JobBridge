@@ -140,8 +140,14 @@ def load_replay_reference(
     row = read_action_execution(db, turn_id, action_name)
     if row is None or row.status != "succeeded":
         raise ActionExecutionStateError("action_not_replayable")
-    if actor_userid is not None and getattr(row, "actor_userid", None) not in (None, actor_userid):
-        raise ActionExecutionStateError("actor_binding_mismatch")
+    if actor_userid is not None:
+        bound_actor = getattr(row, "actor_userid", None)
+        if not bound_actor:
+            # A succeeded legacy row without an actor binding must never be
+            # replayed by an arbitrary account.
+            raise ActionExecutionStateError("actor_binding_missing")
+        if bound_actor != actor_userid:
+            raise ActionExecutionStateError("actor_binding_mismatch")
     if action_name not in SUPPORTED_ACTIONS:
         raise ActionExecutionStateError("unsupported_action")
     if row.turn_id != turn_id or not row.result_ref_type or not row.result_schema_version:
@@ -299,8 +305,12 @@ def claim_action_execution(
 
     if request_digest is not None and row.request_digest not in (None, request_digest):
         raise ActionExecutionConflict("request_digest_mismatch")
-    if actor_userid is not None and getattr(row, "actor_userid", None) not in (None, actor_userid):
-        raise ActionExecutionConflict("actor_binding_mismatch")
+    if actor_userid is not None:
+        bound_actor = getattr(row, "actor_userid", None)
+        if not bound_actor:
+            raise ActionExecutionConflict("actor_binding_missing")
+        if bound_actor != actor_userid:
+            raise ActionExecutionConflict("actor_binding_mismatch")
 
     state = _state_for_row(row, now_value)
     if state != "acquired":
