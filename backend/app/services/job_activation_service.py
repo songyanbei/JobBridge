@@ -35,18 +35,20 @@ def activate_job(db: Session, job: Job, now: datetime | None = None) -> Job:
     job.activated_at = now
     job.expires_at = now + timedelta(days=get_job_ttl_days(db))
     job.candidate_expires_at = None
-    job.version = int(job.version or 0) + 1
+    current_version = int(job.version or 0)
+    current_aggregate = int(getattr(job, "aggregate_version", None) or 0)
+    job.version = current_version + 1
+    job.aggregate_version = max(current_version, current_aggregate) + 1
     try:
         from app.models import MediaAssetLifecycle
         db.query(MediaAssetLifecycle).filter(
             MediaAssetLifecycle.entity_type == "job",
             MediaAssetLifecycle.entity_id == job.id,
             MediaAssetLifecycle.state == "attached",
-        ).update({"entity_version": int(getattr(job, "aggregate_version", None) or job.version)}, synchronize_session=False)
+        ).update({"entity_version": int(job.aggregate_version)}, synchronize_session=False)
     except Exception:
         # Mixed fleets may still run without the additive media column.
         pass
-    job.aggregate_version = int(getattr(job, "aggregate_version", None) or job.version or 1) + 1
     if db is not None and getattr(job, "id", None) is not None:
         db.flush()
         if _domain_outbox_available(db):

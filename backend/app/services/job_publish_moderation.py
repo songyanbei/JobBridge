@@ -91,7 +91,9 @@ def apply_job_moderation(
     job.audit_reason = decision.reason or None
     job.audited_by = operator
     job.audited_at = now
+    current_aggregate = int(getattr(job, "aggregate_version", None) or 0)
     job.version = current_version + 1
+    job.aggregate_version = max(current_version, current_aggregate) + 1
     db.add(AuditLog(
         target_type="job", target_id=str(job.id), action=f"moderation_{decision.status}",
         reason=f"{decision.rule_version}:{decision.reason}" if decision.reason else decision.rule_version,

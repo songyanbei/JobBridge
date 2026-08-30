@@ -96,6 +96,20 @@ def test_transition_bumps_aggregate_version_for_every_mutation(monkeypatch, acti
     assert append_domain_event.call_args.kwargs["event_type"] == event_type
 
 
+def test_transition_never_lags_legacy_version_when_aggregate_column_is_stale(monkeypatch):
+    append_domain_event = MagicMock()
+    monkeypatch.setitem(sys.modules, "app.services.domain_outbox_service", SimpleNamespace(append_domain_event=append_domain_event))
+    job = _job(id=11, version=8, aggregate_version=2)
+    db = MagicMock(); db.info = {}
+    db.query.return_value.populate_existing.return_value.filter.return_value.with_for_update.return_value.one_or_none.return_value = job
+
+    transition_job(db, 11, action="delist", reason="manual_delist")
+
+    assert job.version == 9
+    assert job.aggregate_version == 9
+    assert append_domain_event.call_args.kwargs["aggregate_version"] == 9
+
+
 def test_emit_missing_domain_outbox_table_keeps_legacy_pending_event(monkeypatch):
     append_domain_event = MagicMock()
     monkeypatch.setitem(sys.modules, "app.services.domain_outbox_service", SimpleNamespace(append_domain_event=append_domain_event))
@@ -120,3 +134,14 @@ def test_phase14_media_migration_is_additive():
     lifecycle = migration.parent / "phase14_003_job_lifecycle_event.sql"
     assert lifecycle.exists()
     assert "idx_job_lifecycle_version" in lifecycle.read_text(encoding="utf-8")
+
+
+def test_phase15_contact_direction_migration_has_non_destructive_down_contract():
+    migration_dir = Path(__file__).parents[2] / "sql" / "migrations"
+    up = (migration_dir / "phase15_002_contact_direction_binding.sql").read_text(encoding="utf-8")
+    down = migration_dir / "phase15_down_002_contact_direction_binding.sql"
+    assert "ADD COLUMN `direction`" in up
+    assert down.exists()
+    down_text = down.read_text(encoding="utf-8")
+    assert "stop-write/stop-consumer" in down_text
+    assert "DROP COLUMN" in down_text

@@ -78,7 +78,13 @@ def reject_if_replacement_in_progress(
 
 def increment_version(job: Job) -> None:
     """Increment an already locked or transaction-local Job instance."""
-    job.version = int(job.version or 0) + 1
+    current_version = int(job.version or 0)
+    current_aggregate = int(getattr(job, "aggregate_version", None) or 0)
+    job.version = current_version + 1
+    if hasattr(job, "aggregate_version"):
+        # Mixed fleets may expose a legacy version ahead of the additive
+        # column; never allow the domain version to move backwards.
+        job.aggregate_version = max(current_version, current_aggregate) + 1
 
 
 def _active_for_owner(job: Job, owner_userid: str, active_at: datetime) -> bool:

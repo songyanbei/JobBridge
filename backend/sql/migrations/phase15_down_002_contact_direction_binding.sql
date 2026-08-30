@@ -1,0 +1,8 @@
+-- Phase 15-002 rollback is stop-write/stop-consumer only by default.
+-- Keep direction facts until all Contact readers and audit exports no longer
+-- depend on them.  After an approved maintenance window, the operator may:
+--   DROP INDEX `idx_contact_request_direction` ON `contact_request`;
+--   ALTER TABLE `contact_request` DROP COLUMN `direction`;
+--   ALTER TABLE `contact_grant` DROP COLUMN `direction`;
+-- The statements stay commented so rollback cannot silently destroy audit
+-- context or break mixed-version readers.

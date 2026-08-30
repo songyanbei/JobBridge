@@ -22,9 +22,10 @@ def utcnow() -> datetime:
 
 def _bump_versions(job: Job, current_version: int) -> None:
     """Mirror legacy ``version`` and additive aggregate version atomically."""
-    job.version = int(current_version) + 1
+    current_version = int(current_version)
     previous_aggregate = getattr(job, "aggregate_version", None)
-    job.aggregate_version = int(previous_aggregate or current_version or 1) + 1
+    job.version = current_version + 1
+    job.aggregate_version = max(current_version, int(previous_aggregate or 0)) + 1
 
 
 def _domain_outbox_available(db: Session | None) -> bool:

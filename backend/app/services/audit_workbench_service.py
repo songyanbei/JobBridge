@@ -791,7 +791,8 @@ def _reject_job(
     candidate.audit_reason = reason
     candidate.audited_by = operator
     candidate.audited_at = now
-    candidate.version = int(candidate.version or 0) + 1
+    from app.services.job_mutation_service import increment_version
+    increment_version(candidate)
     if relation is not None:
         relation.review_outcome = "rejected"
         relation.reviewed_at = now
@@ -1124,8 +1125,13 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
             continue
         if key in before_snapshot:
             setattr(obj, key, _restore_value(key, before_snapshot.get(key)))
-    # version += 1（表示这是一次新操作）
-    obj.version = int(obj.version or 0) + 1
+    # version += 1（表示这是一次新操作），并同步 Phase14/15 聚合版本。
+    if target_type == "job":
+        from app.services.job_mutation_service import increment_version
+        increment_version(obj)
+    else:
+        from app.services.resume_mutation_service import increment_resume_version
+        increment_resume_version(obj)
 
     write_admin_log(
         db,
