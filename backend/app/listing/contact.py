@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest
+from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest, WecomOutboundOutbox
 from app.schemas.contact import (
     ContactGrantMetadata,
     ContactRequestCreate,
@@ -27,6 +27,19 @@ from app.schemas.contact import (
 )
 
 CONTACT_UNAVAILABLE_MESSAGE = "暂时无法提供联系方式，请稍后重试。"
+
+
+class ContactDeliveryError(RuntimeError):
+    """Delivery cannot be sent without a valid encrypted payload."""
+
+
+@dataclass(frozen=True)
+class ContactDeliveryHandle:
+    """Short-lived in-process plaintext handle; never serialized or persisted."""
+
+    delivery_id: str
+    channel: str
+    payload: str
 
 
 def _now() -> datetime:
@@ -189,7 +202,7 @@ class ContactService:
         session.flush()
         return ContactGrantMetadata(grant_id=grant.grant_id, token=token, expires_at=grant.expires_at)
 
-    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None) -> ContactResponse:
+    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None) -> ContactResponse:
         """Consume a grant once and create one stable delivery reference."""
         if not self.enabled:
             return self.unavailable()
@@ -224,6 +237,15 @@ class ContactService:
             status="prepared", expires_at=grant.expires_at,
         )
         session.add(delivery)
+        if inbound_event_id is not None:
+            # Same transaction: the outbox contains only an opaque delivery
+            # reference and a template marker, never a token or PII value.
+            session.add(WecomOutboundOutbox(
+                inbound_event_id=int(inbound_event_id), reply_index=max(0, int(reply_index)),
+                userid=str(userid or actor_id), msg_type="text", content=None,
+                contact_delivery_id=delivery.delivery_id, intent="contact_request",
+                status="pending",
+            ))
         self.audit_contact_event("grant_redeem", "allowed", "redeemed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant.grant_id, trace_id=trace_id, db=session)
         session.flush()
         return ContactResponse(success=True, code="ok", grant=None, message="联系请求已提交。")
@@ -258,6 +280,51 @@ class ContactService:
             ContactAccessAudit.created_at >= day_cutoff,
         ).count()
         return daily < self.daily_limit
+
+    def load_delivery_for_send(self, delivery_id: str, *, crypto_service=None, db: Session | None = None) -> ContactDeliveryHandle:
+        """Load/decrypt exactly once for a dispatcher; all failures fail closed."""
+        session = db or self.db
+        if session is None:
+            raise ContactDeliveryError("db_unavailable")
+        delivery = session.query(ContactDelivery).filter(ContactDelivery.delivery_id == str(delivery_id)).with_for_update().first()
+        if delivery is None:
+            raise ContactDeliveryError("delivery_not_found")
+        if delivery.status in {"revoked", "expired", "sent"} or delivery.expires_at <= _now():
+            if delivery.status not in {"revoked", "sent"}:
+                delivery.status = "expired"
+            raise ContactDeliveryError("delivery_not_sendable")
+        if not delivery.content_ciphertext:
+            # platform_request deliveries are valid acknowledgements but have
+            # no external payload; never send a blank or legacy plaintext value.
+            raise ContactDeliveryError("delivery_ciphertext_missing")
+        if crypto_service is None:
+            raise ContactDeliveryError("crypto_unavailable")
+        try:
+            payload = crypto_service.decrypt(
+                delivery.content_ciphertext,
+                field="delivery_payload",
+                entity_type="contact_delivery",
+                entity_id=delivery.delivery_id,
+            )
+        except Exception as exc:
+            raise ContactDeliveryError("delivery_decrypt_failed") from exc
+        return ContactDeliveryHandle(delivery_id=delivery.delivery_id, channel=delivery.channel, payload=payload)
+
+    def dispatch_contact_delivery(self, delivery_id: str, sender, *, crypto_service=None, db: Session | None = None) -> bool:
+        """Send one existing delivery; retries reuse this delivery id/payload."""
+        session = db or self.db
+        handle = self.load_delivery_for_send(delivery_id, crypto_service=crypto_service, db=session)
+        delivery = session.query(ContactDelivery).filter(ContactDelivery.delivery_id == handle.delivery_id).with_for_update().one()
+        delivery.status = "sending"
+        try:
+            sender(handle.payload, channel=handle.channel, delivery_id=handle.delivery_id)
+        except Exception:
+            delivery.status = "retry_wait"
+            session.flush()
+            raise
+        delivery.status, delivery.sent_at = "sent", _now()
+        session.flush()
+        return True
 
     def revoke_grant(self, grant_id: str, *, reason: str = "revoked", db: Session | None = None, trace_id: str | None = None) -> bool:
         session = db or self.db
