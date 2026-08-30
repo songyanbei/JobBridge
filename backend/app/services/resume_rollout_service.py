@@ -2,11 +2,31 @@
 from __future__ import annotations
 
 import json
+import hashlib
 
 from sqlalchemy.orm import Session
 
 from app.models import ResumeReplacementRolloutAssignment, SystemConfig
 from app.services.resume_replacement_rollout_service import ROLLOUT_CONFIG_KEY, validate_allowlist
+
+ROLL_OUT_DIRECTIONS = frozenset({"worker_to_job", "factory_to_worker", "broker_to_job", "broker_to_worker"})
+
+
+def direction_allowed(direction: str, allowlist=()) -> bool:
+    configured = set(allowlist or ())
+    return str(direction) in ROLL_OUT_DIRECTIONS and (not configured or str(direction) in configured)
+
+
+def rollout_enabled(actor_id: str, *, percentage: int, direction: str, allowlist=(), kill_switch: bool = True) -> bool:
+    if kill_switch or not direction_allowed(direction, allowlist):
+        return False
+    pct = max(0, min(100, int(percentage)))
+    if pct == 0:
+        return False
+    if pct == 100:
+        return True
+    digest = hashlib.sha256(str(actor_id).encode()).hexdigest()
+    return int(digest[:8], 16) % 100 < pct
 
 
 def assign_operation(
