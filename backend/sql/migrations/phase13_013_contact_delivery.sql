@@ -37,7 +37,26 @@ SET @sql := (SELECT IF(COUNT(*) = 0,
   'ALTER TABLE `wecom_outbound_outbox` ADD KEY `idx_outbox_contact_delivery` (`status`,`contact_delivery_id`,`id`)',
   'SELECT 1') FROM information_schema.statistics WHERE table_schema=@db AND table_name='wecom_outbound_outbox' AND index_name='idx_outbox_contact_delivery');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+-- MySQL 8 rejects a CHECK that references a column participating in a
+-- foreign-key referential action (ERROR 3823).  Use guarded triggers instead;
+-- this also converges cleanly when the earlier CREATE/ALTER statements were
+-- committed before a prior run failed at the CHECK.
 SET @sql := (SELECT IF(COUNT(*) = 0,
-  'ALTER TABLE `wecom_outbound_outbox` ADD CONSTRAINT `ck_outbox_single_delivery_kind` CHECK (NOT (recommendation_delivery_id IS NOT NULL AND contact_delivery_id IS NOT NULL))',
-  'SELECT 1') FROM information_schema.table_constraints WHERE table_schema=@db AND table_name='wecom_outbound_outbox' AND constraint_name='ck_outbox_single_delivery_kind');
+  'SELECT 1',
+  'ALTER TABLE `wecom_outbound_outbox` DROP CHECK `ck_outbox_single_delivery_kind`')
+  FROM information_schema.table_constraints
+  WHERE table_schema=@db AND table_name='wecom_outbound_outbox'
+    AND constraint_name='ck_outbox_single_delivery_kind');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := (SELECT IF(COUNT(*) = 0,
+  'CREATE TRIGGER `trg_outbox_single_delivery_kind_ins` BEFORE INSERT ON `wecom_outbound_outbox` FOR EACH ROW BEGIN IF NEW.`recommendation_delivery_id` IS NOT NULL AND NEW.`contact_delivery_id` IS NOT NULL THEN SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''outbox delivery kind conflict''; END IF; END',
+  'SELECT 1') FROM information_schema.triggers
+  WHERE trigger_schema=@db AND trigger_name='trg_outbox_single_delivery_kind_ins');
+PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @sql := (SELECT IF(COUNT(*) = 0,
+  'CREATE TRIGGER `trg_outbox_single_delivery_kind_upd` BEFORE UPDATE ON `wecom_outbound_outbox` FOR EACH ROW BEGIN IF NEW.`recommendation_delivery_id` IS NOT NULL AND NEW.`contact_delivery_id` IS NOT NULL THEN SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''outbox delivery kind conflict''; END IF; END',
+  'SELECT 1') FROM information_schema.triggers
+  WHERE trigger_schema=@db AND trigger_name='trg_outbox_single_delivery_kind_upd');
 PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;

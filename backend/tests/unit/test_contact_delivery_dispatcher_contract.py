@@ -27,3 +27,21 @@ def test_contact_delivery_has_no_outbox_plaintext_path():
     # The outbox stores only the opaque reference; no contact value column is added.
     assert "phone" not in migration.lower()
     assert "wechat" not in migration.lower()
+
+
+def test_contact_delivery_migration_uses_mysql_safe_idempotent_kind_triggers():
+    migration = (ROOT / "sql" / "migrations" / "phase13_013_contact_delivery.sql").read_text(encoding="utf-8")
+    lowered = migration.lower()
+    # A CHECK over recommendation_delivery_id is rejected by MySQL 8 when
+    # that column has a referential action (ERROR 3823).
+    assert "check (not (recommendation_delivery_id" not in lowered
+    assert "trg_outbox_single_delivery_kind_ins" in lowered
+    assert "trg_outbox_single_delivery_kind_upd" in lowered
+    assert "before insert" in lowered
+    assert "before update" in lowered
+    assert "signal sqlstate ''45000''" in lowered
+    # Both trigger creation and the optional legacy CHECK drop are guarded by
+    # information_schema lookups, so a run interrupted after ALTER succeeds.
+    assert "information_schema.triggers" in lowered
+    assert "information_schema.table_constraints" in lowered
+    assert "drop check `ck_outbox_single_delivery_kind`" in lowered
