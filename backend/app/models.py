@@ -974,6 +974,7 @@ class ActionExecution(Base):
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
     turn_id = sa.Column(sa.String(36), nullable=False, comment="不可变入站轮次 ID")
+    actor_userid = deferred(sa.Column(sa.String(64), nullable=True, comment="Action actor 绑定"))
     action_name = sa.Column(sa.String(64), nullable=False, comment="稳定 Action 名称")
     status = sa.Column(
         sa.Enum(
