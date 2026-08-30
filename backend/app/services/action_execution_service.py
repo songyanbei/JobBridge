@@ -13,6 +13,7 @@ from typing import Mapping
 from typing import Any, Literal
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.models import ActionExecution
@@ -22,6 +23,15 @@ ActionState = Literal[
 ]
 _FINAL_STATUSES = {"succeeded", "failed_retryable", "failed_terminal"}
 SUPPORTED_ACTIONS = frozenset({"search_job", "show_more_job", "relax_job"})
+
+
+def _available_columns(db: Session) -> set[str]:
+    """Allow mixed-version workers to read/write the pre-A0 table safely."""
+    try:
+        bind = db.get_bind()
+        return {column["name"] for column in inspect(bind).get_columns("action_execution")}
+    except Exception:
+        return set()
 
 
 class ActionExecutionConflict(ValueError):
@@ -207,9 +217,10 @@ def claim_action_execution(
     now_value = _naive_utc(now)
     lease_until = now_value + timedelta(seconds=lease_seconds)
 
+    available = _available_columns(db)
     row = read_action_execution(db, turn_id, action_name, for_update=True)
     if row is None:
-        row = ActionExecution(
+        values = dict(
             turn_id=turn_id,
             action_name=action_name,
             status="started",
@@ -217,16 +228,18 @@ def claim_action_execution(
             lease_owner=owner,
             lease_until=lease_until,
             fencing_token=1,
-            action_version=action_version,
-            parse_ref=parse_ref,
-            parse_digest=parse_digest,
-            parse_version=parse_version,
-            parse_expires_at=_naive_utc(parse_expires_at) if parse_expires_at else None,
         )
+        optional_values = {
+            "action_version": action_version,
+            "parse_ref": parse_ref,
+            "parse_digest": parse_digest,
+            "parse_version": parse_version,
+            "parse_expires_at": _naive_utc(parse_expires_at) if parse_expires_at else None,
+        }
+        values.update({key: value for key, value in optional_values.items() if key in available})
         try:
             with db.begin_nested():
-                db.add(row)
-                db.flush()
+                db.execute(ActionExecution.__table__.insert().values(**values))
         except IntegrityError:
             # Another worker inserted the unique key.  Re-read it under a row
             # lock and apply the same state machine as an existing row.
@@ -234,6 +247,9 @@ def claim_action_execution(
             if row is None:
                 raise
         else:
+            row = read_action_execution(db, turn_id, action_name, for_update=True)
+            if row is None:
+                raise ActionExecutionStateError("action_insert_readback_missing")
             return ActionClaim("acquired", row, 1, None)
 
     if request_digest is not None and row.request_digest not in (None, request_digest):
@@ -250,16 +266,25 @@ def claim_action_execution(
 
     # Reclaiming either an expired started lease or a retryable failure fences
     # the previous worker.  The token is monotonic for the lifetime of a key.
-    row.status = "started"
-    row.lease_owner = owner
-    row.lease_until = lease_until
-    row.fencing_token = int(row.fencing_token or 0) + 1
-    row.finished_at = None
-    row.result_digest = None
+    next_token = int(row.fencing_token or 0) + 1
+    reclaim_values = {
+        "status": "started", "lease_owner": owner, "lease_until": lease_until,
+        "fencing_token": next_token, "finished_at": None, "result_digest": None,
+    }
     if request_digest is not None:
-        row.request_digest = request_digest
+        reclaim_values["request_digest"] = request_digest
+    db.expire_all()
+    with db.no_autoflush:
+        db.query(ActionExecution).filter(
+            ActionExecution.turn_id == turn_id,
+            ActionExecution.action_name == action_name,
+        ).update(reclaim_values, synchronize_session=False)
     db.flush()
-    return ActionClaim("acquired", row, int(row.fencing_token), None)
+    db.expire_all()
+    row = read_action_execution(db, turn_id, action_name, for_update=True)
+    if row is None:
+        raise ActionExecutionStateError("action_reclaim_readback_missing")
+    return ActionClaim("acquired", row, next_token, None)
 
 
 def finalize_action_execution(
@@ -289,8 +314,10 @@ def finalize_action_execution(
         "finished_at": now_value,
         "lease_owner": None,
         "lease_until": None,
-        "failure_code": failure_code,
     }
+    available = _available_columns(db)
+    if failure_code is not None and "failure_code" in available:
+        values["failure_code"] = failure_code
     if result_reference is not None:
         ref = result_reference if isinstance(result_reference, ActionResultReference) else build_result_reference(**dict(result_reference))
         if ref.turn_id != turn_id or ref.action_name != action_name:
@@ -305,22 +332,30 @@ def finalize_action_execution(
             "session_commit_id": ref.session_commit_id,
             "result_schema_version": ref.result_schema_version,
         })
-    updated = (
-        db.query(ActionExecution)
-        .filter(
-            ActionExecution.turn_id == turn_id,
-            ActionExecution.action_name == action_name,
-            ActionExecution.status == "started",
-            ActionExecution.lease_owner == owner,
-            ActionExecution.fencing_token == int(fencing_token),
-            ActionExecution.lease_until.isnot(None),
-            ActionExecution.lease_until > now_value,
+        values = {key: value for key, value in values.items() if key in available or key in {
+            "status", "result_digest", "finished_at", "lease_owner", "lease_until",
+        }}
+    # The claim API returns ORM rows for compatibility, but callers may retain
+    # an older instance (e.g. a pre-fence worker). Detach all identities before
+    # the fenced bulk update so an autoflush can never write that stale state.
+    db.expunge_all()
+    with db.no_autoflush:
+        updated = (
+            db.query(ActionExecution)
+            .filter(
+                ActionExecution.turn_id == turn_id,
+                ActionExecution.action_name == action_name,
+                ActionExecution.status == "started",
+                ActionExecution.lease_owner == owner,
+                ActionExecution.fencing_token == int(fencing_token),
+                ActionExecution.lease_until.isnot(None),
+                ActionExecution.lease_until > now_value,
+            )
+            .update(
+                values,
+                synchronize_session=False,
+            )
         )
-        .update(
-            values,
-            synchronize_session=False,
-        )
-    )
     return updated == 1
 
 
