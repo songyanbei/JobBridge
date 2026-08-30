@@ -27,6 +27,7 @@ from app.schemas.contact import (
 )
 
 CONTACT_UNAVAILABLE_MESSAGE = "暂时无法提供联系方式，请稍后重试。"
+CONTACT_PLATFORM_REQUEST_MESSAGE = "联系请求已提交，请通过平台联系对方。"
 
 
 class ContactDeliveryError(RuntimeError):
@@ -241,8 +242,9 @@ class ContactService:
             return ContactResponse(success=False, code="already_used", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.status == "revoked":
             return ContactResponse(success=False, code="revoked", message=CONTACT_UNAVAILABLE_MESSAGE)
-        # The delivery payload is intentionally null until an encrypted B1
-        # source is available; never fall back to legacy phone columns.
+        # ``platform_request`` is a safe, PII-free acknowledgement.  It uses
+        # a fixed Worker template and therefore does not need a ciphertext;
+        # channels carrying actual contact values must provide ciphertext.
         now = _now()
         grant.status, grant.used_at = "used", now
         delivery = ContactDelivery(
@@ -308,9 +310,13 @@ class ContactService:
             if delivery.status not in {"revoked", "sent"}:
                 delivery.status = "expired"
             raise ContactDeliveryError("delivery_not_sendable")
+        if delivery.channel == "platform_request":
+            return ContactDeliveryHandle(
+                delivery_id=delivery.delivery_id,
+                channel=delivery.channel,
+                payload=CONTACT_PLATFORM_REQUEST_MESSAGE,
+            )
         if not delivery.content_ciphertext:
-            # platform_request deliveries are valid acknowledgements but have
-            # no external payload; never send a blank or legacy plaintext value.
             raise ContactDeliveryError("delivery_ciphertext_missing")
         if crypto_service is None:
             raise ContactDeliveryError("crypto_unavailable")

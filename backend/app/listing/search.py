@@ -20,6 +20,7 @@ from app.schemas.search import ListingCard, SearchCriteriaPatch
 from app.services.search_permission import check_search_permission
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +136,14 @@ def _salary_text(job: dict) -> str | None:
     return None
 
 
-def _job_card(job: dict, actor: UserContext, snapshot_id: str | None, explanation: str | None = None) -> ListingCard:
+def _job_card(
+    job: dict,
+    actor: UserContext,
+    snapshot_id: str | None,
+    explanation: str | None = None,
+    *,
+    db: Session | None = None,
+) -> ListingCard:
     listing_ref = f"recruitment.job:{job.get('id')}"
     company = job.get("hiring_company") or job.get("company")
     category = job.get("job_category")
@@ -149,7 +157,22 @@ def _job_card(job: dict, actor: UserContext, snapshot_id: str | None, explanatio
         "benefits": benefits or None, "headcount": job.get("headcount"),
         "employment_type": job.get("employment_type"),
     }.items() if value not in (None, "", [])}
-    contact_id = _opaque_contact_id(actor, listing_ref, snapshot_id)
+    # Contact requests are created in the same transaction as the search
+    # result facts.  The non-Session fallback is retained only for isolated
+    # projection tests that use a mock database; production always persists a
+    # ContactRequest and never derives the public id from a hash.
+    if isinstance(db, Session):
+        from app.listing.contact import ContactService
+
+        contact_id = ContactService(db).create_contact_request(
+            actor.external_userid,
+            listing_ref,
+            listing_version=job.get("version"),
+            trace_id=snapshot_id,
+            db=db,
+        ).request_id
+    else:
+        contact_id = _opaque_contact_id(actor, listing_ref, snapshot_id)
     return ListingCard(
         listing_id=listing_ref,
         listing_ref=listing_ref,
@@ -392,7 +415,10 @@ class JobSearchFacade:
         dicts = search_service._jobs_to_dicts(jobs, db)
         visibility = search_service._visibility_snapshot(db, "search_job", actor.role)
         visible = permission_service.filter_jobs_batch(dicts, actor.role, visibility)
-        return [_job_card(job, actor, snapshot.snapshot_id) for job in visible]
+        return [
+            _job_card(job, actor, snapshot.snapshot_id, db=db)
+            for job in visible
+        ]
 
     _cards_from_snapshot = cards_for_snapshot
 

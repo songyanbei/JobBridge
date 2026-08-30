@@ -2912,6 +2912,7 @@ def _jobs_to_dicts(jobs: list, db: Session) -> list[dict]:
     for j in jobs:
         d = {
             "id": j.id,
+            "version": getattr(j, "version", None),
             "city": j.city,
             "job_category": j.job_category,
             "salary_floor_monthly": j.salary_floor_monthly,

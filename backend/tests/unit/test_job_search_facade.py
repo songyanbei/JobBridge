@@ -3,10 +3,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
+from app.db import Base
 from app.listing.render import render_listing_card, render_listing_cards
 from app.listing.search import JobSearchFacade, SearchTurn, apply_criteria_patch, scrub_listing_text
 from app.listing.search import FacadeResult
+from app.models import ContactRequest
 from app.schemas.conversation import CandidateSnapshot, SessionState
 from app.schemas.search import ListingCard
 from app.services.user_service import UserContext
@@ -110,6 +114,39 @@ def test_facade_legacy_adapter_preserves_result_and_adds_cards(monkeypatch):
     assert response.cards[0].listing_ref == "recruitment.job:1"
     assert response.cards[0].contact_request_id.startswith("cr_")
     legacy.search_jobs.assert_called_once()
+
+
+def test_facade_persists_contact_request_for_each_real_card(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[ContactRequest.__table__])
+    db = Session(engine)
+    result = SimpleNamespace(reply_text="legacy", result_count=1, has_more=False)
+    outcome = SimpleNamespace(direction="search_job")
+    legacy = MagicMock()
+    legacy.search_jobs.return_value = (result, outcome)
+    facade = JobSearchFacade(db, enabled=True, legacy_service=legacy)
+    session = SessionState(
+        role="worker",
+        candidate_snapshot=CandidateSnapshot(
+            candidate_ids=["1"], snapshot_id="snap-contact", direction="search_job",
+        ),
+        shown_items=["1"],
+    )
+    job = {"id": 1, "version": 7, "city": "苏州", "job_category": "普工", "description": "desc"}
+    monkeypatch.setattr("app.services.search_service._validate_job_ids", lambda ids, db: [SimpleNamespace(id=1)])
+    monkeypatch.setattr("app.services.search_service._jobs_to_dicts", lambda jobs, db: [job])
+    monkeypatch.setattr("app.services.search_service._visibility_snapshot", lambda *args: SimpleNamespace())
+    monkeypatch.setattr("app.services.permission_service.filter_jobs_batch", lambda jobs, role, vis: jobs)
+
+    response = facade.search_jobs_v1(
+        _worker(), {"city": ["苏州"]}, session, SearchTurn("苏州普工"), db=db,
+    )
+
+    request = db.query(ContactRequest).one()
+    assert response.cards[0].contact_request_id == request.request_id
+    assert request.actor_id == "worker-1"
+    assert request.listing_ref == "recruitment.job:1"
+    assert request.listing_version == 7
 
 
 def test_legacy_adapter_retries_only_for_old_signature():

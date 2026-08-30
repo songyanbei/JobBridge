@@ -23,6 +23,8 @@ def test_search_modules_leave_action_lease_to_worker_gateway():
     worker_source = inspect.getsource(worker)
     assert "claim_action_execution" in worker_source
     assert "finalize_action_execution" in worker_source
+    assert "user_service.identify_or_register(userid, db)" in worker_source
+    assert "user_context=preloaded_user_context" in worker_source
 
 
 def test_turn_id_reaches_worker_router_message_boundary():

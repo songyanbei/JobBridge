@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from app.services import worker
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,6 +28,15 @@ def test_contact_delivery_has_no_outbox_plaintext_path():
     # The outbox stores only the opaque reference; no contact value column is added.
     assert "phone" not in migration.lower()
     assert "wechat" not in migration.lower()
+
+
+def test_worker_claims_contact_delivery_as_a_distinct_send_kind():
+    source = Path(worker.__file__).read_text(encoding="utf-8")
+    assert "discovered_contact_delivery_id" in source
+    assert 'row.contact_delivery_id' in source
+    assert "CONTACT_PLATFORM_REQUEST_MESSAGE" in source
+    assert "_mark_contact_delivery_sent" in source
+    assert 'if item.get("contact_delivery_id")' in source
 
 
 def test_contact_delivery_migration_uses_mysql_safe_idempotent_kind_triggers():
