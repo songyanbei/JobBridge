@@ -4,6 +4,9 @@
 不重复调用 LLM；追问轮数由 session.follow_up_rounds 统一承载。
 """
 import logging
+import hashlib
+import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +22,8 @@ from app.services import audit_service, conversation_service
 from app.services.lifecycle_config_service import get_job_ttl_days, get_resume_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
+from app.schemas.job import JobDraftContext
+from app.listing.job_profile import missing_job_fields, normalize_job_fields
 from app.tasks.common import log_event
 
 # 单条记录最多挂载图片数（与 system_config.upload.max_images 对齐）
@@ -117,6 +122,67 @@ MAX_FOLLOW_UP_ROUNDS = 2
 
 # Stage A：上传草稿默认 10 分钟过期（详见 docs/multi-turn-upload-stage-a-implementation.md §3.4）
 PENDING_UPLOAD_TTL_MINUTES = 10
+
+
+def _job_draft_digest(fields: dict) -> str:
+    payload = json.dumps(fields, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def create_job_draft(
+    owner_userid: str,
+    fields: dict | None = None,
+    *,
+    operation_id: str | None = None,
+    source_msg_id: str | None = None,
+    session: SessionState | None = None,
+) -> JobDraftContext:
+    """Create an in-session job draft; repeated operation IDs are idempotent."""
+    operation_id = operation_id or str(uuid.uuid4())
+    if session is not None and session.pending_operation_id == operation_id and session.pending_upload:
+        normalized = normalize_job_fields(session.pending_upload)
+        return JobDraftContext(
+            owner_userid=owner_userid, operation_id=operation_id,
+            source_msg_id=source_msg_id, fields=normalized,
+            missing_fields=missing_job_fields(normalized), digest=_job_draft_digest(normalized),
+        )
+    normalized = normalize_job_fields(fields)
+    if session is not None:
+        _save_pending_upload(session, "upload_job", normalized, missing_job_fields(normalized), "")
+        session.pending_operation_id = operation_id
+    return JobDraftContext(
+        owner_userid=owner_userid, operation_id=operation_id,
+        source_msg_id=source_msg_id, fields=normalized,
+        missing_fields=missing_job_fields(normalized), digest=_job_draft_digest(normalized),
+    )
+
+
+def update_job_draft(
+    draft: JobDraftContext,
+    patch: dict | None = None,
+    *,
+    session: SessionState | None = None,
+    source_msg_id: str | None = None,
+) -> JobDraftContext:
+    """Apply an allowlisted patch and return a new immutable draft context."""
+    fields = dict(draft.fields)
+    fields.update(normalize_job_fields(patch))
+    if session is not None:
+        _save_pending_upload(session, "upload_job", normalize_job_fields(patch), missing_job_fields(fields), "")
+        session.pending_operation_id = draft.operation_id
+    return draft.model_copy(update={
+        "fields": fields,
+        "missing_fields": missing_job_fields(fields),
+        "digest": _job_draft_digest(fields),
+        "source_msg_id": source_msg_id or draft.source_msg_id,
+        "status": "ready" if not missing_job_fields(fields) else "collecting",
+    })
+
+
+def validate_job_draft(draft: JobDraftContext | dict) -> list[str]:
+    """Return deterministic missing-field names; callers decide whether to ask again."""
+    fields = draft.fields if isinstance(draft, JobDraftContext) else draft
+    return missing_job_fields(fields)
 
 
 def initialize_pending_upload_window(
@@ -291,6 +357,7 @@ def process_upload(
     # The original wording remains in final_raw_text/description for audit.
     data = dict(intent_result.structured_data or {})
     if entity_type == "job":
+        data = normalize_job_fields(data)
         normalized_pay_type = _normalize_pay_type(data.get("pay_type"), raw_text)
         if normalized_pay_type is not None:
             data["pay_type"] = normalized_pay_type
@@ -311,6 +378,8 @@ def process_upload(
             missing=missing,
             raw_text=raw_text,
         )
+        if not session.pending_operation_id:
+            session.pending_operation_id = str(uuid.uuid4())
 
         # 生成追问文本
         conversation_service.increment_follow_up(session)

@@ -1,7 +1,7 @@
 """岗位相关 DTO。"""
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class JobBase(BaseModel):
@@ -20,6 +20,23 @@ class JobBase(BaseModel):
     address: str | None = Field(default=None, max_length=255)
     contact_person: str | None = Field(default=None, max_length=64)
     phone: str | None = Field(default=None, max_length=32)
+
+
+class JobDraftContext(BaseModel):
+    """Durable-friendly S4 draft envelope used during multi-turn collection."""
+    owner_userid: str = Field(..., max_length=64)
+    operation_id: str
+    source_msg_id: str | None = None
+    fields: dict = Field(default_factory=dict)
+    missing_fields: list[str] = Field(default_factory=list)
+    digest: str = ""
+    status: str = "collecting"
+    model_config = ConfigDict(extra="forbid")
+
+
+class JobDraftPatch(BaseModel):
+    """Allowlisted field patch extracted from one conversation turn."""
+    fields: dict = Field(default_factory=dict)
 
 
 class JobCreate(JobBase):
