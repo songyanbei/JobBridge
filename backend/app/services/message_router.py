@@ -909,7 +909,7 @@ def _dispatch_intent(
         if intent == "follow_up":
             return _handle_follow_up(intent_result, msg, user_ctx, session, db)
         if intent == "show_more":
-            return _handle_show_more(msg, user_ctx, session, db)
+            return _handle_show_more(msg, user_ctx, session, db, action_context=action_context)
         if intent == "chitchat":
             return [_reply(userid, _chitchat_text(user_ctx))]
         # 未知意图兜底
@@ -1936,6 +1936,8 @@ def _handle_show_more(
     user_ctx: UserContext,
     session: SessionState,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     # Phase 5 §5.0：show_more 现返回 tuple[SearchResult, SearchOutcome]
     direction = search_service.resolve_show_more_direction(session, user_ctx)

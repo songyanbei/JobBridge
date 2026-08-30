@@ -63,6 +63,7 @@ class FacadeResult:
     cards: list[ListingCard]
     used_facade: bool = True
     fallback_reason: str | None = None
+    action_result_ref: dict[str, Any] | None = None
 
     @property
     def reply_text(self) -> str:
@@ -262,7 +263,14 @@ class JobSearchFacade:
             cards = self.cards_for_snapshot(actor, session, db, result)
             if not isinstance(cards, list):
                 raise TypeError("facade_card_schema_invalid")
-            return FacadeResult(result, outcome, cards)
+            return FacadeResult(
+                result, outcome, cards,
+                action_result_ref={
+                    "request_id": getattr(result, "request_id", None),
+                    "snapshot_id": getattr(result, "snapshot_id", None),
+                    "result_schema_version": "search.v1",
+                },
+            )
         except Exception as exc:
             logger.exception("job search facade failed; caller should use legacy", exc_info=True)
             self._record_fallback(type(exc).__name__, action="search", actor=actor, turn=turn)
@@ -310,8 +318,20 @@ class JobSearchFacade:
                 )
         else:
             cards = []
-        return FacadeResult(raw_result, outcome, cards, used_facade=self.enabled,
-                            fallback_reason=None if self.enabled else "disabled")
+        snapshot_id = getattr(raw_result, "snapshot_id", None) or getattr(getattr(session, "candidate_snapshot", None), "snapshot_id", None)
+        return FacadeResult(
+            raw_result, outcome, cards, used_facade=self.enabled,
+            fallback_reason=None if self.enabled else "disabled",
+            action_result_ref={
+                "request_id": getattr(raw_result, "request_id", None),
+                "snapshot_id": snapshot_id,
+                "page_ids": list(session.shown_items[before:]),
+                "cursor_before": before,
+                "cursor_after": len(session.shown_items),
+                "exhausted": bool(getattr(raw_result, "has_more", False) is False),
+                "result_schema_version": "show-more.v1",
+            },
+        )
 
     def relax_search(self, actor, session, turn, step: str, db=None, *, confirmed: bool = False, experience_flags=None) -> FacadeResult:
         """Execute exactly one pre-approved relaxation step."""
