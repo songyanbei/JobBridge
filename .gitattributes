@@ -4,3 +4,9 @@
 # changing every digest and failing `apply_phase9_migrations.py --check`.
 # Pin them to LF so the checksum is platform-independent.
 backend/sql/migrations/** text eol=lf
+
+# WSL entrypoints must remain executable as LF files even on Windows checkouts.
+mock-testbed/scripts/wsl-e2e-smoke.sh text eol=lf
+mock-testbed/scripts/wsl-e2e-full-smoke.sh text eol=lf
+mock-testbed/scripts/wsl-demo-start.sh text eol=lf
+mock-testbed/scripts/wsl-stack-restart.sh text eol=lf
