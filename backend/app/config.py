@@ -248,6 +248,16 @@ class Settings(BaseSettings):
     job_publish_rollout_percentage: int = 0
     job_publish_kill_switch: bool = False
     job_publish_action_version: str = "job_publish_v1"
+    # S5 resume publishing/search remain fail-closed until rollout approval.
+    resume_publish_flow_enabled: bool = False
+    resume_search_facade_enabled: bool = False
+    resume_publish_kill_switch: bool = True
+    resume_search_kill_switch: bool = True
+    resume_publish_rollout_percentage: int = 0
+    resume_search_rollout_percentage: int = 0
+    resume_publish_action_version: str = "resume_publish_v1"
+    resume_matching_policy_version: str = "matching-policy-v1"
+    resume_direction_allowlist: tuple[str, ...] = ()
     contact_service_mode: Literal["off", "shadow", "on"] = "off"
     contact_grant_ttl_seconds: int = 60
     contact_rate_per_listing_window_seconds: int = 600
@@ -325,6 +335,22 @@ class Settings(BaseSettings):
         value = str(value or "").strip()
         if not value or len(value) > 64:
             raise ValueError("job_publish_action_version must be a non-empty string <= 64 chars")
+        return value
+
+    @field_validator("resume_publish_rollout_percentage", "resume_search_rollout_percentage", mode="after")
+    @classmethod
+    def _valid_resume_rollout(cls, value: int) -> int:
+        value = int(value)
+        if not 0 <= value <= 100:
+            raise ValueError("resume rollout percentage must be between 0 and 100")
+        return value
+
+    @field_validator("resume_publish_action_version", "resume_matching_policy_version", mode="after")
+    @classmethod
+    def _valid_resume_versions(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or len(value) > 64:
+            raise ValueError("resume version must be a non-empty string <= 64 chars")
         return value
 
     @field_validator(
