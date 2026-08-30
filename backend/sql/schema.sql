@@ -222,6 +222,7 @@ CREATE TABLE `media_asset_lifecycle` (
     `owner_userid` VARCHAR(64) NOT NULL,
     `entity_type` ENUM('job','resume') DEFAULT NULL,
     `entity_id` BIGINT UNSIGNED DEFAULT NULL,
+    `entity_version` INT UNSIGNED DEFAULT NULL,
     `state` ENUM('pending','attached','delete_pending','deleted','dead_letter') NOT NULL DEFAULT 'pending',
     `draft_expires_at` DATETIME DEFAULT NULL,
     `attempt_count` INT UNSIGNED NOT NULL DEFAULT 0,
@@ -236,6 +237,7 @@ CREATE TABLE `media_asset_lifecycle` (
     UNIQUE KEY `uq_media_object_key` (`object_key`),
     KEY `idx_media_operation` (`operation_id`),
     KEY `idx_media_entity` (`entity_type`,`entity_id`,`state`),
+    KEY `idx_media_entity_version` (`entity_type`,`entity_id`,`entity_version`,`state`),
     KEY `idx_media_cleanup` (`state`,`next_attempt_at`),
     KEY `idx_media_draft_expiry` (`state`,`draft_expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='媒体生命周期';

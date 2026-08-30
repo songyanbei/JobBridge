@@ -47,3 +47,7 @@ def test_phase14_media_migration_is_additive():
     text = migration.read_text(encoding="utf-8")
     assert "ADD COLUMN `entity_version`" in text
     assert "idx_media_entity_version" in text
+    schema = migration.parents[1] / "schema.sql"
+    schema_text = schema.read_text(encoding="utf-8")
+    assert "`entity_version` INT UNSIGNED" in schema_text
+    assert "idx_media_entity_version" in schema_text
