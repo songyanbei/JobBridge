@@ -195,9 +195,11 @@ def test_cleanup_mysql_smoke_data_deletes_user_owned_rows(monkeypatch):
 
     assert result["checked"] is True
     assert set(result["deleted"]) == {
-        "conversation_log", "wecom_inbound_event", "audit_log", "resume", "job", "user",
+        "wecom_outbound_outbox", "conversation_log", "wecom_inbound_event",
+        "contact_access_audit", "contact_delivery", "contact_grant", "contact_request", "audit_log",
+        "resume", "job", "user",
     }
-    assert len(calls["statements"]) == 6
+    assert len(calls["statements"]) == 10
     assert calls["committed"] is True
     assert calls["closed"] is True
 
@@ -240,7 +242,7 @@ def test_create_mysql_inbound_event_returns_id_and_commits(monkeypatch):
         payload,
     ) == 42
     assert "INSERT INTO wecom_inbound_event" in calls["statement"]
-    assert calls["params"][:3] == (payload["msg_id"], "smoke-a", "text")
+    assert calls["params"][:3] == (payload["msg_id"], payload["turn_id"], "smoke-a")
     assert calls["committed"] is True
     assert calls["closed"] is True
 

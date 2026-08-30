@@ -326,8 +326,13 @@ def cleanup_mysql_smoke_data(mysql_dsn: str, userid: str, msg_ids: list[str]) ->
     try:
         with conn.cursor() as cursor:
             statements = (
+                ("wecom_outbound_outbox", "DELETE FROM wecom_outbound_outbox WHERE userid = %s", (userid,)),
                 ("conversation_log", "DELETE FROM conversation_log WHERE userid = %s", (userid,)),
                 ("wecom_inbound_event", "DELETE FROM wecom_inbound_event WHERE from_userid = %s", (userid,)),
+                ("contact_access_audit", "DELETE FROM contact_access_audit WHERE request_id IN (SELECT request_id FROM contact_request WHERE actor_id = %s)", (userid,)),
+                ("contact_delivery", "DELETE FROM contact_delivery WHERE actor_id = %s", (userid,)),
+                ("contact_grant", "DELETE FROM contact_grant WHERE actor_id = %s", (userid,)),
+                ("contact_request", "DELETE FROM contact_request WHERE actor_id = %s", (userid,)),
                 ("audit_log", "DELETE FROM audit_log WHERE target_type = 'user' AND target_id = %s", (userid,)),
                 ("resume", "DELETE FROM resume WHERE owner_userid = %s", (userid,)),
                 ("job", "DELETE FROM job WHERE owner_userid = %s", (userid,)),
