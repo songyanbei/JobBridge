@@ -289,6 +289,32 @@ class ContactAccessAudit(Base):
     )
 
 
+class ContactDelivery(Base):
+    """Stable encrypted delivery created when a grant is consumed (B2)."""
+
+    __tablename__ = "contact_delivery"
+
+    delivery_id = sa.Column(sa.String(64), primary_key=True)
+    grant_id = sa.Column(sa.String(64), sa.ForeignKey("contact_grant.grant_id", ondelete="RESTRICT"), nullable=False, unique=True)
+    actor_id = sa.Column(sa.String(64), nullable=False)
+    listing_ref = sa.Column(sa.String(200), nullable=False)
+    channel = sa.Column(sa.String(32), nullable=False, server_default="platform_request")
+    content_ciphertext = sa.Column(sa.LargeBinary, nullable=True)
+    key_version = sa.Column(mysql.SMALLINT(unsigned=True), nullable=True)
+    content_hash = sa.Column(mysql.CHAR(64), nullable=True)
+    status = sa.Column(sa.Enum("prepared", "sending", "sent", "retry_wait", "revoked", "expired", name="contact_delivery_status"), nullable=False, server_default="prepared")
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoke_reason = sa.Column(sa.String(64), nullable=True)
+    sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (
+        sa.Index("idx_contact_delivery_due", "status", "expires_at", "delivery_id"),
+        sa.Index("idx_contact_delivery_actor", "actor_id", "created_at", "delivery_id"),
+    )
+
+
 class JobReplacement(Base):
     __tablename__ = "job_replacement"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
@@ -1046,6 +1072,7 @@ class WecomOutboundOutbox(Base):
     msg_type = sa.Column(sa.String(16), nullable=False, server_default="text")
     content = sa.Column(mysql.MEDIUMTEXT, nullable=True)
     recommendation_delivery_id = sa.Column(sa.String(36), nullable=True, unique=True)
+    contact_delivery_id = sa.Column(sa.String(64), nullable=True, unique=True, comment="ContactDelivery 引用，不存联系方式")
     intent = sa.Column(sa.String(32), nullable=True)
     criteria_snapshot = sa.Column(sa.JSON, nullable=True)
     status = sa.Column(

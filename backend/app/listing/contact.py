@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import ContactAccessAudit, ContactGrant, ContactRequest
+from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest
 from app.schemas.contact import (
     ContactGrantMetadata,
     ContactRequestCreate,
@@ -58,9 +58,13 @@ class ContactDecision:
 class ContactService:
     """Server-side contact request/grant state machine."""
 
-    def __init__(self, db: Session | None = None, *, mode: str | None = None):
+    def __init__(self, db: Session | None = None, *, mode: str | None = None, redis_client=None, rate_window_seconds: int = 600, rate_limit: int = 3, daily_limit: int = 30):
         self.db = db
         self.mode = str(mode if mode is not None else getattr(settings, "contact_service_mode", "off")).lower()
+        self.redis_client = redis_client
+        self.rate_window_seconds = max(1, int(rate_window_seconds))
+        self.rate_limit = max(1, int(rate_limit))
+        self.daily_limit = max(1, int(daily_limit))
 
     @property
     def enabled(self) -> bool:
@@ -186,12 +190,15 @@ class ContactService:
         return ContactGrantMetadata(grant_id=grant.grant_id, token=token, expires_at=grant.expires_at)
 
     def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None) -> ContactResponse:
-        """B0 fail-closed endpoint; B2 adds rate/revoke/delivery transaction."""
+        """Consume a grant once and create one stable delivery reference."""
         if not self.enabled:
             return self.unavailable()
         session = db or self.db
         if session is None:
             return self.unavailable()
+        if not self._rate_allowed(actor_id, grant_id, session):
+            self.audit_contact_event("grant_redeem", "denied", "rate_limited", actor_id=actor_id, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="rate_limited", message=CONTACT_UNAVAILABLE_MESSAGE)
         grant = session.query(ContactGrant).filter(ContactGrant.grant_id == str(grant_id)).with_for_update().first()
         if grant is None or not secrets.compare_digest(str(grant.token_hash), _digest(token)):
             self.audit_contact_event("grant_redeem", "denied", "invalid_grant", actor_id=actor_id, grant_id=grant_id, trace_id=trace_id, db=session)
@@ -206,8 +213,51 @@ class ContactService:
             return ContactResponse(success=False, code="already_used", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.status == "revoked":
             return ContactResponse(success=False, code="revoked", message=CONTACT_UNAVAILABLE_MESSAGE)
-        # Contact value is intentionally absent in B0; never return legacy phone.
-        return ContactResponse(success=False, code="contact_unavailable", message=CONTACT_UNAVAILABLE_MESSAGE)
+        # The delivery payload is intentionally null until an encrypted B1
+        # source is available; never fall back to legacy phone columns.
+        now = _now()
+        grant.status, grant.used_at = "used", now
+        delivery = ContactDelivery(
+            delivery_id="cd_" + secrets.token_urlsafe(24).rstrip("="), grant_id=grant.grant_id,
+            actor_id=grant.actor_id, listing_ref=grant.listing_ref, channel="platform_request",
+            content_ciphertext=None, key_version=None, content_hash=None,
+            status="prepared", expires_at=grant.expires_at,
+        )
+        session.add(delivery)
+        self.audit_contact_event("grant_redeem", "allowed", "redeemed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant.grant_id, trace_id=trace_id, db=session)
+        session.flush()
+        return ContactResponse(success=True, code="ok", grant=None, message="联系请求已提交。")
+
+    def _rate_allowed(self, actor_id: str, grant_id: str, session: Session) -> bool:
+        """Redis is only a fast pre-check; DB audit remains authoritative."""
+        if self.redis_client is not None:
+            try:
+                key = f"contact:rate:{_digest(actor_id)}"
+                result = self.redis_client.incr(key)
+                if int(result) == 1:
+                    self.redis_client.expire(key, self.rate_window_seconds)
+                if int(result) > self.rate_limit:
+                    return False
+            except Exception:
+                # A broken limiter must never open the gate.
+                return False
+        cutoff = _now() - timedelta(seconds=self.rate_window_seconds)
+        recent = session.query(ContactAccessAudit).filter(
+            ContactAccessAudit.actor_hash == _digest(actor_id),
+            ContactAccessAudit.event_type == "grant_redeem",
+            ContactAccessAudit.outcome == "allowed",
+            ContactAccessAudit.created_at >= cutoff,
+        ).count()
+        if recent >= self.rate_limit:
+            return False
+        day_cutoff = _now() - timedelta(days=1)
+        daily = session.query(ContactAccessAudit).filter(
+            ContactAccessAudit.actor_hash == _digest(actor_id),
+            ContactAccessAudit.event_type == "grant_redeem",
+            ContactAccessAudit.outcome == "allowed",
+            ContactAccessAudit.created_at >= day_cutoff,
+        ).count()
+        return daily < self.daily_limit
 
     def revoke_grant(self, grant_id: str, *, reason: str = "revoked", db: Session | None = None, trace_id: str | None = None) -> bool:
         session = db or self.db
@@ -239,4 +289,3 @@ issue_one_time_grant = ContactService.issue_one_time_grant
 redeem_grant = ContactService.redeem_grant
 revoke_grant = ContactService.revoke_grant
 audit_contact_event = ContactService.audit_contact_event
-
