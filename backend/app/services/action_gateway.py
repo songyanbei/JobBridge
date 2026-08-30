@@ -7,13 +7,17 @@ from typing import Any
 from app.config import settings
 from app.services import intent_service
 
-SUPPORTED_ACTIONS = frozenset({"search_job", "show_more_job", "relax_job"})
+SUPPORTED_ACTIONS = frozenset({
+    "search_job", "show_more_job", "relax_job",
+    "publish_job", "edit_job_draft", "confirm_job", "delist_job", "restore_job",
+})
 ACTION_GATEWAY_SCHEMA_VERSION = "action-gateway.v1"
 CLASSIFIER_VERSION = "intent-adapter.v1"
 _SENSITIVE_KEYS = frozenset({
     "phone", "wechat", "wechat_id", "contact", "contact_person", "mobile",
 })
 _ACCEPT = frozenset({"好", "好的", "可以", "行", "同意", "确认", "放宽", "是"})
+_CONFIRM = frozenset({"确认发布", "发布", "确认", "确定发布"})
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str)
@@ -86,6 +90,15 @@ class ActionGateway:
             return self._envelope(turn_id, "none", legacy_reason="mode_off")
         if not text:
             return self._envelope(turn_id, "unknown", legacy_reason="empty_text")
+        # Confirmation operates on the durable draft and does not re-run the
+        # intent classifier, preserving one provider call per turn.
+        if getattr(session, "pending_upload_intent", None) == "upload_job" and text in _CONFIRM:
+            digest = _digest({
+                "turn_id": turn_id,
+                "action_name": "confirm_job",
+                "draft": _safe_payload(getattr(session, "pending_upload", {}) or {}),
+            })
+            return self._envelope(turn_id, "confirm_job", request_digest=digest)
         try:
             route = intent_service.classify_for_action_gateway(text=text, role=getattr(actor, "role", "worker"), history=getattr(session, "history", None), session=session, user_msg_id=getattr(msg, "msg_id", None), userid=getattr(msg, "from_user", None))
             parsed = _parse_from_route(route, session)

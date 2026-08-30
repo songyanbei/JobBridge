@@ -22,7 +22,10 @@ ActionState = Literal[
     "acquired", "in_progress", "succeeded", "failed_retryable", "failed_terminal"
 ]
 _FINAL_STATUSES = {"succeeded", "failed_retryable", "failed_terminal"}
-SUPPORTED_ACTIONS = frozenset({"search_job", "show_more_job", "relax_job"})
+SUPPORTED_ACTIONS = frozenset({
+    "search_job", "show_more_job", "relax_job",
+    "publish_job", "edit_job_draft", "confirm_job", "delist_job", "restore_job",
+})
 
 
 def _available_columns(db: Session) -> set[str]:

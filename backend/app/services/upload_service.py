@@ -274,6 +274,8 @@ def clear_pending_upload(session: SessionState) -> None:
     session.pending_target_id = None
     session.pending_target_version = None
     session.pending_operation_id = None
+    session.pending_confirmation_nonce = None
+    session.pending_confirmation_digest = None
     session.pending_rollout_cohort = None
     session.pending_rollout_revision = None
     session.pending_upload_media_ids = []
@@ -322,6 +324,57 @@ class UploadResult:
     entity_type: str | None = None  # "job" / "resume"
     entity_id: int | None = None
     needs_followup: bool = False
+
+
+@dataclass(frozen=True)
+class JobConfirmation:
+    """Confirmation envelope; the digest binds the user's summary to the draft."""
+    operation_id: str
+    confirmation_nonce: str
+    draft_digest: str
+    fields: dict
+    status: str = "awaiting_confirmation"
+
+
+def prepare_job_confirmation(session: SessionState, *, operation_id: str | None = None) -> JobConfirmation:
+    """Create/reuse a confirmation nonce for the current complete draft."""
+    fields = normalize_job_fields(session.pending_upload)
+    missing = missing_job_fields(fields)
+    if missing:
+        raise ValueError("draft_missing_fields:" + ",".join(missing))
+    operation = operation_id or session.pending_operation_id or str(uuid.uuid4())
+    digest = _job_draft_digest(fields)
+    if session.pending_confirmation_digest == digest and session.pending_confirmation_nonce:
+        nonce = session.pending_confirmation_nonce
+    else:
+        nonce = str(uuid.uuid4())
+        session.pending_confirmation_nonce = nonce
+        session.pending_confirmation_digest = digest
+    session.pending_operation_id = operation
+    session.pending_action = {
+        "action_name": "confirm_job", "operation_id": operation,
+        "confirmation_nonce": nonce, "draft_digest": digest,
+    }
+    return JobConfirmation(operation, nonce, digest, fields)
+
+
+def confirm_job_draft(
+    session: SessionState,
+    *,
+    confirmation_nonce: str,
+    draft_digest: str,
+) -> JobConfirmation:
+    """Validate an explicit confirmation without activating or auto-passing a Job."""
+    expected = prepare_job_confirmation(session)
+    if confirmation_nonce != expected.confirmation_nonce:
+        raise ValueError("confirmation_nonce_mismatch")
+    if draft_digest != expected.draft_digest:
+        raise ValueError("draft_digest_mismatch")
+    session.pending_action = {**(session.pending_action or {}), "confirmed": True}
+    return JobConfirmation(
+        expected.operation_id, expected.confirmation_nonce, expected.draft_digest,
+        expected.fields, status="confirmed",
+    )
 
 
 # ---------------------------------------------------------------------------

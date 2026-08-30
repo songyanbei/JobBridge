@@ -72,6 +72,8 @@ class SessionState(BaseModel):
     pending_target_id: int | None = Field(default=None)
     pending_target_version: int | None = Field(default=None)
     pending_operation_id: str | None = Field(default=None)
+    pending_confirmation_nonce: str | None = Field(default=None)
+    pending_confirmation_digest: str | None = Field(default=None)
     pending_rollout_cohort: str | None = Field(default=None, pattern="^(enabled|control)$")
     pending_rollout_revision: int | None = Field(default=None, ge=1)
     pending_upload_media_ids: list[int] = Field(default_factory=list)
@@ -168,6 +170,7 @@ class SessionState(BaseModel):
             "pending_updated_at", "pending_expires_at", "pending_raw_text_parts",
             "pending_upload_mode", "pending_target_id", "pending_target_version",
             "pending_operation_id", "pending_rollout_cohort", "pending_rollout_revision",
+            "pending_confirmation_nonce", "pending_confirmation_digest",
             "pending_upload_media_ids", "attachment_target_type", "attachment_target_id",
             "active_flow", "last_intent", "pending_interruption", "failed_patch_rounds",
             "last_criteria", "conflict_followup_rounds", "awaiting_fields",
