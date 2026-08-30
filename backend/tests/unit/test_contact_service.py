@@ -52,3 +52,29 @@ def test_cross_actor_and_expired_grants_are_denied_without_contact_value():
     db.flush()
     expired = service.redeem_grant(grant.grant_id, grant.token, "actor-1")
     assert expired.code == "expired"
+
+
+def test_direction_bound_grant_requires_matching_direction_at_redeem():
+    db = _db()
+    service = ContactService(db, mode="on")
+    request = service.create_contact_request(
+        "actor-1", "recruitment.resume:1", direction="search_worker",
+        listing_version=3, policy_version="matching-policy-v1",
+    )
+    grant = service.issue_one_time_grant(
+        request.request_id, "actor-1", "recruitment.resume:1",
+        direction="search_worker", listing_version=3,
+        policy_version="matching-policy-v1",
+    )
+    denied = service.redeem_grant(
+        grant.grant_id, grant.token, "actor-1", current_direction="search_job",
+        current_listing_version=3, current_policy_version="matching-policy-v1",
+        listing_status="passed",
+    )
+    assert denied.code == "forbidden"
+    allowed = service.redeem_grant(
+        grant.grant_id, grant.token, "actor-1", current_direction="search_worker",
+        current_listing_version=3, current_policy_version="matching-policy-v1",
+        listing_status="passed",
+    )
+    assert allowed.success

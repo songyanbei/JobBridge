@@ -211,7 +211,7 @@ class ContactService:
         session.flush()
         return ContactGrantMetadata(grant_id=grant.grant_id, token=token, expires_at=grant.expires_at)
 
-    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None, current_listing_version: int | None = None, current_policy_version: str | None = None, listing_status: str | None = None, actor_status: str | None = None) -> ContactResponse:
+    def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None, current_listing_version: int | None = None, current_policy_version: str | None = None, current_direction: str | None = None, listing_status: str | None = None, actor_status: str | None = None) -> ContactResponse:
         """Consume a grant once and create one stable delivery reference."""
         if not self.enabled:
             return self.unavailable()
@@ -227,6 +227,11 @@ class ContactService:
             return ContactResponse(success=False, code="invalid_grant", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.actor_id != str(actor_id):
             self.audit_contact_event("grant_redeem", "denied", "actor_mismatch", actor_id=actor_id, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if grant.direction is not None and (
+            current_direction is None or str(current_direction) != str(grant.direction)
+        ):
+            self.audit_contact_event("grant_redeem", "denied", "direction_changed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
             return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
         # Re-authorize mutable facts while the grant row is locked. Callers
         # must provide these facts from a fresh listing/actor lookup; omitted
