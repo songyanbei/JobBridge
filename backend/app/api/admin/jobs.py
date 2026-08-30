@@ -57,6 +57,11 @@ def _enrich_with_owner(db: _Session, jobs: list) -> dict[str, dict]:
 def _job_to_dict(job, owner_map: dict[str, dict], projection: dict | None = None) -> dict:
     item = JobRead.model_validate(job).model_dump(mode="json")
     item["images"] = storage_urls_for_response(item.get("images"))
+    # Optional S4 columns are exposed when the additive migration/model is
+    # present, while mixed-version admin fleets continue to serialize safely.
+    item.setdefault("aggregate_version", getattr(job, "aggregate_version", getattr(job, "version", None)))
+    item.setdefault("event_status", getattr(job, "event_status", None))
+    item.setdefault("trace_id", getattr(job, "trace_id", None))
     item.update(owner_map.get(job.owner_userid, {}))
     item.update(projection or {})
     return item
@@ -187,6 +192,7 @@ def export_jobs(
         "candidate_expires_at", "replacement_id", "replacement_review_outcome",
         "replacement_lifecycle_status", "replacement_closed_reason",
         "replaces_job_id", "replaced_by_job_id", "created_at", "expires_at", "version",
+        "aggregate_version", "event_status", "trace_id",
     ]
     body = []
     for r in rows:
@@ -204,6 +210,7 @@ def export_jobs(
             rp.get("replacement_closed_reason"), rp.get("replaces_job_id"),
             rp.get("replaced_by_job_id"),
             r.created_at, r.expires_at.isoformat() if r.expires_at else None, r.version,
+            getattr(r, "aggregate_version", r.version), getattr(r, "event_status", None), getattr(r, "trace_id", None),
         ])
     data = rows_to_csv_bytes(headers, body)
     filename = f"jobs_{datetime.now().strftime('%Y%m%d%H%M')}.csv"

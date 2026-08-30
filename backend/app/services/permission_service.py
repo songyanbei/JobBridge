@@ -11,6 +11,38 @@ from app.services.visibility_contract import (
 )
 from app.services.visibility_policy import EffectivePolicySnapshot
 
+
+PUBLISHER_ROLES = frozenset({"factory", "broker"})
+
+
+def can_publish_job(user_or_context, *, owner_userid: str | None = None) -> bool:
+    """Deterministic S4 publisher matrix.
+
+    Workers are never allowed to publish/manage jobs.  Factories may publish
+    their own jobs; brokers must be active and have at least one recruiting
+    capability flag enabled.  Unknown/missing attributes fail closed so this
+    helper works with both ORM ``User`` rows and ``UserContext`` adapters.
+    """
+    role = getattr(user_or_context, "role", None)
+    userid = getattr(user_or_context, "external_userid", None)
+    status = getattr(user_or_context, "status", None)
+    if role not in PUBLISHER_ROLES or status in {"blocked", "deleted", "disabled"}:
+        return False
+    if owner_userid is not None and userid != owner_userid:
+        return False
+    if role == "factory":
+        return True
+    return bool(
+        getattr(user_or_context, "can_search_workers", False)
+        or getattr(user_or_context, "can_search_jobs", False)
+        or getattr(user_or_context, "broker_recruiting_enabled", False)
+    )
+
+
+def can_manage_job(user_or_context, job) -> bool:
+    """Publisher ownership guard used by message and admin compatibility paths."""
+    return can_publish_job(user_or_context, owner_userid=getattr(job, "owner_userid", None))
+
 _JOB_CANDIDATE_KEYS: Mapping[str, tuple[str, ...]] = {
     "hiring_company": ("hiring_company", "hiring_company_source"),
     "job_category": ("job_category",),
