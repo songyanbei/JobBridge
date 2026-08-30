@@ -243,7 +243,7 @@ class TestFormatResumeResults:
         ]
         text = _format_resume_results(resumes, 3)
         assert "张三" in text
-        assert "13800001111" in text
+        assert "13800001111" not in text
         assert "更多" in text
 
     def test_phone_placeholder(self):
@@ -252,11 +252,12 @@ class TestFormatResumeResults:
                 "id": 1, "display_name": "李四", "gender": "女", "age": 28,
                 "expected_job_categories": [], "salary_expect_floor_monthly": 4000,
                 "expected_cities": [], "phone": None,
-                "phone_placeholder": "联系方式待补充",
+                "contact_available": False,
+                "contact_placeholder": "联系方式需通过联系请求获取",
             },
         ]
         text = _format_resume_results(resumes, 0)
-        assert "联系方式待补充" in text
+        assert "联系方式需通过联系请求获取" in text
 
     def test_category_only_does_not_render_zero_salary(self):
         text = _format_resume_results(

@@ -36,6 +36,8 @@ def _sample_job():
         "hiring_company_source": "job.hiring_company",
         "contact_person": "张经理",
         "phone": "13812345678",
+        "contact_available": True,
+        "contact_placeholder": "联系方式需通过联系请求获取",
         "description": "招普工",
     }
 
@@ -85,28 +87,33 @@ class TestFilterJobForRole:
     def test_broker_sees_all(self):
         job = _sample_job()
         filtered = filter_job_for_role(job, "broker", _snapshot("job_search", "broker"))
-        assert "phone" in filtered
+        assert filtered["contact_available"] is True
+        assert filtered["contact_placeholder"] == "联系方式需通过联系请求获取"
+        assert "phone" not in filtered
+        assert "contact_person" not in filtered
 
 
 class TestFilterResumeForRole:
     def test_factory_sees_phone(self):
         resume = _sample_resume()
-        user = {"display_name": "张三", "phone": "13800001111"}
+        user = {"display_name": "张三", "contact_available": True}
         filtered = filter_resume_for_role(resume, user, "factory", _snapshot("candidate_search", "factory"))
-        assert filtered["phone"] == "13800001111"
+        assert filtered["contact_available"] is True
+        assert "phone" not in filtered
         assert filtered["display_name"] == "张三"
 
     def test_phone_missing_placeholder(self):
         resume = _sample_resume()
-        user = {"display_name": "张三", "phone": None}
+        user = {"display_name": "张三", "contact_available": False}
         filtered = filter_resume_for_role(resume, user, "factory", _snapshot("candidate_search", "factory"))
-        assert filtered["phone"] is None
-        assert filtered["phone_placeholder"] == "联系方式待补充"
+        assert filtered["contact_available"] is False
+        assert filtered["contact_placeholder"] == "联系方式需通过联系请求获取"
 
     def test_no_user_data(self):
         resume = _sample_resume()
         filtered = filter_resume_for_role(resume, None, "factory", _snapshot("candidate_search", "factory"))
-        assert filtered["phone_placeholder"] == "联系方式待补充"
+        assert filtered["contact_available"] is False
+        assert filtered["contact_placeholder"] == "联系方式需通过联系请求获取"
 
 
 class TestBatchFiltering:
@@ -118,7 +125,7 @@ class TestBatchFiltering:
 
     def test_resumes_batch(self):
         resumes = [_sample_resume()]
-        users_map = {"u_worker_1": {"display_name": "张三", "phone": "138"}}
+        users_map = {"u_worker_1": {"display_name": "张三", "contact_available": True}}
         filtered = filter_resumes_batch(resumes, users_map, "factory", _snapshot("candidate_search", "factory"))
         assert filtered[0]["display_name"] == "张三"
 
