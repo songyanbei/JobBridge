@@ -24,6 +24,7 @@ DEFAULT_SEARCH_MESSAGE = "帮我找苏州电子厂岗位，5500以上，最好�
 def build_inbound_payload(userid: str, content: str) -> dict:
     return {
         "msg_id": f"phase5_smoke_{uuid.uuid4().hex}",
+        "turn_id": str(uuid.uuid4()),
         "from_userid": userid,
         "msg_type": "text",
         "content": content,
@@ -152,11 +153,12 @@ def create_mysql_inbound_event(mysql_dsn: str, payload: dict) -> int:
             cursor.execute(
                 """
                 INSERT INTO wecom_inbound_event (
-                  msg_id, from_userid, msg_type, media_id, content_brief, status
-                ) VALUES (%s, %s, %s, %s, %s, 'received')
+                  msg_id, turn_id, from_userid, msg_type, media_id, content_brief, status
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'received')
                 """,
                 (
                     payload["msg_id"],
+                    payload["turn_id"],
                     payload["from_userid"],
                     payload["msg_type"],
                     payload.get("media_id"),
