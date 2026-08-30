@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from app.tasks import worker_monitor
 from scripts import action_contact_chaos
 from scripts import action_execution_preflight
+from scripts import action_execution_emergency_rollback
 from scripts import legacy_exit_gate
 
 
@@ -113,3 +114,22 @@ def test_c3_legacy_exit_blocks_unapproved_diffs_and_pending_facts():
     assert report["eligible_to_propose_rfc"] is False
     blocked_codes = {item["code"] for item in report["findings"] if not item["passed"]}
     assert {"golden_diffs_approved", "pending_outbox_count"} <= blocked_codes
+
+
+def test_c4_rollback_plan_is_deterministic_and_preserves_facts():
+    first = action_execution_emergency_rollback.build_plan(operator="alice", reason="provider incident")
+    second = action_execution_emergency_rollback.build_plan(operator="alice", reason="provider incident")
+    assert first["incident_id"] == second["incident_id"]
+    assert [step["order"] for step in first["steps"]] == [1, 2, 3, 4, 5, 6]
+    assert first["facts_deleted"] is False
+    assert {"action", "contact", "facade", "strategy"} == set(first["switches"])
+
+
+def test_c4_switch_application_is_idempotent(monkeypatch):
+    redis = MagicMock()
+    monkeypatch.setattr("app.core.redis_client.get_redis", lambda: redis)
+    plan = action_execution_emergency_rollback.build_plan(operator="alice", reason="test")
+    action_execution_emergency_rollback._redis_switches(plan)
+    action_execution_emergency_rollback._redis_switches(plan)
+    assert redis.set.call_count == 8
+    assert all(call.args[0].startswith("routing:") for call in redis.set.call_args_list)
