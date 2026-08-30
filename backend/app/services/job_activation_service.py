@@ -19,7 +19,7 @@ def activate_job(db: Session, job: Job, now: datetime | None = None) -> Job:
             MediaAssetLifecycle.entity_type == "job",
             MediaAssetLifecycle.entity_id == job.id,
             MediaAssetLifecycle.state == "attached",
-        ).update({"entity_version": int(job.version)}, synchronize_session=False)
+        ).update({"entity_version": int(getattr(job, "aggregate_version", None) or job.version)}, synchronize_session=False)
     except Exception:
         # Mixed fleets may still run without the additive media column.
         pass

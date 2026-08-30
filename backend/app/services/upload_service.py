@@ -646,7 +646,7 @@ def attach_image(
         [image_key] = attach_media(
             db, [media_lifecycle_id], entity_type, record.id,
             owner_userid=external_userid,
-            entity_version=int(record.version or 1),
+            entity_version=int(getattr(record, "aggregate_version", None) or record.version or 1),
         )
     images.append(image_key)
     record.images = images
@@ -657,7 +657,7 @@ def attach_image(
         db.query(MediaAssetLifecycle).filter(
             MediaAssetLifecycle.id == media_lifecycle_id,
             MediaAssetLifecycle.state == "attached",
-        ).update({"entity_version": int(record.version)}, synchronize_session=False)
+        ).update({"entity_version": int(getattr(record, "aggregate_version", None) or record.version)}, synchronize_session=False)
     db.flush()
 
     kind = "岗位" if entity_type == "job" else "简历"
@@ -863,7 +863,7 @@ def _create_job(
         job.images = attach_media(
             db, media_ids, "job", job.id,
             owner_userid=user_ctx.external_userid,
-            entity_version=int(job.version or 1),
+            entity_version=int(getattr(job, "aggregate_version", None) or job.version or 1),
         )
     if audit_result.status == "passed":
         activate_job(db, job, now=now)

@@ -214,7 +214,7 @@ def create_replacement_candidate(
         new_job.images = attach_media(
             db, media_ids, "job", new_job.id,
             owner_userid=owner_userid,
-            entity_version=int(new_job.version or 1),
+            entity_version=int(getattr(new_job, "aggregate_version", None) or new_job.version or 1),
         )
 
     relation = JobReplacement(
