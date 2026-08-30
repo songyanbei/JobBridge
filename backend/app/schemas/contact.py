@@ -17,6 +17,7 @@ class ContactRequestCreate(BaseModel):
 
     actor_id: str = Field(min_length=1, max_length=64)
     listing_ref: str = Field(min_length=1, max_length=200)
+    direction: Literal["search_job", "search_worker"] | None = None
     action: Literal["request_contact"] = "request_contact"
     listing_version: int | None = Field(default=None, ge=0)
     policy_version: str | None = Field(default=None, max_length=64)
@@ -28,6 +29,7 @@ class ContactRequestView(BaseModel):
 
     request_id: str = Field(min_length=1, max_length=64)
     listing_ref: str = Field(min_length=1, max_length=200)
+    direction: Literal["search_job", "search_worker"] | None = None
     action: Literal["request_contact"]
     status: Literal["pending", "authorized", "revoked", "expired"]
     expires_at: datetime
@@ -75,4 +77,3 @@ def validate_opaque_id(value: str) -> str:
 
 for _model in (ContactRequestCreate, ContactRequestView, ContactGrantMetadata, ContactRedeemRequest):
     _model.model_fields.get("actor_id")
-

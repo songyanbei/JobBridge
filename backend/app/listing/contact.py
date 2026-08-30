@@ -97,6 +97,7 @@ class ContactService:
         action: str = "request_contact",
         listing_version: int | None = None,
         policy_version: str | None = None,
+        direction: str | None = None,
         trace_id: str | None = None,
         expires_in_seconds: int | None = None,
         db: Session | None = None,
@@ -113,6 +114,7 @@ class ContactService:
             request_id=request_id,
             actor_id=actor_id,
             listing_ref=listing_ref,
+            direction=direction,
             action=action,
             request_digest=_digest({"actor": actor_id, "listing": listing_ref, "action": action}),
             nonce_digest=_digest(nonce),
@@ -129,6 +131,7 @@ class ContactService:
         return ContactRequestView(
             request_id=request.request_id,
             listing_ref=request.listing_ref,
+            direction=request.direction,
             action="request_contact",
             status="pending",
             expires_at=request.expires_at,
@@ -143,6 +146,7 @@ class ContactService:
         *,
         listing_version: int | None = None,
         policy_version: str | None = None,
+        direction: str | None = None,
         db: Session | None = None,
     ) -> ContactDecision:
         """Re-check actor/listing/version/policy on the server before issuing."""
@@ -158,6 +162,8 @@ class ContactService:
         if request.actor_id != str(actor_id) or request.listing_ref != str(listing_ref):
             self.audit_contact_event("authorize", "denied", "actor_or_listing_mismatch", actor_id=actor_id, listing_ref=listing_ref, request_id=request_id, db=session)
             return ContactDecision(False, "forbidden", request_id)
+        if direction is not None and request.direction not in (None, str(direction)):
+            return ContactDecision(False, "direction_mismatch", request_id)
         if request.expires_at <= now:
             request.status = "expired"
             self.audit_contact_event("authorize", "denied", "request_expired", actor_id=actor_id, listing_ref=listing_ref, request_id=request_id, db=session)
@@ -180,6 +186,7 @@ class ContactService:
         *,
         listing_version: int | None = None,
         policy_version: str | None = None,
+        direction: str | None = None,
         trace_id: str | None = None,
         db: Session | None = None,
     ) -> ContactGrantMetadata | ContactResponse:
@@ -188,14 +195,14 @@ class ContactService:
         session = db or self.db
         if session is None:
             return ContactResponse(success=False, code="contact_unavailable", message=CONTACT_UNAVAILABLE_MESSAGE)
-        decision = self.authorize_contact(request_id, actor_id, listing_ref, listing_version=listing_version, policy_version=policy_version, db=session)
+        decision = self.authorize_contact(request_id, actor_id, listing_ref, listing_version=listing_version, policy_version=policy_version, direction=direction, db=session)
         if not decision.allowed:
             code = "forbidden" if decision.reason_code in {"forbidden", "invalid_request"} else "expired"
             return ContactResponse(success=False, code=code, message=CONTACT_UNAVAILABLE_MESSAGE)
         token = secrets.token_urlsafe(32)
         grant = ContactGrant(
             grant_id=_new_grant_id(), request_id=str(request_id), actor_id=str(actor_id), listing_ref=str(listing_ref),
-            action="request_contact", token_hash=_digest(token), nonce_digest=_digest(secrets.token_bytes(32)),
+            action="request_contact", direction=direction, token_hash=_digest(token), nonce_digest=_digest(secrets.token_bytes(32)),
             listing_version=listing_version, policy_version=policy_version, status="issued",
             expires_at=_now() + timedelta(seconds=max(1, int(getattr(settings, "contact_grant_ttl_seconds", 60)))), trace_id=trace_id,
         )
