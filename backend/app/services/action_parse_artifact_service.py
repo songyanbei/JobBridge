@@ -12,7 +12,9 @@ from sqlalchemy.orm import Session
 from app.models import ActionParseArtifact
 
 PARSE_SCHEMA_VERSION = "action-gateway.v1"
-_SENSITIVE_KEYS = frozenset({"phone", "wechat", "wechat_id", "contact", "mobile", "email"})
+_SENSITIVE_KEYS = frozenset({
+    "phone", "wechat", "wechat_id", "contact", "contact_person", "mobile", "email",
+})
 
 
 def _safe_payload(value: Any) -> Any:

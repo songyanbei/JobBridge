@@ -63,6 +63,11 @@ def test_artifact_rejects_pii_and_cross_actor_or_digest(db):
             db, parse_ref="parse-pii", turn_id="turn-1", actor_userid="u1",
             payload={"phone": "13800138000"}, parse_digest_value="b" * 64, classifier_version="v1",
         )
+    with pytest.raises(ValueError, match="sensitive"):
+        persist_parse_artifact(
+            db, parse_ref="parse-contact-person", turn_id="turn-1", actor_userid="u1",
+            payload={"contact_person": "张经理"}, parse_digest_value="b" * 64, classifier_version="v1",
+        )
     persist_parse_artifact(
         db, parse_ref="parse-2", turn_id="turn-1", actor_userid="u1",
         payload={"intent": "show_more"}, parse_digest_value="c" * 64, classifier_version="v1",

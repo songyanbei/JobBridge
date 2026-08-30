@@ -105,6 +105,16 @@ def test_classifier_failure_is_fail_closed_and_does_not_retry(monkeypatch):
     assert envelope.parse_ref is None
 
 
+def test_safe_payload_removes_contact_person_alongside_other_contact_pii():
+    payload = action_gateway._safe_payload({
+        "contact_person": "张经理",
+        "phone": "13800138000",
+        "wechat": "wxid_secret",
+        "city": "苏州",
+    })
+    assert payload == {"city": "苏州"}
+
+
 def test_actor_and_turn_bind_request_digest(monkeypatch):
     monkeypatch.setattr(
         action_gateway.intent_service, "classify_for_action_gateway",

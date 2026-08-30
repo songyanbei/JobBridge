@@ -10,7 +10,9 @@ from app.services import intent_service
 SUPPORTED_ACTIONS = frozenset({"search_job", "show_more_job", "relax_job"})
 ACTION_GATEWAY_SCHEMA_VERSION = "action-gateway.v1"
 CLASSIFIER_VERSION = "intent-adapter.v1"
-_SENSITIVE_KEYS = frozenset({"phone", "wechat", "wechat_id", "contact", "mobile"})
+_SENSITIVE_KEYS = frozenset({
+    "phone", "wechat", "wechat_id", "contact", "contact_person", "mobile",
+})
 _ACCEPT = frozenset({"好", "好的", "可以", "行", "同意", "确认", "放宽", "是"})
 
 def _canonical(value: Any) -> str:
