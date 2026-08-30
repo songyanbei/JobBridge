@@ -4,6 +4,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from app.tasks import worker_monitor
+from scripts import action_contact_chaos
 from scripts import action_execution_preflight
 
 
@@ -59,3 +60,18 @@ def test_preflight_rejects_invalid_mode_or_rollout(monkeypatch):
     monkeypatch.setenv("ACTION_EXECUTION_MODE", "on")
     monkeypatch.setenv("ACTION_EXECUTION_ROLLOUT_PERCENTAGE", "101")
     assert action_execution_preflight.run(dsn=None) == 2
+
+
+def test_c2_chaos_matrix_covers_all_rows_and_forbidden_outcomes():
+    report = action_contact_chaos.run()
+    assert report["scenario_count"] == 9
+    assert report["passed"] is True
+    assert all(item["forbidden_hits"] == [] for item in report["results"])
+
+
+def test_c2_chaos_scenario_is_repeatable_and_selectable():
+    first = action_contact_chaos.run(["grant_consumed_provider_timeout"])
+    second = action_contact_chaos.run(["grant_consumed_provider_timeout"])
+    assert first["passed"] is True
+    assert second["passed"] is True
+    assert first["results"][0]["events"] == second["results"][0]["events"]
