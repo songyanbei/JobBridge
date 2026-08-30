@@ -4,6 +4,16 @@
 > 不在本方案实现：岗位发布、简历发布、factory/broker 找工人、二手物品、远程 MCP、向量库和新的公共事实表。  
 > 兼容要求：legacy 搜索始终可用；任何新路径都不能破坏现有 `search_jobs` 行为。
 
+## 实施状态（2026-08-30）
+
+**工程实施与代码审查：已完成（本轮范围）。** Phase 0-3 以及 Phase 5 中纳入本轮交付的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限/脱敏和观测测试均已落地，并按独立提交节点提交；Phase 4 的独立 Contact Domain Service/明文兑换仍未实现。
+
+**部署与端到端验证：已完成。** WSL 中 MySQL、Redis、App、Worker、Nginx 已启动且 `/ready` 返回 200；mock-testbed 接口 smoke 为 8/8，mock-testbed 单测为 42 passed；模拟页面已验证求职者多轮条件修改、`更多`、放宽提示、`/帮助`、招聘者查询、SSE 出站、重复消息去重和身份前缀守卫。最近 30 分钟入站事件全部 `done`，出站全部 `sent`，PII 查询命中 0，Redis 队列无积压。
+
+**发布边界：保持 legacy/fallback 优先。** 当前 Search Facade rollout 默认关闭，实际执行日志显示 `execution_mode=off`、`served_assignment=legacy`，异常时仍按设计记录 `facade_fallback` 并回到 legacy；本轮不宣称生产全量切换完成。
+
+**保留限制：** `action_execution` 的 schema、lease/fencing helper 和审计契约已完成，但尚未接入真实搜索生产调用链。由于当前 DB 提交与 Redis Session CAS 为两阶段恢复边界，本轮没有做半接入；详见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+
 ## 1. v1 目标和成功定义
 
 用户可以用自然语言开始找岗位，跨轮次追加/替换/删除城市、工种、薪资等条件，在无结果时接受有限放宽，使用“更多”消费同一候选快照，并从卡片进入受控联系入口。服务端始终按 worker 身份、岗位审核/生命周期和脱敏策略裁决；LLM 只解析语义。
@@ -40,6 +50,8 @@
 - [`backend/app/models.py`](../../backend/app/models.py)：`Job` 具有 `audit_status`、`expires_at`、`deleted_at`、`version` 等字段；`WecomInboundEvent` status 闭集为 `received/processing/session_pending/done/failed/dead_letter`；已存在推荐请求/尝试/投递表。
 
 ### 2.2 v1 尚未具备
+
+> 本节保留方案编写时的目标差距基线。实施后的完成度和可验证限制以本文开头“实施状态”和第 6 节为准。
 
 以下是本方案的目标改动，不应在发布前标记为“已有”：
 
@@ -346,3 +358,17 @@ v1 只读 `jobs` 及关联用户/字典表，不创建公共 `listing` 表，不
 
 本方案完成不等于岗位发布、简历发布、双向招聘或二手领域完成；这些必须遵循 [07 总体改造路线图](07-overall-migration-roadmap.md) 的后续阶段和独立验收。
 
+## 6. 实施后状态与验收记录
+
+### 6.1 已完成并验证
+
+- 可靠入站：`turn_id`、限流审计、dispatcher lease/fencing、重复消息和故障契约已实现并有测试覆盖。
+- 多轮搜索：criteria add/replace/remove、Session version/CAS、候选快照、`show_more`、低召回放宽和固定 renderer 已验证。
+- Search Facade：legacy adapter、超时/异常 fallback、rollout/kill switch、权限/状态/有效期复核和 PII 白名单已验证。
+- 出站链路：DB Outbox、Worker 发送、mock WeCom Redis pub/sub、SSE 页面回复已完成实测；页面与数据库结果一致。
+- 测试结果：主后端此前回归 `419 passed`；mock-testbed `42 passed`；接口 smoke `8/8`；部署后最近 30 分钟业务事件 `done=11`（另有后续重复消息验证为 `done`）、未发送 outbox 为 0、PII 命中为 0。
+
+### 6.2 尚未宣称完成
+
+- `action_execution` 尚未接入真实搜索调用链，因此当前日志中的搜索执行事实仍以推荐请求/尝试、Session、Outbox 和 `facade_fallback` 记录为准；接入前必须先完成 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md) 中的结果引用和事务边界设计。
+- Search Facade、Contact 和 Dialogue v1 的生产 rollout 默认仍为 0%；扩大灰度、生产 SLO 观察窗口和真实历史语料评估不属于本轮本地 WSL 验收结论。

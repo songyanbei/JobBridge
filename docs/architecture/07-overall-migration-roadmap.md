@@ -123,6 +123,8 @@ S2 依赖 S0 的可回放基线和 S1 的协议/状态，但允许在 S1 未全�
 
 ### S2：求职搜索首版（worker 搜索 job）
 
+> 状态（2026-08-30）：工程实现、代码审查、WSL 部署和 mock 页面端到端验证已完成；生产 rollout 保持 legacy/fallback 优先。`action_execution` 尚未接入真实搜索调用链，见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+
 **前置依赖**：S0 回放/可靠性基线；S1 的 v1 adapter、Session CAS 和 Reducer 可在灰度桶运行。
 
 **目标与需求**

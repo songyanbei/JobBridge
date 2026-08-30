@@ -1,7 +1,7 @@
 # JobBridge 架构方案文档集
 
 > 版本：v1.0
-> 状态：架构基线
+> 状态：架构基线；求职搜索 v1 已完成工程实施与 WSL 验证，尚未进行生产全量切换
 > 适用范围：企业微信文字机器人，以及未来扩展到二手物品、房屋、服务等分类信息场景。
 
 ## 目标
@@ -33,6 +33,13 @@ JobBridge 的目标架构是：
 | [08 求职搜索 v1 实施方案](08-job-search-v1-implementation-plan.md) | 首版求职搜索的详细实施、代码范围、测试和灰度 | 后端、AI、测试、运维 |
 
 阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，最后以 08 作为当前首个可执行交付切片。08 仅覆盖求职者找岗位，不代表岗位发布、简历发布、双向招聘或二手物品已经完成。
+
+## 当前实施状态
+
+- 求职搜索 v1 的可靠入站、Dialogue/Session 多轮状态、Search Facade/fallback、`show_more`、放宽契约、权限与脱敏测试已完成；实现和代码审查在 `codex/unified-listing-flow-architecture` 分支完成。
+- WSL 生产编排、mock 企业微信测试台、页面多轮对话和执行日志核验已通过；详细记录见 [08 求职搜索 v1 首版详细实施方案](08-job-search-v1-implementation-plan.md)。
+- 当前默认配置保持 legacy/fallback 优先，Search Facade rollout 仍为关闭状态；这属于可回滚发布策略，不代表删除或绕过 v1 代码。
+- `action_execution` 的通用 schema/lease/fencing 契约已具备，但尚未接入真实搜索生产调用链；该限制和后续入口见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
 
 ## 当前系统基线
 

@@ -2,6 +2,8 @@
 
 审计基线：`2026-08-30`，分支 `codex/unified-listing-flow-architecture`。
 
+验证状态：本轮 WSL 部署和模拟对话已完成；实际日志确认搜索请求仍为 `execution_mode=off` / `served_assignment=legacy`，`action_execution` 近期无生产搜索记录。该结果与本审计结论一致，不能将通用 Action 契约测试等同于生产链路已接入。
+
 ## 结论
 
 当前生产搜索链路**没有真正调用** `action_execution_service.py`，因此不能宣称搜索 read action 已记录
