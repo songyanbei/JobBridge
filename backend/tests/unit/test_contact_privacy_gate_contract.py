@@ -49,6 +49,30 @@ def _job(**overrides):
     return SimpleNamespace(**values)
 
 
+def _resume(**overrides):
+    values = {
+        "id": 1,
+        "owner_userid": "owner-1",
+        "expected_cities": ["苏州市"],
+        "expected_job_categories": ["普工"],
+        "salary_expect_floor_monthly": 5000,
+        "gender": "男",
+        "age": 30,
+        "education": "高中",
+        "work_experience": "联系人张经理 电话13800138000 微信wxid_secret",
+        "description": "可联系张经理，电话13800138000，微信wxid_secret",
+        "created_at": None,
+        "expected_districts": [],
+        "available_from": None,
+        "accept_night_shift": None,
+        "accept_overtime": None,
+        "accept_long_term": None,
+        "accept_short_term": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_search_projection_is_pii_free_even_when_legacy_values_exist(monkeypatch):
     monkeypatch.setattr(
         search_service,
@@ -77,6 +101,21 @@ def test_search_projection_uses_ciphertext_presence_only(monkeypatch):
     )[0]
     assert card["contact_available"] is True
     assert not any(key in card for key in _SENSITIVE_KEYS)
+
+
+def test_resume_free_text_is_redacted_in_projection_and_card():
+    projected = search_service._resumes_to_dicts([_resume()])[0]
+    assert not any(value in str(projected) for value in _SENSITIVE_VALUES)
+    assert "[联系方式已隐藏]" in projected["work_experience"]
+    assert "[联系方式已隐藏]" in projected["description"]
+
+    rendered = search_service._format_resume_results([{
+        "id": 1,
+        "expected_job_categories": ["普工"],
+        "work_experience": "联系人张经理 电话13800138000 微信wxid_secret",
+    }], 0)
+    assert not any(value in rendered for value in _SENSITIVE_VALUES)
+    assert "[联系方式已隐藏]" in rendered
 
 
 def test_permission_projection_maps_contact_policy_to_safe_fields():

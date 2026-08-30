@@ -2991,8 +2991,8 @@ def _resumes_to_dicts(resumes: list) -> list[dict]:
             "gender": r.gender,
             "age": r.age,
             "education": r.education,
-            "work_experience": r.work_experience,
-            "description": r.description,
+            "work_experience": _redact_contact_text(r.work_experience),
+            "description": _redact_contact_text(r.description),
             "created_at": str(r.created_at) if r.created_at else "",
             "owner_userid": r.owner_userid,
             # recommendation-v1 inputs: §6.4 quality fields plus the §6.9.2
@@ -3216,7 +3216,7 @@ def _format_resume_results(
         elif r.get("contact_placeholder"):
             lines.append(f"   📞 {r['contact_placeholder']}")
 
-        exp = r.get("work_experience", "")
+        exp = _redact_contact_text(r.get("work_experience", ""))
         if exp:
             lines.append(f"   💼 经验：{exp[:50]}")
         lines.append("")
