@@ -10,6 +10,7 @@ from app.services import intent_service
 SUPPORTED_ACTIONS = frozenset({
     "search_job", "show_more_job", "relax_job",
     "publish_job", "edit_job_draft", "confirm_job", "delist_job", "restore_job",
+    "publish_resume", "replace_resume", "confirm_resume", "edit_resume_draft", "delist_resume", "restore_resume",
 })
 ACTION_GATEWAY_SCHEMA_VERSION = "action-gateway.v1"
 CLASSIFIER_VERSION = "intent-adapter.v1"
@@ -92,13 +93,14 @@ class ActionGateway:
             return self._envelope(turn_id, "unknown", legacy_reason="empty_text")
         # Confirmation operates on the durable draft and does not re-run the
         # intent classifier, preserving one provider call per turn.
-        if getattr(session, "pending_upload_intent", None) == "upload_job" and text in _CONFIRM:
+        if getattr(session, "pending_upload_intent", None) in {"upload_job", "upload_resume"} and text in _CONFIRM:
+            action_name = "confirm_resume" if getattr(session, "pending_upload_intent", None) == "upload_resume" else "confirm_job"
             digest = _digest({
                 "turn_id": turn_id,
-                "action_name": "confirm_job",
+                "action_name": action_name,
                 "draft": _safe_payload(getattr(session, "pending_upload", {}) or {}),
             })
-            return self._envelope(turn_id, "confirm_job", request_digest=digest)
+            return self._envelope(turn_id, action_name, request_digest=digest)
         try:
             route = intent_service.classify_for_action_gateway(text=text, role=getattr(actor, "role", "worker"), history=getattr(session, "history", None), session=session, user_msg_id=getattr(msg, "msg_id", None), userid=getattr(msg, "from_user", None))
             parsed = _parse_from_route(route, session)
@@ -112,7 +114,9 @@ class ActionGateway:
             action = "show_more_job"
         elif intent in {"search_job", "follow_up"} and getattr(actor, "role", "worker") == "worker":
             action = "search_job"
-        elif intent in {"search_worker", "upload_job", "upload_resume", "command", "chitchat"}:
+        elif intent == "upload_resume":
+            action = "publish_resume"
+        elif intent in {"search_worker", "upload_job", "command", "chitchat"}:
             action = "none"
         else:
             action = "unknown"

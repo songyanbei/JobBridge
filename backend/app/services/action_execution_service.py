@@ -25,6 +25,7 @@ _FINAL_STATUSES = {"succeeded", "failed_retryable", "failed_terminal"}
 SUPPORTED_ACTIONS = frozenset({
     "search_job", "show_more_job", "relax_job",
     "publish_job", "edit_job_draft", "confirm_job", "delist_job", "restore_job",
+    "publish_resume", "replace_resume", "confirm_resume", "edit_resume_draft", "delist_resume", "restore_resume",
 })
 
 

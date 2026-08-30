@@ -21,6 +21,8 @@ def to_utc_naive(value: datetime) -> datetime:
 
 def increment_resume_version(resume: Resume) -> None:
     resume.version = int(resume.version or 0) + 1
+    if hasattr(resume, "aggregate_version"):
+        resume.aggregate_version = int(getattr(resume, "aggregate_version", None) or resume.version - 1 or 0) + 1
 
 
 def lock_resume(db: Session, resume_id: int) -> Resume:

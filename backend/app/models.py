@@ -528,6 +528,8 @@ class Resume(Base):
 
     # ---- 乐观锁 ----
     version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"), comment="乐观锁版本号")
+    # Phase 15 additive domain version; legacy ``version`` remains mirrored.
+    aggregate_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("1"), comment="领域聚合版本号")
 
     # ---- 扩展 ----
     extra = sa.Column(MutableDict.as_mutable(sa.JSON), nullable=True, comment="扩展字段")
