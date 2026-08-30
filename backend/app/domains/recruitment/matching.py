@@ -103,5 +103,6 @@ class MatchingPolicyV1:
         return [item for _, item in scored[: (limit or self.max_candidates)]]
 
 
-__all__ = ["DIRECTIONS", "POLICY_VERSION", "MatchingPolicyV1", "MatchDecision", "direction_for", "hard_filter", "policy_digest"]
+MatchingPolicy = MatchingPolicyV1
 
+__all__ = ["DIRECTIONS", "POLICY_VERSION", "MatchingPolicy", "MatchingPolicyV1", "MatchDecision", "direction_for", "hard_filter", "policy_digest"]
