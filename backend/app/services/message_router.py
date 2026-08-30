@@ -399,7 +399,7 @@ _WELCOME_WORKER = (
 # 公开入口
 # ---------------------------------------------------------------------------
 
-def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
+def process(msg: WeComMessage, db: Session, action_context=None) -> list[ReplyMessage]:
     """消息路由主入口。Worker 调用，返回待发送的回复列表。"""
     userid = msg.from_user
     if not userid:
@@ -430,7 +430,7 @@ def process(msg: WeComMessage, db: Session) -> list[ReplyMessage]:
     try:
         mtype = msg.msg_type or ""
         if mtype == "text":
-            return _handle_text(msg, user_ctx, db)
+            return _handle_text(msg, user_ctx, db, action_context=action_context)
         if mtype == "image":
             return _handle_image(msg, user_ctx, db)
         if mtype == "voice":
@@ -463,6 +463,8 @@ def _handle_text(
     msg: WeComMessage,
     user_ctx: UserContext,
     db: Session,
+    *,
+    action_context=None,
 ) -> list[ReplyMessage]:
     userid = msg.from_user
     content = (msg.content or "").strip()
@@ -644,7 +646,12 @@ def _handle_text(
     decision = None  # type: ignore[assignment]
     source = "legacy"
 
-    if v2_mode == "off":
+    if action_context is not None and getattr(action_context, "intent_result", None) is not None:
+        # ActionGateway already performed the single allowed parse for this turn.
+        intent_result = action_context.intent_result
+        decision = None
+        source = "legacy_from_parse"
+    elif v2_mode == "off":
         # session_hint 只在 legacy 路径下需要在此处构造；classify_dialogue 内部会自己构造。
         session_hint = intent_service.build_session_hint(session)
         try:

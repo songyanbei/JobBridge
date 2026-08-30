@@ -32,6 +32,7 @@ from typing import Any, Callable
 from sqlalchemy import and_, exists, func, null, or_, text
 from sqlalchemy.orm import Session, aliased
 
+from app.config import settings
 from app.core.redis_client import (
     QUEUE_DEAD_LETTER,
     QUEUE_INCOMING,
@@ -55,9 +56,12 @@ from app.models import (
     WecomInboundEvent,
     WecomOutboundOutbox,
     RecommendationDelivery,
+    User,
 )
 from app.schemas.conversation import ReplyMessage
 from app.services import (
+    action_gateway,
+    action_execution_service,
     conversation_service,
     message_router,
     recommendation_shadow_service,
@@ -739,6 +743,53 @@ class Worker:
 
             msg = _build_wecom_message(msg_data)
 
+            # Workstream A pre-routing: parse once before entering the Router.
+            # The default remains off; legacy turns never create Action rows.
+            action_context = None
+            action_claim = None
+            if msg.msg_type == "text":
+                gateway = action_gateway.ActionGateway()
+                role = db.query(User.role).filter(User.external_userid == userid).scalar()
+                session_hint = conversation_service.load_session(userid)
+                envelope = gateway.classify(
+                    msg, session=session_hint,
+                    actor=type("GatewayActor", (), {"role": role or ""})(),
+                )
+                mode = getattr(settings, "action_execution_mode", "off")
+                percentage = int(getattr(settings, "action_execution_rollout_percentage", 0) or 0)
+                in_bucket = percentage >= 100 or (
+                    percentage > 0 and int(identifier_hash(userid)[:8], 16) % 100 < percentage
+                )
+                if mode == "on" and in_bucket and envelope.is_supported:
+                    action_claim = action_execution_service.claim_action_execution(
+                        db, envelope.turn_id, envelope.action_name, self._lease_owner,
+                        request_digest=envelope.request_digest,
+                        lease_seconds=int(getattr(settings, "action_execution_lease_seconds", 180)),
+                        parse_ref=envelope.parse_ref, parse_digest=envelope.parse_digest,
+                        parse_version=envelope.parse_schema_version,
+                        parse_expires_at=envelope.parse_expires_at,
+                    )
+                    db.commit()
+                    if action_claim.replay:
+                        try:
+                            action_execution_service.load_replay_reference(
+                                db, envelope.turn_id, envelope.action_name,
+                            )
+                        except Exception:
+                            return "action_replay_terminal"
+                        if inbound_event_id:
+                            self._apply_session_commit_for_event(inbound_event_id, userid)
+                            self._deliver_outbox_for_event(inbound_event_id)
+                        return "action_replayed"
+                    if action_claim.busy:
+                        return "action_in_progress"
+                    if action_claim.state == "failed_terminal":
+                        return "action_terminal"
+                    action_context = envelope
+                elif mode in {"on", "shadow"}:
+                    # Keep the same parse for compatible legacy routing; no claim.
+                    action_context = envelope
+
             # 图片：Worker 层下载存 storage 并回填 image_url
             if msg.msg_type == "image" and msg.media_id:
                 self._download_and_attach_image(msg)
@@ -756,7 +807,7 @@ class Worker:
             )
             staged_session = None
             try:
-                replies = message_router.process(msg, db)
+                replies = message_router.process(msg, db, action_context=action_context)
             finally:
                 submitted_shadow_request_ids.update(
                     recommendation_shadow_service.end_turn_tracking(
@@ -794,6 +845,35 @@ class Worker:
                 )
             else:
                 self._mark_event_done(db, inbound_event_id)
+            if action_claim is not None and action_claim.acquired:
+                request_ids = [
+                    reply.recommendation_request.request_id
+                    for reply in replies
+                    if reply.recommendation_request is not None
+                    and reply.recommendation_request.request_id
+                ]
+                snapshot_ids = [
+                    reply.recommendation_request.snapshot_id
+                    for reply in replies
+                    if reply.recommendation_request is not None
+                    and reply.recommendation_request.snapshot_id
+                ]
+                delivery_ids = [reply.delivery_id for reply in replies if reply.delivery_id]
+                reference = action_execution_service.build_result_reference(
+                    turn_id=action_claim.row.turn_id,
+                    action_name=action_claim.row.action_name,
+                    request_id=request_ids[-1] if request_ids else None,
+                    snapshot_id=snapshot_ids[-1] if snapshot_ids else None,
+                    delivery_ids=delivery_ids,
+                    result_ref_type="recommendation" if request_ids or delivery_ids else "terminal",
+                )
+                if not action_execution_service.finalize_action_execution(
+                    db, action_claim.row.turn_id, action_claim.row.action_name,
+                    self._lease_owner, action_claim.fencing_token,
+                    result_reference=reference,
+                    result_digest=action_context.request_digest if action_context else None,
+                ):
+                    raise RuntimeError("action_fence_lost")
             db.commit()
             business_committed = True
             # A shadow callback may persist only after the served request/outbox
