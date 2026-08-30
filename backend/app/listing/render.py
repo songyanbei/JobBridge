@@ -6,6 +6,26 @@ from collections.abc import Iterable
 from app.schemas.search import ListingCard
 
 
+def redact_resume_for_viewer(resume, *, role: str) -> dict:
+    """Return the bounded candidate-search projection for factory/broker."""
+    if role not in {"factory", "broker"}:
+        return {"id": getattr(resume, "id", None)}
+    age = getattr(resume, "age", None)
+    age_band = None
+    if age is not None:
+        age_band = f"{(int(age)//5)*5}-{(int(age)//5)*5+4}岁"
+    return {
+        "id": getattr(resume, "id", None),
+        "gender": getattr(resume, "gender", None),
+        "age_band": age_band,
+        "expected_job_categories": list(getattr(resume, "expected_job_categories", None) or []),
+        "expected_cities": list(getattr(resume, "expected_cities", None) or []),
+        "salary_expect_floor_monthly": getattr(resume, "salary_expect_floor_monthly", None),
+        "work_experience": str(getattr(resume, "work_experience", None) or "")[:120],
+        "contact_placeholder": "回复“联系”获取沟通入口",
+    }
+
+
 def render_listing_card(card: ListingCard, *, position: int | None = None) -> str:
     """Render one card using a stable template owned by the application."""
     marker = f"{position}. " if position is not None else ""
