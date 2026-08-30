@@ -131,6 +131,7 @@ def test_contact_outbox_claims_delivery_and_sends_fixed_platform_request():
             status="authorized",
             expires_at=datetime.utcnow() + timedelta(minutes=5),
         ))
+        db.flush()
         db.add(ContactGrant(
             grant_id=grant_id,
             request_id=request_id,
@@ -143,6 +144,10 @@ def test_contact_outbox_claims_delivery_and_sends_fixed_platform_request():
             expires_at=datetime.utcnow() + timedelta(minutes=5),
             used_at=datetime.utcnow(),
         ))
+        # Flush the parent explicitly before constructing the FK child.  This
+        # mirrors the production issue_one_time_grant boundary and keeps the
+        # fixture valid on MySQL's immediate FK checks.
+        db.flush()
         db.add(ContactDelivery(
             delivery_id=delivery_id,
             grant_id=grant_id,
@@ -184,6 +189,10 @@ def test_contact_outbox_claims_delivery_and_sends_fixed_platform_request():
         worker._wecom_client.send_text.return_value = {"errcode": 0, "msgid": "contact-msg-1"}
         assert worker._deliver_outbox_item(item) is True
 
+        # End the setup transaction before reading rows updated by the worker's
+        # independent Session; otherwise MySQL repeatable-read keeps the old
+        # ``sending`` snapshot visible to this assertion Session.
+        db.rollback()
         db.expire_all()
         assert db.query(WecomOutboundOutbox).filter_by(id=outbox_id).one().status == "sent"
         assert db.query(ContactDelivery).filter_by(delivery_id=delivery_id).one().status == "sent"
