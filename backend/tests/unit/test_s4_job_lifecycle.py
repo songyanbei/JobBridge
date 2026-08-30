@@ -64,11 +64,36 @@ def test_transition_emits_versioned_domain_event(monkeypatch):
         db,
         aggregate_type="job",
         aggregate_id=8,
-        aggregate_version=11,
+        aggregate_version=12,
         event_type="job.restored",
         payload={"reason": "operator_restore"},
         tombstone=False,
     )
+
+
+@pytest.mark.parametrize(
+    ("action", "overrides", "event_type"),
+    [
+        ("delist", {}, "job.delisted"),
+        ("expire", {"expires_at": datetime.utcnow() - timedelta(hours=1)}, "job.expired"),
+        ("restore", {"delist_reason": "manual_delist"}, "job.restored"),
+        ("replace", {}, "job.replaced"),
+    ],
+)
+def test_transition_bumps_aggregate_version_for_every_mutation(monkeypatch, action, overrides, event_type):
+    append_domain_event = MagicMock()
+    monkeypatch.setitem(sys.modules, "app.services.domain_outbox_service", SimpleNamespace(append_domain_event=append_domain_event))
+    values = {"id": 9, "version": 3, "aggregate_version": 10, "audit_status": "passed", "deleted_at": None, "delist_reason": None, "expires_at": datetime.utcnow() + timedelta(hours=1)}
+    values.update(overrides)
+    job = SimpleNamespace(**values)
+    db = MagicMock(); db.info = {}
+    db.query.return_value.populate_existing.return_value.filter.return_value.with_for_update.return_value.one_or_none.return_value = job
+    transition_reason = "manual_delist" if action == "delist" else "test"
+    transition_job(db, 9, action=action, reason=transition_reason)
+    assert job.version == 4
+    assert job.aggregate_version == 11
+    assert append_domain_event.call_args.kwargs["aggregate_version"] == 11
+    assert append_domain_event.call_args.kwargs["event_type"] == event_type
 
 
 def test_phase14_media_migration_is_additive():

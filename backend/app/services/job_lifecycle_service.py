@@ -19,6 +19,13 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _bump_versions(job: Job, current_version: int) -> None:
+    """Mirror legacy ``version`` and additive aggregate version atomically."""
+    job.version = int(current_version) + 1
+    previous_aggregate = getattr(job, "aggregate_version", None)
+    job.aggregate_version = int(previous_aggregate or current_version or 1) + 1
+
+
 def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, tombstone: bool = False) -> None:
     """Best-effort bridge to the S4 DomainOutboxEvent model.
 
@@ -88,7 +95,7 @@ def transition_job(
             return job
         job.delist_reason = lifecycle_reason
         job.deleted_at = now if lifecycle_reason in {"expired", "replaced"} else job.deleted_at
-        job.version = current + 1
+        _bump_versions(job, current)
         mark_job_media_delete_pending(db, job.id)
         _emit(db, job, "job.expired" if lifecycle_reason == "expired" else "job.delisted", reason=lifecycle_reason, tombstone=True)
     elif action == "expire":
@@ -98,7 +105,7 @@ def transition_job(
             raise BusinessException(40904, "job_not_expired")
         job.delist_reason = "expired"
         job.deleted_at = now
-        job.version = current + 1
+        _bump_versions(job, current)
         mark_job_media_delete_pending(db, job.id)
         _emit(db, job, "job.expired", reason="expired", tombstone=True)
     elif action == "restore":
@@ -109,14 +116,14 @@ def transition_job(
         if job.delist_reason is None:
             raise BusinessException(40904, "岗位未下架")
         job.delist_reason = None
-        job.version = current + 1
+        _bump_versions(job, current)
         _emit(db, job, "job.restored", reason=reason or "restore")
     elif action == "replace":
         if job.deleted_at is not None:
             raise BusinessException(40904, "job_deleted")
         job.delist_reason = "replaced"
         job.deleted_at = now
-        job.version = current + 1
+        _bump_versions(job, current)
         mark_job_media_delete_pending(db, job.id, include_pending=True)
         _emit(db, job, "job.replaced", reason=reason or "replaced", tombstone=True)
     else:
