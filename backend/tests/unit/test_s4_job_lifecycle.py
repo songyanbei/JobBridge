@@ -51,3 +51,7 @@ def test_phase14_media_migration_is_additive():
     schema_text = schema.read_text(encoding="utf-8")
     assert "`entity_version` INT UNSIGNED" in schema_text
     assert "idx_media_entity_version" in schema_text
+    assert (migration.parent / "phase14_down_002_job_media_version.sql").exists()
+    lifecycle = migration.parent / "phase14_003_job_lifecycle_event.sql"
+    assert lifecycle.exists()
+    assert "idx_job_lifecycle_version" in lifecycle.read_text(encoding="utf-8")
