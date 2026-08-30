@@ -748,7 +748,8 @@ class Worker:
             # The default remains off; legacy turns never create Action rows.
             action_context = None
             action_claim = None
-            if msg.msg_type == "text":
+            mode = getattr(settings, "action_execution_mode", "off")
+            if msg.msg_type == "text" and mode in {"on", "shadow"}:
                 gateway = action_gateway.ActionGateway()
                 role = db.query(User.role).filter(User.external_userid == userid).scalar()
                 session_hint = conversation_service.load_session(userid)
@@ -756,7 +757,6 @@ class Worker:
                     msg, session=session_hint,
                     actor=type("GatewayActor", (), {"role": role or ""})(),
                 )
-                mode = getattr(settings, "action_execution_mode", "off")
                 percentage = int(getattr(settings, "action_execution_rollout_percentage", 0) or 0)
                 in_bucket = percentage >= 100 or (
                     percentage > 0 and int(identifier_hash(userid)[:8], 16) % 100 < percentage
