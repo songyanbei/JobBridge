@@ -5,6 +5,7 @@ SET @ddl = IF(
   EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='action_version'),
   'SELECT 1',
   'ALTER TABLE `action_execution`
+     ADD COLUMN `actor_userid` VARCHAR(64) NULL AFTER `action_name`,
      ADD COLUMN `action_version` VARCHAR(32) NOT NULL DEFAULT ''v1'' AFTER `result_digest`,
      ADD COLUMN `result_ref_type` VARCHAR(32) NULL AFTER `action_version`,
      ADD COLUMN `request_id` CHAR(36) NULL AFTER `result_ref_type`,

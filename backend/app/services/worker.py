@@ -764,6 +764,7 @@ class Worker:
                     action_claim = action_execution_service.claim_action_execution(
                         db, envelope.turn_id, envelope.action_name, self._lease_owner,
                         request_digest=envelope.request_digest,
+                        actor_userid=userid,
                         lease_seconds=int(getattr(settings, "action_execution_lease_seconds", 180)),
                         parse_ref=envelope.parse_ref, parse_digest=envelope.parse_digest,
                         parse_version=envelope.parse_schema_version,

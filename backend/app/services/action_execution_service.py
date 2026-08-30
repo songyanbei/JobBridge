@@ -140,6 +140,8 @@ def load_replay_reference(
     row = read_action_execution(db, turn_id, action_name)
     if row is None or row.status != "succeeded":
         raise ActionExecutionStateError("action_not_replayable")
+    if actor_userid is not None and getattr(row, "actor_userid", None) not in (None, actor_userid):
+        raise ActionExecutionStateError("actor_binding_mismatch")
     if action_name not in SUPPORTED_ACTIONS:
         raise ActionExecutionStateError("unsupported_action")
     if row.turn_id != turn_id or not row.result_ref_type or not row.result_schema_version:
@@ -236,6 +238,7 @@ def claim_action_execution(
     owner: str,
     *,
     request_digest: str | None = None,
+    actor_userid: str | None = None,
     lease_seconds: int = 180,
     now: datetime | None = None,
     action_version: str = "v1",
@@ -271,6 +274,7 @@ def claim_action_execution(
             fencing_token=1,
         )
         optional_values = {
+            "actor_userid": actor_userid,
             "action_version": action_version,
             "parse_ref": parse_ref,
             "parse_digest": parse_digest,
@@ -295,6 +299,8 @@ def claim_action_execution(
 
     if request_digest is not None and row.request_digest not in (None, request_digest):
         raise ActionExecutionConflict("request_digest_mismatch")
+    if actor_userid is not None and getattr(row, "actor_userid", None) not in (None, actor_userid):
+        raise ActionExecutionConflict("actor_binding_mismatch")
 
     state = _state_for_row(row, now_value)
     if state != "acquired":
