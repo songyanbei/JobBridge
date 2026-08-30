@@ -20,6 +20,7 @@ from app.schemas.search import ListingCard, SearchCriteriaPatch
 from app.services.search_permission import check_search_permission
 from app.services.user_service import UserContext
 from app.tasks.common import log_event
+from app.domains.recruitment.matching import MatchingPolicyV1, direction_for
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -423,11 +424,56 @@ class JobSearchFacade:
     _cards_from_snapshot = cards_for_snapshot
 
 
+class ResumeSearchFacade:
+    """Direction-scoped facade for factory/broker candidate search."""
+    profile = "recruitment.resume"
+    policy = MatchingPolicyV1()
+
+    def __init__(self, db=None, *, enabled: bool | None = None, rollout_percentage: int | None = None):
+        self.db = db
+        self.enabled = bool(getattr(settings, "resume_search_facade_enabled", False)) if enabled is None else bool(enabled)
+        self.rollout_percentage = int(getattr(settings, "resume_search_rollout_percentage", 0)) if rollout_percentage is None else max(0, min(100, int(rollout_percentage)))
+
+    def _bucket_enabled(self, actor) -> bool:
+        if not self.enabled or bool(getattr(settings, "resume_search_kill_switch", True)):
+            return False
+        if self.rollout_percentage >= 100:
+            return True
+        if self.rollout_percentage <= 0:
+            return False
+        digest = hashlib.sha256(str(getattr(actor, "external_userid", "")).encode()).hexdigest()
+        return int(digest[:8], 16) % 100 < self.rollout_percentage
+
+    def search_workers_v1(self, actor: UserContext, criteria: dict, session: SessionState, turn: SearchTurn | dict | Any, db=None):
+        if actor.role not in {"factory", "broker"}:
+            raise PermissionError("resume search requires factory or broker")
+        direction = getattr(session, "broker_direction", None) if actor.role == "broker" else "search_worker"
+        if actor.role == "broker" and direction != "search_worker":
+            raise PermissionError("broker_direction_mismatch")
+        decision = check_search_permission(actor, "search_worker", entrypoint="listing.resume_search")
+        if not decision.allowed:
+            from app.services.search_permission import denied_search_response
+            result, outcome = denied_search_response(decision)
+            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason=decision.reason_code)
+        from app.services import search_service
+        raw_query, msg_id = _turn_values(turn)
+        result, outcome = search_service.search_workers(criteria, raw_query, session, actor, db or self.db, user_msg_id=msg_id)
+        if not self._bucket_enabled(actor):
+            return FacadeResult(result, outcome, [], used_facade=False, fallback_reason="disabled_or_out_of_bucket")
+        return FacadeResult(result, outcome, [], used_facade=True, action_result_ref={
+            "direction": direction_for(actor.role, "search_worker"),
+            "policy_version": self.policy.version,
+            "policy_digest": self.policy.digest,
+            "request_id": getattr(result, "request_id", None),
+            "snapshot_id": getattr(result, "snapshot_id", None),
+        })
+
+
 def search_jobs_v1(actor, criteria, session, turn, db=None, **kwargs) -> FacadeResult:
     return JobSearchFacade(db, **kwargs).search_jobs_v1(actor, criteria, session, turn, db=db)
 
 
 __all__ = [
-    "FacadeResult", "JobSearchFacade", "LegacySearchAdapter", "SearchTurn",
+    "FacadeResult", "JobSearchFacade", "ResumeSearchFacade", "LegacySearchAdapter", "SearchTurn",
     "apply_criteria_patch", "scrub_listing_text", "search_jobs_v1",
 ]
