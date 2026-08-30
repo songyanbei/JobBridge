@@ -19,7 +19,12 @@ from sqlalchemy import func, text
 from app.config import settings
 from app.core.redis_client import QUEUE_DEAD_LETTER, QUEUE_INCOMING, get_redis
 from app.db import SessionLocal
-from app.models import MediaAssetLifecycle, WecomInboundEvent, WecomOutboundOutbox
+from app.models import (
+    ActionExecution,
+    MediaAssetLifecycle,
+    WecomInboundEvent,
+    WecomOutboundOutbox,
+)
 from app.tasks.common import log_event, task_lock
 
 
@@ -209,6 +214,110 @@ def check_session_commits() -> None:
             logger.exception("check_session_commits failed")
         finally:
             db.close()
+
+
+def check_action_execution() -> None:
+    """Observe Action leases, result references, and replay backlog.
+
+    This check is intentionally read-only with respect to business rows.  A
+    stop-condition violation writes only the Redis routing kill-switch key, so
+    already committed Action/result facts remain available for reconciliation.
+    ``result_digest`` is the reference completeness signal available on the
+    current schema; later result-reference columns can be folded into the same
+    query without changing the operator contract.
+    """
+    with task_lock("worker_monitor.action_execution", ttl=45) as acquired:
+        if not acquired:
+            return
+        db = SessionLocal()
+        try:
+            stale_count = int(db.query(func.count(ActionExecution.id)).filter(
+                ActionExecution.status == "started",
+                ActionExecution.lease_until.isnot(None),
+                ActionExecution.lease_until < func.now(6),
+            ).scalar() or 0)
+            stale_age = int(db.query(func.timestampdiff(
+                text("SECOND"),
+                func.min(ActionExecution.lease_until),
+                func.now(6),
+            )).filter(
+                ActionExecution.status == "started",
+                ActionExecution.lease_until.isnot(None),
+                ActionExecution.lease_until < func.now(6),
+            ).scalar() or 0)
+
+            missing_refs = int(db.query(func.count(ActionExecution.id)).filter(
+                ActionExecution.status == "succeeded",
+                ActionExecution.result_digest.is_(None),
+            ).scalar() or 0)
+            replay_backlog = int(db.query(func.count(ActionExecution.id)).filter(
+                ActionExecution.status == "failed_retryable",
+            ).scalar() or 0)
+            replay_age = int(db.query(func.timestampdiff(
+                text("SECOND"),
+                func.min(ActionExecution.created_at),
+                func.now(6),
+            )).filter(
+                ActionExecution.status == "failed_retryable",
+            ).scalar() or 0)
+
+            stale_limit = int(getattr(settings, "monitor_action_stale_lease_max_age_seconds", 300))
+            missing_limit = int(getattr(settings, "monitor_action_missing_reference_threshold", 0))
+            replay_limit = int(getattr(settings, "monitor_action_replay_backlog_threshold", 0))
+            replay_age_limit = int(getattr(settings, "monitor_action_replay_backlog_max_age_seconds", 600))
+            if stale_age > stale_limit:
+                _alert(
+                    "action_stale_lease",
+                    f"Action stale lease {stale_count} rows, oldest {stale_age}s; "
+                    f"threshold {stale_limit}s",
+                )
+                _stop_action_routing("stale_lease")
+            if missing_refs > missing_limit:
+                _alert(
+                    "action_missing_reference",
+                    f"Action succeeded rows missing result reference: {missing_refs}; "
+                    f"threshold {missing_limit}",
+                )
+                _stop_action_routing("missing_result_reference")
+            if (
+                replay_backlog > replay_limit
+                and replay_age > replay_age_limit
+            ):
+                _alert(
+                    "action_replay_backlog",
+                    f"Action retryable replay backlog {replay_backlog} rows, oldest {replay_age}s; "
+                    f"threshold {replay_age_limit}s",
+                )
+                _stop_action_routing("replay_backlog")
+
+            log_event(
+                "action_execution_health",
+                stale_lease_count=stale_count,
+                stale_lease_oldest_age_seconds=stale_age,
+                missing_reference_count=missing_refs,
+                replay_backlog_count=replay_backlog,
+                replay_backlog_oldest_age_seconds=replay_age,
+            )
+        except Exception:
+            logger.exception("check_action_execution failed")
+        finally:
+            db.close()
+
+
+ACTION_EXECUTION_KILL_SWITCH_KEY = "routing:action_execution:kill_switch"
+
+
+def _stop_action_routing(reason: str) -> None:
+    """Engage the routing kill switch without deleting committed facts."""
+    if not getattr(settings, "action_execution_auto_kill_switch", True):
+        return
+    try:
+        get_redis().set(ACTION_EXECUTION_KILL_SWITCH_KEY, reason)
+        log_event("action_execution_kill_switch_engaged", reason=reason)
+    except Exception:
+        # A Redis outage must remain visible; the caller still emits its metric
+        # alert and the runtime's fail-closed configuration remains in effect.
+        logger.exception("failed to engage action execution kill switch")
 
 
 # ---------------------------------------------------------------------------

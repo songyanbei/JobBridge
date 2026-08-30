@@ -163,6 +163,15 @@ def build_scheduler() -> BackgroundScheduler:
         coalesce=True,
     )
 
+    # ---- Action execution lease/reference/replay observation (60s) ----
+    sched.add_job(
+        worker_monitor.check_action_execution,
+        IntervalTrigger(seconds=60),
+        id="action_execution_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
     # ---- 推荐曝光日聚合校验/重算（§11.8） ----
     # 每天 00:15 全量对账昨日；再叠一个小时级增量，避免整整一天的偏差要等到次日才
     # 被发现。两个 job 共用任务内部的 task_lock，重叠时后者直接跳过。
