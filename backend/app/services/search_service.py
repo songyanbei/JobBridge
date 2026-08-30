@@ -2878,7 +2878,7 @@ def _normalized_optional_text(value) -> str | None:
 
 _CONTACT_PLACEHOLDER = "联系方式需通过联系请求获取"
 _CONTACT_TEXT_RE = re.compile(
-    r"(?i)(?:1\d{10}|wxid_[a-z0-9_-]+|(?:联系人|联系电话|手机|电话|微信|wechat)\s*[:：]?\s*[^\s，。,；;]+)"
+    r"(?i)(?:1\d{10}|wxid_[a-z0-9_-]+|(?:联系人|联系电话|手机|电话|微信|wechat|联系)\s*[:：]?\s*[^\s，。,；;]+)"
 )
 
 

@@ -118,6 +118,12 @@ def test_resume_free_text_is_redacted_in_projection_and_card():
     assert "[联系方式已隐藏]" in rendered
 
 
+def test_contact_verb_without_person_label_is_redacted():
+    redacted = search_service._redact_contact_text("请联系张经理，电话13800138000")
+    assert "张经理" not in redacted
+    assert "13800138000" not in redacted
+
+
 def test_permission_projection_maps_contact_policy_to_safe_fields():
     candidate = {
         "id": 1,
