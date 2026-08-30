@@ -34,9 +34,32 @@ docker exec -i jobbridge-mysql mysql --default-character-set=utf8mb4 \
     -ujobbridge -pjobbridge jobbridge \
     < "$ROOT/mock-testbed/sql/seed_mock_users.sql" 2>&1 | grep -v "Warning" || true
 
+# 配置 mock-testbed .env：优先沿用现有 DSN；未配置时从 compose 容器取 bridge IP。
+read_env_value() {
+    local key="$1"
+    grep -E "^${key}=" "$BACKEND/.env" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+container_ip() {
+    local name="$1"
+    docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$name" 2>/dev/null || true
+}
+MOCK_DB_DSN_VALUE="$(read_env_value MOCK_DB_DSN)"
+MOCK_REDIS_URL_VALUE="$(read_env_value MOCK_REDIS_URL)"
+if [ -z "$MOCK_DB_DSN_VALUE" ]; then
+    MYSQL_IP="$(container_ip jobbridge-mysql)"
+    [ -n "$MYSQL_IP" ] && MOCK_DB_DSN_VALUE="mysql+pymysql://jobbridge:jobbridge@${MYSQL_IP}:3306/jobbridge?charset=utf8mb4"
+fi
+if [ -z "$MOCK_REDIS_URL_VALUE" ]; then
+    REDIS_IP="$(container_ip jobbridge-redis)"
+    [ -n "$REDIS_IP" ] && MOCK_REDIS_URL_VALUE="redis://${REDIS_IP}:6379/0"
+fi
+: "${MOCK_DB_DSN_VALUE:=mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge?charset=utf8mb4}"
+: "${MOCK_REDIS_URL_VALUE:=redis://127.0.0.1:6379/0}"
+echo "  DB DSN source: $([ -n "$(read_env_value MOCK_DB_DSN)" ] && echo existing .env || echo container IP/fallback)"
+echo "  Redis URL source: $([ -n "$(read_env_value MOCK_REDIS_URL)" ] && echo existing .env || echo container IP/fallback)"
 cat > "$BACKEND/.env" <<EOF
-MOCK_DB_DSN=mysql+pymysql://jobbridge:jobbridge@127.0.0.1:3306/jobbridge?charset=utf8mb4
-MOCK_REDIS_URL=redis://127.0.0.1:6379/0
+MOCK_DB_DSN=$MOCK_DB_DSN_VALUE
+MOCK_REDIS_URL=$MOCK_REDIS_URL_VALUE
 MOCK_PORT=8001
 MOCK_HOST=127.0.0.1
 MOCK_CORS_ORIGINS=http://localhost:5174
