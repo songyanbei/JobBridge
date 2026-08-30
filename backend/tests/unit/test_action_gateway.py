@@ -1,5 +1,6 @@
 """Workstream A Gateway single-parse and fail-closed contracts."""
 from types import SimpleNamespace
+import inspect
 
 import pytest
 
@@ -7,6 +8,7 @@ from app.llm.base import IntentResult
 from app.schemas.conversation import SessionState
 from app.services import action_gateway
 from app.services.action_gateway import ActionGateway
+from app.services.worker import Worker
 from app.wecom.callback import WeComMessage
 
 
@@ -125,3 +127,14 @@ def test_context_with_unsupported_action_is_fail_closed():
     envelope = ActionGateway._envelope("turn-1", "unknown")
     assert envelope.is_supported is False
     assert envelope.action_name not in {"search_job", "show_more_job", "relax_job"}
+
+
+def test_worker_replay_binds_actor_and_bypasses_router():
+    """Replay must validate actor before recovery and return without routing."""
+    source = inspect.getsource(Worker._process_locked)
+    replay_at = source.index("load_replay_reference")
+    replay_block = source[replay_at:replay_at + 300]
+    assert "actor_userid=userid" in replay_block
+    assert source.index("return \"action_replayed\"", replay_at) < source.index(
+        "message_router.process", replay_at,
+    )

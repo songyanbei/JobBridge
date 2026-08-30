@@ -775,6 +775,7 @@ class Worker:
                         try:
                             action_execution_service.load_replay_reference(
                                 db, envelope.turn_id, envelope.action_name,
+                                actor_userid=userid,
                             )
                         except Exception:
                             return "action_replay_terminal"
