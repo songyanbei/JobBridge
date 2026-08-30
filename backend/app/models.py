@@ -1107,6 +1107,11 @@ class WecomOutboundOutbox(Base):
         sa.Index("idx_outbox_status_locked", "status", "locked_at"),
         sa.Index("idx_outbox_event", "inbound_event_id", "id"),
         sa.Index("idx_outbox_user_status_id", "userid", "status", "id"),
+        sa.Index("idx_outbox_contact_delivery", "status", "contact_delivery_id", "id"),
+        sa.CheckConstraint(
+            "NOT (recommendation_delivery_id IS NOT NULL AND contact_delivery_id IS NOT NULL)",
+            name="ck_outbox_single_delivery_kind",
+        ),
     )
 
 
