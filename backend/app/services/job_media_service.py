@@ -42,8 +42,12 @@ def attach_media(
     entity_id: int,
     *,
     owner_userid: str | None = None,
+    entity_version: int | None = None,
+    max_media: int = 5,
 ) -> list[str]:
     unique_ids = sorted(set(media_ids))
+    if len(unique_ids) > max(1, int(max_media)):
+        raise ValueError("media_count_exceeds_limit")
     rows = (
         db.query(MediaAssetLifecycle)
         .filter(MediaAssetLifecycle.id.in_(unique_ids))
@@ -56,11 +60,55 @@ def attach_media(
     if owner_userid is not None and any(row.owner_userid != owner_userid for row in rows):
         raise ValueError("media_lifecycle_owner_mismatch")
     for row in rows:
+        # A pending row may be replayed only for the same operation.  Once it
+        # is attached, the state guard above prevents a second binding.
         row.state = "attached"
         row.entity_type = entity_type
         row.entity_id = entity_id
+        row.entity_version = int(entity_version) if entity_version is not None else None
         row.draft_expires_at = None
     return [row.object_key for row in rows]
+
+
+def attached_media_keys(
+    db: Session,
+    entity_type: str,
+    entity_id: int,
+    *,
+    entity_version: int | None = None,
+) -> list[str]:
+    """Return only attached media belonging to the requested entity version."""
+    if entity_type not in ("job", "resume"):
+        raise ValueError("unsupported_media_entity_type")
+    query = db.query(MediaAssetLifecycle).filter(
+        MediaAssetLifecycle.entity_type == entity_type,
+        MediaAssetLifecycle.entity_id == entity_id,
+        MediaAssetLifecycle.state == "attached",
+    )
+    if entity_version is not None:
+        query = query.filter(MediaAssetLifecycle.entity_version == int(entity_version))
+    rows = query.order_by(MediaAssetLifecycle.id).all()
+    return [row.object_key for row in rows]
+
+
+def bind_job_media_version(
+    db: Session,
+    media_ids: list[int],
+    job_id: int,
+    *,
+    owner_userid: str,
+    job_version: int,
+) -> list[str]:
+    """Bind a bounded media set to a concrete Job version."""
+    return attach_media(
+        db,
+        media_ids,
+        "job",
+        job_id,
+        owner_userid=owner_userid,
+        entity_version=job_version,
+        max_media=5,
+    )
 
 
 def mark_delete_pending(db: Session, media_ids: list[int]) -> None:

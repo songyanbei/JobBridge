@@ -391,6 +391,9 @@ class MediaAssetLifecycle(Base):
     owner_userid = sa.Column(sa.String(64), nullable=False)
     entity_type = sa.Column(sa.Enum("job", "resume", name="media_entity_type"), nullable=True)
     entity_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
+    # Version of the owning listing at attachment time.  Nullable keeps old
+    # lifecycle rows readable during the additive migration/backfill window.
+    entity_version = sa.Column(mysql.INTEGER(unsigned=True), nullable=True)
     state = sa.Column(
         sa.Enum(
             "pending",
@@ -414,6 +417,7 @@ class MediaAssetLifecycle(Base):
 
     __table_args__ = (
         sa.Index("idx_media_entity", "entity_type", "entity_id", "state"),
+        sa.Index("idx_media_entity_version", "entity_type", "entity_id", "entity_version", "state"),
         sa.Index("idx_media_cleanup", "state", "next_attempt_at"),
         sa.Index("idx_media_draft_expiry", "state", "draft_expires_at"),
     )
