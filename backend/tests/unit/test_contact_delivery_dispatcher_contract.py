@@ -10,6 +10,9 @@ def test_dispatcher_is_fail_closed_without_ciphertext():
     assert "crypto_unavailable" in source
     assert "delivery_decrypt_failed" in source
     assert "delivery.status = \"retry_wait\"" in source
+    assert "outbox.status = \"pending\"" in source
+    assert "outbox.status, outbox.sent_at = \"sent\", delivery.sent_at" in source
+    assert "provider_msg_id" in source
 
 
 def test_contact_delivery_has_no_outbox_plaintext_path():

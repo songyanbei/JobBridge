@@ -315,14 +315,29 @@ class ContactService:
         session = db or self.db
         handle = self.load_delivery_for_send(delivery_id, crypto_service=crypto_service, db=session)
         delivery = session.query(ContactDelivery).filter(ContactDelivery.delivery_id == handle.delivery_id).with_for_update().one()
+        outbox = session.query(WecomOutboundOutbox).filter(
+            WecomOutboundOutbox.contact_delivery_id == handle.delivery_id,
+        ).with_for_update().first()
+        if outbox is not None:
+            outbox.status = "sending"
         delivery.status = "sending"
         try:
-            sender(handle.payload, channel=handle.channel, delivery_id=handle.delivery_id)
+            provider_result = sender(handle.payload, channel=handle.channel, delivery_id=handle.delivery_id)
         except Exception:
             delivery.status = "retry_wait"
+            if outbox is not None:
+                outbox.status = "pending"
+                outbox.next_attempt_at = _now() + timedelta(seconds=5)
+                outbox.last_error = "contact_delivery_send_failed"
             session.flush()
             raise
         delivery.status, delivery.sent_at = "sent", _now()
+        if outbox is not None:
+            outbox.status, outbox.sent_at = "sent", delivery.sent_at
+            if isinstance(provider_result, dict):
+                outbox.provider_msg_id = str(provider_result.get("msgid") or provider_result.get("message_id") or "")[:128] or None
+            elif provider_result:
+                outbox.provider_msg_id = str(provider_result)[:128]
         session.flush()
         return True
 
