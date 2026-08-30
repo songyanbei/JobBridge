@@ -243,6 +243,11 @@ class Settings(BaseSettings):
     action_execution_search_enabled: bool = False
     action_show_more_enabled: bool = False
     action_relax_enabled: bool = False
+    # S4 job publishing remains fail-closed until the production gates are signed off.
+    job_publish_flow_enabled: bool = False
+    job_publish_rollout_percentage: int = 0
+    job_publish_kill_switch: bool = False
+    job_publish_action_version: str = "job_publish_v1"
     contact_service_mode: Literal["off", "shadow", "on"] = "off"
     contact_grant_ttl_seconds: int = 60
     contact_rate_per_listing_window_seconds: int = 600
@@ -304,6 +309,22 @@ class Settings(BaseSettings):
         value = int(value)
         if not 0 <= value <= 100:
             raise ValueError("action_execution_rollout_percentage must be between 0 and 100")
+        return value
+
+    @field_validator("job_publish_rollout_percentage", mode="after")
+    @classmethod
+    def _valid_job_publish_rollout(cls, value: int) -> int:
+        value = int(value)
+        if not 0 <= value <= 100:
+            raise ValueError("job_publish_rollout_percentage must be between 0 and 100")
+        return value
+
+    @field_validator("job_publish_action_version", mode="after")
+    @classmethod
+    def _valid_job_publish_action_version(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or len(value) > 64:
+            raise ValueError("job_publish_action_version must be a non-empty string <= 64 chars")
         return value
 
     @field_validator(
