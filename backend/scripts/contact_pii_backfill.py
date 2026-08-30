@@ -42,7 +42,7 @@ def run(*, apply: bool, entity: str = "all", batch_size: int = 100, crypto: PiiC
             if state["status"] == "completed":
                 result[item]["status"] = "completed"
                 continue
-            last_pk = str(state["last_pk"] or "0")
+            last_pk = int(state["last_pk"] or 0) if item == "job" else str(state["last_pk"] or "")
             if apply:
                 db.execute(text("UPDATE contact_pii_migration_state SET status='running', last_error_code=NULL WHERE entity=:entity"), {"entity": item})
                 db.commit()
