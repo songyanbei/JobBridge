@@ -24,6 +24,42 @@ SET @ddl = IF(
 );
 PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 
+-- Repair guard: older partial deployments may already have action_version while
+-- one or more sibling columns are absent. Keep every column independently
+-- additive so reruns converge instead of silently skipping the remainder.
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='actor_userid'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `actor_userid` VARCHAR(64) NULL AFTER `action_name`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='action_version'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `action_version` VARCHAR(32) NOT NULL DEFAULT ''v1'' AFTER `result_digest`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='result_ref_type'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `result_ref_type` VARCHAR(32) NULL AFTER `action_version`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='request_id'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `request_id` CHAR(36) NULL AFTER `result_ref_type`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='snapshot_id'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `snapshot_id` CHAR(36) NULL AFTER `request_id`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='delivery_ids'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `delivery_ids` JSON NULL AFTER `snapshot_id`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='outbox_ids'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `outbox_ids` JSON NULL AFTER `delivery_ids`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='session_commit_id'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `session_commit_id` CHAR(36) NULL AFTER `outbox_ids`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='result_schema_version'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `result_schema_version` VARCHAR(32) NULL AFTER `session_commit_id`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='failure_code'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `failure_code` VARCHAR(64) NULL AFTER `result_schema_version`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='replay_count'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `replay_count` INT UNSIGNED NOT NULL DEFAULT 0 AFTER `failure_code`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='last_replayed_at'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `last_replayed_at` DATETIME(6) NULL AFTER `replay_count`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='parse_ref'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `parse_ref` CHAR(36) NULL AFTER `last_replayed_at`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='parse_digest'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `parse_digest` CHAR(64) NULL AFTER `parse_ref`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='parse_version'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `parse_version` VARCHAR(32) NULL AFTER `parse_digest`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+SET @ddl = IF(EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=@schema_name AND table_name='action_execution' AND column_name='parse_expires_at'), 'SELECT 1', 'ALTER TABLE `action_execution` ADD COLUMN `parse_expires_at` DATETIME(6) NULL AFTER `parse_version`');
+PREPARE stmt FROM @ddl; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
 SET @ddl = IF(
   EXISTS (SELECT 1 FROM information_schema.statistics WHERE table_schema=@schema_name AND table_name='action_execution' AND index_name='idx_action_execution_request_snapshot'),
   'SELECT 1',
