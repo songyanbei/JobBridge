@@ -26,10 +26,15 @@ def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, 
     info lets the new writer flush it after the model migration without making
     legacy lifecycle operations fail.
     """
+    aggregate_version = int(
+        getattr(job, "aggregate_version", None)
+        or getattr(job, "version", None)
+        or 1
+    )
     payload = {
         "aggregate_type": "job",
         "aggregate_id": int(job.id),
-        "aggregate_version": int(job.version or 1),
+        "aggregate_version": aggregate_version,
         "event_type": event_type,
         "reason": reason,
         "tombstone": bool(tombstone),
@@ -43,7 +48,7 @@ def _emit(db: Session, job: Job, event_type: str, *, reason: str | None = None, 
         db,
         aggregate_type="job",
         aggregate_id=int(job.id),
-        aggregate_version=int(job.version or 1),
+        aggregate_version=aggregate_version,
         event_type=event_type,
         payload={"reason": reason} if reason else {},
         tombstone=tombstone,

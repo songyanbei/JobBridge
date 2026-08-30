@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -9,7 +11,7 @@ from app.listing.contact import (
     contact_reference,
     is_listing_version_current,
 )
-from app.services.job_lifecycle_service import contact_version_is_current
+from app.services.job_lifecycle_service import contact_version_is_current, transition_job
 
 
 def _job(**overrides):
@@ -40,6 +42,33 @@ def test_contact_reference_is_opaque_and_typed():
     }
     with pytest.raises(ValueError):
         contact_reference("user", 8, 3)
+
+
+def test_transition_emits_versioned_domain_event(monkeypatch):
+    append_domain_event = MagicMock()
+    monkeypatch.setitem(
+        sys.modules,
+        "app.services.domain_outbox_service",
+        SimpleNamespace(append_domain_event=append_domain_event),
+    )
+    job = _job(delist_reason="manual_delist")
+    job.id = 8
+    job.aggregate_version = 11
+    db = MagicMock()
+    db.info = {}
+    db.query.return_value.populate_existing.return_value.filter.return_value.with_for_update.return_value.one_or_none.return_value = job
+
+    transition_job(db, 8, action="restore", reason="operator_restore")
+
+    append_domain_event.assert_called_once_with(
+        db,
+        aggregate_type="job",
+        aggregate_id=8,
+        aggregate_version=11,
+        event_type="job.restored",
+        payload={"reason": "operator_restore"},
+        tombstone=False,
+    )
 
 
 def test_phase14_media_migration_is_additive():

@@ -12,6 +12,15 @@ def _domain_outbox_available(db: Session | None) -> bool:
     if bind is None:
         return False
     try:
+        # SQLite in-memory engines commonly share one connection between the
+        # Session and Inspector.  Opening an Inspector on the Engine while a
+        # transaction is active can roll that transaction back when the
+        # inspector closes.  Inspect the session connection in that case.
+        if (
+            getattr(getattr(bind, "dialect", None), "name", None) == "sqlite"
+            and db.in_transaction()
+        ):
+            return bool(inspect(db.connection()).has_table("domain_outbox_event"))
         return bool(inspect(bind).has_table("domain_outbox_event"))
     except Exception:
         # A temporarily unavailable inspector must not turn a legacy activation
