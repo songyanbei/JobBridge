@@ -113,7 +113,7 @@
 - [x] PASS J1 Phase14 临时库 up：domain outbox/media/lifecycle schema/index。
 - [x] PASS J2 Phase14 down：通过，stop-write/consumer 说明下未删除事实/事件。
 - [x] PASS J3 Phase15 up/down：通过，resume/contact direction schema。
-- [ ] FAIL J4 manifest LF/SHA 已修复（`test_manifest_pins...` `1 passed`）；root DSN 下 Phase11 checkpoint 参数化 `4 passed`、stage-2 activation `1 passed`、stage-5 fences `7 passed`（`60472c9` 修复全局 `delivery_order=1` 冲突），但完整五文件集合运行约 7 分钟后超时中止，既有真实集成基线仍为 `20 passed, 13 failed, 103 skipped`，`jobbridge` 测试账号无临时 schema 权限。
+- [ ] FAIL J4 manifest LF/SHA 已修复（`test_manifest_pins...` `1 passed`）；root DSN 下 Phase11 checkpoint 参数化 `4 passed`、stage-2 activation `1 passed`、stage-5 fences `7 passed`（`60472c9` 修复全局 `delivery_order=1` 冲突，`1556134` 隔离 expiry 查询边界；锁序用例连续 `3/3 passed`），但完整五文件集合运行约 7 分钟后超时中止，既有真实集成基线仍为 `20 passed, 13 failed, 103 skipped`，`jobbridge` 测试账号无临时 schema 权限。
 - [x] PASS J5 隔离 env on 时 `s4_preflight --json` passed=true；切回 off 时 gate incomplete 且保持 fail-closed；本地结果不能替代生产观察窗口。
 - [ ] BLOCKED J6 rollout/rollback/legacy exit 长期观察证据未提供；生产开关保持 off。
 - [x] PASS J7 app/worker health 通过；补入口后两个脚本从 backend/仓库根目录 `--help` 均通过。
@@ -149,7 +149,7 @@
 |---|---|---|---|---|---|
 | C8 | `pytest -q tests/unit/test_phase3_job_visibility.py` | WSL `.venv-wsl` | `8 passed` | 旧 PII 断言已改为无明文字段/Contact 占位 | 不回退隐私契约 |
 | H3 | `pytest -q tests/unit/test_phase11_stage2_visibility.py` | WSL `.venv-wsl` | `6 passed` | fixture 冻结 `utc_now_naive` | 保持时间可重复 |
-| J4 | manifest contract；Phase11 checkpoint、activation、stage-5 fences（均显式 root MySQL DSN + `PHASE11_TEST_REDIS_DSN=redis://127.0.0.1:6379/0`）；完整五文件集合 | WSL `.venv-wsl`/MySQL/Redis | manifest `1 passed`；checkpoint `4 passed`；activation `1 passed`；stage-5 fences `7 passed`；完整集合超时中止；历史集成 `20 passed,13 failed,103 skipped` | `60472c9` 消除 `delivery_order=1` seed 冲突；未取得完整集合最终摘要，历史失败原因为 `jobbridge` 无 CREATE 临时 schema 权限 | 使用专用测试账号并重新跑完整集合 |
+| J4 | manifest contract；Phase11 checkpoint、activation、stage-5 fences（均显式 root MySQL DSN + `PHASE11_TEST_REDIS_DSN=redis://127.0.0.1:6379/0`）；锁序用例连续 3 次；完整五文件集合 | WSL `.venv-wsl`/MySQL/Redis | manifest `1 passed`；checkpoint `4 passed`；activation `1 passed`；stage-5 fences `7 passed`，锁序 `3/3 passed`；完整集合超时中止；历史集成 `20 passed,13 failed,103 skipped` | `60472c9` 消除 `delivery_order=1` seed 冲突，`1556134` 隔离 expiry 查询边界；未取得完整集合最终摘要，历史失败原因为 `jobbridge` 无 CREATE 临时 schema 权限 | 使用专用测试账号并重新跑完整集合 |
 | J7 | `python scripts/phase10_preflight.py --help`、`phase14_media_reconcile.py --help`（backend/根目录） | WSL `.venv-wsl` | `ROOT_HELP_OK` | sys.path/argparse 入口修复 | 已提交 `3e40ca9` |
 | GF7 | mock `/inbound` + Redis SSE；临时 `job:50.expires_at` 过去 | WSL/MySQL/Redis | SSE 安全引导；无新增 Delivery | 恢复 expiry 后结束 |
 | GF8 | Contact privacy/reauthorization tests | WSL `.venv-wsl` | `12 passed` | actor/listing/direction mismatch fail-closed | 保持方向隔离 |
