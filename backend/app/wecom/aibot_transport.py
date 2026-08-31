@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import random
+import uuid
 from contextlib import suppress
 from enum import Enum
 from typing import Any, Awaitable, Callable
@@ -246,6 +247,35 @@ class AibotTransport:
             raise AibotTransportError("ack timeout; delivery is uncertain") from exc
         finally:
             self._ack_waiters.pop(req_id, None)
+
+    async def send_outbox(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Build and send the protocol frame represented by an outbox row.
+
+        ``AibotSender`` passes channel-neutral outbox metadata, while
+        :meth:`send` intentionally accepts only a validated protocol frame.
+        Keeping this adapter here prevents workers from learning WebSocket
+        details and gives the synchronous outbox state machine a stable ACK
+        mapping to validate.
+        """
+        command = str(item.get("reply_command") or "aibot_respond_msg")
+        req_id = str(item.get("provider_req_id") or item.get("ack_req_id") or f"out-{uuid.uuid4().hex}")
+        content = str(item.get("content") or "")
+        stream_id = item.get("stream_id")
+        finish = bool(item.get("finish", False))
+        if command == "aibot_respond_welcome_msg":
+            frame = self.client.respond_welcome(req_id, content)
+        elif command == "aibot_send_msg":
+            frame = self.client.send_msg(req_id, content, chat_id=item.get("chat_id"))
+        elif command == "aibot_respond_update_msg":
+            frame = self.client.respond_update_msg(req_id, str(stream_id or ""), content, finish=finish)
+        elif stream_id:
+            frame = self.client.stream(req_id, str(stream_id), content, finish=finish)
+        elif command == "aibot_respond_msg":
+            frame = self.client.respond_msg(req_id, content)
+        else:
+            raise AibotClientError(f"unsupported AIBot outbox command: {command}")
+        errcode, errmsg = await self.send(frame)
+        return {"headers": {"req_id": req_id}, "errcode": errcode, "errmsg": errmsg}
 
     async def handle_frame(self, payload: Any) -> None:
         """Route ACKs to waiters and callbacks to the reader handler."""

@@ -7,10 +7,10 @@ so unit tests can exercise leases and fencing without a live WSS endpoint.
 """
 from __future__ import annotations
 
-import json
+import asyncio
+import inspect
 import logging
 import os
-import time
 import uuid
 from datetime import datetime
 from enum import StrEnum
@@ -24,6 +24,8 @@ from app.core.redis_client import get_redis
 from app.db import SessionLocal
 from app.models import WecomOutboundOutbox
 from app.services.delivery_registry import AIBOT_CHANNEL, AibotSender
+from app.wecom.aibot_client import AibotClient
+from app.wecom.aibot_transport import AibotTransport
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,22 @@ class AibotOutboxWriter:
             return self._mark_uncertain(item, "aibot acknowledgement missing or mismatched")
         return self._mark_sent(item, response)
 
+    async def deliver_async(self, item: Mapping[str, Any]) -> bool:
+        """Async counterpart used by the connector owning an async socket."""
+        try:
+            response = self.sender.send(item)
+            if inspect.isawaitable(response):
+                response = await response
+        except AibotAckTimeout as exc:
+            return self._mark_uncertain(item, str(exc))
+        except Exception as exc:
+            if "ack timeout" in str(exc).lower() and "uncertain" in str(exc).lower():
+                return self._mark_uncertain(item, str(exc))
+            return self._mark_pending(item, str(exc))
+        if not self._valid_ack(response, item):
+            return self._mark_uncertain(item, "aibot acknowledgement missing or mismatched")
+        return self._mark_sent(item, response)
+
     @staticmethod
     def _valid_ack(response: Any, item: Mapping[str, Any]) -> bool:
         if not isinstance(response, Mapping) or response.get("errcode") != 0:
@@ -297,20 +315,34 @@ class AibotConnection:
     def release_lease(self) -> None:
         expected = f"{self.lease_value}:{self.fencing_token}" if self.fencing_token is not None else None
         try:
-            if expected is not None and self.redis.get(self.lease_key) == expected:
-                self.redis.delete(self.lease_key)
+            if expected is not None:
+                # Compare-and-delete must be atomic: a plain GET followed by
+                # DELETE can erase a replacement owner's newly acquired lease.
+                script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+                try:
+                    self.redis.eval(script, 1, self.lease_key, expected)
+                except (AttributeError, NotImplementedError):
+                    current = self.redis.get(self.lease_key)
+                    if isinstance(current, bytes):
+                        current = current.decode()
+                    if current == expected:
+                        self.redis.delete(self.lease_key)
         except Exception:
             logger.warning("aibot: failed to release lease", exc_info=True)
         self.fencing_token = None
         self.state = ConnectionState.STOPPED
 
     def writer(self) -> AibotOutboxWriter | None:
-        if self.state != ConnectionState.ACTIVE or self.fencing_token is None or self.transport is None:
+        transport_fenced = bool(getattr(self.transport, "is_fenced", False))
+        if self.transport is None or self.fencing_token is None:
             return None
+        if self.state != ConnectionState.ACTIVE and not transport_fenced:
+            return None
+        token = getattr(self.transport, "fencing_token", None) or self.fencing_token
         return AibotOutboxWriter(
             transport=self.transport,
             lease_owner=self.instance_id,
-            fencing_token=self.fencing_token,
+            fencing_token=int(token),
         )
 
     def run_once(self) -> int:
@@ -327,23 +359,65 @@ class AibotConnection:
             count += 1
         return count
 
+    async def run_once_async(self) -> int:
+        """Process one writer pass without blocking the Reader event loop."""
+        writer = self.writer()
+        if writer is None:
+            return 0
+        await asyncio.to_thread(writer.recover_stale)
+        items = await asyncio.to_thread(writer.claim)
+        for item in items:
+            await writer.deliver_async(item)
+        return len(items)
+
+    def accept_callback(self, callback: Any) -> Any:
+        """Persist a validated callback; ACK policy stays with the Reader."""
+        from app.services.inbound_acceptance import InboundAcceptanceService
+
+        return InboundAcceptanceService().accept(callback.to_wecom_message(), strict_redis=True)
+
+
+async def _run_connector(connection: AibotConnection) -> None:
+    client = AibotClient(settings.wecom_aibot_bot_id, settings.wecom_aibot_secret.get_secret_value())
+
+    def acquire():
+        acquired = connection.acquire_lease()
+        return acquired, connection.fencing_token
+
+    async def on_callback(callback):
+        return await asyncio.to_thread(connection.accept_callback, callback)
+
+    transport = AibotTransport(
+        client,
+        ws_url=settings.wecom_aibot_ws_url,
+        connect_timeout=settings.wecom_aibot_connect_timeout_seconds,
+        subscribe_timeout=settings.wecom_aibot_subscribe_timeout_seconds,
+        heartbeat_seconds=settings.wecom_aibot_heartbeat_seconds,
+        reconnect_max_seconds=settings.wecom_aibot_reconnect_max_seconds,
+        instance_id=connection.instance_id,
+        lease_acquire=acquire,
+        lease_renew=lambda _token: connection.renew_lease(),
+        lease_release=lambda _token: connection.release_lease(),
+        on_callback=on_callback,
+    )
+    connection.transport = transport
+    reader = asyncio.create_task(transport.run())
+    try:
+        while not transport._stop.is_set():
+            await connection.run_once_async()
+            await asyncio.sleep(1)
+    finally:
+        transport.request_stop()
+        await reader
+
 
 def main() -> None:
-    """Standalone connector entry point (network transport is deployed separately)."""
+    """Standalone connector entry point owning Reader, Writer and lease."""
     if not settings.wecom_aibot_enabled:
         logger.info("aibot connector disabled")
         return
     connection = AibotConnection()
-    if not connection.acquire_lease():
-        logger.warning("aibot connector could not acquire lease")
-        return
-    try:
-        connection.state = ConnectionState.ACTIVE
-        while connection.state == ConnectionState.ACTIVE:
-            connection.run_once()
-            time.sleep(LEASE_RENEW_SECONDS)
-    finally:
-        connection.release_lease()
+    asyncio.run(_run_connector(connection))
 
 
 if __name__ == "__main__":
