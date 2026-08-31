@@ -27,6 +27,7 @@ def build_scheduler() -> BackgroundScheduler:
     # 延迟 import，避免 app 启动时的循环依赖
     from app.tasks import (
         daily_report,
+        domain_outbox_consumer,
         job_candidate_cleanup,
         job_expiry_cleanup,
         media_cleanup_worker,
@@ -159,6 +160,17 @@ def build_scheduler() -> BackgroundScheduler:
         worker_monitor.check_session_commits,
         IntervalTrigger(seconds=60),
         id="session_commit_health",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # ---- Phase 14 domain outbox projection consumer (30s) ----
+    # The task is registered in every app process; its distributed lease and
+    # feature switch keep disabled/duplicate instances harmless.
+    sched.add_job(
+        domain_outbox_consumer.run,
+        IntervalTrigger(seconds=30),
+        id="domain_outbox_consumer",
         max_instances=1,
         coalesce=True,
     )

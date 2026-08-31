@@ -17,6 +17,13 @@ def test_scheduler_registers_ten_minute_job_lifecycle_tasks():
     assert candidate.trigger.interval.total_seconds() == 600
 
 
+def test_scheduler_registers_domain_outbox_consumer():
+    sched = scheduler.build_scheduler()
+    consumer = sched.get_job("domain_outbox_consumer")
+    assert consumer is not None
+    assert consumer.trigger.interval.total_seconds() == 30
+
+
 def test_scheduler_registers_media_dead_letter_monitor():
     sched = scheduler.build_scheduler()
     monitor = sched.get_job("media_cleanup_health")

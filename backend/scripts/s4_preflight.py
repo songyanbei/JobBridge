@@ -62,14 +62,21 @@ def check_migration_artifacts(root: str | Path, findings: list[Finding]) -> dict
     return {"migration_dir": str(migration_dir), "required": list(required), "missing": missing}
 
 
+def check_consumer_health(findings: list[Finding]) -> dict[str, bool]:
+    enabled = os.environ.get("DOMAIN_OUTBOX_CONSUMER_ENABLED", "false").strip().lower() in {"1", "true", "on", "yes"}
+    healthy = os.environ.get("DOMAIN_OUTBOX_CONSUMER_HEALTHY", "false").strip().lower() in {"1", "true", "on", "yes"}
+    if enabled and not healthy:
+        findings.append(Finding(ERROR, "domain_outbox_consumer_unhealthy", "domain outbox consumer enabled but health signal is absent"))
+    return {"enabled": enabled, "healthy": healthy}
+
+
 def run(*, backend_root: str | Path | None = None, json_output: bool = False) -> int:
     findings: list[Finding] = []
     root = Path(backend_root or Path(__file__).resolve().parents[1])
     runtime = check_runtime_config(findings)
-    consumer_enabled = os.environ.get("DOMAIN_OUTBOX_CONSUMER_ENABLED", "false").strip().lower() in {"1", "true", "on", "yes"}
-    runtime["domain_outbox_consumer_enabled"] = consumer_enabled
-    if not consumer_enabled:
-        findings.append(Finding(ERROR, "domain_outbox_consumer_unhealthy", "domain outbox consumer is disabled or has no health signal"))
+    consumer = check_consumer_health(findings)
+    runtime["domain_outbox_consumer_enabled"] = consumer["enabled"]
+    runtime["domain_outbox_consumer_healthy"] = consumer["healthy"]
     migrations = check_migration_artifacts(root, findings)
     # Legacy remains the rollback path until explicit exit approval exists.
     legacy = {"available": True, "reason": "legacy/fallback retained by contract"}
