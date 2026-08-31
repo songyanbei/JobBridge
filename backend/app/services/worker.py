@@ -900,8 +900,16 @@ class Worker:
                                 return "action_parse_artifact_missing"
                     action_context = envelope
 
-            # 图片：Worker 层下载存 storage 并回填 image_url
-            if msg.msg_type == "image" and msg.media_id:
+            # AIBot media uses the short-lived encrypted URL captured at durable
+            # acceptance.  It must never fall through to legacy media_id API.
+            if (
+                msg.source_channel == "wecom_aibot"
+                and inbound_event_id
+                and msg.msg_type in {"image", "voice", "video", "file"}
+            ):
+                self._download_and_attach_aibot_media(msg, inbound_event_id)
+            # Legacy image path remains unchanged.
+            elif msg.msg_type == "image" and msg.media_id:
                 self._download_and_attach_image(msg)
 
             # 调路由；把 pop 后的队列深度作为 turn-scoped hint 传给 reranker。
@@ -1128,6 +1136,72 @@ class Worker:
             )
             msg.image_url = ""
             msg.media_lifecycle_id = None
+
+    def _download_and_attach_aibot_media(
+        self, msg: WeComMessage, inbound_event_id: Any,
+    ) -> None:
+        """Download/decrypt a durable AIBot media reference and store it."""
+        import httpx
+        from app.services.pii_crypto_service import PiiCryptoService
+        from app.storage import get_storage
+
+        db = SessionLocal()
+        try:
+            row = db.get(WecomInboundEvent, int(inbound_event_id))
+            if row is None:
+                raise RuntimeError("aibot_media_event_missing")
+            if row.media_storage_ref:
+                msg.media_storage_ref = row.media_storage_ref
+                if msg.msg_type == "image":
+                    msg.image_url = row.media_storage_ref
+                return
+            expires_at = row.media_expires_at
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if expires_at is None or expires_at <= now:
+                row.media_download_status = "expired"
+                row.media_download_attempts = int(row.media_download_attempts or 0) + 1
+                db.commit()
+                msg.media_storage_ref = ""
+                return
+            crypto = PiiCryptoService.from_settings()
+            entity_id = str(row.provider_msg_id or row.msg_id)
+            media_url = crypto.decrypt(
+                row.media_url_ciphertext,
+                field="media_url",
+                entity_type="wecom_inbound_event",
+                entity_id=entity_id,
+            )
+            if row.media_aes_key_ciphertext:
+                crypto.decrypt(
+                    row.media_aes_key_ciphertext,
+                    field="media_aes_key",
+                    entity_type="wecom_inbound_event",
+                    entity_id=entity_id,
+                )
+            response = httpx.get(media_url, timeout=10.0)
+            response.raise_for_status()
+            blob = response.content
+            key = f"aibot-media/{row.source_channel}/{row.provider_msg_id or row.msg_id}"
+            get_storage().save(key, blob, content_type="application/octet-stream")
+            updated = db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == int(inbound_event_id),
+                WecomInboundEvent.media_storage_ref.is_(None),
+            ).update({
+                "media_storage_ref": key,
+                "media_download_status": "downloaded",
+                "media_download_attempts": int(row.media_download_attempts or 0) + 1,
+            }, synchronize_session=False)
+            if updated != 1:
+                raise RuntimeError("aibot_media_reference_race")
+            db.commit()
+            msg.media_storage_ref = key
+            if msg.msg_type == "image":
+                msg.image_url = key
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     # -----------------------------------------------------------------------
     # 回复发送（失败补偿）
@@ -3374,6 +3448,10 @@ def _build_wecom_message(msg_data: dict) -> WeComMessage:
         provider_req_id=msg_data.get("provider_req_id") or "",
         aibot_id=msg_data.get("aibot_id") or "",
         media_storage_ref=msg_data.get("media_storage_ref") or "",
+        media_expires_at=(
+            int(msg_data["media_expires_at"])
+            if msg_data.get("media_expires_at") is not None else None
+        ),
         actor_id_kind=msg_data.get("actor_id_kind") or "plain",
     )
 

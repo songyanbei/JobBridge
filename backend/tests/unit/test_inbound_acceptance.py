@@ -1,6 +1,7 @@
 import json
-from datetime import datetime
-from unittest.mock import MagicMock
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from app.services.inbound_acceptance import InboundAcceptanceService
 from app.wecom.callback import WeComMessage
@@ -119,3 +120,51 @@ def test_aibot_db_failure_is_retryable():
         enqueue=MagicMock(),
     ).accept(_aibot_message())
     assert result.status == "retryable"
+
+
+def test_aibot_media_is_encrypted_during_durable_acceptance():
+    db = FakeDB()
+    msg = _aibot_message(
+        msg_type="image",
+        media_id="media-1",
+        media_url="https://example.invalid/media",
+        media_aes_key="aes-key",
+        media_expires_at=1_900_000_000,
+    )
+
+    class FakeCrypto:
+        @classmethod
+        def from_settings(cls):
+            return cls()
+
+        def encrypt(self, value, **_kwargs):
+            return SimpleNamespace(value=("sealed:" + value).encode())
+
+    queued = []
+    with patch("app.services.pii_crypto_service.PiiCryptoService", FakeCrypto):
+        result = InboundAcceptanceService(
+            db_factory=lambda: db,
+            duplicate_check=lambda _key: False,
+            enqueue=lambda payload, queue: queued.append(payload),
+        ).accept(msg)
+
+    assert result.status == "accepted"
+    assert db.added.media_url_ciphertext == b"sealed:https://example.invalid/media"
+    assert db.added.media_aes_key_ciphertext == b"sealed:aes-key"
+    assert db.added.media_expires_at == datetime.fromtimestamp(1_900_000_000, timezone.utc).replace(tzinfo=None)
+    envelope = json.loads(queued[0])
+    assert envelope["media_expires_at"] == 1_900_000_000
+    assert "https://example.invalid/media" not in queued[0]
+    assert "aes-key" not in queued[0]
+
+
+def test_aibot_media_missing_url_or_expiry_is_invalid():
+    db = FakeDB()
+    result = InboundAcceptanceService(
+        db_factory=lambda: db,
+        duplicate_check=lambda _key: False,
+        enqueue=MagicMock(),
+    ).accept(_aibot_message(msg_type="image", media_id="media-1"))
+
+    assert result.status == "invalid"
+    assert db.added is None

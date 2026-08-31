@@ -11,6 +11,8 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 from typing import Callable, Literal
 
 from sqlalchemy.exc import IntegrityError
@@ -20,6 +22,28 @@ from app.core.redis_client import check_msg_duplicate, enqueue_message, QUEUE_IN
 from app.db import SessionLocal
 from app.models import WecomInboundEvent
 from app.wecom.callback import WeComMessage
+
+
+def _aibot_media_ciphertext(value: str, *, field: str, entity_id: str) -> bytes | None:
+    if not value:
+        return None
+    from app.services.pii_crypto_service import PiiCryptoService
+
+    return PiiCryptoService.from_settings().encrypt(
+        value,
+        field=field,
+        entity_type="wecom_inbound_event",
+        entity_id=entity_id,
+    ).value
+
+
+def _aibot_media_expiry(value: int | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError("invalid AIBot media expiry") from exc
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +85,11 @@ class InboundAcceptanceService:
     def accept(self, msg: WeComMessage, *, strict_redis: bool | None = None) -> AcceptanceResult:
         is_aibot = msg.source_channel == "wecom_aibot"
         strict = is_aibot if strict_redis is None else strict_redis
-        normalized = self._normalize(msg)
+        try:
+            normalized = self._normalize(msg)
+        except (TypeError, ValueError, OverflowError, OSError):
+            logger.warning("inbound acceptance rejected malformed metadata")
+            return AcceptanceResult("invalid", reason="invalid inbound message metadata")
         if normalized is None:
             return AcceptanceResult("invalid", reason="invalid inbound message metadata")
 
@@ -151,6 +179,14 @@ class InboundAcceptanceService:
             return None
         if source == "wecom_app" and not msg.msg_id:
             return None
+        if source == "wecom_aibot" and msg.msg_type in {"image", "voice", "video", "file"}:
+            if not msg.media_url or msg.media_expires_at is None:
+                return None
+            parsed_media_url = urlparse(msg.media_url)
+            if parsed_media_url.scheme != "https" or not parsed_media_url.netloc:
+                return None
+            if msg.msg_type in {"image", "video", "file"} and not msg.media_aes_key:
+                return None
         dedupe = hashlib.sha256(f"{source}\0{provider_id}".encode()).hexdigest() if provider_id else None
         internal_msg_id = (
             "aibot_" + hashlib.sha256(f"{source}\0{provider_id}".encode()).hexdigest()[:58]
@@ -171,6 +207,8 @@ class InboundAcceptanceService:
             "aibot_id": msg.aibot_id or None,
             "actor_id_kind": msg.actor_id_kind or "plain",
             "turn_id": msg.turn_id or str(uuid.uuid4()),
+            "media_expires_at": _aibot_media_expiry(msg.media_expires_at)
+            if source == "wecom_aibot" else None,
         }
 
     @staticmethod
@@ -181,13 +219,24 @@ class InboundAcceptanceService:
         content = msg.content or ""
         if raw_type in {"image", "voice", "video", "file"}:
             content = f"[{raw_type}] media_id saved"
-        return {
+        values = {
             **normalized,
             "msg_type": raw_type,
             "media_id": msg.media_id or None,
             "content_brief": content[:500] or None,
             "status": "received",
         }
+        if msg.source_channel == "wecom_aibot" and msg.msg_type in {"image", "voice", "video", "file"}:
+            entity_id = normalized["provider_msg_id"]
+            values["media_url_ciphertext"] = _aibot_media_ciphertext(
+                msg.media_url, field="media_url", entity_id=entity_id,
+            )
+            values["media_aes_key_ciphertext"] = _aibot_media_ciphertext(
+                msg.media_aes_key, field="media_aes_key", entity_id=entity_id,
+            )
+            values["media_expires_at"] = normalized["media_expires_at"]
+            values["media_download_status"] = "pending"
+        return values
 
     @staticmethod
     def _queue_payload(event: WecomInboundEvent, normalized: dict, msg: WeComMessage) -> dict:
@@ -211,6 +260,10 @@ class InboundAcceptanceService:
             "content": content,
             "media_id": event.media_id or "",
             "media_storage_ref": event.media_storage_ref or "",
+            "media_expires_at": (
+                int(event.media_expires_at.replace(tzinfo=timezone.utc).timestamp())
+                if event.media_expires_at else None
+            ),
             "provider_req_id": event.provider_req_id,
             "aibot_id": event.aibot_id,
             "created_at_epoch": int(event.created_at.timestamp()) if event.created_at else int(time.time()),
