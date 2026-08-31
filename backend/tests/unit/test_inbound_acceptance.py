@@ -168,3 +168,46 @@ def test_aibot_media_missing_url_or_expiry_is_invalid():
 
     assert result.status == "invalid"
     assert db.added is None
+
+
+def test_aibot_rate_limit_uses_conversation_and_actor_keys_and_never_enqueues():
+    db = FakeDB()
+    queued = []
+    checks = []
+
+    def rate_check(key, window, max_count):
+        checks.append((key, window, max_count))
+        return not key.endswith("opaque-user")
+
+    result = InboundAcceptanceService(
+        db_factory=lambda: db,
+        duplicate_check=lambda _key: False,
+        enqueue=lambda payload, queue: queued.append((payload, queue)),
+        aibot_rate_check=rate_check,
+    ).accept(_aibot_message())
+
+    assert result.status == "retryable"
+    assert not result.acknowledged
+    assert queued == []
+    assert db.added.rate_limit_decision == "rate_limited"
+    assert db.added.rate_limit_rule == "aibot.conversation_actor.v1"
+    assert {key for key, _window, _limit in checks} == {
+        "rate:wecom_aibot:single:opaque-user",
+        "rate:wecom_aibot:actor:opaque-user",
+    }
+    assert {(window, limit) for _key, window, limit in checks} == {(60, 30), (3600, 1000)}
+
+
+def test_aibot_rate_limited_duplicate_does_not_ack_or_enqueue():
+    existing = MagicMock(id=17, rate_limit_decision="rate_limited")
+    db = FakeDB(existing=existing)
+    enqueue = MagicMock()
+    result = InboundAcceptanceService(
+        db_factory=lambda: db,
+        duplicate_check=lambda _key: True,
+        enqueue=enqueue,
+        aibot_rate_check=MagicMock(),
+    ).accept(_aibot_message())
+    assert result.status == "retryable"
+    assert not result.acknowledged
+    enqueue.assert_not_called()

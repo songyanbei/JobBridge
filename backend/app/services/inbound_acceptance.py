@@ -18,7 +18,12 @@ from typing import Callable, Literal
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.core.redis_client import check_msg_duplicate, enqueue_message, QUEUE_INCOMING
+from app.core.redis_client import (
+    check_msg_duplicate,
+    check_rate_limit_key,
+    enqueue_message,
+    QUEUE_INCOMING,
+)
 from app.db import SessionLocal
 from app.models import WecomInboundEvent
 from app.wecom.callback import WeComMessage
@@ -49,6 +54,8 @@ logger = logging.getLogger(__name__)
 
 AcceptanceStatus = Literal["accepted", "duplicate", "retryable", "invalid"]
 
+AIBOT_RATE_WINDOWS = ((60, 30, "1m"), (3600, 1000, "1h"))
+
 
 @dataclass(frozen=True)
 class AcceptanceResult:
@@ -77,10 +84,12 @@ class InboundAcceptanceService:
         db_factory: Callable[[], Session] = SessionLocal,
         duplicate_check: Callable[[str], bool] = check_msg_duplicate,
         enqueue: Callable[[str, str], None] = enqueue_message,
+        aibot_rate_check: Callable[[str, int, int], bool] = check_rate_limit_key,
     ) -> None:
         self._db_factory = db_factory
         self._duplicate_check = duplicate_check
         self._enqueue = enqueue
+        self._aibot_rate_check = aibot_rate_check
 
     def accept(self, msg: WeComMessage, *, strict_redis: bool | None = None) -> AcceptanceResult:
         is_aibot = msg.source_channel == "wecom_aibot"
@@ -122,6 +131,10 @@ class InboundAcceptanceService:
                     # upstream retry.  Continue through the insert path.
                     logger.warning("stale inbound L1 marker identity=%s", identity)
                 else:
+                    if getattr(existing, "rate_limit_decision", None) == "rate_limited":
+                        return AcceptanceResult(
+                            "retryable", event_id=int(existing.id), reason="aibot rate limited",
+                        )
                     return AcceptanceResult("duplicate", event_id=int(existing.id))
 
             event = WecomInboundEvent(**self._event_values(normalized, msg))
@@ -130,6 +143,19 @@ class InboundAcceptanceService:
             db.refresh(event)
             event_id = int(event.id)
             payload = self._queue_payload(event, normalized, msg)
+            if is_aibot:
+                try:
+                    rate_allowed = self._aibot_rate_allowed(normalized)
+                except Exception:
+                    db.rollback()
+                    logger.exception("aibot acceptance rate-limit check failed event_id=%s", event_id)
+                    return AcceptanceResult("retryable", event_id=event_id, payload=payload, reason="rate limiter unavailable")
+                if not rate_allowed:
+                    event.rate_limit_decision = "rate_limited"
+                    event.rate_limit_rule = "aibot.conversation_actor.v1"
+                    event.rate_limited_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    db.commit()
+                    return AcceptanceResult("retryable", event_id=event_id, payload=payload, reason="aibot rate limited")
         except IntegrityError:
             db.rollback()
             try:
@@ -157,6 +183,18 @@ class InboundAcceptanceService:
             if strict:
                 return AcceptanceResult("retryable", event_id=event_id, payload=payload, reason="redis queue unavailable")
         return AcceptanceResult("accepted", event_id=event_id, payload=payload)
+
+    def _aibot_rate_allowed(self, normalized: dict) -> bool:
+        keys = (
+            f"rate:wecom_aibot:{normalized['conversation_type']}:{normalized['conversation_id']}",
+            f"rate:wecom_aibot:actor:{normalized['from_userid']}",
+        )
+        allowed = True
+        for window, max_count, _label in AIBOT_RATE_WINDOWS:
+            for key in keys:
+                if not self._aibot_rate_check(key, window, max_count):
+                    allowed = False
+        return allowed
 
     @staticmethod
     def _normalize(msg: WeComMessage) -> dict | None:

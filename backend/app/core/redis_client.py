@@ -603,6 +603,16 @@ def check_msg_duplicate(msg_id: str) -> bool:
 RATE_LIMIT_PREFIX = "rate:"
 
 
+def check_rate_limit_key(rate_key: str, window: int = 60, max_count: int = 30) -> bool:
+    """Apply a fixed-window counter to an already namespaced rate key."""
+    r = get_redis()
+    key = rate_key if rate_key.startswith(RATE_LIMIT_PREFIX) else f"{RATE_LIMIT_PREFIX}{rate_key}"
+    current = r.incr(key)
+    if current == 1:
+        r.expire(key, window)
+    return current <= max_count
+
+
 def check_rate_limit(userid: str, window: int = 10, max_count: int = 5) -> bool:
     """用户级消息限流。返回 True 表示允许通过，False 表示被限流。"""
     r = get_redis()
