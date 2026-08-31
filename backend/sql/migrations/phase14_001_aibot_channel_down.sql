@@ -2,10 +2,52 @@
 -- Every index/column operation is guarded through information_schema so this
 -- file is safe to run repeatedly and against a partially applied migration.
 
+DROP PROCEDURE IF EXISTS phase14_assert_aibot_rollback_guards;
 DROP PROCEDURE IF EXISTS phase14_drop_index_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_column_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_check_if_exists;
 DELIMITER //
+CREATE PROCEDURE phase14_assert_aibot_rollback_guards()
+BEGIN
+    DECLARE v_rollout_enabled VARCHAR(32) DEFAULT NULL;
+    DECLARE v_inbound BIGINT DEFAULT 0;
+    DECLARE v_outbox BIGINT DEFAULT 0;
+    DECLARE v_identity BIGINT DEFAULT 0;
+    DECLARE v_audit BIGINT DEFAULT 0;
+
+    SELECT config_value INTO v_rollout_enabled
+      FROM system_config
+     WHERE config_key = 'wecom_aibot.rollout_enabled'
+     LIMIT 1;
+    IF v_rollout_enabled IS NULL
+       OR LOWER(TRIM(v_rollout_enabled)) NOT IN ('0', 'false', 'off', 'disabled') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'phase14 rollback blocked: aibot rollout is not disabled';
+    END IF;
+
+    SELECT COUNT(*) INTO v_inbound
+      FROM wecom_inbound_event
+     WHERE source_channel = 'wecom_aibot';
+    SELECT COUNT(*) INTO v_outbox
+      FROM wecom_outbound_outbox
+     WHERE channel = 'wecom_aibot';
+    SELECT COUNT(*) INTO v_identity
+      FROM wecom_aibot_identity;
+    IF v_inbound <> 0 OR v_outbox <> 0 OR v_identity <> 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'phase14 rollback blocked: aibot data cleanup is incomplete';
+    END IF;
+
+    SELECT COUNT(*) INTO v_audit
+      FROM audit_log
+     WHERE target_type = 'system'
+       AND target_id = 'wecom_aibot'
+       AND action = 'strategy_rollback'
+       AND operator IS NOT NULL AND TRIM(operator) <> ''
+       AND reason LIKE '%phase14%';
+    IF v_audit = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'phase14 rollback blocked: audit confirmation is missing';
+    END IF;
+END//
+
 CREATE PROCEDURE phase14_drop_index_if_exists(
     IN p_table VARCHAR(64), IN p_index VARCHAR(64)
 )
@@ -71,6 +113,8 @@ BEGIN
 END//
 DELIMITER ;
 
+CALL phase14_assert_aibot_rollback_guards();
+
 -- Constraints must be removed before their referenced columns.
 CALL phase14_drop_check_if_exists('wecom_inbound_event', 'ck_inbound_channel_contract');
 CALL phase14_drop_check_if_exists('wecom_inbound_event', 'ck_inbound_conversation_contract');
@@ -125,3 +169,4 @@ DROP TABLE IF EXISTS wecom_aibot_identity;
 DROP PROCEDURE IF EXISTS phase14_drop_index_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_column_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_check_if_exists;
+DROP PROCEDURE IF EXISTS phase14_assert_aibot_rollback_guards;
