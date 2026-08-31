@@ -26,7 +26,7 @@ def can_publish_job(user_or_context, *, owner_userid: str | None = None) -> bool
     role = getattr(user_or_context, "role", None)
     userid = getattr(user_or_context, "external_userid", None)
     status = getattr(user_or_context, "status", None)
-    if role not in PUBLISHER_ROLES or status in {"blocked", "deleted", "disabled"}:
+    if role not in PUBLISHER_ROLES or status != "active":
         return False
     if owner_userid is not None and userid != owner_userid:
         return False

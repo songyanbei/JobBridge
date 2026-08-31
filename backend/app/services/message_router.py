@@ -1810,6 +1810,19 @@ def _handle_upload(
     # Phase 1：进入上传流程时清搜索 awaiting，避免上传草稿的裸值（如 headcount 的 "2"）
     # 与搜索 awaiting 的薪资字段（"2500"）混淆。
     conversation_service.clear_search_awaiting(session)
+    if intent_result.intent in ("upload_job", "upload_and_search"):
+        from app.services.permission_service import can_publish_job
+        if not can_publish_job(user_ctx):
+            return [_reply(msg.from_user, "当前账号无权发布岗位。")]
+        from app.services.publish_policy import evaluate_publish_policy
+        decision = evaluate_publish_policy(
+            actor_id=user_ctx.external_userid, role=user_ctx.role,
+            action_name="publish_job",
+        )
+        # The S4 switch is fail-closed only when explicitly enabled; while it
+        # remains off, preserve the legacy upload path for compatibility.
+        if _settings_module.job_publish_flow_enabled and not decision.allowed:
+            return [_reply(msg.from_user, "岗位发布功能暂不可用，请稍后再试。")]
     result = upload_service.process_upload(
         user_ctx=user_ctx,
         intent_result=intent_result,
@@ -2939,11 +2952,35 @@ def _run_search(
             experience_flags=experience_flags,
         )
     else:
-        result, outcome = search_service.search_workers(
-            composed, raw_query, session, user_ctx, db,
-            user_msg_id=user_msg_id,
-            experience_flags=experience_flags,
-        )
+        # Candidate search uses the direction-scoped facade. The facade owns
+        # off/out-of-bucket fallback while router-level errors remain an
+        # explicit legacy fallback for mixed-version workers.
+        try:
+            from app.listing.search import ResumeSearchFacade, SearchTurn
+            facade_response = ResumeSearchFacade(db).search_workers_v1(
+                user_ctx, composed, session,
+                SearchTurn(raw_query=raw_query, user_msg_id=user_msg_id), db=db,
+            )
+            result, outcome = facade_response.result, facade_response.outcome
+            if facade_response.used_facade:
+                log_event(
+                    "resume_search_facade_served",
+                    facade_version=ResumeSearchFacade.policy.version,
+                    direction="search_worker",
+                )
+            else:
+                log_event(
+                    "facade_fallback", direction="search_worker",
+                    reason=facade_response.fallback_reason or "disabled",
+                    user_msg_id=user_msg_id,
+                )
+        except Exception as exc:
+            log_event("facade_fallback", direction="search_worker", reason=type(exc).__name__)
+            result, outcome = search_service.search_workers(
+                composed, raw_query, session, user_ctx, db,
+                user_msg_id=user_msg_id,
+                experience_flags=experience_flags,
+            )
 
     # Phase 5 §5.2：available_relax_steps 现已由 search_jobs/search_workers 在
     # post_search_policy_mode=on 时内部填好（跳过 _run_*_fallback_steps 由 reducer
