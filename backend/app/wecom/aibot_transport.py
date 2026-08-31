@@ -243,7 +243,12 @@ class AibotTransport:
         mapping to validate.
         """
         command = str(item.get("reply_command") or "aibot_respond_msg")
-        req_id = str(item.get("provider_req_id") or item.get("ack_req_id") or f"out-{uuid.uuid4().hex}")
+        if command == "aibot_send_msg":
+            if not item.get("ack_req_id"):
+                raise AibotClientError("aibot_send_msg requires persisted ack_req_id")
+            req_id = str(item["ack_req_id"])
+        else:
+            req_id = str(item.get("provider_req_id") or item.get("ack_req_id") or f"out-{uuid.uuid4().hex}")
         content = str(item.get("content") or "")
         stream_id = item.get("stream_id")
         finish = bool(item.get("finish", False))

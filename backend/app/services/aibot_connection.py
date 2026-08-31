@@ -8,6 +8,7 @@ so unit tests can exercise leases and fencing without a live WSS endpoint.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import os
@@ -35,6 +36,14 @@ OUTBOX_LEASE_SECONDS = 180
 OUTBOX_BATCH_SIZE = 20
 EVENT_RESPONSE_TIMEOUT_SECONDS = 5.0
 WELCOME_RESPONSE_CONTENT = "您好！我是智能助手。"
+
+
+def stable_aibot_ack_req_id(outbox_id: int | str, provider_req_id: str | None = None) -> str:
+    """Return the deterministic protocol ACK key for one active-push row."""
+    digest = hashlib.sha256(
+        f"{outbox_id}\0{provider_req_id or ''}".encode(),
+    ).hexdigest()[:24]
+    return f"aibot-send-{outbox_id}-{digest}"
 
 
 class ConnectionState(StrEnum):
@@ -96,6 +105,9 @@ class AibotOutboxWriter:
                     row.last_error = "reply_window_expired"
                     continue
                 row.status = "sending"
+                command = row.reply_command or "aibot_respond_msg"
+                if command == "aibot_send_msg" and not row.ack_req_id:
+                    row.ack_req_id = stable_aibot_ack_req_id(row.id, row.provider_req_id)
                 row.locked_at = now
                 row.lease_owner = self.lease_owner
                 row.fencing_token = self.fencing_token
@@ -110,7 +122,8 @@ class AibotOutboxWriter:
                     "chat_id": row.chat_id,
                     "ordering_key": row.ordering_key,
                     "provider_req_id": row.provider_req_id,
-                    "reply_command": row.reply_command or "aibot_respond_msg",
+                    "ack_req_id": row.ack_req_id,
+                    "reply_command": command,
                     "stream_id": row.stream_id,
                     "finish": row.finish,
                     "attempt_count": int(row.attempt_count),
@@ -188,7 +201,12 @@ class AibotOutboxWriter:
     def _valid_ack(response: Any, item: Mapping[str, Any]) -> bool:
         if not isinstance(response, Mapping) or response.get("errcode") != 0:
             return False
-        req_id = item.get("provider_req_id") or item.get("ack_req_id")
+        if item.get("reply_command") == "aibot_send_msg":
+            req_id = item.get("ack_req_id")
+            if not req_id:
+                return False
+        else:
+            req_id = item.get("provider_req_id") or item.get("ack_req_id")
         response_req_id = response.get("req_id") or (response.get("headers") or {}).get("req_id")
         return (not req_id and not response_req_id) or (
             bool(req_id) and bool(response_req_id) and str(req_id) == str(response_req_id)
@@ -223,7 +241,7 @@ class AibotOutboxWriter:
         return self._update(item, {
             "status": "sent",
             "provider_response": summary or None,
-            "ack_req_id": req_id,
+            "ack_req_id": item.get("ack_req_id") or req_id,
             "ack_received_at": func.now(6),
             "first_sent_at": func.coalesce(WecomOutboundOutbox.first_sent_at, func.now(6)),
             "sent_at": func.now(6),

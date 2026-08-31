@@ -3,8 +3,12 @@ import json
 
 import pytest
 
-from app.services.aibot_connection import AibotConnection, AibotOutboxWriter
-from app.wecom.aibot_client import AibotClient
+from app.services.aibot_connection import (
+    AibotConnection,
+    AibotOutboxWriter,
+    stable_aibot_ack_req_id,
+)
+from app.wecom.aibot_client import AibotClient, AibotClientError
 from app.wecom.aibot_transport import AibotTransport, TransportState
 
 
@@ -56,6 +60,33 @@ async def test_real_transport_adapts_outbox_to_protocol_frame_and_ack():
 
 
 @pytest.mark.asyncio
+async def test_active_push_uses_ack_req_id_and_rejects_missing_value():
+    socket = AckSocket()
+    transport = AibotTransport(
+        AibotClient("BOTID", "SECRET"),
+        connect_factory=lambda _url: socket,
+        lease_acquire=lambda: (True, 7),
+        lease_renew=lambda _token: True,
+        heartbeat_seconds=60,
+    )
+
+    assert await transport.connect_once()
+    result = await transport.send_outbox({
+        "content": "hello",
+        "provider_req_id": "source-req",
+        "ack_req_id": "aibot-send-42-stable",
+        "reply_command": "aibot_send_msg",
+        "chat_id": "chat-1",
+    })
+    assert result["headers"]["req_id"] == "aibot-send-42-stable"
+    assert socket.sent[-1]["cmd"] == "aibot_send_msg"
+    assert socket.sent[-1]["headers"]["req_id"] == "aibot-send-42-stable"
+    with pytest.raises(AibotClientError, match="ack_req_id"):
+        await transport.send_outbox({"content": "missing", "reply_command": "aibot_send_msg"})
+    await transport.close()
+
+
+@pytest.mark.asyncio
 async def test_async_writer_awaits_transport_and_accepts_mapping_ack(monkeypatch):
     class AsyncTransport:
         async def send_outbox(self, item):
@@ -67,6 +98,23 @@ async def test_async_writer_awaits_transport_and_accepts_mapping_ack(monkeypatch
     monkeypatch.setattr(writer, "_mark_sent", lambda current, response: marked.append((current, response)) or True)
     assert await writer.deliver_async(item)
     assert marked and marked[0][1]["errcode"] == 0
+
+
+def test_active_push_ack_req_id_is_stable_and_required():
+    ack_req_id = stable_aibot_ack_req_id(42, "provider-1")
+    assert ack_req_id == stable_aibot_ack_req_id(42, "provider-1")
+    assert AibotOutboxWriter._valid_ack(
+        {"headers": {"req_id": ack_req_id}, "errcode": 0},
+        {"reply_command": "aibot_send_msg", "ack_req_id": ack_req_id},
+    )
+    assert not AibotOutboxWriter._valid_ack(
+        {"headers": {"req_id": "wrong"}, "errcode": 0},
+        {"reply_command": "aibot_send_msg", "ack_req_id": ack_req_id},
+    )
+    assert not AibotOutboxWriter._valid_ack(
+        {"headers": {"req_id": ack_req_id}, "errcode": 0},
+        {"reply_command": "aibot_send_msg"},
+    )
 
 
 def test_release_lease_handles_bytes_from_redis(monkeypatch):
