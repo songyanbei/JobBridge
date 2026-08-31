@@ -43,6 +43,7 @@ class WeComIdentityAppClient:
         *,
         timeout: float = 10.0,
         transport: Any | None = None,
+        http_client: Any | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         secret = app_secret
@@ -53,7 +54,7 @@ class WeComIdentityAppClient:
         if not self.corp_id or not self._app_secret:
             raise ValueError("corp_id and identity app secret are required")
         self.timeout = timeout
-        self._transport = transport or httpx
+        self._transport = transport or http_client or httpx
         self._clock = clock
         self._token = ""
         self._token_expires_at = 0.0
@@ -162,3 +163,9 @@ class WeComIdentityAppClient:
 
 
 IdentityAppClient = WeComIdentityAppClient
+AibotIdentityAppClient = WeComIdentityAppClient
+
+
+def batch_openuserid_to_userid(client: WeComIdentityAppClient, open_userids: list[str]) -> ConversionResult:
+    """Functional alias useful for dependency-injected workers/tests."""
+    return client.batch_openuserid_to_userid(open_userids)
