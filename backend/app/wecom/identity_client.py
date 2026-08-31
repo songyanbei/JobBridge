@@ -17,6 +17,8 @@ from app.config import settings
 
 IDENTITY_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 MAX_BATCH_SIZE = 1000
+_TEMPORARY_ERRCODES = frozenset({42001, 45009, 50001})
+_PERMANENT_ERRCODES = frozenset({40001, 40003, 40013, 40014, 60111, 60112, 40031})
 
 
 class IdentityClientError(RuntimeError):
@@ -31,6 +33,26 @@ class ConversionResult:
     mapping: dict[str, str]
     invalid: frozenset[str]
     batches: int
+
+
+def _errcode(payload: dict[str, Any], prefix: str) -> int:
+    """Validate provider errcode without coercing malformed values."""
+    if "errcode" not in payload:
+        raise IdentityClientError(f"{prefix} response missing errcode", code=f"{prefix}_invalid", retryable=False)
+    value = payload.get("errcode")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise IdentityClientError(f"{prefix} response errcode invalid", code=f"{prefix}_invalid", retryable=False)
+    if value < 0:
+        raise IdentityClientError(f"{prefix} response errcode unknown", code="unknown_errcode", retryable=False)
+    return value
+
+
+def _provider_error(prefix: str, errcode: int) -> IdentityClientError:
+    if errcode in _TEMPORARY_ERRCODES:
+        return IdentityClientError(f"{prefix} temporary error", code=f"{prefix}_err_{errcode}", retryable=True)
+    if errcode in _PERMANENT_ERRCODES:
+        return IdentityClientError(f"{prefix} permanent error", code=f"{prefix}_err_{errcode}", retryable=False)
+    return IdentityClientError(f"{prefix} unknown error", code="unknown_errcode", retryable=False)
 
 
 class WeComIdentityAppClient:
@@ -76,10 +98,12 @@ class WeComIdentityAppClient:
                 raise IdentityClientError("identity app token request failed", code="token_unavailable", retryable=True) from exc
             if not isinstance(payload, dict):
                 raise IdentityClientError("identity app token response invalid", code="token_invalid", retryable=True)
-            errcode = int(payload.get("errcode", 0) or 0)
+            errcode = _errcode(payload, "token")
             token = payload.get("access_token")
-            if errcode != 0 or not isinstance(token, str) or not token:
-                raise IdentityClientError("identity app token rejected", code=f"token_err_{errcode}", retryable=errcode in {40001, 40014, 42001, 45009})
+            if errcode != 0:
+                raise _provider_error("token", errcode)
+            if not isinstance(token, str) or not token:
+                raise IdentityClientError("identity app token missing", code="token_invalid", retryable=False)
             expires = payload.get("expires_in", 7200)
             try:
                 expires_seconds = max(60, int(expires))
@@ -171,12 +195,9 @@ class WeComIdentityAppClient:
             raise IdentityClientError("identity conversion request failed", code="conversion_unavailable", retryable=True) from exc
         if not isinstance(payload, dict):
             raise IdentityClientError("identity conversion response invalid", code="conversion_invalid", retryable=True)
-        try:
-            errcode = int(payload.get("errcode", 0) or 0)
-        except (TypeError, ValueError):
-            raise IdentityClientError("identity conversion errcode invalid", code="conversion_invalid", retryable=True)
+        errcode = _errcode(payload, "conversion")
         if errcode != 0:
-            raise IdentityClientError("identity conversion rejected", code=f"conversion_err_{errcode}", retryable=errcode >= 500 or errcode in {40014, 42001, 45009})
+            raise _provider_error("conversion", errcode)
         rows = payload.get("userid_list", [])
         bad = payload.get("invalid_open_userid_list", [])
         if not isinstance(rows, list) or not isinstance(bad, list) or any(not isinstance(v, str) for v in bad):

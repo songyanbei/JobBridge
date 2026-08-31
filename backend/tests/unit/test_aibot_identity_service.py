@@ -52,6 +52,21 @@ def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatc
     assert row.identity_status == "conversion_pending"
 
 
+def test_nonretryable_identity_client_error_is_rejected(monkeypatch):
+    db = Mock()
+    row = _row()
+    svc = service.AibotIdentityService(client=Mock(), bot_id="bot")
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+    monkeypatch.setattr(svc, "resolve_open_userids", lambda values: (_ for _ in ()).throw(IdentityClientError("bad code", code="unknown_errcode", retryable=False)))
+    monkeypatch.setattr(service.settings, "identity_resolution_enabled", True)
+
+    result = svc.resolve_for_event(db, actor_id="open-a", actor_id_kind="open_userid")
+
+    assert result.status == "rejected"
+    assert result.reason_code == "unknown_errcode"
+    assert row.next_resolution_at is None
+
+
 def test_binding_ensures_canonical_user_before_flush(monkeypatch):
     db = Mock()
     calls = []

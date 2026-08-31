@@ -98,3 +98,51 @@ def test_incomplete_mapping_is_retryable_error():
         client.batch_openuserid_to_userid(["open-a"])
     assert exc.value.code == "conversion_incomplete"
     assert exc.value.retryable
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_code", "retryable"),
+    [
+        (None, "token_invalid", False),
+        ("0", "token_invalid", False),
+        (-1, "unknown_errcode", False),
+        (999999, "unknown_errcode", False),
+        (42001, "token_err_42001", True),
+        (40001, "token_err_40001", False),
+    ],
+)
+def test_token_errcode_classification(value, expected_code, retryable):
+    class _TokenTransport(_Transport):
+        def get(self, url, **kwargs):
+            return _Response({"access_token": "token"} if value is None else {"errcode": value, "access_token": "token"})
+    client = WeComIdentityAppClient("corp", "secret", transport=_TokenTransport({}))
+    with pytest.raises(IdentityClientError) as exc:
+        client.get_access_token()
+    assert exc.value.code == expected_code
+    assert exc.value.retryable is retryable
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_code", "retryable"),
+    [
+        (None, "conversion_invalid", False),
+        ("0", "conversion_invalid", False),
+        (-1, "unknown_errcode", False),
+        (999999, "unknown_errcode", False),
+        (45009, "conversion_err_45009", True),
+        (40013, "conversion_err_40013", False),
+    ],
+)
+def test_conversion_errcode_classification(value, expected_code, retryable):
+    class _ConversionTransport(_Transport):
+        def get(self, url, **kwargs):
+            return _Response({"errcode": 0, "access_token": "token", "expires_in": 7200})
+
+        def post(self, url, **kwargs):
+            payload = {} if value is None else {"errcode": value}
+            return _Response(payload)
+    client = WeComIdentityAppClient("corp", "secret", transport=_ConversionTransport({}))
+    with pytest.raises(IdentityClientError) as exc:
+        client.batch_openuserid_to_userid(["open-a"])
+    assert exc.value.code == expected_code
+    assert exc.value.retryable is retryable
