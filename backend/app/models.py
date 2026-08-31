@@ -1213,16 +1213,110 @@ class WecomAibotIdentity(Base):
     __tablename__ = "wecom_aibot_identity"
 
     opaque_actor_id = sa.Column(sa.String(128), primary_key=True)
+    bot_id = sa.Column(sa.String(128), nullable=False, server_default="")
+    actor_id_kind = sa.Column(sa.Enum("plain", "open_userid", name="aibot_actor_id_kind"), nullable=False, server_default="open_userid")
+    opaque_actor_digest = sa.Column(mysql.CHAR(64), nullable=True)
     mapped_external_userid = sa.Column(sa.String(64), nullable=True)
+    canonical_userid = sa.Column(sa.String(64), nullable=True)
     identity_status = sa.Column(
-        sa.Enum("unverified", "verified", "rejected", name="wecom_aibot_identity_status"),
+        sa.Enum("unverified", "conversion_pending", "verified", "rejected", "revoked", name="wecom_aibot_identity_status"),
         nullable=False, server_default="unverified",
     )
+    resolution_attempts = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    next_resolution_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    last_error_code = sa.Column(sa.String(64), nullable=True)
+    last_error_digest = sa.Column(mysql.CHAR(64), nullable=True)
+    source_msg_id = sa.Column(sa.String(128), nullable=True)
+    first_seen_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    last_seen_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     verified_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
     updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"), onupdate=sa.func.now())
 
-    __table_args__ = (sa.Index("idx_aibot_identity_mapped", "mapped_external_userid"),)
+    __table_args__ = (
+        sa.Index("idx_aibot_identity_mapped", "mapped_external_userid"),
+        sa.Index("idx_aibot_identity_status_due", "identity_status", "next_resolution_at"),
+        sa.Index("idx_aibot_identity_canonical", "canonical_userid"),
+        sa.UniqueConstraint("bot_id", "opaque_actor_digest", name="uk_aibot_identity_bot_digest"),
+        sa.UniqueConstraint("bot_id", "canonical_userid", name="uk_aibot_identity_bot_canonical"),
+    )
+
+
+class AibotIdentityBinding(Base):
+    """Explicit channel-to-business identity binding; never a role grant."""
+
+    __tablename__ = "aibot_identity_binding"
+
+    binding_id = sa.Column(sa.String(36), primary_key=True)
+    bot_id = sa.Column(sa.String(128), nullable=False)
+    opaque_actor_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    canonical_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid"), nullable=False)
+    binding_status = sa.Column(sa.Enum("pending", "active", "rejected", "revoked", name="aibot_binding_status"), nullable=False, server_default="pending")
+    binding_source = sa.Column(sa.Enum("auto_verified", "invite", "pre_registered", "admin", name="aibot_binding_source"), nullable=False, server_default="auto_verified")
+    invite_id = sa.Column(sa.String(36), nullable=True)
+    approved_by = sa.Column(sa.String(64), nullable=True)
+    approved_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    revoked_by = sa.Column(sa.String(64), nullable=True)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("bot_id", "opaque_actor_digest", "binding_status", name="uk_aibot_binding_identity_status"),
+        sa.Index("idx_aibot_binding_canonical", "bot_id", "canonical_userid", "binding_status"),
+    )
+
+
+class AibotRegistration(Base):
+    __tablename__ = "aibot_registration"
+
+    registration_id = sa.Column(sa.String(36), primary_key=True)
+    canonical_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid"), nullable=True)
+    identity_binding_id = sa.Column(sa.String(36), nullable=False)
+    registration_status = sa.Column(sa.Enum("discovered", "pending_role", "active", "rejected", "revoked", name="aibot_registration_status"), nullable=False, server_default="discovered")
+    registration_source = sa.Column(sa.Enum("auto_worker", "pre_registered", "invite", "admin", name="aibot_registration_source"), nullable=False, server_default="auto_worker")
+    requested_role = sa.Column(sa.Enum("worker", "factory", "broker", name="aibot_requested_role"), nullable=True)
+    granted_role = sa.Column(sa.Enum("worker", "factory", "broker", name="aibot_granted_role"), nullable=True)
+    capability_snapshot = sa.Column(sa.JSON, nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"), onupdate=sa.func.now())
+
+    __table_args__ = (sa.Index("idx_aibot_registration_user_status", "canonical_userid", "registration_status"),)
+
+
+class AibotRoleInvite(Base):
+    __tablename__ = "aibot_role_invite"
+
+    invite_id = sa.Column(sa.String(36), primary_key=True)
+    token_digest = sa.Column(mysql.CHAR(64), nullable=False, unique=True)
+    target_role = sa.Column(sa.Enum("factory", "broker", name="aibot_invite_role"), nullable=False)
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False)
+    max_uses = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    used_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    created_by = sa.Column(sa.String(64), nullable=False)
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (sa.Index("idx_aibot_invite_active", "target_role", "expires_at", "revoked_at"),)
+
+
+class AibotIdentityAudit(Base):
+    __tablename__ = "aibot_identity_audit"
+
+    audit_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    bot_id = sa.Column(sa.String(128), nullable=False)
+    opaque_actor_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    canonical_userid = sa.Column(sa.String(64), nullable=True)
+    action = sa.Column(sa.String(48), nullable=False)
+    result = sa.Column(sa.String(32), nullable=False)
+    reason_code = sa.Column(sa.String(64), nullable=True)
+    actor = sa.Column(sa.String(64), nullable=True)
+    metadata = sa.Column(sa.JSON, nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+
+    __table_args__ = (sa.Index("idx_aibot_identity_audit_lookup", "bot_id", "opaque_actor_digest", "created_at"),)
 
 
 # ============================================================================

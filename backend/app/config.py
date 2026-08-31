@@ -447,6 +447,12 @@ class Settings(BaseSettings):
     wecom_aibot_send_queue_max: int = 1000
     wecom_aibot_streaming_enabled: bool = False
     wecom_aibot_allow_opaque_registration: bool = False
+    # Identity resolution deliberately has an independent credential and is
+    # disabled until the test-enterprise visibility checks are complete.
+    identity_resolution_enabled: bool = False
+    wecom_aibot_identity_app_secret: SecretStr = SecretStr("")
+    role_binding_mode: Literal["shadow", "on"] = "shadow"
+    aibot_identity_digest_key: SecretStr = SecretStr("")
 
     @field_validator("wecom_aibot_ws_url", mode="after")
     @classmethod
@@ -486,6 +492,10 @@ class Settings(BaseSettings):
         if self.app_env.lower() == "production" and self.wecom_aibot_allow_opaque_registration:
             raise ValueError(
                 "WECOM_AIBOT_ALLOW_OPAQUE_REGISTRATION must remain false in production"
+            )
+        if self.identity_resolution_enabled and not self.wecom_aibot_identity_app_secret.get_secret_value().strip():
+            raise ValueError(
+                "WECOM_AIBOT_IDENTITY_APP_SECRET is required when identity resolution is enabled"
             )
         return self
 
