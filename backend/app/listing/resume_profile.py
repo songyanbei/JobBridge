@@ -35,4 +35,3 @@ class ResumeProfile:
 
 
 RESUME_PROFILE = ResumeProfile()
-

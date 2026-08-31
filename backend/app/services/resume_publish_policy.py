@@ -26,4 +26,3 @@ class ResumePublishPolicy:
         redacted = RESUME_PROFILE.redact(values)
         body = json.dumps(redacted, ensure_ascii=True, sort_keys=True, default=str)
         return {"profile": RESUME_PROFILE.name, "policy_version": self.version, "fields": redacted, "digest": hashlib.sha256(body.encode()).hexdigest()}
-

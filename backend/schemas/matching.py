@@ -10,4 +10,3 @@ class MatchingRequest(BaseModel):
     direction: RecruitmentDirection
     criteria: dict = Field(default_factory=dict)
     policy_version: str = "matching-policy-v1"
-

@@ -34,4 +34,3 @@ def test_resume_projection_has_no_contact_or_exact_age():
     result = redact_resume_for_viewer(Resume(), role="factory")
     assert result["age_band"] == "30-34岁"
     assert "phone" not in result
-

@@ -34,4 +34,3 @@ if __name__ == "__main__":
     parser.add_argument("--kill-switch", action="store_true", default=False)
     args = parser.parse_args()
     print(json.dumps(plan(directions=args.directions, percentage=args.percentage, kill_switch=args.kill_switch), ensure_ascii=True, sort_keys=True))
-

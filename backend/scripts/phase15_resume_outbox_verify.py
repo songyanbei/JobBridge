@@ -31,4 +31,3 @@ if __name__ == "__main__":
     parser.parse_args()
     print(json.dumps(verify(), ensure_ascii=True, sort_keys=True))
     sys.exit(0)
-
