@@ -32,3 +32,9 @@ def test_phase16_down_drops_fk_before_phase16_tables_and_is_repeat_safe():
     assert SQL.index("phase16_drop_fk_if_exists('aibot_identity_binding'") < SQL.index("DROP TABLE IF EXISTS aibot_registration;")
     assert "DROP TABLE IF EXISTS" in SQL
     assert "DROP PROCEDURE IF EXISTS phase16_assert_aibot_rollback_guards" in SQL
+
+
+def test_partial_phase16_state_cannot_be_treated_as_noop():
+    assert "v_phase16_tables = 0 AND v_phase16_columns = 0" in SQL
+    assert "v_phase16_tables <> 4 OR v_tables <> 5 OR v_phase16_columns < 5" in SQL
+    assert "v_phase16_tables" in SQL

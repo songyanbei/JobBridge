@@ -12,6 +12,7 @@ DELIMITER //
 CREATE PROCEDURE phase16_assert_aibot_rollback_guards()
 rollback_guard: BEGIN
     DECLARE v_tables INT DEFAULT 0;
+    DECLARE v_phase16_tables INT DEFAULT 0;
     DECLARE v_phase16_columns INT DEFAULT 0;
     DECLARE v_aibot_enabled VARCHAR(32) DEFAULT NULL;
     DECLARE v_identity_enabled VARCHAR(32) DEFAULT NULL;
@@ -27,6 +28,11 @@ rollback_guard: BEGIN
        AND table_name IN ('aibot_identity_binding', 'aibot_registration',
                           'aibot_role_invite', 'aibot_identity_audit',
                           'wecom_aibot_identity');
+    SELECT COUNT(*) INTO v_phase16_tables
+      FROM information_schema.tables
+     WHERE table_schema = DATABASE()
+       AND table_name IN ('aibot_identity_binding', 'aibot_registration',
+                          'aibot_role_invite', 'aibot_identity_audit');
     SELECT COUNT(*) INTO v_phase16_columns
       FROM information_schema.columns
      WHERE table_schema = DATABASE()
@@ -36,10 +42,10 @@ rollback_guard: BEGIN
 
     -- A completed rollback is a safe no-op.  Any partially applied state is
     -- blocked rather than guessed at.
-    IF v_phase16_columns = 0 AND v_tables <= 1 THEN
+    IF v_phase16_tables = 0 AND v_phase16_columns = 0 THEN
         LEAVE rollback_guard;
     END IF;
-    IF v_tables <> 5 OR v_phase16_columns < 5 THEN
+    IF v_phase16_tables <> 4 OR v_tables <> 5 OR v_phase16_columns < 5 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'phase16 rollback blocked: migration is incomplete';
     END IF;
 
