@@ -143,6 +143,18 @@
 - [x] PASS GF9 app 重建为 `CONTACT_SERVICE_MODE=off`、`JOB_PUBLISH_KILL_SWITCH=true` 后 mock 联系请求只返回安全引导，不产生 grant/delivery。
 - [x] PASS GF10 `action_contact_chaos.py --json`：9/9，含 outbox response lost、provider timeout、revoke-before-send/dead-letter。
 
+## AIBot WebSocket 专项（A9）
+
+- [ ] A9.1 subscribe/鉴权/单活连接：匹配 `headers.req_id` 回执，旧连接被踢且无双主。
+- [ ] A9.2 heartbeat/reconnect/lease fencing：30 秒心跳、指数退避、租约丢失立即停连。
+- [ ] A9.3 JSON callback durable inbox + idempotency：`schema_version=2`、provider 幂等键、DB/Redis 故障不成功确认。
+- [ ] A9.4 single/group session ordering：单聊按用户、群聊按 chat_id，`ordering_key` 贯穿锁/Session/Outbox。
+- [ ] A9.5 AIBot outbox ack/uncertain/recovery：渠道隔离、ACK 丢失进入 `uncertain` 且不自动重试。
+- [ ] A9.6 media URL/aeskey lifecycle：加密短存、Worker 下载转存、过期停止重试。
+- [ ] A9.7 stream finish/deadline：启用流式时校验 `req_id`、`stream.id`、`finish=true` 和 10 分钟 deadline。
+- [ ] A9.8 platform quota/24h/主动推送：24 小时窗口、30/min、1000/hour 及先前会话条件。
+- [ ] A9.9 real test enterprise E2E：明文/加密 userid、单聊/群聊、重启接管和失败恢复。
+
 ## 命令与证据索引（执行时填写）
 
 | 编号 | 命令/入口 | 环境 | 结果 | 证据路径/摘要 | 影响/建议 |
