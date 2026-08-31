@@ -584,6 +584,7 @@ def process_upload(
     else:
         entity = _create_resume(
             data, user_ctx, audit_result, ttl_days, final_raw_text, image_keys, db,
+            media_ids=list(session.pending_upload_media_ids),
         )
 
     # 用真实实体 ID 写 audit_log
@@ -948,6 +949,7 @@ def _create_resume(
     raw_text: str,
     image_keys: list[str],
     db: Session,
+    media_ids: list[int] | None = None,
 ) -> Resume:
     """创建简历记录。"""
     from app.services.lifecycle_config_service import get_resume_candidate_ttl_days
@@ -993,6 +995,21 @@ def _create_resume(
     )
     db.add(resume)
     db.flush()
+    if media_ids:
+        from app.services.job_media_service import attach_media
+
+        resume.images = attach_media(
+            db,
+            media_ids,
+            "resume",
+            resume.id,
+            owner_userid=user_ctx.external_userid,
+            entity_version=int(
+                getattr(resume, "aggregate_version", None)
+                or resume.version
+                or 1
+            ),
+        )
     if audit_result.status == "passed":
         activate_resume(db, resume, now=now)
     return resume
