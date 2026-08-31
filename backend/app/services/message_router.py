@@ -338,9 +338,9 @@ def _is_relaxation_expired(iso_str: str) -> bool:
 
 
 def _contact_listing_ref(content: str, session: SessionState) -> str | None:
-    """Resolve an explicit contact command to a job in the current snapshot."""
+    """Resolve an explicit contact command to a job or resume snapshot item."""
     match = _CONTACT_COMMAND_RE.fullmatch((content or "").strip())
-    if match is None or session.profile != "recruitment.job":
+    if match is None or session.profile not in {"recruitment.job", "recruitment.resume"}:
         return None
     shown = [str(item) for item in (session.shown_items or []) if str(item).strip()]
     if not shown:
@@ -352,13 +352,16 @@ def _contact_listing_ref(content: str, session: SessionState) -> str | None:
         candidate = shown[ordinal - 1]
     else:
         candidate = shown[-1]
-    if candidate.startswith("recruitment.job:"):
+    expected_prefix = "recruitment.resume:" if session.profile == "recruitment.resume" else "recruitment.job:"
+    if candidate.startswith("recruitment.job:") or candidate.startswith("recruitment.resume:"):
+        if ":" in candidate and not candidate.startswith(expected_prefix):
+            return ""
         suffix = candidate.rsplit(":", 1)[-1]
     else:
         suffix = candidate
     if not suffix.isdigit() or int(suffix) <= 0:
         return ""
-    return f"recruitment.job:{int(suffix)}"
+    return f"{expected_prefix}{int(suffix)}"
 
 
 def _try_handle_contact(
@@ -384,15 +387,18 @@ def _try_handle_contact(
         return [_reply(userid, CONTACT_REQUEST_GUIDANCE_REPLY, intent="request_contact")]
 
     try:
-        job_id = int(listing_ref.rsplit(":", 1)[1])
-        job = db.query(Job).filter(Job.id == job_id).first()
+        listing_type, listing_id_text = listing_ref.split(":", 1)
+        listing_id = int(listing_id_text)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        if (
-            job is None
-            or job.audit_status != "passed"
-            or job.deleted_at is not None
-            or (job.expires_at is not None and job.expires_at <= now)
-        ):
+        if listing_type == "recruitment.resume":
+            listing = db.query(Resume).filter(Resume.id == listing_id).first()
+            direction = "search_worker"
+            valid = listing is not None and listing.audit_status == "passed" and getattr(listing, "deleted_at", None) is None and getattr(listing, "delist_reason", None) is None and (getattr(listing, "expires_at", None) is None or listing.expires_at > now)
+        else:
+            listing = db.query(Job).filter(Job.id == listing_id).first()
+            direction = "search_job"
+            valid = listing is not None and listing.audit_status == "passed" and getattr(listing, "deleted_at", None) is None and getattr(listing, "delist_reason", None) is None and (getattr(listing, "expires_at", None) is None or listing.expires_at > now)
+        if not valid:
             return [_reply(userid, CONTACT_UNAVAILABLE_REPLY, intent="request_contact")]
 
         request = db.query(ContactRequest).filter(
@@ -407,7 +413,9 @@ def _try_handle_contact(
             request = service.create_contact_request(
                 userid,
                 listing_ref,
-                listing_version=getattr(job, "version", None),
+                listing_version=getattr(listing, "aggregate_version", None) or getattr(listing, "version", None),
+                policy_version=getattr(_settings_module, "resume_matching_policy_version", None) if listing_type == "recruitment.resume" else None,
+                direction=direction,
                 trace_id=msg.turn_id or msg.msg_id,
                 db=db,
             )
@@ -416,7 +424,9 @@ def _try_handle_contact(
             request_id,
             userid,
             listing_ref,
-            listing_version=getattr(job, "version", None),
+            listing_version=getattr(listing, "aggregate_version", None) or getattr(listing, "version", None),
+            policy_version=getattr(_settings_module, "resume_matching_policy_version", None) if listing_type == "recruitment.resume" else None,
+            direction=direction,
             trace_id=msg.turn_id or msg.msg_id,
             db=db,
         )
@@ -429,8 +439,10 @@ def _try_handle_contact(
             trace_id=msg.turn_id or msg.msg_id,
             inbound_event_id=inbound_event_id,
             userid=userid,
-            current_listing_version=getattr(job, "version", None),
-            listing_status=getattr(job, "audit_status", None),
+            current_listing_version=getattr(listing, "aggregate_version", None) or getattr(listing, "version", None),
+            current_policy_version=getattr(_settings_module, "resume_matching_policy_version", None) if listing_type == "recruitment.resume" else None,
+            current_direction=direction,
+            listing_status=getattr(listing, "audit_status", None),
             actor_status=user_ctx.status,
             db=db,
         )
