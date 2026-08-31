@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
-from app.models import SystemConfig, User
+from app.models import AibotIdentityBinding, AibotRegistration, SystemConfig, User
 from app.services.admin_log_service import write_admin_log
 
 logger = logging.getLogger(__name__)
@@ -170,6 +170,47 @@ def pre_register(db: Session, role: str, payload: dict, operator: str) -> User:
         reason="pre_register",
     )
     return user
+
+
+def pre_register_aibot(
+    db: Session,
+    *,
+    binding: AibotIdentityBinding,
+    role: str,
+    operator: str,
+) -> AibotRegistration:
+    """Create a role application for an already verified binding.
+
+    Unlike the legacy admin ``pre_register`` path this function never creates
+    a pseudo ``User.external_userid``.  The canonical user is supplied by the
+    identity resolver and role approval remains a separate audited action.
+    """
+    if role not in {"factory", "broker"}:
+        raise BusinessException(40101, "仅厂家/中介可申请角色")
+    if binding.binding_status != "active" or not binding.canonical_userid:
+        raise BusinessException(40101, "需要已验证的 canonical userid")
+    existing = db.query(AibotRegistration).filter(
+        AibotRegistration.identity_binding_id == binding.binding_id,
+    ).first()
+    if existing and existing.registration_status not in {"rejected", "revoked"}:
+        return existing
+    registration = existing or AibotRegistration(
+        registration_id=str(uuid.uuid4()), canonical_userid=binding.canonical_userid,
+        identity_binding_id=binding.binding_id,
+    )
+    registration.registration_status = "pending_role"
+    registration.registration_source = "pre_registered"
+    registration.requested_role = role
+    if existing is None:
+        db.add(registration)
+    db.flush()
+    write_admin_log(
+        db, target_type="aibot_registration", target_id=registration.registration_id,
+        action="pre_register", operator=operator, before=None,
+        after={"role": role, "canonical_userid": binding.canonical_userid},
+        reason="aibot_pre_register",
+    )
+    return registration
 
 
 def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:

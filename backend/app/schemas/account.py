@@ -77,3 +77,17 @@ class ImportResult(BaseModel):
         default_factory=list,
         description="失败明细 [{row, error}]；任意一行失败时包含所有问题行",
     )
+
+
+class AibotInviteCreate(BaseModel):
+    target_role: Literal["factory", "broker"]
+    expires_at: datetime
+    max_uses: int = Field(default=1, ge=1, le=1000)
+
+
+class AibotRoleApproval(BaseModel):
+    role: Literal["factory", "broker"] | None = None
+
+
+class AibotBindingRevoke(BaseModel):
+    reason: str = Field(default="admin_revoked", min_length=1, max_length=255)

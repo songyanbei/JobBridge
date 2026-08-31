@@ -9,6 +9,9 @@ from app.core.exceptions import BusinessException
 from app.core.responses import ok, paged
 from app.models import AdminUser
 from app.schemas.account import (
+    AibotBindingRevoke,
+    AibotInviteCreate,
+    AibotRoleApproval,
     BlockRequest,
     BrokerCreate,
     BrokerUpdate,
@@ -18,6 +21,7 @@ from app.schemas.account import (
     UserAdminRead,
 )
 from app.services import account_service
+from app.services import registration_service
 
 router = APIRouter(prefix="/admin/accounts", tags=["admin-accounts"])
 
@@ -26,6 +30,44 @@ _MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024  # 2MB
 
 def _serialize_user(user) -> dict:
     return UserAdminRead.model_validate(user).model_dump(mode="json")
+
+
+@router.post("/aibot/invites", summary="创建 AIBot 角色邀请码")
+def create_aibot_invite(
+    req: AibotInviteCreate,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    invite, token = registration_service.create_invite(
+        db, role=req.target_role, expires_at=req.expires_at,
+        operator=current.username, max_uses=req.max_uses,
+    )
+    db.commit()
+    return ok({"invite_id": invite.invite_id, "target_role": invite.target_role, "expires_at": invite.expires_at, "token": token})
+
+
+@router.post("/aibot/registrations/{registration_id}/approve", summary="审核 AIBot 角色")
+def approve_aibot_registration(
+    registration_id: str,
+    req: AibotRoleApproval | None = None,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    registration = registration_service.approve_role(db, registration_id=registration_id, operator=current.username)
+    db.commit()
+    return ok({"registration_id": registration.registration_id, "status": registration.registration_status, "granted_role": registration.granted_role})
+
+
+@router.post("/aibot/bindings/{binding_id}/revoke", summary="撤销 AIBot 身份绑定")
+def revoke_aibot_binding(
+    binding_id: str,
+    req: AibotBindingRevoke,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    registration_service.revoke_binding(db, binding_id=binding_id, operator=current.username, reason=req.reason)
+    db.commit()
+    return ok()
 
 
 # ---------------------------------------------------------------------------
