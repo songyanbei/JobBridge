@@ -1,40 +1,30 @@
 """AIBot durable inbox/outbox integration contract.
 
-The test is intentionally skipped until the migration implementation exposes
-the acceptance/registry APIs.  It then enforces the critical failure semantics
-from the migration ADR without depending on a live WSS provider.
+The contract is intentionally bound to the durable acceptance service and ORM
+model used by production.  It does not require a live WSS, MySQL, or Redis.
 """
 
 from __future__ import annotations
 
-import pytest
+from typing import get_args
 
-from tests.fixtures.aibot_protocol import load_fixture
-
-
-inbox = pytest.importorskip("app.services.aibot_inbox")
-outbox = pytest.importorskip("app.services.aibot_outbox")
-
-
-def _find(module, names):
-    for name in names:
-        value = getattr(module, name, None)
-        if value is not None:
-            return value
-    pytest.fail(f"{module.__name__} missing one of {names}")
+from app.models import WecomOutboundOutbox
+from app.services.inbound_acceptance import AcceptanceStatus, InboundAcceptanceService
 
 
 def test_acceptance_contract_names_durable_result_states():
-    result_type = _find(inbox, ("AcceptanceResult", "InboundAcceptanceResult"))
-    values = {getattr(item, "value", item) for item in result_type}
+    values = set(get_args(AcceptanceStatus))
     assert {"accepted", "duplicate", "retryable"}.issubset(values)
+    assert InboundAcceptanceService.__name__ == "InboundAcceptanceService"
 
 
 def test_outbox_status_contract_is_single_authoritative_state():
-    statuses = getattr(outbox, "OUTBOX_STATUSES", None)
-    if statuses is None:
-        statuses = getattr(outbox, "VALID_OUTBOX_STATUSES", None)
-    assert statuses is not None
-    assert {str(value) for value in statuses} >= {
+    statuses = WecomOutboundOutbox.__table__.columns["status"].type.enums
+    assert set(statuses) >= {
         "pending", "sending", "sent", "uncertain", "dead_letter",
     }
+
+
+def test_outbox_ack_contract_has_fencing_and_uncertainty_columns():
+    columns = WecomOutboundOutbox.__table__.columns
+    assert {"ack_req_id", "ack_received_at", "uncertain_at", "fencing_token"}.issubset(columns.keys())
