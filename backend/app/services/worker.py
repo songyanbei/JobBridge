@@ -1854,6 +1854,10 @@ class Worker:
                     delivery.last_error = stale.last_error
                     delivery.last_error_code = "sending_lease_expired"
             stale_contacts = db.query(WecomOutboundOutbox).filter(
+                or_(
+                    WecomOutboundOutbox.channel == LEGACY_CHANNEL,
+                    WecomOutboundOutbox.channel.is_(None),
+                ),
                 WecomOutboundOutbox.status == "sending",
                 WecomOutboundOutbox.locked_at <= stale_before,
                 WecomOutboundOutbox.contact_delivery_id.isnot(None),
