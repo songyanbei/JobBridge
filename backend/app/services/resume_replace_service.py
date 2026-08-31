@@ -5,6 +5,7 @@ import logging
 from datetime import timedelta
 
 from sqlalchemy import event
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session, SessionTransaction
 
 from app.core.exceptions import BusinessException
@@ -25,6 +26,19 @@ from app.tasks.common import log_event
 _PENDING_EVENTS = "resume_replace_pending_events"
 logger = logging.getLogger(__name__)
 REPLACEMENT_CANCEL_REASON_MAX_LENGTH = 64
+
+
+def _domain_outbox_available(db: Session) -> bool:
+    bind = getattr(db, "bind", None)
+    if bind is None:
+        return False
+    try:
+        connection = bind
+        if getattr(getattr(bind, "dialect", None), "name", None) == "sqlite" and db.in_transaction():
+            connection = db.connection()
+        return bool(inspect(connection).has_table("domain_outbox_event"))
+    except Exception:
+        return False
 
 
 def _contains(transaction, ancestor):
@@ -256,20 +270,32 @@ def activate_replacement_locked(
         db, "resume", old.id, reason="replaced", operation_id=relation.operation_id,
     )
     db.flush()
-    try:
-        from app.services.domain_outbox_service import append_domain_event
-        for target, event_type, tombstone in (
-            (old, "resume.replaced", True), (candidate, "resume.updated", False),
-        ):
-            append_domain_event(
-                db, aggregate_type="resume", aggregate_id=int(target.id),
-                aggregate_version=int(getattr(target, "aggregate_version", None) or target.version),
-                event_type=event_type,
-                payload={"resume_id": int(target.id), "status": "replaced" if tombstone else "candidate", "reason": "replacement"},
-                tombstone=tombstone,
+    from app.services.domain_outbox_service import append_domain_event
+    if not _domain_outbox_available(db):
+        pending = db.info.setdefault("pending_resume_lifecycle_events", [])
+        pending.extend([
+            {"aggregate_type": "resume", "aggregate_id": int(target.id),
+             "aggregate_version": int(getattr(target, "aggregate_version", None) or target.version),
+             "event_type": event_type, "tombstone": tombstone,
+             "reason": "replacement"}
+            for target, event_type, tombstone in (
+                (old, "resume.replaced", True), (new, "resume.updated", False),
             )
-    except Exception:
-        logger.exception("resume domain event append failed")
+        ])
+        return True
+    for target, event_type, tombstone in (
+        (old, "resume.replaced", True), (new, "resume.updated", False),
+    ):
+        # Event insertion is part of the caller's transaction. Any database
+        # failure propagates so the fact mutation cannot commit without its
+        # corresponding lifecycle event.
+        append_domain_event(
+            db, aggregate_type="resume", aggregate_id=int(target.id),
+            aggregate_version=int(getattr(target, "aggregate_version", None) or target.version),
+            event_type=event_type,
+            payload={"resume_id": int(target.id), "status": "replaced" if tombstone else "candidate", "reason": "replacement"},
+            tombstone=tombstone,
+        )
     return True
 
 

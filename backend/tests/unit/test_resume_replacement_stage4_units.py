@@ -1,4 +1,7 @@
 from datetime import datetime, timedelta
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import MetaData, create_engine
@@ -95,6 +98,19 @@ def test_unit_a_exact_base_activates_and_creates_cleanup_in_same_transaction(db)
     assert relation.lifecycle_status == "activated" and relation.active_old_resume_id is None
     task = db.query(TargetCleanupTask).filter_by(target_type="resume", target_id=old.id).one()
     assert task.reason == "replaced"
+
+
+def test_unit_a_replacement_events_use_old_and_new_targets(db, monkeypatch):
+    relation, old, new = _graph(db)
+    append = MagicMock()
+    monkeypatch.setitem(sys.modules, "app.services.domain_outbox_service", SimpleNamespace(append_domain_event=append))
+    monkeypatch.setattr(resume_replace_service, "_domain_outbox_available", lambda _db: True)
+    assert resume_replace_service.activate_replacement_locked(
+        db, relation, old, new, expected_old_version=2,
+    ) is True
+    assert [call.kwargs["aggregate_id"] for call in append.call_args_list] == [old.id, new.id]
+    assert append.call_args_list[0].kwargs["event_type"] == "resume.replaced"
+    assert append.call_args_list[1].kwargs["event_type"] == "resume.updated"
 
 
 def test_unit_a_digest_change_is_stable_conflict_without_switch(db):
