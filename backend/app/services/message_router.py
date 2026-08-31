@@ -266,6 +266,9 @@ PENDING_ACTION_EXISTS_REPLY = (
 AIBOT_IDENTITY_BINDING_REPLY = (
     "当前身份尚未完成绑定。请先完成企业微信身份绑定，或输入 /帮助查看说明。"
 )
+GROUP_CAPABILITY_UNSUPPORTED_REPLY = (
+    "群聊当前仅支持基础帮助与身份绑定引导；搜索、联系、发布和简历操作请在单聊中进行。"
+)
 CONTACT_REQUEST_GUIDANCE_REPLY = "请先搜索岗位，再回复“联系”获取沟通入口。"
 CONTACT_UNAVAILABLE_REPLY = "暂时无法发起联系请求，请稍后重试。"
 _CONTACT_COMMAND_RE = re.compile(r"^联系(?:\s*(\d{1,2}))?$")
@@ -586,6 +589,13 @@ def process(
     except Exception:
         logger.exception("message_router: update_last_active failed (non-fatal)")
 
+    # Group AIBot turns have a chat-scoped session and deliberately expose only
+    # the currently supported safe surface.  Never fall through to the
+    # single-user search/Contact/Action/upload handlers, which would bind a
+    # group turn to one actor's session or durable business target.
+    if msg.source_channel == "wecom_aibot" and msg.conversation_type == "group":
+        return _process_aibot_group(msg, db, user_ctx, userid)
+
     # 4. 按消息类型分流
     # Phase 5 §5.2：用 try/finally 清空 turn-scoped v2 context，避免跨 turn 泄漏。
     _reset_recommendation_clock()
@@ -621,6 +631,31 @@ def process(
     finally:
         _clear_v2_turn_context()
         _reset_recommendation_clock()
+
+
+def _process_aibot_group(
+    msg: WeComMessage,
+    db: Session,
+    user_ctx,
+    actor_userid: str,
+) -> list[ReplyMessage]:
+    """Handle the narrowly supported AIBot group surface fail-closed."""
+    chat_id = (msg.chat_id or msg.conversation_id or "").strip()
+    if not chat_id:
+        return [_reply(actor_userid, GROUP_CAPABILITY_UNSUPPORTED_REPLY)]
+    session_key = f"wecom:aibot:group:{chat_id}"
+    session = conversation_service.load_session(session_key)
+    if session is None:
+        session = conversation_service.create_session(session_key, user_ctx.role)
+    conversation_service.record_history(session, "user", msg.content or f"[{msg.msg_type}]")
+    content = (msg.content or "").strip()
+    if msg.msg_type == "text" and content in {"/帮助", "帮助", "/help", "help"}:
+        reply_text = "群聊仅支持基础帮助与身份绑定引导；请在单聊中使用搜索、联系、发布和简历操作。"
+    else:
+        reply_text = GROUP_CAPABILITY_UNSUPPORTED_REPLY
+    conversation_service.record_history(session, "assistant", reply_text)
+    conversation_service.save_session(session_key, session)
+    return [_reply(actor_userid, reply_text)]
 
 
 # ---------------------------------------------------------------------------

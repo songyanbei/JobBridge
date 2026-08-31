@@ -612,6 +612,7 @@ class Worker:
     def _process_message(self, msg_data: dict) -> None:
         process_started = time.perf_counter()
         userid = msg_data.get("from_userid") or ""
+        session_key = _session_key_from_message_data(msg_data, userid)
         ordering_key = msg_data.get("ordering_key") or userid
         channel = msg_data.get("source_channel") or LEGACY_CHANNEL
         inbound_event_id = msg_data.get("inbound_event_id")
@@ -679,6 +680,7 @@ class Worker:
 
                 outcome = self._process_locked(
                     msg_data, inbound_event_id, retry_count, userid, lock_lease,
+                    session_key=session_key,
                 )
         finally:
             log_event(
@@ -734,8 +736,11 @@ class Worker:
         retry_count: int,
         userid: str,
         lock_lease: Any = None,
+        *,
+        session_key: str | None = None,
     ) -> str:
         db: Session = SessionLocal()
+        session_key = session_key or _session_key_from_message_data(msg_data, userid)
         business_committed = False
         submitted_shadow_request_ids: set[str] = set()
         committed_shadow_request_ids: set[str] = set()
@@ -757,7 +762,7 @@ class Worker:
                     return "duplicate_terminal_skipped"
                 if event_status == "session_pending":
                     applied = self._apply_session_commit_for_event(
-                        inbound_event_id, userid,
+                        inbound_event_id, session_key,
                     )
                     if applied:
                         self._deliver_outbox_for_event(inbound_event_id)
@@ -810,7 +815,7 @@ class Worker:
                     gateway_user = user_service.identify_or_register(action_userid, db)
                 preloaded_user_context = gateway_user
                 role = gateway_user.role
-                session_hint = conversation_service.load_session(userid)
+                session_hint = conversation_service.load_session(session_key)
                 envelope = gateway.classify(
                     msg, session=session_hint,
                     actor=type("GatewayActor", (), {"role": role or ""})(),
@@ -866,7 +871,7 @@ class Worker:
                         except Exception:
                             return "action_replay_terminal"
                         if inbound_event_id:
-                            self._apply_session_commit_for_event(inbound_event_id, userid)
+                            self._apply_session_commit_for_event(inbound_event_id, session_key)
                             self._deliver_outbox_for_event(inbound_event_id)
                         return "action_replayed"
                     if action_claim.busy:
@@ -906,7 +911,7 @@ class Worker:
             except Exception:
                 backlog_depth = 0
             backlog_token = search_service.set_queue_backlog_hint(backlog_depth)
-            stage_token = conversation_service.begin_session_staging(userid)
+            stage_token = conversation_service.begin_session_staging(session_key)
             shadow_tracking_token = (
                 recommendation_shadow_service.begin_turn_tracking()
             )
@@ -1009,7 +1014,7 @@ class Worker:
             session_ready = True
             if inbound_event_id and staged_session is not None:
                 session_ready = self._apply_session_commit_for_event(
-                    inbound_event_id, userid,
+                    inbound_event_id, session_key,
                 )
             elif not inbound_event_id and staged_session is not None:
                 session_ready = conversation_service.apply_staged_session(
@@ -1291,6 +1296,7 @@ class Worker:
             )
             claimed: list[dict] = []
             for row, raw_deadline_epoch, reached in rows:
+                session_key = _session_key_for_inbound_event(row)
                 operation = str(row.session_operation or "")
                 payload_available = True
                 try:
@@ -1318,14 +1324,14 @@ class Worker:
                 ) + 1
                 claimed.append({
                     "event_id": int(row.id),
-                    "userid": row.from_userid,
+                    "userid": session_key,
                     "attempts": int(row.session_apply_attempts),
                     "lease_owner": claim_owner,
                     "deadline_epoch": raw_deadline_epoch,
                     "deadline_reached": bool(reached),
                     "payload_available": payload_available,
                     "commit": conversation_service.StagedSessionCommit(
-                        userid=row.from_userid,
+                        userid=session_key,
                         operation=operation,
                         expected_version=int(
                             row.session_expected_version or 0,
@@ -1748,7 +1754,7 @@ class Worker:
             db.add(WecomOutboundOutbox(
                 inbound_event_id=int(inbound_event_id),
                 reply_index=index,
-                userid=reply.userid,
+                userid=(None if conversation_type == "group" else reply.userid),
                 msg_type=reply.msg_type,
                 content=reply.content,
                 intent=reply.intent,
@@ -3320,6 +3326,32 @@ def _decrypt_session_patch(delivery: RecommendationDelivery) -> dict | None:
     if not isinstance(payload, dict):
         raise ValueError("session patch payload is not a JSON object")
     return payload
+
+
+def _session_key_for_message(msg: WeComMessage) -> str:
+    if msg.source_channel == "wecom_aibot" and msg.conversation_type == "group":
+        return f"wecom:aibot:group:{msg.chat_id or msg.conversation_id}"
+    if msg.source_channel == "wecom_aibot":
+        return f"wecom:aibot:single:{msg.conversation_id or msg.from_user}"
+    return msg.from_user
+
+
+def _session_key_from_message_data(msg_data: dict, userid: str) -> str:
+    source = msg_data.get("source_channel") or LEGACY_CHANNEL
+    conversation_type = msg_data.get("conversation_type") or "single"
+    conversation_id = msg_data.get("conversation_id") or msg_data.get("chat_id") or userid
+    if source == "wecom_aibot":
+        return f"wecom:aibot:{conversation_type}:{conversation_id}"
+    return userid
+
+
+def _session_key_for_inbound_event(row: WecomInboundEvent) -> str:
+    source = getattr(row, "source_channel", None) or LEGACY_CHANNEL
+    conversation_type = getattr(row, "conversation_type", None) or "single"
+    conversation_id = getattr(row, "conversation_id", None) or getattr(row, "from_userid", None) or ""
+    if source == "wecom_aibot":
+        return f"wecom:aibot:{conversation_type}:{conversation_id}"
+    return str(getattr(row, "from_userid", None) or "")
 
 
 def _build_wecom_message(msg_data: dict) -> WeComMessage:
