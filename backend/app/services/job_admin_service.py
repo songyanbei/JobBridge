@@ -20,6 +20,7 @@ from app.services.job_mutation_service import (
     close_active_replacement,
     reject_if_replacement_in_progress,
 )
+from app.services.job_lifecycle_service import mutate_job_fields, transition_job
 
 
 # ---------------------------------------------------------------------------
@@ -222,23 +223,7 @@ def update_job(db: Session, job_id: int, version: int, payload: dict, operator: 
 
     before = _snapshot(job)
 
-    # 原子 UPDATE + version 递增（WHERE id=? AND version=?，rowcount=0 则乐观锁失败）
-    new_version = int(version) + 1
-    patch = {**payload, "version": new_version}
-    rowcount = (
-        db.query(Job)
-        .filter(Job.id == job_id, Job.version == version)
-        .update(patch, synchronize_session=False)
-    )
-    if rowcount == 0:
-        db.rollback()
-        current = db.query(Job).populate_existing().filter(Job.id == job_id).first()
-        raise BusinessException(
-            40902, "此条目已被修改，请刷新",
-            {"current_version": int(current.version) if current else 0},
-        )
-    # populate_existing 避免 synchronize_session=False 与 identity map 组合下返回旧值
-    job = db.query(Job).populate_existing().filter(Job.id == job_id).first()
+    job = mutate_job_fields(db, job_id, version, payload, event_type="job.updated")
     after = _snapshot(job)
 
     write_admin_log(
@@ -257,24 +242,7 @@ def update_job(db: Session, job_id: int, version: int, payload: dict, operator: 
 
 def _atomic_job_update(db: Session, job_id: int, expected_version: int, patch: dict) -> Job:
     """共用的原子 UPDATE + version 递增 + populate_existing 刷新。"""
-    new_version = int(expected_version) + 1
-    body = {**patch, "version": new_version}
-    rowcount = (
-        db.query(Job)
-        .filter(Job.id == job_id, Job.version == expected_version)
-        .update(body, synchronize_session=False)
-    )
-    if rowcount == 0:
-        db.rollback()
-        current = db.query(Job).filter(Job.id == job_id).first()
-        raise BusinessException(
-            40902, "此条目已被修改，请刷新",
-            {"current_version": int(current.version) if current else 0},
-        )
-    # populate_existing 让 identity-mapped 的 Job 实例从 DB 重新加载属性，
-    # 避免 after 快照拿到 synchronize_session=False 后的旧值。
-    job = db.query(Job).populate_existing().filter(Job.id == job_id).first()
-    return job
+    return mutate_job_fields(db, job_id, expected_version, patch, event_type="job.lifecycle.updated")
 
 
 def delist(db: Session, job_id: int, version: int, reason: str, operator: str) -> None:

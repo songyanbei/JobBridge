@@ -154,6 +154,24 @@ def transition_job(
     return job
 
 
+def mutate_job_fields(db: Session, job_id: int, expected_version: int, patch: dict, *, event_type: str = "job.updated") -> Job:
+    """CAS update for admin/worker field mutations with versioned outbox event."""
+    job = db.query(Job).populate_existing().filter(Job.id == job_id).with_for_update().one_or_none()
+    if job is None:
+        raise BusinessException(40401, "岗位不存在")
+    current = int(job.version or 1)
+    if current != int(expected_version):
+        raise BusinessException(40902, "此条目已被修改，请刷新", {"current_version": current})
+    for key, value in patch.items():
+        if key in {"version", "aggregate_version"}:
+            continue
+        setattr(job, key, value)
+    _bump_versions(job, current)
+    _emit(db, job, event_type)
+    db.flush()
+    return job
+
+
 def contact_version_is_current(job: Job, expected_version: int | None) -> bool:
     """Contact grants are valid only for a live, unchanged Job version."""
     if expected_version is None or int(job.version or 0) != int(expected_version):
@@ -168,4 +186,4 @@ def contact_version_is_current(job: Job, expected_version: int | None) -> bool:
     )
 
 
-__all__ = ["contact_version_is_current", "transition_job", "utcnow"]
+__all__ = ["contact_version_is_current", "mutate_job_fields", "transition_job", "utcnow"]
