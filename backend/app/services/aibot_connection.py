@@ -33,6 +33,8 @@ LEASE_TTL_MS = 45_000
 LEASE_RENEW_SECONDS = 15
 OUTBOX_LEASE_SECONDS = 180
 OUTBOX_BATCH_SIZE = 20
+EVENT_RESPONSE_TIMEOUT_SECONDS = 5.0
+WELCOME_RESPONSE_CONTENT = "您好！我是智能助手。"
 
 
 class ConnectionState(StrEnum):
@@ -365,6 +367,31 @@ class AibotConnection:
 
         return InboundAcceptanceService().accept(callback.to_wecom_message(), strict_redis=True)
 
+    async def handle_callback(self, callback: Any, *, transport: AibotTransport) -> Any:
+        """Durably accept a callback and answer only known event commands.
+
+        A retryable DB/Redis result deliberately produces no response frame.
+        ``enter_chat`` is the only event response whose command semantics are
+        defined locally; unknown card events are logged and ignored rather
+        than guessed into a potentially invalid protocol command.
+        """
+        result = await asyncio.to_thread(self.accept_callback, callback)
+        if not getattr(result, "acknowledged", False):
+            logger.warning("aibot callback not acknowledged status=%s reason=%s", getattr(result, "status", "unknown"), getattr(result, "reason", ""))
+            return result
+        if getattr(callback, "command", "") != "aibot_event_callback":
+            return result
+        event_type = str(getattr(callback, "event_type", "") or "")
+        if event_type != "enter_chat":
+            logger.warning("aibot event response unsupported event_type=%s; fail-closed", event_type)
+            return result
+        frame = transport.client.respond_welcome(callback.req_id, WELCOME_RESPONSE_CONTENT)
+        try:
+            await transport.send(frame, timeout=EVENT_RESPONSE_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception("aibot event response failed event_type=%s req_id=%s", event_type, callback.req_id)
+        return result
+
 
 async def _run_connector(connection: AibotConnection) -> None:
     client = AibotClient(settings.wecom_aibot_bot_id, settings.wecom_aibot_secret.get_secret_value())
@@ -372,9 +399,6 @@ async def _run_connector(connection: AibotConnection) -> None:
     def acquire():
         acquired = connection.acquire_lease()
         return acquired, connection.fencing_token
-
-    async def on_callback(callback):
-        return await asyncio.to_thread(connection.accept_callback, callback)
 
     transport = AibotTransport(
         client,
@@ -387,9 +411,13 @@ async def _run_connector(connection: AibotConnection) -> None:
         lease_acquire=acquire,
         lease_renew=lambda _token: connection.renew_lease(),
         lease_release=lambda _token: connection.release_lease(),
-        on_callback=on_callback,
     )
     connection.transport = transport
+
+    async def on_callback(callback):
+        return await connection.handle_callback(callback, transport=transport)
+
+    transport.on_callback = on_callback
     reader = asyncio.create_task(transport.run())
     try:
         while not transport._stop.is_set():
