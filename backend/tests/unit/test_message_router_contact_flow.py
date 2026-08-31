@@ -10,6 +10,7 @@ from app.models import (
     ContactGrant,
     ContactRequest,
     Job,
+    Resume,
     WecomOutboundOutbox,
 )
 from app.schemas.conversation import CandidateSnapshot, SessionState
@@ -131,3 +132,58 @@ def test_contact_command_without_search_context_is_guidance(monkeypatch):
     )
     assert len(replies) == 1
     assert "先搜索岗位" in replies[0].content
+
+
+def test_resume_contact_command_uses_explicit_resume_ref_and_direction(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[
+        ContactRequest.__table__, ContactGrant.__table__,
+        ContactDelivery.__table__, ContactAccessAudit.__table__,
+    ])
+    db = Session(engine)
+    resume = SimpleNamespace(
+        id=7, audit_status="passed", deleted_at=None, delist_reason=None,
+        expires_at=None, aggregate_version=4, version=4,
+    )
+    real_query = db.query
+
+    def query(entity, *args, **kwargs):
+        if entity is Resume:
+            class _ResumeQuery:
+                def filter(self, *_args, **_kwargs):
+                    return self
+
+                def first(self):
+                    return resume
+
+            return _ResumeQuery()
+        return real_query(entity, *args, **kwargs)
+
+    monkeypatch.setattr(db, "query", query)
+    monkeypatch.setattr(message_router._settings_module, "contact_service_mode", "on")
+    session = SessionState(
+        role="employer", active_flow="search_active",
+        candidate_snapshot=CandidateSnapshot(
+            candidate_ids=["recruitment.resume:7"], snapshot_id="snap-resume-contact",
+        ),
+        shown_items=["recruitment.resume:7"],
+        profile="recruitment.resume",
+    )
+    result = message_router._try_handle_contact(
+        "联系", WeComMessage(from_user="employer-1", msg_type="text", content="联系"),
+        SimpleNamespace(status="active"), session, db,
+    )
+
+    assert result and result[0].content == "联系请求已提交。"
+    request = db.query(ContactRequest).one()
+    assert request.listing_ref == "recruitment.resume:7"
+    assert request.listing_version == 4
+    assert request.policy_version == message_router._settings_module.resume_matching_policy_version
+    assert request.direction == "search_worker"
+
+
+def test_contact_ref_rejects_cross_direction_shown_item():
+    session = SessionState(
+        role="employer", profile="recruitment.resume", shown_items=["recruitment.job:9"],
+    )
+    assert message_router._contact_listing_ref("联系", session) == ""
