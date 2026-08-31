@@ -48,7 +48,10 @@ def _errcode(payload: dict[str, Any], prefix: str) -> int:
 
 
 def _provider_error(prefix: str, errcode: int) -> IdentityClientError:
-    if errcode in _TEMPORARY_ERRCODES:
+    # WeCom may return any documented 5xx code (including 50002) during a
+    # transient provider outage.  Treat the complete valid 500-599 range as
+    # retryable while keeping unknown non-5xx codes terminal.
+    if errcode in _TEMPORARY_ERRCODES or 500 <= errcode <= 599 or 50000 <= errcode <= 59999:
         return IdentityClientError(f"{prefix} temporary error", code=f"{prefix}_err_{errcode}", retryable=True)
     if errcode in _PERMANENT_ERRCODES:
         return IdentityClientError(f"{prefix} permanent error", code=f"{prefix}_err_{errcode}", retryable=False)
@@ -178,6 +181,8 @@ class WeComIdentityAppClient:
             return True, "visible"
         if errcode in {60111, 60112, 40031}:
             return False, "directory_not_visible"
+        if 500 <= errcode <= 599 or 50000 <= errcode <= 59999:
+            return False, "directory_unavailable"
         return False, f"directory_err_{errcode}"
 
     def _convert_batch(self, chunk: list[str]) -> tuple[dict[str, str], set[str]]:

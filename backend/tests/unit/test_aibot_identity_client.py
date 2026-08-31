@@ -108,6 +108,8 @@ def test_incomplete_mapping_is_retryable_error():
         (-1, "unknown_errcode", False),
         (999999, "unknown_errcode", False),
         (42001, "token_err_42001", True),
+        (500, "token_err_500", True),
+        (50002, "token_err_50002", True),
         (40001, "token_err_40001", False),
     ],
 )
@@ -130,6 +132,8 @@ def test_token_errcode_classification(value, expected_code, retryable):
         (-1, "unknown_errcode", False),
         (999999, "unknown_errcode", False),
         (45009, "conversion_err_45009", True),
+        (500, "conversion_err_500", True),
+        (50002, "conversion_err_50002", True),
         (40013, "conversion_err_40013", False),
     ],
 )
