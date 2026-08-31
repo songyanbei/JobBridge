@@ -397,6 +397,10 @@ class AibotConnection:
         if not getattr(result, "acknowledged", False):
             logger.warning("aibot callback not acknowledged status=%s reason=%s", getattr(result, "status", "unknown"), getattr(result, "reason", ""))
             return result
+        # A duplicate/replayed durable event is acknowledged for protocol
+        # retry purposes, but it must not trigger a second business response.
+        if getattr(result, "status", "") != "accepted":
+            return result
         if getattr(callback, "command", "") != "aibot_event_callback":
             return result
         event_type = str(getattr(callback, "event_type", "") or "")

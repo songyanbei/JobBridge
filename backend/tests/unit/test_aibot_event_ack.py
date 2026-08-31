@@ -88,3 +88,29 @@ async def test_retryable_or_unknown_event_does_not_send_response(caplog):
     assert len(socket.sent) == 1  # subscribe only
     assert "not acknowledged" in caplog.text
     await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_enter_chat_is_acknowledged_without_second_welcome():
+    socket = EventSocket()
+    transport = AibotTransport(
+        AibotClient("BOTID", "SECRET"),
+        connect_factory=lambda _url: socket,
+        lease_acquire=lambda: (True, 1),
+        lease_renew=lambda _token: True,
+        heartbeat_seconds=60,
+    )
+    assert await transport.connect_once()
+    connection = AibotConnection(redis_client=SimpleNamespace())
+    results = iter((
+        SimpleNamespace(acknowledged=True, status="accepted"),
+        SimpleNamespace(acknowledged=True, status="duplicate"),
+    ))
+    connection.accept_callback = lambda _callback: next(results)
+
+    await connection.handle_callback(_event(), transport=transport)
+    await connection.handle_callback(_event(), transport=transport)
+
+    welcomes = [frame for frame in socket.sent if frame["cmd"] == "aibot_respond_welcome_msg"]
+    assert len(welcomes) == 1
+    await transport.close()
