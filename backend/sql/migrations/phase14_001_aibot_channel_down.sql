@@ -4,6 +4,7 @@
 
 DROP PROCEDURE IF EXISTS phase14_drop_index_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_column_if_exists;
+DROP PROCEDURE IF EXISTS phase14_drop_check_if_exists;
 DELIMITER //
 CREATE PROCEDURE phase14_drop_index_if_exists(
     IN p_table VARCHAR(64), IN p_index VARCHAR(64)
@@ -46,7 +47,34 @@ BEGIN
         DEALLOCATE PREPARE phase14_stmt;
     END IF;
 END//
+
+CREATE PROCEDURE phase14_drop_check_if_exists(
+    IN p_table VARCHAR(64), IN p_constraint VARCHAR(64)
+)
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_schema = DATABASE()
+          AND table_name = p_table
+          AND constraint_name = p_constraint
+          AND constraint_type = 'CHECK'
+    ) THEN
+        SET @phase14_sql = CONCAT(
+            'ALTER TABLE `', REPLACE(DATABASE(), '`', '``'), '`.',
+            '`', REPLACE(p_table, '`', '``'), '` DROP CHECK `',
+            REPLACE(p_constraint, '`', '``'), '`'
+        );
+        PREPARE phase14_stmt FROM @phase14_sql;
+        EXECUTE phase14_stmt;
+        DEALLOCATE PREPARE phase14_stmt;
+    END IF;
+END//
 DELIMITER ;
+
+-- Constraints must be removed before their referenced columns.
+CALL phase14_drop_check_if_exists('wecom_inbound_event', 'ck_inbound_channel_contract');
+CALL phase14_drop_check_if_exists('wecom_inbound_event', 'ck_inbound_conversation_contract');
+CALL phase14_drop_check_if_exists('wecom_outbound_outbox', 'ck_outbox_conversation_contract');
 
 CALL phase14_drop_index_if_exists('wecom_outbound_outbox', 'idx_outbox_channel_status_due');
 CALL phase14_drop_index_if_exists('wecom_outbound_outbox', 'idx_outbox_ordering_status');
@@ -96,3 +124,4 @@ DROP TABLE IF EXISTS wecom_aibot_identity;
 
 DROP PROCEDURE IF EXISTS phase14_drop_index_if_exists;
 DROP PROCEDURE IF EXISTS phase14_drop_column_if_exists;
+DROP PROCEDURE IF EXISTS phase14_drop_check_if_exists;
