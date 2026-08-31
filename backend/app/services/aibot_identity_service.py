@@ -10,7 +10,7 @@ from typing import Callable
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import AibotIdentityAudit, WecomAibotIdentity
+from app.models import AibotIdentityAudit, AibotIdentityBinding, WecomAibotIdentity
 from app.services.registration_service import actor_digest, auto_register_worker, ensure_binding
 from app.services import aibot_identity_metrics
 from app.wecom.identity_client import ConversionResult, IdentityClientError, WeComIdentityAppClient
@@ -84,6 +84,22 @@ class AibotIdentityService:
         aibot_identity_metrics.record_identity_seen(actor_id_kind)
         bot = bot_id or self.bot_id or row.bot_id or ""
         digest = row.opaque_actor_digest or actor_digest(actor_id)
+        if row.identity_status == "revoked":
+            aibot_identity_metrics.record_resolution("rejected", "identity_revoked")
+            return ResolvedActor(actor_id, actor_id_kind, "revoked", reason_code="identity_revoked")
+        # A revoked binding is a terminal administrative decision.  Do not
+        # re-run conversion and create a fresh active binding on replay.
+        try:
+            revoked_binding = db.query(AibotIdentityBinding).filter(
+                AibotIdentityBinding.bot_id == bot,
+                AibotIdentityBinding.opaque_actor_digest == digest,
+                AibotIdentityBinding.binding_status == "revoked",
+            ).first()
+        except Exception:
+            revoked_binding = None
+        if getattr(revoked_binding, "binding_status", None) == "revoked":
+            aibot_identity_metrics.record_resolution("rejected", "binding_revoked")
+            return ResolvedActor(actor_id, actor_id_kind, "revoked", reason_code="binding_revoked")
         if actor_id_kind == "plain":
             ok, reason = self.verify_plain_userid(actor_id)
             if not ok:

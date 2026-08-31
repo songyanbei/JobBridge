@@ -21,6 +21,7 @@ from app.models import (
     AibotIdentityBinding,
     AibotRegistration,
     AibotRoleInvite,
+    WecomAibotIdentity,
     User,
 )
 
@@ -196,5 +197,13 @@ def revoke_binding(db: Session, *, binding_id: str, operator: str, reason: str =
     registration = db.query(AibotRegistration).filter(AibotRegistration.identity_binding_id == binding_id).first()
     if registration:
         registration.registration_status = "revoked"
+    identity = db.query(WecomAibotIdentity).filter(
+        WecomAibotIdentity.bot_id == binding.bot_id,
+        WecomAibotIdentity.opaque_actor_digest == binding.opaque_actor_digest,
+    ).first()
+    if identity is not None:
+        identity.identity_status = "revoked"
+        identity.revoked_at = binding.revoked_at
+        identity.last_error_code = reason
     _audit(db, bot_id=binding.bot_id, digest=binding.opaque_actor_digest, action="binding_revoked", result="revoked", canonical=binding.canonical_userid, actor=operator, reason=reason)
     db.flush()
