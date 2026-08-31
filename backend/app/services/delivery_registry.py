@@ -73,7 +73,12 @@ class DeliveryRegistry:
     """Explicit channel -> sender registry with fail-closed lookup."""
 
     def __init__(self, senders: Mapping[str, DeliverySender] | None = None) -> None:
-        self._senders: dict[str, DeliverySender] = dict(senders or {})
+        # AIBot is registered even while disconnected so channel lookup is
+        # explicit and fail-closed; it cannot silently fall back to legacy.
+        self._senders: dict[str, DeliverySender] = dict(senders or {
+            LEGACY_CHANNEL: LegacyWeComSender(),
+            AIBOT_CHANNEL: AibotSender(None),
+        })
 
     def register(self, sender: DeliverySender, *, replace: bool = False) -> None:
         if sender.channel in self._senders and not replace:
@@ -104,7 +109,7 @@ def get_delivery_registry(*, aibot_transport: Any | None = None) -> DeliveryRegi
     """
     global _default_registry
     if _default_registry is None:
-        _default_registry = DeliveryRegistry({LEGACY_CHANNEL: LegacyWeComSender()})
+        _default_registry = DeliveryRegistry()
     if aibot_transport is not None:
         _default_registry.register(AibotSender(aibot_transport), replace=True)
     return _default_registry
@@ -119,4 +124,3 @@ def reset_delivery_registry() -> None:
     """Test hook; production code should inject/replace a transport instead."""
     global _default_registry
     _default_registry = None
-
