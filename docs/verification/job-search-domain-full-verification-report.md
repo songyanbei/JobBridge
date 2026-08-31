@@ -17,6 +17,7 @@
 - `7856c6e`：固定 Phase11 manifest helper 为 LF。
 - `3e40ca9`：修复 preflight/reconcile 脚本模块入口。
 - `1e7220c`：Phase11 激活 MySQL 测试使用当前相对、冻结的审核时钟夹具。
+- `60472c9`：Phase11 stage-5 fences 测试移除全局固定 `delivery_order=1`，改由 MySQL 自增分配隔离值。
 
 ## 清单覆盖率
 
@@ -37,6 +38,7 @@
 | MySQL/Redis 探测 | WSL socket、SQL `SELECT VERSION()`、`redis-cli PING` | MySQL 8.0.45、Redis PONG/7.4.8 |
 | Phase11 checkpoint | `RUN_INTEGRATION=1 PHASE11_TEST_MYSQL_DSN=mysql+pymysql://root:root@127.0.0.1:3306/jobbridge PHASE11_TEST_REDIS_DSN=redis://127.0.0.1:6379/0 pytest -q tests/integration/test_phase11_stage1_migration_mysql.py::test_python_batch_checkpoint_survives_process_crash_with_full_run_audit` | `4 passed in 33.08s` |
 | Phase11 stage-2 activation | 同上 DSN 环境，`pytest -q tests/integration/test_phase11_stage2_activation_mysql.py` | `1 passed in 2.67s`；测试时钟由 `1e7220c` 固定 |
+| Phase11 stage-5 fences | 同上 DSN 环境，`pytest -q tests/integration/test_resume_phase11_stage5_fences.py` | 修复前 `5 passed, 2 failed`（唯一键 `delivery_order=1`）；`60472c9` 后 `7 passed, 18 warnings in 3.08s` |
 | Phase14/15 up/down | 临时 `jobbridge_verify_mig`：Phase14 001/004、Phase15 001/002 up；对应 down（非破坏 stop-write/consumer） | schema/index 创建成功，down 无删除事实/事件 |
 | 源码首发 MySQL 重放 | 当前工作区 `_create_job` + `activate_job`，新 job `id=36` | `version=2`、`aggregate_version=2`；`job.published` event `aggregate_version=2`，同事务提交 |
 
@@ -89,7 +91,7 @@ GF3/GF4 判定：`PASS`。此前发现的 stale `profile=recruitment.job` 串线
 1. **P1 版本双写（已修复并复测）**：旧 Docker app/worker 曾产生 `version=2/aggregate_version=1`；提交 `686e93f` 加固后重建镜像复测 GF1/GF2 均为两个版本相等，事件版本一致。旧镜像必须重建，不能作为验收运行时。
 2. **全量 unit**：修复后 C8/H3 相关集合分别为 `8 passed`、`6 passed`；manifest contract `1 passed`。全量 unit 旧基线的其余失败需重新跑完整集合确认。
 3. **真实 MySQL 集成集合**：`20 passed, 13 failed, 103 skipped`。主要失败是测试用户 `jobbridge` 无权创建临时 schema（`Access denied ... phase10_*`）；需用具备临时库权限的专用账号重跑，不能作为全绿证据。
-   本轮使用 root DSN 并补齐 Redis DSN 启动完整五文件集合；运行约 7 分钟后仅持续输出点号、无最终摘要，按超时中止处理，不能推导新的通过/失败统计。checkpoint 参数化 4/4 与 stage-2 activation 1/1 已独立通过。
+   本轮使用 root DSN 并补齐 Redis DSN 启动完整五文件集合；运行约 7 分钟后仅持续输出点号、无最终摘要，按超时中止处理，不能推导新的通过/失败统计。checkpoint 参数化 4/4、stage-2 activation 1/1、stage-5 fences 7/7 已独立通过。
 4. **预检脚本可执行性（已修复）**：`phase10_preflight.py`、`phase14_media_reconcile.py` 已加入 backend 根路径和标准 argparse；从 backend/仓库根目录 `--help` 均通过。
 5. **mock 脚本 CRLF**：直接 `bash scripts/smoke.sh` 因 `\r` 失败；去 CR 临时管道执行通过。应在仓库规范化脚本换行或统一通过 WSL wrapper 执行。
 6. **S4 生产门禁（本地已验证）**：隔离 on/100% preflight passed；恢复 off/0% 后 gate incomplete，符合安全默认但不满足生产放量条件。
