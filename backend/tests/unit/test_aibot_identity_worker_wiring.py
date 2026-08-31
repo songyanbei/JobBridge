@@ -1,4 +1,7 @@
+from unittest.mock import Mock
+
 from app.services import worker
+from app.services.aibot_identity_service import ResolvedActor
 
 
 class _FakeIdentityClient:
@@ -26,3 +29,42 @@ def test_worker_wiring_injects_identity_client_and_directory_verifier(monkeypatc
     service = worker.build_aibot_identity_service()
     assert service.client is fake
     assert service.verify_plain_userid("canonical-a") == (True, "visible")
+
+
+def test_worker_maps_transient_directory_failure_to_retry(monkeypatch):
+    db = Mock()
+    db.query.return_value.filter.return_value.scalar.return_value = None
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "build_aibot_identity_service", lambda: Mock(
+        resolve_for_event=Mock(return_value=ResolvedActor(
+            actor_id="open-a",
+            actor_id_kind="open_userid",
+            status="conversion_pending",
+            reason_code="directory_unavailable",
+        )),
+    ))
+
+    instance = worker.Worker.__new__(worker.Worker)
+    mark_processing = Mock()
+    mark_failure = Mock()
+    instance._mark_event_processing = mark_processing
+    instance._mark_event_fail = mark_failure
+
+    result = instance._process_locked(
+        {
+            "inbound_event_id": 42,
+            "msg_id": "m1",
+            "from_userid": "open-a",
+            "source_channel": "wecom_aibot",
+            "actor_id_kind": "opaque",
+            "msg_type": "text",
+            "create_time": 1700000000,
+        },
+        inbound_event_id=42,
+        retry_count=1,
+        userid="open-a",
+    )
+
+    assert result == "identity_pending"
+    mark_failure.assert_called_once_with(42, "failed", "identity_directory_unavailable", 2)
+    db.close.assert_called_once_with()

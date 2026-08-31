@@ -83,6 +83,46 @@ class AibotIdentityService:
             raise IdentityClientError("identity client is not configured", code="identity_client_missing", retryable=True)
         return self.client.batch_openuserid_to_userid(userids)
 
+    @staticmethod
+    def _directory_failure_retryable(reason: str | None) -> bool:
+        """Keep transient directory outages on the worker retry path only."""
+        return reason in {"directory_unavailable", "directory_timeout", "directory_temporary"}
+
+    def _record_directory_failure(
+        self,
+        db: Session,
+        row: WecomAibotIdentity,
+        *,
+        actor_id: str,
+        actor_id_kind: str,
+        bot: str,
+        digest: str,
+        reason: str,
+        canonical: str | None = None,
+    ) -> ResolvedActor:
+        retryable = self._directory_failure_retryable(reason)
+        row.identity_status = "conversion_pending" if retryable else "rejected"
+        row.resolution_attempts = int(row.resolution_attempts or 0) + 1
+        row.last_error_code = reason
+        row.next_resolution_at = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            + timedelta(seconds=min(3600, 2 ** min(row.resolution_attempts, 10)))
+            if retryable else None
+        )
+        self._audit(
+            db,
+            bot,
+            digest,
+            actor_id,
+            "directory_verify",
+            "pending" if retryable else "rejected",
+            reason,
+            canonical=canonical,
+        )
+        db.flush()
+        aibot_identity_metrics.record_resolution(row.identity_status, reason)
+        return ResolvedActor(actor_id, actor_id_kind, row.identity_status, reason_code=reason)
+
     def resolve_for_event(self, db: Session, *, actor_id: str, actor_id_kind: str = "open_userid", bot_id: str | None = None, source_msg_id: str | None = None, auto_register: bool = True) -> ResolvedActor:
         row = self.observe_actor(db, actor_id, actor_id_kind=actor_id_kind, bot_id=bot_id, source_msg_id=source_msg_id)
         aibot_identity_metrics.record_identity_seen(actor_id_kind)
@@ -107,6 +147,17 @@ class AibotIdentityService:
         if actor_id_kind == "plain":
             ok, reason = self.verify_plain_userid(actor_id)
             if not ok:
+                if self._directory_failure_retryable(reason):
+                    return self._record_directory_failure(
+                        db,
+                        row,
+                        actor_id=actor_id,
+                        actor_id_kind=actor_id_kind,
+                        bot=bot,
+                        digest=digest,
+                        reason=reason,
+                        canonical=actor_id,
+                    )
                 row.identity_status = "rejected"
                 row.last_error_code = reason
                 self._audit(db, bot, digest, actor_id, "plain_verify", "rejected", reason)
@@ -154,6 +205,17 @@ class AibotIdentityService:
                 if self._directory_verifier_provided:
                     ok, reason = self.verify_plain_userid(canonical)
                     if not ok:
+                        if self._directory_failure_retryable(reason):
+                            return self._record_directory_failure(
+                                db,
+                                row,
+                                actor_id=actor_id,
+                                actor_id_kind=actor_id_kind,
+                                bot=bot,
+                                digest=digest,
+                                reason=reason,
+                                canonical=canonical,
+                            )
                         row.identity_status = "rejected"
                         row.last_error_code = reason
                         self._audit(db, bot, digest, actor_id, "directory_verify", "rejected", reason, canonical=canonical)

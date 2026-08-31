@@ -52,6 +52,52 @@ def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatc
     assert row.identity_status == "conversion_pending"
 
 
+def test_plain_directory_outage_returns_pending_for_worker_retry(monkeypatch):
+    db = Mock()
+    row = _row()
+    svc = service.AibotIdentityService(plain_verifier=lambda _userid: (False, "directory_unavailable"), bot_id="bot")
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+
+    result = svc.resolve_for_event(db, actor_id="canonical-a", actor_id_kind="plain")
+
+    assert result.status == "conversion_pending"
+    assert result.reason_code == "directory_unavailable"
+    assert row.identity_status == "conversion_pending"
+    assert row.resolution_attempts == 1
+    assert row.next_resolution_at is not None
+    assert db.add.call_args.args[0].action == "directory_verify"
+    assert db.add.call_args.args[0].result == "pending"
+
+
+def test_open_userid_directory_outage_returns_pending_for_worker_retry(monkeypatch):
+    db = Mock()
+    row = _row()
+    svc = service.AibotIdentityService(
+        client=Mock(),
+        plain_verifier=lambda _userid: (False, "directory_unavailable"),
+        bot_id="bot",
+    )
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+    monkeypatch.setattr(
+        svc,
+        "resolve_open_userids",
+        lambda values: ConversionResult({values[0]: "zhangsan"}, frozenset(), 1),
+    )
+    monkeypatch.setattr(service.settings, "identity_resolution_enabled", True)
+
+    result = svc.resolve_for_event(db, actor_id="open-a", actor_id_kind="open_userid")
+
+    assert result.status == "conversion_pending"
+    assert result.reason_code == "directory_unavailable"
+    assert row.identity_status == "conversion_pending"
+    assert row.resolution_attempts == 1
+    assert row.next_resolution_at is not None
+    audit = db.add.call_args.args[0]
+    assert audit.action == "directory_verify"
+    assert audit.result == "pending"
+    assert audit.canonical_userid == "zhangsan"
+
+
 def test_nonretryable_identity_client_error_is_rejected(monkeypatch):
     db = Mock()
     row = _row()
