@@ -81,6 +81,7 @@ from app.wecom.client import (
     recipient_rejected,
     whitelist_send_response,
 )
+from app.wecom.identity_client import WeComIdentityAppClient
 from app.services.delivery_registry import (
     DeliveryRegistry,
     LEGACY_CHANNEL,
@@ -108,6 +109,30 @@ RECOVERY_PROCESSING_STALE_SECONDS = 180
 DISPATCHER_LEASE_SECONDS = 180
 OUTBOX_SENDING_STALE_SECONDS = 180
 OUTBOX_CLAIM_BATCH_SIZE = 20
+
+_AIBOT_IDENTITY_CLIENT: WeComIdentityAppClient | None = None
+
+
+def build_aibot_identity_service() -> AibotIdentityService:
+    """Build the worker-side resolver with the isolated identity app client.
+
+    Configuration or credential failures intentionally produce a resolver with
+    no client/verifier, so both plain and opaque actors remain fail-closed.
+    """
+    global _AIBOT_IDENTITY_CLIENT
+    if not getattr(settings, "identity_resolution_enabled", False):
+        return AibotIdentityService(bot_id=getattr(settings, "wecom_aibot_bot_id", ""))
+    try:
+        if _AIBOT_IDENTITY_CLIENT is None:
+            _AIBOT_IDENTITY_CLIENT = WeComIdentityAppClient()
+        return AibotIdentityService(
+            client=_AIBOT_IDENTITY_CLIENT,
+            plain_verifier=_AIBOT_IDENTITY_CLIENT.is_canonical_user_visible,
+            bot_id=getattr(settings, "wecom_aibot_bot_id", ""),
+        )
+    except Exception:
+        logger.warning("worker: AIBot identity client unavailable; keeping identity gate fail-closed")
+        return AibotIdentityService(bot_id=getattr(settings, "wecom_aibot_bot_id", ""))
 OUTBOX_MAX_ATTEMPTS = 5
 OUTBOX_RETRY_BACKOFFS = [30, 60, 120, 300, 600]
 SESSION_COMMIT_STALE_SECONDS = 180
@@ -783,7 +808,7 @@ class Worker:
                 # reader only persists/enqueues the opaque actor.  No failure
                 # path may call identify_or_register(opaque).
                 try:
-                    resolved = AibotIdentityService().resolve_for_event(
+                    resolved = build_aibot_identity_service().resolve_for_event(
                         db,
                         actor_id=userid,
                         actor_id_kind=("plain" if msg.actor_id_kind == "plain" else "open_userid"),

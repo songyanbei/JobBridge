@@ -68,7 +68,11 @@ class AibotIdentityService:
         if not isinstance(userid, str) or not _CANONICAL_RE.fullmatch(userid):
             return False, "invalid_canonical_userid"
         try:
-            if not self.plain_verifier(userid):
+            verdict = self.plain_verifier(userid)
+            if isinstance(verdict, tuple):
+                visible, reason = verdict
+                return (bool(visible), str(reason or "directory_not_visible"))
+            if not verdict:
                 return False, "directory_not_visible"
         except Exception:
             return False, "directory_lookup_failed"

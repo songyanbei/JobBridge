@@ -120,6 +120,42 @@ class WeComIdentityAppClient:
             raise IdentityClientError("identity conversion response incomplete", code="conversion_incomplete", retryable=True)
         return ConversionResult(mapping, frozenset(invalid), batches)
 
+    def is_canonical_user_visible(self, userid: str) -> tuple[bool, str]:
+        """Check directory visibility without returning member/PII fields.
+
+        The endpoint response is reduced to a boolean and a stable reason
+        code.  Callers must not log or persist the response body.
+        """
+        if not isinstance(userid, str) or not userid or len(userid) > 64:
+            return False, "invalid_canonical_userid"
+        try:
+            token = self.get_access_token()
+        except IdentityClientError as exc:
+            return False, "directory_unavailable" if exc.retryable else "directory_auth_failed"
+        try:
+            response = self._transport.get(
+                f"{IDENTITY_API_BASE}/user/get",
+                params={"access_token": token, "userid": userid},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError, TypeError):
+            return False, "directory_unavailable"
+        if not isinstance(payload, dict):
+            return False, "directory_invalid_response"
+        try:
+            errcode = int(payload.get("errcode", 0) or 0)
+        except (TypeError, ValueError):
+            return False, "directory_invalid_response"
+        if errcode == 0:
+            # Do not expose/return payload fields such as name, mobile or
+            # department; errcode=0 is the only visibility signal required.
+            return True, "visible"
+        if errcode in {60111, 60112, 40031}:
+            return False, "directory_not_visible"
+        return False, f"directory_err_{errcode}"
+
     def _convert_batch(self, chunk: list[str]) -> tuple[dict[str, str], set[str]]:
         token = self.get_access_token()
         try:
