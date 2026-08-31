@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import AibotIdentityAudit, WecomAibotIdentity
 from app.services.registration_service import actor_digest, auto_register_worker, ensure_binding
+from app.services import aibot_identity_metrics
 from app.wecom.identity_client import ConversionResult, IdentityClientError, WeComIdentityAppClient
 
 _CANONICAL_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
@@ -76,6 +77,7 @@ class AibotIdentityService:
 
     def resolve_for_event(self, db: Session, *, actor_id: str, actor_id_kind: str = "open_userid", bot_id: str | None = None, source_msg_id: str | None = None, auto_register: bool = True) -> ResolvedActor:
         row = self.observe_actor(db, actor_id, actor_id_kind=actor_id_kind, bot_id=bot_id, source_msg_id=source_msg_id)
+        aibot_identity_metrics.record_identity_seen(actor_id_kind)
         bot = bot_id or self.bot_id or row.bot_id or ""
         digest = row.opaque_actor_digest or actor_digest(actor_id)
         if actor_id_kind == "plain":
@@ -84,6 +86,7 @@ class AibotIdentityService:
                 row.identity_status = "rejected"
                 row.last_error_code = reason
                 self._audit(db, bot, digest, actor_id, "plain_verify", "rejected", reason)
+                aibot_identity_metrics.record_resolution("rejected", reason)
                 db.flush()
                 return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code=reason)
             canonical = actor_id
@@ -108,14 +111,16 @@ class AibotIdentityService:
                     row.last_error_code = exc.code
                     row.next_resolution_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=min(3600, 2 ** min(row.resolution_attempts, 10))) if exc.retryable else None
                     self._audit(db, bot, digest, actor_id, "openuserid_conversion", "pending" if exc.retryable else "rejected", exc.code)
-                    db.flush()
-                    return ResolvedActor(actor_id, actor_id_kind, row.identity_status, reason_code=exc.code)
+                db.flush()
+                aibot_identity_metrics.record_resolution(row.identity_status, exc.code)
+                return ResolvedActor(actor_id, actor_id_kind, row.identity_status, reason_code=exc.code)
                 if actor_id in result.invalid or actor_id not in result.mapping:
                     row.identity_status = "rejected"
                     row.last_error_code = "invalid_open_userid"
                     self._audit(db, bot, digest, actor_id, "openuserid_conversion", "rejected", "invalid_open_userid")
-                    db.flush()
-                    return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="invalid_open_userid")
+                db.flush()
+                aibot_identity_metrics.record_resolution("rejected", "invalid_open_userid")
+                return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="invalid_open_userid")
                 canonical = result.mapping[actor_id]
         row.mapped_external_userid = canonical
         row.canonical_userid = canonical
@@ -127,6 +132,7 @@ class AibotIdentityService:
             auto_register_worker(db, canonical, binding)
         self._audit(db, bot, digest, actor_id, "identity_verified", "verified", canonical=canonical)
         db.flush()
+        aibot_identity_metrics.record_resolution("verified", "")
         return ResolvedActor(actor_id, actor_id_kind, "verified", canonical_userid=canonical, binding_id=binding.binding_id)
 
     @staticmethod
