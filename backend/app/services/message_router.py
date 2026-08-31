@@ -352,7 +352,18 @@ def _contact_listing_ref(content: str, session: SessionState) -> str | None:
         candidate = shown[ordinal - 1]
     else:
         candidate = shown[-1]
-    expected_prefix = "recruitment.resume:" if session.profile == "recruitment.resume" else "recruitment.job:"
+    # Candidate search reuses the job dialogue profile for legacy compatibility;
+    # its intent/snapshot direction is the authoritative listing type for
+    # contact resolution.  Without this, resume ids are queried as Job rows.
+    search_direction = getattr(session, "last_intent", None) or getattr(session, "current_intent", None)
+    snapshot = getattr(session, "candidate_snapshot", None)
+    if search_direction != "search_worker" and snapshot is not None:
+        search_direction = getattr(snapshot, "direction", None)
+    expected_prefix = (
+        "recruitment.resume:"
+        if session.profile == "recruitment.resume" or search_direction == "search_worker"
+        else "recruitment.job:"
+    )
     if candidate.startswith("recruitment.job:") or candidate.startswith("recruitment.resume:"):
         if ":" in candidate and not candidate.startswith(expected_prefix):
             return ""

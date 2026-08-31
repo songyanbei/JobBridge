@@ -187,3 +187,11 @@ def test_contact_ref_rejects_cross_direction_shown_item():
         role="employer", profile="recruitment.resume", shown_items=["recruitment.job:9"],
     )
     assert message_router._contact_listing_ref("联系", session) == ""
+
+
+def test_contact_ref_uses_search_worker_direction_with_legacy_job_profile():
+    session = SessionState(
+        role="employer", profile="recruitment.job", last_intent="search_worker",
+        shown_items=["97"],
+    )
+    assert message_router._contact_listing_ref("联系1", session) == "recruitment.resume:97"
