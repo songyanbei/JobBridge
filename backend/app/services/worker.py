@@ -71,7 +71,7 @@ from app.services import (
     user_service,
     upload_service,
 )
-from app.services.aibot_identity_gate import resolve_aibot_identity
+from app.services.aibot_identity_service import AibotIdentityService
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 from app.wecom.client import (
@@ -778,15 +778,39 @@ class Worker:
             msg = _build_wecom_message(msg_data)
 
             aibot_identity = None
-            if msg.source_channel == "wecom_aibot" and msg.actor_id_kind == "opaque":
+            if msg.source_channel == "wecom_aibot":
+                # Identity resolution is deliberately worker-side.  The WSS
+                # reader only persists/enqueues the opaque actor.  No failure
+                # path may call identify_or_register(opaque).
                 try:
-                    aibot_identity = resolve_aibot_identity(db, userid)
+                    resolved = AibotIdentityService().resolve_for_event(
+                        db,
+                        actor_id=userid,
+                        actor_id_kind=("plain" if msg.actor_id_kind == "plain" else "open_userid"),
+                        bot_id=msg.aibot_id,
+                        source_msg_id=msg.provider_msg_id or msg.msg_id,
+                    )
                 except Exception:
-                    # The Router applies the same fail-closed policy.  Keep the
-                    # failure local to this turn and never fall back to User
-                    # auto-registration on an opaque actor.
-                    logger.exception("worker: AIBot identity lookup failed")
-                    aibot_identity = None
+                    db.rollback()
+                    logger.exception("worker: AIBot identity resolution failed")
+                    self._mark_event_fail(inbound_event_id, "failed", "identity_resolution_failed", retry_count + 1)
+                    return "identity_resolution_failed"
+                if not resolved.verified:
+                    status = "failed" if resolved.status == "conversion_pending" else "dead_letter"
+                    self._mark_event_fail(
+                        inbound_event_id, status,
+                        f"identity_{resolved.reason_code or resolved.status}",
+                        retry_count + 1,
+                    )
+                    return "identity_pending" if status == "failed" else "identity_rejected"
+                # From this point onward every business service sees only the
+                # verified canonical userid.  Group ordering remains chat-id
+                # based, while permissions/audit use this member userid.
+                userid = resolved.canonical_userid or userid
+                msg.from_user = userid
+                if msg.conversation_type == "single":
+                    session_key = f"session:{userid}"
+                aibot_identity = resolved
 
             # Workstream A pre-routing: parse once before entering the Router.
             # The default remains off; legacy turns never create Action rows.
