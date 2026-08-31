@@ -61,6 +61,9 @@ def test_expiry_cleanup_dispatcher_lock_order_has_no_three_session_cycle(monkeyp
     request_id = str(uuid4())
     worker_owner = f"cleanup-{token[:16]}"
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    # Keep the expiry query isolated from shared seed rows.  The cleanup task
+    # and delivery still use the real current time so their leases remain live.
+    expiry_now = datetime(2000, 1, 1, 0, 0, 0)
     ids: dict[str, int] = {}
 
     with SessionLocal() as db:
@@ -77,8 +80,8 @@ def test_expiry_cleanup_dispatcher_lock_order_has_no_three_session_cycle(monkeyp
             accept_short_term=False,
             raw_text="stage5 three session lock order",
             audit_status="passed",
-            activated_at=now - timedelta(days=31),
-            expires_at=now - timedelta(seconds=1),
+            activated_at=expiry_now - timedelta(days=31),
+            expires_at=expiry_now - timedelta(seconds=1),
             candidate_expires_at=None,
         )
         db.add(resume)
@@ -210,7 +213,9 @@ def test_expiry_cleanup_dispatcher_lock_order_has_no_three_session_cycle(monkeyp
         current_thread().name = "stage5-expiry"
         try:
             with SessionLocal() as db:
-                results["expiry"] = expire_locked_batch(db, now=now, batch_size=1)
+                results["expiry"] = expire_locked_batch(
+                    db, now=expiry_now, batch_size=1,
+                )
         except BaseException as exc:
             failures.append(exc)
 
