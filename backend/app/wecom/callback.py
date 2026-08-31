@@ -31,7 +31,6 @@ class WeComMessage:
     image_url: str = ""
     media_lifecycle_id: int | None = None
     expired_upload_draft: bool = False
-    turn_id: str = ""
     source_channel: str = "wecom_app"
     conversation_type: str = "single"
     conversation_id: str = ""
