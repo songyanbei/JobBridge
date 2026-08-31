@@ -1,7 +1,7 @@
 """Minimal real-MySQL transaction gate for the stage-2 activation primitive."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -11,11 +11,21 @@ from sqlalchemy.exc import OperationalError
 from app.db import SessionLocal
 from app.models import AuditLog, Resume, User
 from app.services import audit_workbench_service
+from app.services import resume_mutation_service
 from app.services.resume_mutation_service import lock_resume
 
 
 pytestmark = pytest.mark.integration
-NOW = datetime(2026, 8, 17, 6, 0, 0)
+# Keep the fixture relative to the test runtime while freezing the service
+# clock below, so this integration test remains reproducible after the date
+# moves past the original historical fixture.
+NOW = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0) + timedelta(days=1)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_audit_clock(monkeypatch):
+    # _pass_resume imports the clock from resume_mutation_service at call time.
+    monkeypatch.setattr(resume_mutation_service, "utc_now_naive", lambda: NOW)
 
 
 def _candidate(owner: str) -> Resume:
