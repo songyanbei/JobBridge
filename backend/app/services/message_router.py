@@ -48,6 +48,7 @@ from app.services import (
     upload_service,
     user_service,
 )
+from app.services.aibot_identity_gate import resolve_aibot_identity
 from app.services.intent_service import (
     _SALARY_MAX,
     _SALARY_MIN,
@@ -261,6 +262,9 @@ PENDING_ACTION_CANCELLED_REPLY = "已取消保存的下一步。"
 PENDING_ACTION_WAIT_REPLY = "请先完成或取消当前发布流程，再执行已保存的下一步。"
 PENDING_ACTION_EXISTS_REPLY = (
     "当前已经保存了一项下一步，请先执行或回复 /取消下一步，再安排新的组合操作。"
+)
+AIBOT_IDENTITY_BINDING_REPLY = (
+    "当前身份尚未完成绑定。请先完成企业微信身份绑定，或输入 /帮助查看说明。"
 )
 CONTACT_REQUEST_GUIDANCE_REPLY = "请先搜索岗位，再回复“联系”获取沟通入口。"
 CONTACT_UNAVAILABLE_REPLY = "暂时无法发起联系请求，请稍后重试。"
@@ -546,6 +550,20 @@ def process(
     if not userid:
         logger.warning("message_router: empty from_user in msg_id=%s", msg.msg_id)
         return []
+
+    # AIBot actor IDs are channel identities, not User.external_userid values.
+    # Unknown/unverified actors must never reach registration, Session, Action or
+    # Contact code.  Legacy XML messages keep the historical path unchanged.
+    aibot_identity = None
+    if msg.source_channel == "wecom_aibot" and msg.actor_id_kind == "opaque":
+        try:
+            aibot_identity = resolve_aibot_identity(db, userid)
+        except Exception:
+            logger.exception("message_router: AIBot identity lookup failed")
+            return [_reply(userid, AIBOT_IDENTITY_BINDING_REPLY)]
+        if not aibot_identity.verified:
+            return [_reply(userid, AIBOT_IDENTITY_BINDING_REPLY)]
+        userid = aibot_identity.mapped_external_userid or userid
 
     # 1. 用户识别 / 注册
     if user_context is not None:

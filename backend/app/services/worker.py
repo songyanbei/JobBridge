@@ -71,6 +71,7 @@ from app.services import (
     user_service,
     upload_service,
 )
+from app.services.aibot_identity_gate import resolve_aibot_identity
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 from app.wecom.client import (
@@ -771,18 +772,42 @@ class Worker:
 
             msg = _build_wecom_message(msg_data)
 
+            aibot_identity = None
+            if msg.source_channel == "wecom_aibot" and msg.actor_id_kind == "opaque":
+                try:
+                    aibot_identity = resolve_aibot_identity(db, userid)
+                except Exception:
+                    # The Router applies the same fail-closed policy.  Keep the
+                    # failure local to this turn and never fall back to User
+                    # auto-registration on an opaque actor.
+                    logger.exception("worker: AIBot identity lookup failed")
+                    aibot_identity = None
+
             # Workstream A pre-routing: parse once before entering the Router.
             # The default remains off; legacy turns never create Action rows.
             action_context = None
             action_claim = None
             preloaded_user_context = None
             mode = getattr(settings, "action_execution_mode", "off")
-            if msg.msg_type == "text" and mode in {"on", "shadow"}:
+            if msg.msg_type == "text" and mode in {"on", "shadow"} and (
+                msg.source_channel != "wecom_aibot"
+                or msg.actor_id_kind != "opaque"
+                or (aibot_identity is not None and aibot_identity.verified)
+            ):
                 gateway = action_gateway.ActionGateway()
                 # The Router normally auto-registers users, but ActionGateway
                 # runs before Router.  Resolve the same registration boundary
                 # here so a first-touch worker can claim a search Action.
-                gateway_user = user_service.identify_or_register(userid, db)
+                action_userid = (
+                    aibot_identity.mapped_external_userid
+                    if aibot_identity is not None and aibot_identity.verified
+                    else userid
+                )
+                if action_userid == userid:
+                    # Preserve the legacy registration boundary verbatim.
+                    gateway_user = user_service.identify_or_register(userid, db)
+                else:
+                    gateway_user = user_service.identify_or_register(action_userid, db)
                 preloaded_user_context = gateway_user
                 role = gateway_user.role
                 session_hint = conversation_service.load_session(userid)
