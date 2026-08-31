@@ -2,6 +2,13 @@
 from __future__ import annotations
 
 import json
+import argparse
+import sys
+from pathlib import Path
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from redis.exceptions import RedisError
 from sqlalchemy import text
@@ -203,6 +210,11 @@ def collect(db) -> dict:
 
 
 def main() -> int:
+    # Keep a standard CLI entrypoint so `--help` is usable from any cwd
+    # without opening a database session.
+    argparse.ArgumentParser(
+        description="Read-only Phase 10 lifecycle rollout preflight",
+    ).parse_args()
     with SessionLocal() as db:
         result = collect(db)
     print(json.dumps(result, ensure_ascii=False, indent=2))
