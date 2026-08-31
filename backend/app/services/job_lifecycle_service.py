@@ -128,7 +128,6 @@ def transition_job(
         job.delist_reason = "expired"
         job.deleted_at = now
         _bump_versions(job, current)
-        mark_job_media_delete_pending(db, job.id)
         _emit(db, job, "job.expired", reason="expired", tombstone=True)
     elif action == "restore":
         if job.deleted_at is not None or job.delist_reason in {"replaced", "expired"}:
