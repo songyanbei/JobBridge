@@ -808,6 +808,7 @@ class Worker:
                 # based, while permissions/audit use this member userid.
                 userid = resolved.canonical_userid or userid
                 msg.from_user = userid
+                msg.actor_id_kind = "plain"
                 if msg.conversation_type == "single":
                     session_key = f"session:{userid}"
                 aibot_identity = resolved
@@ -955,6 +956,7 @@ class Worker:
                     action_context=action_context,
                     user_context=preloaded_user_context,
                     inbound_event_id=inbound_event_id,
+                    resolved_actor=(resolved if msg.source_channel == "wecom_aibot" else None),
                 )
             finally:
                 submitted_shadow_request_ids.update(

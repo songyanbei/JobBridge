@@ -547,12 +547,19 @@ def process(
     action_context=None,
     user_context=None,
     inbound_event_id=None,
+    resolved_actor=None,
 ) -> list[ReplyMessage]:
     """消息路由主入口。Worker 调用，返回待发送的回复列表。"""
     userid = msg.from_user
     if not userid:
         logger.warning("message_router: empty from_user in msg_id=%s", msg.msg_id)
         return []
+
+    # AIBot business routing requires the Worker identity gate to provide an
+    # explicit resolved actor.  This prevents callers from bypassing the gate
+    # by constructing a canonical-looking message directly.
+    if msg.source_channel == "wecom_aibot" and resolved_actor is None and msg.actor_id_kind != "opaque":
+        return [_reply(userid, AIBOT_IDENTITY_BINDING_REPLY)]
 
     # AIBot actor IDs are channel identities, not User.external_userid values.
     # Unknown/unverified actors must never reach registration, Session, Action or
