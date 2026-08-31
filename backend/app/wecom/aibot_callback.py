@@ -61,6 +61,7 @@ class AibotCallback:
     media_expires_at: int | None = None
     parts: tuple[AibotMediaPart, ...] = ()
     event_type: str = ""
+    actor_id_kind: str = "opaque"
 
     @property
     def conversation_type(self) -> str:
@@ -106,7 +107,7 @@ class AibotCallback:
             media_url=self.media_url,
             media_aes_key=self.media_aes_key,
             media_expires_at=self.media_expires_at,
-            actor_id_kind="opaque",
+            actor_id_kind="opaque" if self.actor_id_kind != "plain" else "plain",
             raw_parts=[
                 {"type": p.msg_type, "length": len(p.content), "has_media": bool(p.media_id)}
                 for p in self.parts
@@ -218,6 +219,12 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
     if not isinstance(sender, dict):
         raise AibotProtocolError("missing body.from")
     from_user = _bounded_id(sender.get("userid"), "body.from.userid")
+    # The protocol does not guarantee whether userid is encrypted.  Only an
+    # explicit provider/test-enterprise assertion may mark it plain; never
+    # infer plainness from the string's shape.
+    actor_id_kind = sender.get("userid_type", body.get("actor_id_kind", "opaque"))
+    if actor_id_kind not in {"plain", "opaque", "open_userid"}:
+        actor_id_kind = "opaque"
     chat_id = _bounded_id(body.get("chatid"), "body.chatid", required=chat_type == "group")
     msg_type = _bounded_id(body.get("msgtype"), "body.msgtype")
     if msg_type not in ALLOWED_MESSAGE_TYPES:
@@ -269,6 +276,7 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
         media_expires_at=_parse_media_expires(media.get("expires_at")),
         parts=parts,
         event_type=str(event_type or ""),
+        actor_id_kind="plain" if actor_id_kind == "plain" else "opaque",
     )
 
 
