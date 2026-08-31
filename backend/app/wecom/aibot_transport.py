@@ -16,7 +16,7 @@ from contextlib import suppress
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
-from app.wecom.aibot_callback import AibotProtocolError, parse_callback, parse_frame
+from app.wecom.aibot_callback import AibotProtocolError, decode_frame, parse_callback, parse_frame
 from app.wecom.aibot_client import AibotClient, AibotClientError
 
 logger = logging.getLogger(__name__)
@@ -272,19 +272,23 @@ class AibotTransport:
         """Route ACKs to waiters and callbacks to the reader handler."""
         # ACKs intentionally have no ``cmd`` in the official fixture.
         try:
-            value = payload if isinstance(payload, dict) else json.loads(
-                payload.decode() if isinstance(payload, bytes) else payload
-            )
-            if isinstance(value, dict) and "cmd" not in value and isinstance(value.get("headers"), dict):
+            value = decode_frame(payload)
+            if "cmd" not in value and isinstance(value.get("headers"), dict):
                 req_id = value["headers"].get("req_id")
                 waiter = self._ack_waiters.get(req_id)
                 if waiter is None or waiter.done():
                     logger.info("aibot websocket orphan ack req_id=%s", req_id)
                     return
-                waiter.set_result((int(value.get("errcode", -1)), str(value.get("errmsg", ""))))
+                errcode = value.get("errcode")
+                errmsg = value.get("errmsg", "")
+                if isinstance(errcode, bool) or not isinstance(errcode, int) or not isinstance(errmsg, str):
+                    logger.warning("aibot websocket ignored malformed ack req_id=%s", req_id)
+                    return
+                waiter.set_result((errcode, errmsg))
                 return
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+        except AibotProtocolError:
+            logger.warning("aibot websocket ignored malformed frame")
+            return
         try:
             frame = parse_frame(payload)
         except AibotProtocolError:
@@ -303,15 +307,7 @@ class AibotTransport:
             return
         if frame.cmd in {"ping", "pong"}:
             return
-        # ACKs have no cmd in the official fixture; parse_frame above is only
-        # used for headers/body validation, so also accept raw ack objects.
-        value = payload if isinstance(payload, dict) else json.loads(payload.decode() if isinstance(payload, bytes) else payload)
-        req_id = ((value.get("headers") or {}).get("req_id"))
-        waiter = self._ack_waiters.get(req_id)
-        if waiter is None or waiter.done():
-            logger.info("aibot websocket orphan ack req_id=%s", req_id)
-            return
-        waiter.set_result((int(value.get("errcode", -1)), str(value.get("errmsg", ""))))
+        logger.warning("aibot websocket ignored unsupported frame cmd=%s", frame.cmd)
 
     async def _heartbeat_loop(self) -> None:
         while self.state == TransportState.ACTIVE and not self._stop.is_set():

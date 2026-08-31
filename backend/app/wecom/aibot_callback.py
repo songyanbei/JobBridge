@@ -158,7 +158,10 @@ def parse_frame(payload: str | bytes | bytearray | dict[str, Any], *, expected_c
 def _parse_parts(body: dict[str, Any], msg_type: str, chat_type: str) -> tuple[AibotMediaPart, ...]:
     if msg_type != "mixed":
         return ()
-    raw_parts = body.get("mixed", {}).get("msg_item", [])
+    mixed = body.get("mixed", {})
+    if not isinstance(mixed, dict):
+        raise AibotProtocolError("mixed must be an object")
+    raw_parts = mixed.get("msg_item", [])
     if not isinstance(raw_parts, list) or len(raw_parts) > MAX_PARTS:
         raise AibotProtocolError("invalid mixed parts")
     parts: list[AibotMediaPart] = []
@@ -170,11 +173,33 @@ def _parse_parts(body: dict[str, Any], msg_type: str, chat_type: str) -> tuple[A
             raise AibotProtocolError("unsupported mixed part")
         if part_type != "text" and chat_type != "single":
             raise AibotProtocolError("media is only supported in single chat")
-        text = raw.get("text", {}).get("content", "") if part_type == "text" else ""
+        part_text = raw.get("text", {}) if part_type == "text" else {}
+        if part_type == "text" and not isinstance(part_text, dict):
+            raise AibotProtocolError("mixed.text must be an object")
+        text = part_text.get("content", "") if part_type == "text" else ""
         if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
             raise AibotProtocolError("text exceeds size limit")
-        parts.append(AibotMediaPart(part_type, str(raw.get("media_id", "")), str(raw.get("url", "")), str(raw.get("aeskey", "")), text))
+        media_id = raw.get("media_id", "") or ""
+        media_url = raw.get("url", "") or ""
+        media_aes_key = raw.get("aeskey", "") or ""
+        if not all(isinstance(value, str) for value in (media_id, media_url, media_aes_key)):
+            raise AibotProtocolError("mixed media fields must be strings")
+        parts.append(AibotMediaPart(part_type, media_id, media_url, media_aes_key, text))
     return tuple(parts)
+
+
+def _parse_media_expires(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise AibotProtocolError("invalid media expires_at")
+    try:
+        expires_at = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AibotProtocolError("invalid media expires_at") from exc
+    if expires_at <= 0:
+        raise AibotProtocolError("invalid media expires_at")
+    return expires_at
 
 
 def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCallback:
@@ -204,16 +229,29 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
         create_time = int(create_time or 0)
     except (TypeError, ValueError) as exc:
         raise AibotProtocolError("invalid create_time") from exc
-    text = body.get("text", {}).get("content", "") if msg_type == "text" else ""
+    text_body = body.get("text", {}) if msg_type == "text" else {}
+    if msg_type == "text" and not isinstance(text_body, dict):
+        raise AibotProtocolError("body.text must be an object")
+    text = text_body.get("content", "") if msg_type == "text" else ""
     if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
         raise AibotProtocolError("text exceeds size limit")
     media = body.get(msg_type, {}) if msg_type in {"image", "voice", "file", "video"} else {}
     if not isinstance(media, dict):
-        media = {}
+        raise AibotProtocolError(f"body.{msg_type} must be an object")
     parts = _parse_parts(body, msg_type, chat_type)
     if msg_type == "mixed":
         text = "".join(p.content for p in parts if p.msg_type == "text")
-    event_type = body.get("event", {}).get("eventtype", "") if msg_type == "event" else ""
+    event_body = body.get("event", {}) if msg_type == "event" else {}
+    if msg_type == "event" and not isinstance(event_body, dict):
+        raise AibotProtocolError("body.event must be an object")
+    event_type = event_body.get("eventtype", "") if msg_type == "event" else ""
+    if not isinstance(event_type, str):
+        raise AibotProtocolError("invalid event type")
+    media_id = media.get("media_id", body.get("media_id", "")) or ""
+    media_url = media.get("url", "") or ""
+    media_aes_key = media.get("aeskey", "") or ""
+    if not all(isinstance(value, str) for value in (media_id, media_url, media_aes_key)):
+        raise AibotProtocolError("media fields must be strings")
     return AibotCallback(
         command=cmd,
         req_id=frame.req_id,
@@ -225,10 +263,10 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
         chat_id=chat_id,
         content=text,
         create_time=create_time,
-        media_id=str(media.get("media_id", body.get("media_id", "")) or ""),
-        media_url=str(media.get("url", "") or ""),
-        media_aes_key=str(media.get("aeskey", "") or ""),
-        media_expires_at=int(media["expires_at"]) if media.get("expires_at") is not None else None,
+        media_id=media_id,
+        media_url=media_url,
+        media_aes_key=media_aes_key,
+        media_expires_at=_parse_media_expires(media.get("expires_at")),
         parts=parts,
         event_type=str(event_type or ""),
     )

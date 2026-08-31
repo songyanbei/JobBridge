@@ -113,6 +113,16 @@ async def test_reader_is_the_only_recv_owner_for_outbound_ack():
     await transport.close()
 
 
+@pytest.mark.asyncio
+async def test_malformed_ack_is_dropped_without_stopping_reader():
+    transport = AibotTransport(AibotClient("BOTID", "SECRET"))
+    transport.state = TransportState.ACTIVE
+    transport.fencing_token = 1
+    await transport.handle_frame({"headers": {"req_id": "missing"}, "errcode": None, "errmsg": {}})
+    await transport.handle_frame({"cmd": "unknown", "headers": {"req_id": "x"}, "body": {}})
+    assert transport.state == TransportState.ACTIVE
+
+
 def test_state_transition_and_backoff_are_bounded():
     transport = AibotTransport(AibotClient("BOTID", "SECRET"))
     transport.transition(TransportState.ACQUIRING_LEASE)
