@@ -160,6 +160,30 @@ def test_revoked_identity_replay_is_rejected_without_conversion(monkeypatch):
     convert.assert_not_called()
 
 
+@pytest.mark.parametrize("actor_id_kind", ["plain", "open_userid"])
+def test_revoked_binding_lookup_error_fails_closed_before_resolution(monkeypatch, actor_id_kind):
+    db = Mock()
+    db.query.side_effect = RuntimeError("database unavailable")
+    row = _row()
+    svc = service.AibotIdentityService(
+        client=Mock(),
+        plain_verifier=lambda _userid: True,
+        bot_id="bot",
+    )
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+    convert = Mock()
+    monkeypatch.setattr(svc, "resolve_open_userids", convert)
+    monkeypatch.setattr(service.settings, "identity_resolution_enabled", True)
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        svc.resolve_for_event(db, actor_id="canonical-a" if actor_id_kind == "plain" else "open-a", actor_id_kind=actor_id_kind)
+
+    assert row.identity_status == "unverified"
+    convert.assert_not_called()
+    db.add.assert_not_called()
+    db.flush.assert_not_called()
+
+
 def test_revoke_binding_marks_identity_revoked(monkeypatch):
     db = Mock()
     binding = SimpleNamespace(

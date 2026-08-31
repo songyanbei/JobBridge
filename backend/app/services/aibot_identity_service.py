@@ -133,14 +133,15 @@ class AibotIdentityService:
             return ResolvedActor(actor_id, actor_id_kind, "revoked", reason_code="identity_revoked")
         # A revoked binding is a terminal administrative decision.  Do not
         # re-run conversion and create a fresh active binding on replay.
-        try:
-            revoked_binding = db.query(AibotIdentityBinding).filter(
-                AibotIdentityBinding.bot_id == bot,
-                AibotIdentityBinding.opaque_actor_digest == digest,
-                AibotIdentityBinding.binding_status == "revoked",
-            ).first()
-        except Exception:
-            revoked_binding = None
+        # A failed revoked-binding lookup is not equivalent to an empty result.
+        # Let the database/transaction error reach the Worker gate so it can
+        # persist a retryable identity_resolution_failed event and stop before
+        # conversion, registration, or business routing.
+        revoked_binding = db.query(AibotIdentityBinding).filter(
+            AibotIdentityBinding.bot_id == bot,
+            AibotIdentityBinding.opaque_actor_digest == digest,
+            AibotIdentityBinding.binding_status == "revoked",
+        ).first()
         if getattr(revoked_binding, "binding_status", None) == "revoked":
             aibot_identity_metrics.record_resolution("rejected", "binding_revoked")
             return ResolvedActor(actor_id, actor_id_kind, "revoked", reason_code="binding_revoked")
