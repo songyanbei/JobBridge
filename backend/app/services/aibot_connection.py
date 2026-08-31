@@ -49,17 +49,6 @@ class AibotAckTimeout(TimeoutError):
     """A frame was written but its matching protocol acknowledgement was lost."""
 
 
-class AibotTransport:
-    """Minimal transport protocol used by :class:`AibotSender`.
-
-    A production WebSocket implementation can provide these methods.  Keeping
-    this object separate from the Worker is the important ownership boundary.
-    """
-
-    def send_outbox(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
-        raise NotImplementedError
-
-
 class AibotOutboxWriter:
     """Claim and deliver only ``channel=wecom_aibot`` rows."""
 
