@@ -96,6 +96,7 @@ class AibotTransport:
         self.fencing_token: int | str | None = None
         self._stop = asyncio.Event()
         self._ack_waiters: dict[str, asyncio.Future[tuple[int, str]]] = {}
+        self._reader_task: asyncio.Task[Any] | None = None
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._attempt = 0
         self.last_error: str = ""
@@ -177,6 +178,7 @@ class AibotTransport:
                 raise AibotTransportError(f"subscribe rejected errcode={errcode}")
             self.transition(TransportState.ACTIVE)
             self._attempt = 0
+            self._reader_task = asyncio.create_task(self._reader_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             return True
         except Exception as exc:  # noqa: BLE001 - transport must recover all socket failures
@@ -223,26 +225,9 @@ class AibotTransport:
         try:
             await self._send_raw(frame)
             deadline = self.ack_timeout if timeout is None else timeout
-            end = asyncio.get_running_loop().time() + deadline
-            while not waiter.done():
-                remaining = end - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                recv_task = asyncio.create_task(_maybe_await(self.socket.recv()))
-                done, _ = await asyncio.wait({waiter, recv_task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-                if waiter in done:
-                    recv_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await recv_task
-                    break
-                if recv_task not in done:
-                    recv_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await recv_task
-                    raise asyncio.TimeoutError
-                await self.handle_frame(recv_task.result())
-            result = await waiter
-            return result
+            # The Reader task is the sole owner of socket.recv().  It resolves
+            # this Future when the matching ACK arrives.
+            return await asyncio.wait_for(asyncio.shield(waiter), timeout=deadline)
         except asyncio.TimeoutError as exc:
             raise AibotTransportError("ack timeout; delivery is uncertain") from exc
         finally:
@@ -332,10 +317,29 @@ class AibotTransport:
                 await self._send_raw(self.client.ping())
             except asyncio.CancelledError:
                 return
+
             except Exception as exc:  # noqa: BLE001
                 self.last_error = type(exc).__name__
                 logger.warning("aibot heartbeat failed error_type=%s", self.last_error)
                 await self.disconnect()
+                return
+
+    async def _reader_loop(self) -> None:
+        """Read and dispatch every frame for the active socket.
+
+        A WebSocket implementation generally permits only one concurrent
+        ``recv`` call.  Keeping this operation in one task also guarantees that
+        ACKs cannot be consumed by a competing sender waiter.
+        """
+        while self.state == TransportState.ACTIVE and not self._stop.is_set():
+            try:
+                incoming = await _maybe_await(self.socket.recv())
+                await self.handle_frame(incoming)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001 - reconnect on reader failure
+                self.last_error = type(exc).__name__
+                logger.warning("aibot websocket receive failed error_type=%s", self.last_error)
                 return
 
     async def lease_lost(self) -> None:
@@ -356,6 +360,11 @@ class AibotTransport:
             with suppress(asyncio.CancelledError):
                 await self._heartbeat_task
             self._heartbeat_task = None
+        if self._reader_task is not None and self._reader_task is not asyncio.current_task():
+            self._reader_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reader_task
+            self._reader_task = None
         socket, self.socket = self.socket, None
         if socket is not None:
             try:
@@ -385,12 +394,17 @@ class AibotTransport:
                     continue
             if self.state != TransportState.ACTIVE:
                 continue
+            reader = self._reader_task
+            if reader is None:
+                reader = asyncio.create_task(self._reader_loop())
+                self._reader_task = reader
             try:
-                incoming = await _maybe_await(self.socket.recv())
-                await self.handle_frame(incoming)
-            except Exception as exc:  # noqa: BLE001
-                self.last_error = type(exc).__name__
-                logger.warning("aibot websocket receive failed error_type=%s", self.last_error)
+                await reader
+            except asyncio.CancelledError:
+                if self._stop.is_set():
+                    break
+                raise
+            if not self._stop.is_set() and self.state == TransportState.ACTIVE:
                 await self.disconnect()
         if self.state != TransportState.STOPPED:
             if self.state not in {TransportState.DRAINING}:

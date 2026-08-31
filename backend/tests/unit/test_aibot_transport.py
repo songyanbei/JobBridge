@@ -24,6 +24,26 @@ class FakeSocket:
         self.closed = True
 
 
+class SingleRecvSocket(FakeSocket):
+    """Fake WSS that fails if two callers wait on recv concurrently."""
+
+    def __init__(self):
+        super().__init__()
+        self.recv_active = 0
+        self.max_recv_active = 0
+
+    async def recv(self):
+        self.recv_active += 1
+        self.max_recv_active = max(self.max_recv_active, self.recv_active)
+        if self.recv_active > 1:
+            self.recv_active -= 1
+            raise RuntimeError("concurrent recv")
+        try:
+            return await self.incoming.get()
+        finally:
+            self.recv_active -= 1
+
+
 @pytest.mark.asyncio
 async def test_connect_subscribe_and_heartbeat_state_machine():
     sock = FakeSocket()
@@ -54,6 +74,42 @@ async def test_matching_ack_and_lease_fencing():
     await asyncio.sleep(0)
     await sock.incoming.put('{"headers":{"req_id":"r1"},"errcode":0,"errmsg":"ok"}')
     assert await pending == (0, "ok")
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_reader_is_the_only_recv_owner_for_outbound_ack():
+    sock = SingleRecvSocket()
+
+    async def send(payload):
+        import json
+        frame = json.loads(payload)
+        sock.sent.append(payload)
+        if frame["cmd"] == "aibot_subscribe":
+            await sock.incoming.put(json.dumps({
+                "headers": {"req_id": frame["headers"]["req_id"]},
+                "errcode": 0,
+                "errmsg": "ok",
+            }))
+        elif frame["headers"]["req_id"] == "out-1":
+            await sock.incoming.put(json.dumps({
+                "headers": {"req_id": "out-1"},
+                "errcode": 0,
+                "errmsg": "ok",
+            }))
+
+    sock.send = send
+    transport = AibotTransport(
+        AibotClient("BOTID", "SECRET"),
+        connect_factory=lambda _url: sock,
+        lease_acquire=lambda: (True, 1),
+        lease_renew=lambda _token: True,
+        heartbeat_seconds=60,
+    )
+    assert await transport.connect_once()
+    result = await transport.send(transport.client.respond_msg("out-1", "hello"), timeout=0.2)
+    assert result == (0, "ok")
+    assert sock.max_recv_active == 1
     await transport.close()
 
 
