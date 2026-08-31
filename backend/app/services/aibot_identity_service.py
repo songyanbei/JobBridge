@@ -35,7 +35,10 @@ class ResolvedActor:
 class AibotIdentityService:
     def __init__(self, client: WeComIdentityAppClient | None = None, *, plain_verifier: Callable[[str], bool] | None = None, bot_id: str | None = None):
         self.client = client
-        self.plain_verifier = plain_verifier or (lambda _userid: True)
+        # A format check alone is not proof that the identity-app can see the
+        # member.  Callers must inject the verified directory lookup; absent
+        # that evidence, plain-looking ids fail closed.
+        self.plain_verifier = plain_verifier or (lambda _userid: False)
         self.bot_id = bot_id or settings.wecom_aibot_bot_id
 
     def observe_actor(self, db: Session, actor_id: str, *, actor_id_kind: str = "open_userid", bot_id: str | None = None, source_msg_id: str | None = None) -> WecomAibotIdentity:

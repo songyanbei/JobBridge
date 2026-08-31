@@ -99,11 +99,13 @@ def auto_register_worker(db: Session, canonical_userid: str, binding: AibotIdent
         AibotRegistration.identity_binding_id == binding.binding_id,
     ).first()
     if registration is None:
+        existing_role = user.role if user is not None else "worker"
         db.add(AibotRegistration(
             registration_id=str(uuid.uuid4()), canonical_userid=canonical_userid,
             identity_binding_id=binding.binding_id, registration_status="active",
-            registration_source="auto_worker", requested_role="worker", granted_role="worker",
-            capability_snapshot={"can_search_jobs": True, "can_search_workers": False},
+            registration_source="auto_worker" if existing_role == "worker" else "pre_registered",
+            requested_role=existing_role, granted_role=existing_role,
+            capability_snapshot={"can_search_jobs": bool(user.can_search_jobs), "can_search_workers": bool(user.can_search_workers)},
         ))
     elif registration.registration_status not in {"active", "revoked"}:
         registration.registration_status = "active"
