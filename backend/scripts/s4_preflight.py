@@ -55,7 +55,7 @@ def check_runtime_config(findings: list[Finding]) -> dict[str, Any]:
 
 def check_migration_artifacts(root: str | Path, findings: list[Finding]) -> dict[str, Any]:
     migration_dir = Path(root) / "sql" / "migrations"
-    required = ("phase14_001_domain_outbox_event.sql", "phase14_down_001_domain_outbox_event.sql")
+    required = ("phase14_001_domain_outbox_event.sql", "phase14_004_domain_outbox_consumer.sql", "phase14_down_001_domain_outbox_event.sql")
     missing = [name for name in required if not (migration_dir / name).is_file()]
     if missing:
         findings.append(Finding(ERROR, "phase14_migration_missing", f"missing migration artifacts: {missing}"))
@@ -66,6 +66,10 @@ def run(*, backend_root: str | Path | None = None, json_output: bool = False) ->
     findings: list[Finding] = []
     root = Path(backend_root or Path(__file__).resolve().parents[1])
     runtime = check_runtime_config(findings)
+    consumer_enabled = os.environ.get("DOMAIN_OUTBOX_CONSUMER_ENABLED", "false").strip().lower() in {"1", "true", "on", "yes"}
+    runtime["domain_outbox_consumer_enabled"] = consumer_enabled
+    if not consumer_enabled:
+        findings.append(Finding(ERROR, "domain_outbox_consumer_unhealthy", "domain outbox consumer is disabled or has no health signal"))
     migrations = check_migration_artifacts(root, findings)
     # Legacy remains the rollback path until explicit exit approval exists.
     legacy = {"available": True, "reason": "legacy/fallback retained by contract"}

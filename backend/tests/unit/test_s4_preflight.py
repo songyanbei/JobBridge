@@ -17,5 +17,5 @@ def test_migration_preflight_checks_up_and_down_files(tmp_path):
     (migration_dir / "phase14_001_domain_outbox_event.sql").write_text("-- up")
     findings: list[Finding] = []
     report = check_migration_artifacts(tmp_path, findings)
-    assert report["missing"] == ["phase14_down_001_domain_outbox_event.sql"]
+    assert report["missing"] == ["phase14_004_domain_outbox_consumer.sql", "phase14_down_001_domain_outbox_event.sql"]
     assert findings and findings[0].level == "error"

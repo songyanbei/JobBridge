@@ -227,6 +227,12 @@ class DomainOutboxEvent(Base):
     occurred_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
     tombstone = sa.Column(sa.Boolean, nullable=False, server_default=sa.text("0"))
     status = sa.Column(sa.Enum("pending", "processing", "published", "dead_letter", name="domain_outbox_status"), nullable=False, server_default="pending")
+    attempt_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
+    next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    lease_until = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    fencing_token = sa.Column(mysql.BIGINT(unsigned=True), nullable=False, server_default=sa.text("0"))
+    last_error = sa.Column(sa.String(255), nullable=True)
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=_CurrentTimestamp6())
 
     __table_args__ = (
