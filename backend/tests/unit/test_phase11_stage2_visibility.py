@@ -79,6 +79,7 @@ def test_image_append_uses_strict_online_target_predicate(monkeypatch):
 
 def test_my_status_separates_online_candidate_and_history(monkeypatch):
     monkeypatch.setattr(settings, "resume_lifecycle_v2_enabled", False)
+    monkeypatch.setattr("app.services.resume_mutation_service.utc_now_naive", lambda: NOW)
     user = SimpleNamespace(
         role="worker", status="active", registered_at=NOW - timedelta(days=100),
     )
@@ -117,6 +118,7 @@ def test_my_status_separates_online_candidate_and_history(monkeypatch):
 
 def test_my_status_finds_online_resume_beyond_twenty_newer_records(monkeypatch):
     monkeypatch.setattr(settings, "resume_lifecycle_v2_enabled", False)
+    monkeypatch.setattr("app.services.resume_mutation_service.utc_now_naive", lambda: NOW)
     user = SimpleNamespace(role="worker", status="active", registered_at=NOW)
     newer = [
         SimpleNamespace(
