@@ -923,7 +923,18 @@ class WecomInboundEvent(Base):
         default=lambda: str(uuid4()),
         comment="不可变入站轮次 ID；重试复用，人工重放新建",
     )
-    from_userid = sa.Column(sa.String(64), nullable=False, comment="发送者 external_userid")
+    source_channel = sa.Column(sa.String(24), nullable=False, server_default="wecom_app", comment="入站渠道")
+    provider_msg_id = sa.Column(sa.String(128), nullable=True, comment="供应商原始消息 ID，不截断")
+    dedupe_key = sa.Column(sa.String(64), nullable=True, comment="跨渠道规范幂等键 SHA-256")
+    from_userid = sa.Column(sa.String(64), nullable=True, comment="发送者 external_userid 或 opaque actor")
+    conversation_type = sa.Column(sa.String(16), nullable=False, server_default="single")
+    conversation_id = sa.Column(sa.String(128), nullable=True, comment="单聊 userid 或群聊 chat_id")
+    chat_id = sa.Column(sa.String(128), nullable=True, comment="群聊目标 ID")
+    ordering_key = sa.Column(sa.String(192), nullable=True, comment="锁、顺序门禁和出站统一键")
+    provider_req_id = sa.Column(sa.String(128), nullable=True, comment="AIBot callback headers.req_id")
+    aibot_id = sa.Column(sa.String(128), nullable=True)
+    actor_id_kind = sa.Column(sa.String(16), nullable=False, server_default="plain")
+    from_userid = sa.Column(sa.String(64), nullable=True, comment="发送者 external_userid 或 opaque actor")
     msg_type = sa.Column(
         sa.Enum(
             "text", "image", "voice",
@@ -938,6 +949,12 @@ class WecomInboundEvent(Base):
         sa.String(128), nullable=True,
         comment="媒体消息的 media_id（image/voice/video/file 有效），用于 Worker crash 后补下载",
     )
+    media_url_ciphertext = sa.Column(mysql.MEDIUMBLOB, nullable=True, comment="加密的短时媒体 URL")
+    media_aes_key_ciphertext = sa.Column(mysql.VARBINARY(512), nullable=True, comment="加密的媒体 aeskey")
+    media_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    media_storage_ref = sa.Column(sa.String(512), nullable=True, comment="下载后的安全对象引用")
+    media_download_status = sa.Column(sa.String(24), nullable=False, server_default="pending")
+    media_download_attempts = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     content_brief = sa.Column(sa.String(500), nullable=True, comment="消息摘要（文本取前 500 字）")
     status = sa.Column(
         sa.Enum(
@@ -1002,6 +1019,9 @@ class WecomInboundEvent(Base):
         sa.Index("idx_status_worker_finished", "status", "worker_finished_at"),
         sa.Index("idx_from_user", "from_userid", "created_at"),
         sa.Index("idx_user_status_id", "from_userid", "status", "id"),
+        sa.Index("idx_inbound_ordering_status", "ordering_key", "status", "id"),
+        sa.UniqueConstraint("source_channel", "provider_msg_id", name="uk_inbound_channel_provider"),
+        sa.UniqueConstraint("dedupe_key", name="uk_inbound_dedupe_key"),
         sa.Index(
             "idx_session_commit_due",
             "status", "session_next_attempt_at", "session_apply_locked_at", "id",
@@ -1120,7 +1140,16 @@ class WecomOutboundOutbox(Base):
         mysql.SMALLINT(unsigned=True), nullable=False,
         comment="同一入站事件内的回复顺序，从 0 开始",
     )
-    userid = sa.Column(sa.String(64), nullable=False, comment="接收者 external_userid")
+    userid = sa.Column(sa.String(64), nullable=True, comment="接收者 external_userid；群聊可空")
+    channel = sa.Column(sa.String(24), nullable=False, server_default="wecom_app")
+    conversation_type = sa.Column(sa.String(16), nullable=False, server_default="single")
+    conversation_id = sa.Column(sa.String(128), nullable=True)
+    chat_id = sa.Column(sa.String(128), nullable=True)
+    ordering_key = sa.Column(sa.String(192), nullable=True)
+    provider_req_id = sa.Column(sa.String(128), nullable=True)
+    reply_command = sa.Column(sa.String(40), nullable=True)
+    stream_id = sa.Column(sa.String(128), nullable=True)
+    finish = sa.Column(mysql.TINYINT(1), nullable=True)
     msg_type = sa.Column(sa.String(16), nullable=False, server_default="text")
     content = sa.Column(mysql.MEDIUMTEXT, nullable=True)
     recommendation_delivery_id = sa.Column(sa.String(36), nullable=True, unique=True)
@@ -1129,7 +1158,7 @@ class WecomOutboundOutbox(Base):
     criteria_snapshot = sa.Column(sa.JSON, nullable=True)
     status = sa.Column(
         sa.Enum(
-            "pending", "sending", "sent", "dead_letter",
+            "pending", "sending", "sent", "uncertain", "dead_letter",
             name="wecom_outbox_status",
         ),
         nullable=False,
@@ -1141,6 +1170,16 @@ class WecomOutboundOutbox(Base):
     next_attempt_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     locked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
     provider_msg_id = sa.Column(sa.String(128), nullable=True)
+    provider_response = sa.Column(sa.JSON, nullable=True)
+    reply_expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    stream_deadline_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    ack_req_id = sa.Column(sa.String(128), nullable=True)
+    ack_received_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    first_sent_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    uncertain_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    provider_close_code = sa.Column(sa.String(32), nullable=True)
+    lease_owner = sa.Column(sa.String(64), nullable=True)
+    fencing_token = sa.Column(mysql.BIGINT(unsigned=True), nullable=True)
     last_error = sa.Column(sa.Text, nullable=True)
     created_at = sa.Column(
         mysql.DATETIME(fsp=6),
@@ -1163,7 +1202,27 @@ class WecomOutboundOutbox(Base):
             "NOT (recommendation_delivery_id IS NOT NULL AND contact_delivery_id IS NOT NULL)",
             name="ck_outbox_single_delivery_kind",
         ),
+        sa.Index("idx_outbox_channel_status_due", "channel", "status", "next_attempt_at", "id"),
+        sa.Index("idx_outbox_ordering_status", "ordering_key", "status", "id"),
     )
+
+
+class WecomAibotIdentity(Base):
+    """Opaque AIBot actor IDs and their explicitly verified mappings."""
+
+    __tablename__ = "wecom_aibot_identity"
+
+    opaque_actor_id = sa.Column(sa.String(128), primary_key=True)
+    mapped_external_userid = sa.Column(sa.String(64), nullable=True)
+    identity_status = sa.Column(
+        sa.Enum("unverified", "verified", "rejected", name="wecom_aibot_identity_status"),
+        nullable=False, server_default="unverified",
+    )
+    verified_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"), onupdate=sa.func.now())
+
+    __table_args__ = (sa.Index("idx_aibot_identity_mapped", "mapped_external_userid"),)
 
 
 # ============================================================================

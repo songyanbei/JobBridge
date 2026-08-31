@@ -17,6 +17,9 @@ class WeComMessage:
     调用 WeComClient.download_media(media_id) + storage.save() 后回填，
     message_router._handle_image 只消费此字段，不依赖 wecom/client。
     """
+    # schema_version=2 is the canonical queue/inbox envelope.  Legacy callers
+    # may continue constructing this dataclass with only the original fields.
+    schema_version: int = 2
     msg_id: str = ""
     from_user: str = ""
     to_user: str = ""
@@ -28,6 +31,21 @@ class WeComMessage:
     image_url: str = ""
     media_lifecycle_id: int | None = None
     expired_upload_draft: bool = False
+    turn_id: str = ""
+    source_channel: str = "wecom_app"
+    conversation_type: str = "single"
+    conversation_id: str = ""
+    chat_id: str = ""
+    ordering_key: str = ""
+    provider_msg_id: str = ""
+    provider_req_id: str = ""
+    aibot_id: str = ""
+    media_url: str = ""
+    media_aes_key: str = ""
+    media_expires_at: int | None = None
+    media_storage_ref: str = ""
+    actor_id_kind: str = "plain"
+    raw_parts: list[dict] = field(default_factory=list)
 
 
 def parse_xml(xml_text: str) -> dict:
