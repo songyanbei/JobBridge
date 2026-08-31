@@ -3326,7 +3326,6 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
     - content 只对 text/event 类型有意义；媒体类型 content_brief 只是类型标签，
       不要把它当 text content 传给 router（否则 message_router 会当成用户在发字面文本）
     """
-<<<<<<< HEAD
     def _text(value: object, default: str = "") -> str:
         return value if isinstance(value, str) else default
 
