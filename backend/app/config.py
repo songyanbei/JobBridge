@@ -248,6 +248,9 @@ class Settings(BaseSettings):
     job_publish_rollout_percentage: int = 0
     job_publish_kill_switch: bool = False
     job_publish_action_version: str = "job_publish_v1"
+    domain_outbox_consumer_enabled: bool = False
+    domain_outbox_consumer_lease_seconds: int = 60
+    domain_outbox_consumer_max_attempts: int = 5
     # S5 resume publishing/search remain fail-closed until rollout approval.
     resume_publish_flow_enabled: bool = False
     resume_search_facade_enabled: bool = False
@@ -335,6 +338,14 @@ class Settings(BaseSettings):
         value = str(value or "").strip()
         if not value or len(value) > 64:
             raise ValueError("job_publish_action_version must be a non-empty string <= 64 chars")
+        return value
+
+    @field_validator("domain_outbox_consumer_lease_seconds", "domain_outbox_consumer_max_attempts", mode="after")
+    @classmethod
+    def _valid_domain_outbox_consumer_limits(cls, value: int) -> int:
+        value = int(value)
+        if value <= 0:
+            raise ValueError("domain outbox consumer limits must be positive")
         return value
 
     @field_validator("resume_publish_rollout_percentage", "resume_search_rollout_percentage", mode="after")
