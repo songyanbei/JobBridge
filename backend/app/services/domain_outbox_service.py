@@ -134,20 +134,30 @@ def finalize_domain_event(
 
 
 def job_event_is_current(db, event: DomainOutboxEvent) -> bool:
-    """Reload Job state and reject stale/late events, including tombstones."""
-    if event.aggregate_type != "job":
-        return True
-    from app.models import Job
-    job = db.query(Job).filter(Job.id == int(event.aggregate_id)).populate_existing().first()
-    if job is None:
+    """Reload the matching fact source and reject stale/late events.
+
+    Unknown aggregate types fail closed. Tombstones are valid only when the
+    current row is itself deleted/delisted and at the exact aggregate version.
+    """
+    aggregate_type = str(event.aggregate_type or "").lower()
+    if aggregate_type == "job":
+        from app.models import Job
+        model = Job
+    elif aggregate_type == "resume":
+        from app.models import Resume
+        model = Resume
+    else:
+        return False
+    row = db.query(model).filter(model.id == int(event.aggregate_id)).populate_existing().first()
+    if row is None:
         return bool(event.tombstone)
-    current_version = int(getattr(job, "aggregate_version", None) or job.version or 1)
+    current_version = int(getattr(row, "aggregate_version", None) or row.version or 1)
     if current_version != int(event.aggregate_version):
         return False
     if event.tombstone:
-        return bool(job.deleted_at is not None or job.delist_reason is not None)
+        return bool(row.deleted_at is not None or row.delist_reason is not None)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    return bool(job.audit_status == "passed" and job.deleted_at is None and job.delist_reason is None and job.expires_at and job.expires_at > now)
+    return bool(row.audit_status == "passed" and row.deleted_at is None and row.delist_reason is None and row.expires_at and row.expires_at > now)
 
 
 def consume_pending_events(db, handler, *, owner: str, limit: int = 100, lease_seconds: int = 60, max_attempts: int = 5) -> dict[str, int]:
