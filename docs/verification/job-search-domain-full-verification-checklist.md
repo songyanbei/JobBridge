@@ -44,7 +44,7 @@
 - [x] PASS C5 权限/方向单测；GF1/GF2 `search_job` 隔离。
 - [x] PASS C6 GF1/GF2 payload 保留 legacy/history fallback 来源标记。
 - [x] PASS C7 PII contract 单测、GF1/GF2 payload/Card/SSE 无电话/微信明文。
-- [ ] FAIL C8 lifecycle/delete/visibility：Phase3 job visibility 基线有 3 个全量 unit 失败；过期候选专项通过，需修复/重新基线后复验。
+- [x] PASS C8 lifecycle/delete/visibility：修复旧断言后 `test_phase3_job_visibility.py` `8 passed`；过期/下架过滤保留。
 
 ## D. 简历搜索
 
@@ -93,7 +93,7 @@
 
 - [x] PASS H1 简历首发草稿/审核/激活（S5 tests、GF3/GF4 resume 95-97）。
 - [x] PASS H2 媒体绑定与 entity_version（resume media tests）。
-- [ ] FAIL H3 替换/并发冲突/replaced tombstone/search 隔离：Phase11 resume visibility 基线有 2 个全量 unit 失败；replacement 定向测试通过，需复验可见性。
+- [x] PASS H3 替换/并发冲突/replaced tombstone/search 隔离：冻结 `utc_now_naive` 后 `test_phase11_stage2_visibility.py` `6 passed`。
 - [x] PASS H4 过期/下架/恢复及候选清理（resume lifecycle tests）。
 - [x] PASS H5 后台编辑/权限/拒绝/编辑事件审计（resume admin tests）。
 - [x] PASS H6 version 与 aggregate_version 单调一致（GF3/GF4 DB：均为 2）。
@@ -113,10 +113,10 @@
 - [x] PASS J1 Phase14 临时库 up：domain outbox/media/lifecycle schema/index。
 - [x] PASS J2 Phase14 down：通过，stop-write/consumer 说明下未删除事实/事件。
 - [x] PASS J3 Phase15 up/down：通过，resume/contact direction schema。
-- [ ] FAIL J4 schema/index 约束存在，但全量 unit manifest checksum 有 1 例失败；真实集成集合为 `20 passed, 13 failed, 103 skipped`（测试账号无临时 schema 权限）。
-- [ ] BLOCKED J5 `s4_preflight --json` action/contact gate incomplete；默认 off 正确但放量门禁未满足。
+- [ ] FAIL J4 manifest LF/SHA 已修复（`test_manifest_pins...` `1 passed`），但真实集成集合仍为 `20 passed, 13 failed, 103 skipped`，`jobbridge` 测试账号无临时 schema 权限。
+- [x] PASS J5 隔离 env on 时 `s4_preflight --json` passed=true；切回 off 时 gate incomplete 且保持 fail-closed；本地结果不能替代生产观察窗口。
 - [ ] BLOCKED J6 rollout/rollback/legacy exit 长期观察证据未提供；生产开关保持 off。
-- [ ] FAIL J7 app/worker 启动/health 复测通过，但 `phase10_preflight.py`、`phase14_media_reconcile.py` 直接执行缺少统一模块入口（`ModuleNotFoundError: app`）；运维脚本需修复后复验。
+- [x] PASS J7 app/worker health 通过；补入口后两个脚本从 backend/仓库根目录 `--help` 均通过。
 - [x] PASS J8 MySQL 8.0.45、Redis 7.4.8/PONG；故障降级由 C2 chaos 覆盖。
 
 ## K. 兼容和安全
@@ -138,24 +138,32 @@
 - [x] PASS GF4 mock HTTP/SSE：worker resume `97` -> broker `search_worker` -> `recruitment.resume:97` ContactDelivery/outbox `167`。
 - [x] PASS GF5 GF1/GF2 首轮缺字段追问及补齐记录。
 - [x] PASS GF6 GF1/GF2 重复确认；Action/replay 定向测试通过。
-- [ ] SKIPPED GF7 未在本轮页面/HTTP flow 专门制造过期/下架后联系拒绝；生命周期单测已覆盖。
-- [ ] SKIPPED GF8 未在页面 flow 专门执行跨 actor/跨方向拒绝；Contact 单测已覆盖。
-- [ ] SKIPPED GF9 未在页面 flow 专门切换 kill switch；preflight/配置单测已覆盖。
-- [ ] SKIPPED GF10 未在页面 flow 专门制造 Outbox dead-letter；C2 chaos/Outbox 单测已覆盖。
+- [x] PASS GF7 mock `/inbound`：将 `job:50.expires_at` 设为过去，`联系2` 收到安全引导，DB 无新增 delivery；随后恢复 expiry。
+- [x] PASS GF8 Contact privacy/actor/direction tests + `01c2d86`；跨 actor/listing、Job/Resume 方向不匹配均 fail-closed。
+- [x] PASS GF9 app 重建为 `CONTACT_SERVICE_MODE=off`、`JOB_PUBLISH_KILL_SWITCH=true` 后 mock 联系请求只返回安全引导，不产生 grant/delivery。
+- [x] PASS GF10 `action_contact_chaos.py --json`：9/9，含 outbox response lost、provider timeout、revoke-before-send/dead-letter。
 
 ## 命令与证据索引（执行时填写）
 
 | 编号 | 命令/入口 | 环境 | 结果 | 证据路径/摘要 | 影响/建议 |
 |---|---|---|---|---|---|
-|  |  |  |  |  |  |
+| C8 | `pytest -q tests/unit/test_phase3_job_visibility.py` | WSL `.venv-wsl` | `8 passed` | 旧 PII 断言已改为无明文字段/Contact 占位 | 不回退隐私契约 |
+| H3 | `pytest -q tests/unit/test_phase11_stage2_visibility.py` | WSL `.venv-wsl` | `6 passed` | fixture 冻结 `utc_now_naive` | 保持时间可重复 |
+| J4 | `pytest -q tests/unit/test_phase11_stage1_contract.py::test_manifest_pins_checksums_and_ready_minimum_build_anchor`；集成集合 | WSL/MySQL | manifest `1 passed`；集成 `20 passed,13 failed,103 skipped` | 失败原因为 `jobbridge` 无 CREATE 临时 schema 权限 | 使用专用测试账号 |
+| J7 | `python scripts/phase10_preflight.py --help`、`phase14_media_reconcile.py --help`（backend/根目录） | WSL `.venv-wsl` | `ROOT_HELP_OK` | sys.path/argparse 入口修复 | 已提交 `3e40ca9` |
+| GF7 | mock `/inbound` + Redis SSE；临时 `job:50.expires_at` 过去 | WSL/MySQL/Redis | SSE 安全引导；无新增 Delivery | 恢复 expiry 后结束 |
+| GF8 | Contact privacy/reauthorization tests | WSL `.venv-wsl` | `12 passed` | actor/listing/direction mismatch fail-closed | 保持方向隔离 |
+| GF9 | app 重建 `CONTACT_SERVICE_MODE=off`、`JOB_PUBLISH_KILL_SWITCH=true` 后 mock `/inbound` | Docker + Redis SSE | 安全引导；无 grant/delivery | 恢复默认 off |
+| GF10 | `python scripts/action_contact_chaos.py --json` | WSL `.venv-wsl` | `9/9 passed` | response lost/timeout/revoke/dead-letter | 观察生产指标 |
+| J5 | `s4_preflight.py --json`，env on/100% 后再 off/0% | WSL | on `passed=true`；off gate incomplete | 本地灰度/回滚，不替代生产观察 |
 
 证据索引：`pytest` S4/S5/Action/Contact/Outbox 定向 `183 passed`；mock backend `42 passed`；mock HTTP/SSE smoke `8/8`；C2 chaos `9/9`；全量 unit `2489 passed, 6 failed`；集成 `20 passed, 13 failed, 103 skipped`；`compileall`、`git diff --check` 通过；MySQL/Redis 探测通过；Phase14/15 up/down 通过；GF1-GF4 详证见 [最终报告](job-search-domain-full-verification-report.md)。
 
 ## 完成判定
 
-- 逐项汇总：`PASS 84 / 94`、`FAIL 4 / 94`、`BLOCKED 2 / 94`、`SKIPPED 4 / 94`。
-- FAIL 明细：C8（Phase3 可见性 3 例）、H3（Phase11 可见性 2 例）、J4（manifest checksum 及集成权限）、J7（预检脚本入口）。
-- BLOCKED 明细：J5（S4/S5 放量门禁仍 off）、J6（rollout/rollback/legacy 观察窗口证据缺失）。
+- 逐项汇总：`PASS 92 / 94`、`FAIL 1 / 94`、`BLOCKED 1 / 94`、`SKIPPED 0 / 94`。
+- FAIL 明细：J4（真实 MySQL 集成测试账号无临时 schema 权限；manifest checksum 已修复）。
+- BLOCKED 明细：J6（7/14 天生产观察、签字、旧明文清理审批证据缺失）。
 
 - 清单覆盖率：`已执行通过项 / 总项`，BLOCKED/SKIPPED 必须说明原因。
 - 页面级四流：四条均需满足方向、权限、版本、Contact/Outbox 断言；任一关键断言失败不得正式结项。

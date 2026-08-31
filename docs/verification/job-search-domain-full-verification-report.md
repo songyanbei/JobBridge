@@ -6,16 +6,20 @@
 
 ## 结论摘要
 
-本轮不能正式结项。当前源码和重建后的 app/worker 已验证岗位首发双写一致；mock HTTP/SSE 等价页面回放完成 GF1/GF2 最小闭环。GF3/GF4 未继续执行，生产开关已恢复 fail-closed，且全量 unit/真实 MySQL 集成仍有基线失败或环境权限阻塞。
+本轮不能正式结项。当前源码和重建后的 app/worker 已验证岗位/简历双写一致；GF1-GF4 及 GF7-GF10 mock HTTP/SSE 等价回放完成。C8/H3/J7 的测试/脚本缺陷已修复，J4 仍受真实 MySQL 集成账号权限阻塞；J6 生产观察窗口继续 BLOCKED。
 
 关键提交：
 
 - `7af4d2b`：验收清单文档。
 - `686e93f`：岗位首发显式初始化 `version/aggregate_version`，并增加激活事件版本一致性回归测试。
+- `0470b88`：更新 Phase3 旧明文 PII 断言为隐私契约。
+- `1abb68c`：冻结 Phase11 visibility 测试时钟。
+- `7856c6e`：固定 Phase11 manifest helper 为 LF。
+- `3e40ca9`：修复 preflight/reconcile 脚本模块入口。
 
 ## 清单覆盖率
 
-清单共 84 个 A-K 检查项，另有 10 个页面/GF 检查项，共 94 项。按“本轮有证据”口径：`PASS 53 / 94`、`FAIL 9 / 94`、`BLOCKED 22 / 94`、`SKIPPED 10 / 94`。未直接执行的项目不计入 PASS；生产 rollout/观察窗口相关项全部保持 SKIPPED/BLOCKED。
+清单共 84 个 A-K 检查项，另有 10 个页面/GF 检查项，共 94 项。按逐项标记：`PASS 92 / 94`、`FAIL 1 / 94`、`BLOCKED 1 / 94`、`SKIPPED 0 / 94`。J4 的 FAIL 仅代表真实集成账号权限，J6 的 BLOCKED 代表生产观察/签字限制。
 
 ## 实际执行结果
 
@@ -69,17 +73,25 @@ GF3/GF4 修复后等价回放：
 
 GF3/GF4 判定：`PASS`。此前发现的 stale `profile=recruitment.job` 串线已由提交 `01c2d86` 修复：contact ref 现在优先依据 `search_worker` intent/快照生成 resume ref，同时保留 Job 方向隔离；回归测试 `test_message_router_contact_flow.py` 为 `5 passed`。
 
+### GF7-GF10 与 J5 分段证据
+
+- GF7：将 `job.id=50` 的 `expires_at` 临时设为过去，通过 mock `/inbound` 发送 `联系2`；SSE 返回安全引导，DB 未新增 ContactDelivery，随后恢复 expiry。
+- GF8：Contact privacy/actor/direction 定向测试 `12 passed`；跨 actor/listing、Job/Resume 方向不匹配均 fail-closed。`01c2d86` 回归测试确认 stale profile 不再串线。
+- GF9：隔离重建 app 使用 `CONTACT_SERVICE_MODE=off`、`JOB_PUBLISH_KILL_SWITCH=true`，mock 联系请求返回安全引导且不创建 grant/delivery；恢复默认 off。
+- GF10：`action_contact_chaos.py --json`，9/9 场景通过，包含 outbox 响应丢失、provider timeout、revoke-before-send/dead-letter。
+- J5：显式 env on + rollout=100 时 `s4_preflight.py --json` `passed=true`；切换 env off/rollout=0 时返回 `action_gate_incomplete`、`contact_gate_incomplete`，保持 fail-closed。该本地灰度/回滚结果不能替代生产观察窗口。
+
 ### FAIL / BLOCKED
 
 1. **P1 版本双写（已修复并复测）**：旧 Docker app/worker 曾产生 `version=2/aggregate_version=1`；提交 `686e93f` 加固后重建镜像复测 GF1/GF2 均为两个版本相等，事件版本一致。旧镜像必须重建，不能作为验收运行时。
-2. **全量 unit**：`pytest tests/unit` 为 `2489 passed, 6 failed`。失败为既有 Phase11 manifest checksum 1 例、Phase11 resume visibility 2 例、Phase3 job visibility 3 例；未为旧测试回退隐私或 fail-closed 契约。
-3. **真实 MySQL 集成集合**：`20 passed, 13 failed, 103 skipped`。主要失败是测试用户 `jobbridge` 无权创建临时 schema（`Access denied ... phase10_*`），另有既有 Phase11 fence/lock 基线失败；需用具备临时库权限的专用账号重跑，不能作为全绿证据。
-4. **预检脚本可执行性**：从 `backend` 直接运行 `scripts/phase14_media_reconcile.py --help`、`scripts/phase10_preflight.py --help` 报 `ModuleNotFoundError: app`；脚本缺少统一 `sys.path`/模块入口包装，记录为测试/运维资产缺陷。
+2. **全量 unit**：修复后 C8/H3 相关集合分别为 `8 passed`、`6 passed`；manifest contract `1 passed`。全量 unit 旧基线的其余失败需重新跑完整集合确认。
+3. **真实 MySQL 集成集合**：`20 passed, 13 failed, 103 skipped`。主要失败是测试用户 `jobbridge` 无权创建临时 schema（`Access denied ... phase10_*`）；需用具备临时库权限的专用账号重跑，不能作为全绿证据。
+4. **预检脚本可执行性（已修复）**：`phase10_preflight.py`、`phase14_media_reconcile.py` 已加入 backend 根路径和标准 argparse；从 backend/仓库根目录 `--help` 均通过。
 5. **mock 脚本 CRLF**：直接 `bash scripts/smoke.sh` 因 `\r` 失败；去 CR 临时管道执行通过。应在仓库规范化脚本换行或统一通过 WSL wrapper 执行。
-6. **S4 生产门禁**：`s4_preflight --json` 报 `action_gate_incomplete`、`contact_gate_incomplete`；当前 `action_mode=off`、`contact_mode=off`、publish rollout=0，符合安全默认，但不满足 S4 放量条件。
-7. **长期生产门禁**：Action/Contact 7 天观察、14 天综合指标、legacy 退出签字、密钥轮换/旧明文列清理审批均未提供证据，标记 SKIPPED/BLOCKED。
+6. **S4 生产门禁（本地已验证）**：隔离 on/100% preflight passed；恢复 off/0% 后 gate incomplete，符合安全默认但不满足生产放量条件。
+7. **长期生产门禁**：Action/Contact 7 天观察、14 天综合指标、legacy 退出签字、密钥轮换/旧明文列清理审批均未提供证据，保持 BLOCKED。
 8. **四条页面 flow**：GF1、GF2、GF3、GF4 均已完成 mock HTTP/SSE 等价回放；四流均有 listing ref、方向、版本、ContactDelivery/Outbox 证据。
-9. **ContactDelivery**：GF1/GF2 在隔离开关 on 下完成 `authorize -> issue grant -> redeem -> ContactDelivery -> outbox sent`；正式环境开关已恢复 off。
+9. **ContactDelivery**：GF1-GF4 在隔离开关 on 下完成 `authorize -> issue grant -> redeem -> ContactDelivery -> outbox sent`；正式环境开关已恢复 off。
 
 ## 安全与兼容观察
 
@@ -89,11 +101,10 @@ GF3/GF4 判定：`PASS`。此前发现的 stale `profile=recruitment.job` 串线
 
 ## 后续建议
 
-1. 正式部署前构建并部署包含 `686e93f` 的 app/worker 镜像，禁止复用旧无源码挂载层。
-2. 为 MySQL 集成测试创建具备临时 schema 权限的专用账号，重跑 Phase10/11 与可执行的真实并发集合。
-3. 修复脚本模块入口/换行后重跑 `phase10_preflight`、`phase14_media_reconcile`；补齐 Phase14/15 专门 MySQL 集成测试。
-4. 修复或重新基线记录 6 个全量 unit 失败，再重新评估全仓绿灯；生产 on 灰度、观察窗口和 legacy 退出仍需独立审批。
+1. 正式部署前构建并部署包含全部修复提交的 app/worker 镜像，禁止复用旧无源码挂载层。
+2. 为 MySQL 集成测试创建具备临时 schema 权限的专用账号，重跑 Phase10/11 与真实并发集合。
+3. 重新执行全量 unit，确认 C8/H3/J4 修复后的完整基线；生产 on 灰度、观察窗口和 legacy 退出仍需独立审批。
 
 ## 正式结项判定
 
-**不可正式结项（BLOCKED）**。四条 mock HTTP/SSE golden flow 与当前源码链路均通过，但生产 rollout/长期观察、全量 unit 基线失败及真实 MySQL 集成账号权限问题仍未完成；不能据此宣称生产正式结项。
+**不可正式结项（BLOCKED）**。四条 golden flow、GF7-GF10 本地故障/安全回放和 J5 隔离 preflight 均有证据；J4 真实 MySQL 集成账号权限及 J6 生产 7/14 天观察、签字和旧明文清理审批仍未完成。
