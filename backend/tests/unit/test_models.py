@@ -170,7 +170,7 @@ class TestKeyColumns:
     def test_wecom_outbox_status_and_event_reply_unique(self):
         col = self._col(WecomOutboundOutbox, "status")
         assert set(col.type.enums) == {
-            "pending", "sending", "sent", "dead_letter",
+            "pending", "sending", "sent", "uncertain", "dead_letter",
         }
         unique_columns = {
             tuple(column.name for column in constraint.columns)
