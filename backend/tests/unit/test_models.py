@@ -123,6 +123,50 @@ class TestKeyColumns:
         col = self._col(WecomInboundEvent, "msg_id")
         assert col.unique
 
+    def test_wecom_inbound_aibot_channel_contract_fields(self):
+        table = WecomInboundEvent.__table__
+        assert {
+            "turn_id", "source_channel", "provider_msg_id", "dedupe_key",
+            "conversation_type", "conversation_id", "chat_id", "ordering_key",
+            "provider_req_id", "aibot_id", "actor_id_kind",
+            "media_url_ciphertext", "media_aes_key_ciphertext", "media_expires_at",
+            "media_storage_ref", "media_download_status", "media_download_attempts",
+        } <= set(table.columns.keys())
+        assert table.c.source_channel.server_default.arg == "wecom_app"
+        assert table.c.conversation_type.server_default.arg == "single"
+        assert table.c.provider_msg_id.type.length == 128
+        assert table.c.ordering_key.type.length == 192
+        unique_columns = {
+            tuple(column.name for column in constraint.columns)
+            for constraint in table.constraints
+            if isinstance(constraint, sa.UniqueConstraint)
+        }
+        assert ("source_channel", "provider_msg_id") in unique_columns
+        assert ("dedupe_key",) in unique_columns
+
+    def test_wecom_outbox_aibot_delivery_fields_and_indexes(self):
+        table = WecomOutboundOutbox.__table__
+        assert {
+            "channel", "conversation_type", "conversation_id", "chat_id",
+            "ordering_key", "provider_req_id", "reply_command", "stream_id",
+            "finish", "provider_response", "reply_expires_at", "stream_deadline_at",
+            "ack_req_id", "ack_received_at", "first_sent_at", "uncertain_at",
+            "provider_close_code", "lease_owner", "fencing_token",
+        } <= set(table.columns.keys())
+        assert table.c.channel.server_default.arg == "wecom_app"
+        assert table.c.conversation_type.server_default.arg == "single"
+        assert table.c.fencing_token.type.unsigned is True
+        indexes = {
+            index.name: tuple(column.name for column in index.columns)
+            for index in table.indexes
+        }
+        assert indexes["idx_outbox_channel_status_due"] == (
+            "channel", "status", "next_attempt_at", "id",
+        )
+        assert indexes["idx_outbox_ordering_status"] == (
+            "ordering_key", "status", "id",
+        )
+
     def test_wecom_outbox_status_and_event_reply_unique(self):
         col = self._col(WecomOutboundOutbox, "status")
         assert set(col.type.enums) == {
