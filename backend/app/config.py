@@ -7,7 +7,7 @@ import os
 from typing import Literal
 from urllib.parse import quote, quote_plus
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -431,6 +431,63 @@ class Settings(BaseSettings):
     wecom_secret: str = ""
     wecom_token: str = ""
     wecom_aes_key: str = ""
+
+    # ---- 企业微信智能机器人 AIBot（默认关闭） ----
+    # AIBot 使用独立的 Bot Secret，不能复用传统自建应用 secret。
+    wecom_aibot_enabled: bool = False
+    wecom_aibot_mode: Literal["long"] = "long"
+    wecom_aibot_bot_id: str = ""
+    wecom_aibot_secret: SecretStr = SecretStr("")
+    wecom_aibot_ws_url: str = "wss://openws.work.weixin.qq.com"
+    wecom_aibot_heartbeat_seconds: int = 30
+    wecom_aibot_connect_timeout_seconds: int = 10
+    wecom_aibot_subscribe_timeout_seconds: int = 10
+    wecom_aibot_reconnect_max_seconds: int = 60
+    wecom_aibot_instance_id: str = ""
+    wecom_aibot_send_queue_max: int = 1000
+    wecom_aibot_streaming_enabled: bool = False
+    wecom_aibot_allow_opaque_registration: bool = False
+
+    @field_validator("wecom_aibot_ws_url", mode="after")
+    @classmethod
+    def _valid_aibot_ws_url(cls, value: str) -> str:
+        value = str(value).strip().rstrip("/")
+        # Keep the production endpoint explicit. Test deployments can use the
+        # same URL through a WSS proxy, but an accidental ws:// downgrade is
+        # never accepted.
+        if value != "wss://openws.work.weixin.qq.com":
+            raise ValueError(
+                "wecom_aibot_ws_url must be wss://openws.work.weixin.qq.com"
+            )
+        return value
+
+    @field_validator(
+        "wecom_aibot_heartbeat_seconds",
+        "wecom_aibot_connect_timeout_seconds",
+        "wecom_aibot_subscribe_timeout_seconds",
+        "wecom_aibot_reconnect_max_seconds",
+        "wecom_aibot_send_queue_max",
+        mode="after",
+    )
+    @classmethod
+    def _valid_aibot_positive_int(cls, value: int) -> int:
+        return max(1, int(value))
+
+    @model_validator(mode="after")
+    def _validate_aibot_enabled(self) -> "Settings":
+        if not self.wecom_aibot_enabled:
+            return self
+        if not self.wecom_aibot_bot_id.strip():
+            raise ValueError("WECOM_AIBOT_BOT_ID is required when AIBot is enabled")
+        if not self.wecom_aibot_secret.get_secret_value().strip():
+            raise ValueError("WECOM_AIBOT_SECRET is required when AIBot is enabled")
+        if not self.wecom_aibot_instance_id.strip():
+            raise ValueError("WECOM_AIBOT_INSTANCE_ID is required when AIBot is enabled")
+        if self.app_env.lower() == "production" and self.wecom_aibot_allow_opaque_registration:
+            raise ValueError(
+                "WECOM_AIBOT_ALLOW_OPAQUE_REGISTRATION must remain false in production"
+            )
+        return self
 
     # ---- LLM（对应方案 §4.3 抽象层）----
     llm_provider: str = "qwen"
