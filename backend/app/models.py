@@ -1313,7 +1313,7 @@ class AibotIdentityAudit(Base):
     result = sa.Column(sa.String(32), nullable=False)
     reason_code = sa.Column(sa.String(64), nullable=True)
     actor = sa.Column(sa.String(64), nullable=True)
-    metadata = sa.Column(sa.JSON, nullable=True)
+    audit_metadata = sa.Column("metadata", sa.JSON, nullable=True)
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
 
     __table_args__ = (sa.Index("idx_aibot_identity_audit_lookup", "bot_id", "opaque_actor_digest", "created_at"),)

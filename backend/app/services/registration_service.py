@@ -39,7 +39,7 @@ def actor_digest(actor: str) -> str:
 def _audit(db: Session, *, bot_id: str, digest: str, action: str, result: str, canonical: str | None = None, reason: str | None = None, actor: str | None = None, metadata: dict | None = None) -> None:
     db.add(AibotIdentityAudit(
         bot_id=bot_id, opaque_actor_digest=digest, canonical_userid=canonical,
-        action=action, result=result, reason_code=reason, actor=actor, metadata=metadata,
+        action=action, result=result, reason_code=reason, actor=actor, audit_metadata=metadata,
     ))
 
 
@@ -186,4 +186,3 @@ def revoke_binding(db: Session, *, binding_id: str, operator: str, reason: str =
         registration.registration_status = "revoked"
     _audit(db, bot_id=binding.bot_id, digest=binding.opaque_actor_digest, action="binding_revoked", result="revoked", canonical=binding.canonical_userid, actor=operator, reason=reason)
     db.flush()
-

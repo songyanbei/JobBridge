@@ -88,25 +88,35 @@ class AibotIdentityService:
                 return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code=reason)
             canonical = actor_id
         else:
-            if not settings.identity_resolution_enabled:
+            # Existing, explicitly verified mappings remain usable while the
+            # resolver kill switch is off; the switch only prevents new
+            # network resolution/registration.
+            if row.identity_status == "verified" and (row.canonical_userid or row.mapped_external_userid):
+                canonical = row.canonical_userid or row.mapped_external_userid
+            elif not settings.identity_resolution_enabled:
                 return ResolvedActor(actor_id, actor_id_kind, "unverified", reason_code="identity_resolution_disabled")
-            try:
-                result = self.resolve_open_userids([actor_id])
-            except IdentityClientError as exc:
-                row.identity_status = "conversion_pending" if exc.retryable else "rejected"
-                row.resolution_attempts = int(row.resolution_attempts or 0) + 1
-                row.last_error_code = exc.code
-                row.next_resolution_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=min(3600, 2 ** min(row.resolution_attempts, 10))) if exc.retryable else None
-                self._audit(db, bot, digest, actor_id, "openuserid_conversion", "pending" if exc.retryable else "rejected", exc.code)
-                db.flush()
-                return ResolvedActor(actor_id, actor_id_kind, row.identity_status, reason_code=exc.code)
-            if actor_id in result.invalid or actor_id not in result.mapping:
-                row.identity_status = "rejected"
-                row.last_error_code = "invalid_open_userid"
-                self._audit(db, bot, digest, actor_id, "openuserid_conversion", "rejected", "invalid_open_userid")
-                db.flush()
-                return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="invalid_open_userid")
-            canonical = result.mapping[actor_id]
+            else:
+                canonical = None
+            if canonical is not None:
+                pass
+            else:
+                try:
+                    result = self.resolve_open_userids([actor_id])
+                except IdentityClientError as exc:
+                    row.identity_status = "conversion_pending" if exc.retryable else "rejected"
+                    row.resolution_attempts = int(row.resolution_attempts or 0) + 1
+                    row.last_error_code = exc.code
+                    row.next_resolution_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=min(3600, 2 ** min(row.resolution_attempts, 10))) if exc.retryable else None
+                    self._audit(db, bot, digest, actor_id, "openuserid_conversion", "pending" if exc.retryable else "rejected", exc.code)
+                    db.flush()
+                    return ResolvedActor(actor_id, actor_id_kind, row.identity_status, reason_code=exc.code)
+                if actor_id in result.invalid or actor_id not in result.mapping:
+                    row.identity_status = "rejected"
+                    row.last_error_code = "invalid_open_userid"
+                    self._audit(db, bot, digest, actor_id, "openuserid_conversion", "rejected", "invalid_open_userid")
+                    db.flush()
+                    return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="invalid_open_userid")
+                canonical = result.mapping[actor_id]
         row.mapped_external_userid = canonical
         row.canonical_userid = canonical
         row.identity_status = "verified"
@@ -125,4 +135,3 @@ class AibotIdentityService:
 
 
 IdentityService = AibotIdentityService
-
