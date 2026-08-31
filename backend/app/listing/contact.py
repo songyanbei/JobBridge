@@ -164,6 +164,12 @@ class ContactService:
             return ContactDecision(False, "forbidden", request_id)
         if direction is not None and request.direction not in (None, str(direction)):
             return ContactDecision(False, "direction_mismatch", request_id)
+        if request.listing_version is not None and listing_version is None:
+            return ContactDecision(False, "listing_version_required", request_id)
+        if request.policy_version is not None and policy_version is None:
+            return ContactDecision(False, "policy_version_required", request_id)
+        if request.direction is not None and direction is None:
+            return ContactDecision(False, "direction_required", request_id)
         if request.expires_at <= now:
             request.status = "expired"
             self.audit_contact_event("authorize", "denied", "request_expired", actor_id=actor_id, listing_ref=listing_ref, request_id=request_id, db=session)
@@ -199,6 +205,12 @@ class ContactService:
         if not decision.allowed:
             code = "forbidden" if decision.reason_code in {"forbidden", "invalid_request"} else "expired"
             return ContactResponse(success=False, code=code, message=CONTACT_UNAVAILABLE_MESSAGE)
+        request_row = session.query(ContactRequest).filter(ContactRequest.request_id == str(request_id)).first()
+        if request_row is None:
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        direction = direction or request_row.direction
+        listing_version = listing_version if listing_version is not None else request_row.listing_version
+        policy_version = policy_version if policy_version is not None else request_row.policy_version
         token = secrets.token_urlsafe(32)
         grant = ContactGrant(
             grant_id=_new_grant_id(), request_id=str(request_id), actor_id=str(actor_id), listing_ref=str(listing_ref),
@@ -227,6 +239,10 @@ class ContactService:
             return ContactResponse(success=False, code="invalid_grant", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.actor_id != str(actor_id):
             self.audit_contact_event("grant_redeem", "denied", "actor_mismatch", actor_id=actor_id, grant_id=grant_id, trace_id=trace_id, db=session)
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if grant.listing_version is not None and current_listing_version is None:
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        if grant.policy_version is not None and current_policy_version is None:
             return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.direction is not None and (
             current_direction is None or str(current_direction) != str(grant.direction)
