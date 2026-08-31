@@ -1,10 +1,18 @@
 import pytest
+from pathlib import Path
 
 from app.llm.base import DialogueParseResult
 from app.schemas.conversation import SessionState
 from app.services.dialogue_applier import apply_decision
 from app.services.dialogue_compat import decision_to_intent_result
 from app.services.dialogue_reducer import reduce
+
+
+def test_message_router_routes_worker_search_through_resume_facade():
+    source = (Path(__file__).parents[2] / "app" / "services" / "message_router.py").read_text(encoding="utf-8")
+    assert "ResumeSearchFacade" in source
+    assert "resume_search_facade_served" in source
+    assert 'direction="search_worker"' in source
 
 
 def _parse(frame: str, city: str) -> DialogueParseResult:
