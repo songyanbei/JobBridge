@@ -111,3 +111,27 @@ def test_revoke_binding_marks_identity_revoked(monkeypatch):
     assert registration.registration_status == "revoked"
     assert identity.identity_status == "revoked"
     assert identity.revoked_at is not None
+
+
+def test_repeated_invite_apply_is_idempotent_without_consuming_use():
+    from datetime import datetime, timedelta
+
+    db = Mock()
+    binding = SimpleNamespace(binding_id="b1", bot_id="bot", opaque_actor_digest="d" * 64, canonical_userid="u1", binding_status="active")
+    invite = SimpleNamespace(target_role="factory", revoked_at=None, expires_at=datetime.utcnow() + timedelta(hours=1), used_count=0, max_uses=1, invite_id="i1")
+    registration = SimpleNamespace(registration_status="pending_role", requested_role="factory")
+    queries = [invite, None, invite, registration]
+
+    def query(_model):
+        q = Mock()
+        q.filter.return_value = q
+        q.first.side_effect = lambda: queries.pop(0)
+        return q
+    db.query.side_effect = query
+
+    first = registration_service.apply_invite(db, binding=binding, token="token")
+    second = registration_service.apply_invite(db, binding=binding, token="token")
+
+    assert first.requested_role == "factory"
+    assert second is registration
+    assert invite.used_count == 1

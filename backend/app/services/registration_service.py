@@ -10,10 +10,12 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
 from app.models import (
@@ -44,6 +46,20 @@ def _audit(db: Session, *, bot_id: str, digest: str, action: str, result: str, c
     ))
 
 
+def _for_update(query):
+    """Apply a row lock on real SQLAlchemy queries; remain mock-friendly in tests."""
+    if hasattr(type(query), "with_for_update"):
+        return query.with_for_update()
+    return query
+
+
+def _nested_transaction(db):
+    """Use a savepoint for real sessions; tolerate lightweight test doubles."""
+    if hasattr(type(db), "begin_nested"):
+        return db.begin_nested()
+    return nullcontext()
+
+
 def ensure_binding(
     db: Session,
     *,
@@ -62,18 +78,27 @@ def ensure_binding(
         AibotIdentityBinding.bot_id == bot_id,
         AibotIdentityBinding.opaque_actor_digest == opaque_actor_digest_value,
         AibotIdentityBinding.binding_status == "active",
-    ).first()
+    )
+    existing = _for_update(existing).first()
     if existing:
         if existing.canonical_userid != canonical_userid:
             existing.binding_status = "rejected"
             _audit(db, bot_id=bot_id, digest=opaque_actor_digest_value, action="binding_conflict", result="rejected", canonical=canonical_userid, reason="identity_already_bound")
             raise ValueError("identity is already bound to another canonical userid")
         return existing
-    conflict = db.query(AibotIdentityBinding).filter(
+    revoked = _for_update(db.query(AibotIdentityBinding).filter(
+        AibotIdentityBinding.bot_id == bot_id,
+        AibotIdentityBinding.opaque_actor_digest == opaque_actor_digest_value,
+        AibotIdentityBinding.binding_status == "revoked",
+    )).first()
+    if revoked is not None:
+        raise ValueError("identity binding has been revoked")
+    conflict_query = db.query(AibotIdentityBinding).filter(
         AibotIdentityBinding.bot_id == bot_id,
         AibotIdentityBinding.canonical_userid == canonical_userid,
         AibotIdentityBinding.binding_status == "active",
-    ).first()
+    )
+    conflict = _for_update(conflict_query).first()
     if conflict and conflict.opaque_actor_digest != opaque_actor_digest_value:
         _audit(db, bot_id=bot_id, digest=opaque_actor_digest_value, action="binding_conflict", result="rejected", canonical=canonical_userid, reason="canonical_already_bound")
         raise ValueError("canonical userid is already bound to another identity")
@@ -82,8 +107,21 @@ def ensure_binding(
         opaque_actor_digest=opaque_actor_digest_value, canonical_userid=canonical_userid,
         binding_status="active", binding_source=source,
     )
-    db.add(binding)
-    db.flush()
+    try:
+        # The unique identity/status key is the final arbiter when two
+        # transactions observe a missing row at the same time.
+        with _nested_transaction(db):
+            db.add(binding)
+            db.flush()
+    except IntegrityError:
+        existing = _for_update(db.query(AibotIdentityBinding).filter(
+            AibotIdentityBinding.bot_id == bot_id,
+            AibotIdentityBinding.opaque_actor_digest == opaque_actor_digest_value,
+            AibotIdentityBinding.binding_status == "active",
+        )).first()
+        if existing and existing.canonical_userid == canonical_userid:
+            return existing
+        raise ValueError("identity binding concurrent conflict")
     _audit(db, bot_id=bot_id, digest=opaque_actor_digest_value, action="binding_created", result="active", canonical=canonical_userid)
     return binding
 
@@ -93,9 +131,9 @@ def auto_register_worker(db: Session, canonical_userid: str, binding: AibotIdent
     if not canonical_userid or canonical_userid != binding.canonical_userid:
         raise ValueError("canonical binding mismatch")
     user = _ensure_canonical_user(db, canonical_userid)
-    registration = db.query(AibotRegistration).filter(
+    registration = _for_update(db.query(AibotRegistration).filter(
         AibotRegistration.identity_binding_id == binding.binding_id,
-    ).first()
+    )).first()
     if registration is None:
         existing_role = user.role if user is not None else "worker"
         db.add(AibotRegistration(
@@ -113,14 +151,20 @@ def auto_register_worker(db: Session, canonical_userid: str, binding: AibotIdent
 
 def _ensure_canonical_user(db: Session, canonical_userid: str) -> User:
     """Return an existing User or create the minimal worker account."""
-    user = db.query(User).filter(User.external_userid == canonical_userid).first()
+    user = _for_update(db.query(User).filter(User.external_userid == canonical_userid)).first()
     if user is None:
         user = User(
             external_userid=canonical_userid, role="worker", status="active",
             can_search_jobs=1, can_search_workers=0,
         )
-        db.add(user)
-        db.flush()
+        try:
+            with _nested_transaction(db):
+                db.add(user)
+                db.flush()
+        except IntegrityError:
+            user = _for_update(db.query(User).filter(User.external_userid == canonical_userid)).first()
+            if user is None:
+                raise
     return user
 
 
@@ -140,13 +184,17 @@ def create_invite(db: Session, *, role: str, expires_at: datetime, operator: str
 def apply_invite(db: Session, *, binding: AibotIdentityBinding, token: str, requested_role: str | None = None) -> AibotRegistration:
     if binding.binding_status != "active" or not binding.canonical_userid:
         raise ValueError("verified active binding required")
-    invite = db.query(AibotRoleInvite).filter(AibotRoleInvite.token_digest == token_digest(token)).first()
+    invite = _for_update(db.query(AibotRoleInvite).filter(AibotRoleInvite.token_digest == token_digest(token))).first()
+    registration = _for_update(db.query(AibotRegistration).filter(AibotRegistration.identity_binding_id == binding.binding_id)).first()
+    # A retried request for the same binding/role is idempotent even if the
+    # invite was consumed by the first committed request.
+    if invite is not None and registration and registration.registration_status == "pending_role" and registration.requested_role == invite.target_role:
+        return registration
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     if invite is None or invite.revoked_at is not None or invite.expires_at <= now or invite.used_count >= invite.max_uses:
         raise ValueError("invite is invalid or expired")
     if requested_role and requested_role != invite.target_role:
         raise ValueError("requested role does not match invite")
-    registration = db.query(AibotRegistration).filter(AibotRegistration.identity_binding_id == binding.binding_id).first()
     if registration is None:
         registration = AibotRegistration(
             registration_id=str(uuid.uuid4()), canonical_userid=binding.canonical_userid,
@@ -188,19 +236,19 @@ def approve_role(db: Session, *, registration_id: str, operator: str) -> AibotRe
 
 
 def revoke_binding(db: Session, *, binding_id: str, operator: str, reason: str = "admin_revoked") -> None:
-    binding = db.query(AibotIdentityBinding).filter(AibotIdentityBinding.binding_id == binding_id).first()
+    binding = _for_update(db.query(AibotIdentityBinding).filter(AibotIdentityBinding.binding_id == binding_id)).first()
     if binding is None:
         raise ValueError("binding not found")
     binding.binding_status = "revoked"
     binding.revoked_by = operator
     binding.revoked_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    registration = db.query(AibotRegistration).filter(AibotRegistration.identity_binding_id == binding_id).first()
+    registration = _for_update(db.query(AibotRegistration).filter(AibotRegistration.identity_binding_id == binding_id)).first()
     if registration:
         registration.registration_status = "revoked"
-    identity = db.query(WecomAibotIdentity).filter(
+    identity = _for_update(db.query(WecomAibotIdentity).filter(
         WecomAibotIdentity.bot_id == binding.bot_id,
         WecomAibotIdentity.opaque_actor_digest == binding.opaque_actor_digest,
-    ).first()
+    )).first()
     if identity is not None:
         identity.identity_status = "revoked"
         identity.revoked_at = binding.revoked_at
