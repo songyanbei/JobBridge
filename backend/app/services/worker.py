@@ -3222,6 +3222,7 @@ def _decrypt_session_patch(delivery: RecommendationDelivery) -> dict | None:
 
 def _build_wecom_message(msg_data: dict) -> WeComMessage:
     return WeComMessage(
+        schema_version=int(msg_data.get("schema_version") or 1),
         msg_id=msg_data.get("msg_id") or "",
         from_user=msg_data.get("from_userid") or "",
         to_user="",
@@ -3230,6 +3231,16 @@ def _build_wecom_message(msg_data: dict) -> WeComMessage:
         media_id=msg_data.get("media_id") or "",
         create_time=int(msg_data.get("create_time") or 0),
         turn_id=msg_data.get("turn_id") or "",
+        source_channel=msg_data.get("source_channel") or "wecom_app",
+        conversation_type=msg_data.get("conversation_type") or "single",
+        conversation_id=msg_data.get("conversation_id") or msg_data.get("from_userid") or "",
+        chat_id=msg_data.get("chat_id") or "",
+        ordering_key=msg_data.get("ordering_key") or "",
+        provider_msg_id=msg_data.get("provider_msg_id") or "",
+        provider_req_id=msg_data.get("provider_req_id") or "",
+        aibot_id=msg_data.get("aibot_id") or "",
+        media_storage_ref=msg_data.get("media_storage_ref") or "",
+        actor_id_kind=msg_data.get("actor_id_kind") or "plain",
     )
 
 
@@ -3242,23 +3253,40 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
     - content 只对 text/event 类型有意义；媒体类型 content_brief 只是类型标签，
       不要把它当 text content 传给 router（否则 message_router 会当成用户在发字面文本）
     """
-    raw_type = row.msg_type or "text"
-    content = row.content_brief or ""
+    def _text(value: object, default: str = "") -> str:
+        return value if isinstance(value, str) else default
+
+    def _integer(value: object, default: int = 0) -> int:
+        return int(value) if isinstance(value, (int, float)) else default
+
+    raw_type = _text(row.msg_type, "text")
+    content = _text(row.content_brief)
     if raw_type in ("image", "voice", "video", "file"):
         # 媒体消息：content_brief 是 "[image] media_id saved" 之类占位，
         # 业务链路不应该把它当正文
         content = ""
 
     return {
-        "msg_id": row.msg_id,
-        "turn_id": row.turn_id if isinstance(row.turn_id, str) else "",
-        "from_userid": row.from_userid,
+        "schema_version": 2,
+        "inbound_event_id": _integer(row.id),
+        "msg_id": _text(row.msg_id),
+        "provider_msg_id": _text(getattr(row, "provider_msg_id", None)) or None,
+        "turn_id": _text(getattr(row, "turn_id", None)) or None,
+        "source_channel": _text(getattr(row, "source_channel", None), "wecom_app"),
+        "from_userid": _text(row.from_userid),
+        "conversation_type": _text(getattr(row, "conversation_type", None), "single"),
+        "conversation_id": _text(getattr(row, "conversation_id", None)) or _text(row.from_userid),
+        "chat_id": _text(getattr(row, "chat_id", None)) or None,
+        "ordering_key": _text(getattr(row, "ordering_key", None)),
         "msg_type": raw_type,
         "content": content,
-        "media_id": row.media_id or "",
-        "create_time": int(row.created_at.timestamp()) if row.created_at else 0,
-        "inbound_event_id": row.id,
-        "_retry_count": int(row.retry_count or 0),
+        "media_id": _text(row.media_id),
+        "media_storage_ref": _text(getattr(row, "media_storage_ref", None)),
+        "provider_req_id": _text(getattr(row, "provider_req_id", None)) or None,
+        "aibot_id": _text(getattr(row, "aibot_id", None)) or None,
+        "created_at_epoch": int(row.created_at.timestamp()) if hasattr(row.created_at, "timestamp") else 0,
+        "create_time": int(row.created_at.timestamp()) if hasattr(row.created_at, "timestamp") else 0,
+        "_retry_count": _integer(row.retry_count),
         "_recovered": True,
         "_enqueued_at": time.time(),
     }

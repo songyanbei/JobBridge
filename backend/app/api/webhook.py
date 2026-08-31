@@ -39,6 +39,7 @@ from app.core.redis_client import (
 )
 from app.db import SessionLocal
 from app.models import SystemConfig, WecomInboundEvent
+from app.services.inbound_acceptance import InboundAcceptanceService
 from app.wecom.callback import WeComMessage, extract_encrypt_from_xml, parse_message
 from app.wecom.crypto import decrypt_message, verify_signature
 
@@ -177,6 +178,20 @@ async def receive_callback(
 
 def _accept_message(msg: WeComMessage, start_ts: float) -> Response:
     """Durably accept and enqueue one parsed callback on a worker thread."""
+    # AIBot callbacks use the shared durable accept service.  The legacy branch
+    # below intentionally retains its historical rate-limit and fail-open
+    # behavior while both channels share the same inbox schema.
+    if msg.source_channel == "wecom_aibot":
+        result = InboundAcceptanceService().accept(msg, strict_redis=True)
+        if result.status == "retryable":
+            return Response(
+                content="temporary failure",
+                status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                media_type="text/plain",
+            )
+        if result.status == "invalid":
+            return Response(content="invalid message", status_code=http_status.HTTP_400_BAD_REQUEST)
+        return _success_response()
     if not msg.msg_id:
         # event 类型等没有 MsgId，直接忽略，不入队不记录
         logger.info("webhook: skipping msg without msg_id, type=%s", msg.msg_type)
@@ -246,14 +261,26 @@ def _accept_message(msg: WeComMessage, start_ts: float) -> Response:
 
     # 8. 入队
     queue_msg = {
+        "schema_version": 2,
         "msg_id": msg.msg_id,
         "turn_id": getattr(msg, "turn_id", ""),
+        "provider_msg_id": msg.provider_msg_id or None,
+        "source_channel": msg.source_channel or "wecom_app",
         "from_userid": msg.from_user,
+        "conversation_type": msg.conversation_type or "single",
+        "conversation_id": msg.conversation_id or msg.from_user,
+        "chat_id": msg.chat_id or None,
+        "ordering_key": msg.ordering_key or f"wecom:{msg.source_channel or 'wecom_app'}:{msg.conversation_type or 'single'}:{msg.conversation_id or msg.from_user}",
         "msg_type": msg.msg_type,
         "content": msg.content,
         "media_id": msg.media_id,
+        "media_storage_ref": msg.media_storage_ref or None,
+        "provider_req_id": msg.provider_req_id or None,
+        "aibot_id": msg.aibot_id or None,
+        "created_at_epoch": msg.create_time,
         "create_time": msg.create_time,
         "inbound_event_id": inbound_event_id,
+        "_retry_count": 0,
         # Worker 用于计算真实排队时延；重试时保留原值，反映端到端积压。
         "_enqueued_at": time.time(),
     }
@@ -294,8 +321,17 @@ def _insert_inbound_event(msg: WeComMessage) -> int | None:
         db = SessionLocal()
         event = WecomInboundEvent(
             msg_id=msg.msg_id,
-            turn_id=str(uuid.uuid4()),
             from_userid=msg.from_user or "",
+            turn_id=msg.turn_id or str(uuid.uuid4()),
+            source_channel=msg.source_channel or "wecom_app",
+            provider_msg_id=msg.provider_msg_id or None,
+            conversation_type=msg.conversation_type or "single",
+            conversation_id=msg.conversation_id or msg.from_user or None,
+            chat_id=msg.chat_id or None,
+            ordering_key=msg.ordering_key or f"wecom:{msg.source_channel or 'wecom_app'}:{msg.conversation_type or 'single'}:{msg.conversation_id or msg.from_user}",
+            provider_req_id=msg.provider_req_id or None,
+            aibot_id=msg.aibot_id or None,
+            actor_id_kind=msg.actor_id_kind or "plain",
             msg_type=enum_type,
             media_id=media_id,
             content_brief=brief,
