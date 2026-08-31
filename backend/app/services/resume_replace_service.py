@@ -169,7 +169,16 @@ def create_replacement_candidate(
         raise RuntimeError("resume_auto_increment_invariant_violated")
     if media_ids:
         candidate.images = attach_media(
-            db, media_ids, "resume", candidate.id, owner_userid=owner_userid,
+            db,
+            media_ids,
+            "resume",
+            candidate.id,
+            owner_userid=owner_userid,
+            entity_version=int(
+                getattr(candidate, "aggregate_version", None)
+                or candidate.version
+                or 1
+            ),
         )
     rejected = audit_result.status == "rejected"
     relation = ResumeReplacement(
