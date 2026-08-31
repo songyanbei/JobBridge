@@ -1,0 +1,1 @@
+{"cmd":"aibot_subscribe","headers":{"req_id":"sub-1"},"body":{"bot_id":"BOTID","secret":"SECRET"}}

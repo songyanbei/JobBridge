@@ -1,0 +1,1 @@
+{"cmd":"aibot_respond_welcome_msg","headers":{"req_id":"evt-1"},"body":{"msgtype":"text","text":{"content":"您好！我是智能助手。"}}}

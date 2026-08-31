@@ -1,0 +1,1 @@
+{"cmd":"aibot_msg_callback","headers":{"req_id":"msg-1"},"body":{"msgid":"MSGID","aibotid":"AIBOTID","chatid":"CHATID","chattype":"group","from":{"userid":"USERID"},"msgtype":"text","text":{"content":"@RobotA hello"}}}
