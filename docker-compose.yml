@@ -88,6 +88,32 @@ services:
     restart: unless-stopped
     # Worker 纯后台消费，不对外暴露端口
 
+  # ---- AIBot WebSocket 单活连接器（默认关闭） ----
+  aibot-connection:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jobbridge-aibot-connection
+    command: python -m app.services.aibot_connection
+    env_file:
+      - ./.env
+    environment:
+      - APP_ENV=development
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TZ=${TZ:-Asia/Shanghai}
+      - WECOM_AIBOT_ENABLED=${WECOM_AIBOT_ENABLED:-false}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    restart: unless-stopped
+
 volumes:
   mysql_data:
   redis_data:

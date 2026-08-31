@@ -165,6 +165,31 @@ services:
       redis:
         condition: service_healthy
 
+  # ---- AIBot WebSocket 单活连接器 ----
+  # 默认由 WECOM_AIBOT_ENABLED=false 关闭；启用时保持单副本或依赖 Redis lease 选主。
+  aibot-connection:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: python -m app.services.aibot_connection
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - TZ=${TZ:-Asia/Shanghai}
+      - WECOM_AIBOT_ENABLED=${WECOM_AIBOT_ENABLED:-false}
+    volumes:
+      - app_logs:/data/logs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
 volumes:
   mysql_data:
   redis_data:

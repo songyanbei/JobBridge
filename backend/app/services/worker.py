@@ -80,6 +80,11 @@ from app.wecom.client import (
     recipient_rejected,
     whitelist_send_response,
 )
+from app.services.delivery_registry import (
+    DeliveryRegistry,
+    LEGACY_CHANNEL,
+    LegacyWeComSender,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +255,12 @@ class Worker:
         self._heartbeat_thread: threading.Thread | None = None
         self._redis = get_redis()
         self._wecom_client = WeComClient()
+        # Each Worker gets an adapter bound to its own HTTP client (tests and
+        # token caches may replace this client).  No AIBot sender is registered
+        # in the ordinary Worker process.
+        self._delivery_registry = DeliveryRegistry({
+            LEGACY_CHANNEL: LegacyWeComSender(self._wecom_client),
+        })
         self._last_recovery_scan = 0.0
         # 每个进程一个稳定且全局唯一的 lease owner。所有 delivery 状态转移都带
         # `lease_owner=?` 条件，租约过期后被别人接管的旧 Worker 无法再覆盖新状态
@@ -600,10 +611,12 @@ class Worker:
     def _process_message(self, msg_data: dict) -> None:
         process_started = time.perf_counter()
         userid = msg_data.get("from_userid") or ""
+        ordering_key = msg_data.get("ordering_key") or userid
+        channel = msg_data.get("source_channel") or LEGACY_CHANNEL
         inbound_event_id = msg_data.get("inbound_event_id")
         retry_count = int(msg_data.get("_retry_count") or 0)
 
-        if not userid:
+        if not userid and channel != "wecom_aibot":
             logger.warning(
                 "worker: queue payload without from_userid msg_id=%s keys=%s",
                 msg_data.get("msg_id"),
@@ -619,13 +632,13 @@ class Worker:
             max(0, int((time.time() - enqueued_at) * 1000))
             if enqueued_at > 0 else None
         )
-        user_hash = identifier_hash(userid)
+        user_hash = identifier_hash(userid or ordering_key)
         lock_started = time.perf_counter()
         outcome = "unknown"
 
         # 分布式锁：同一 userid 串行（blocking_timeout=5 秒）
         try:
-            with user_lock(userid, timeout=5) as lock_lease:
+            with user_lock(ordering_key, timeout=5) as lock_lease:
                 lock_wait_ms = int((time.perf_counter() - lock_started) * 1000)
                 if not lock_lease:
                     outcome = "lock_busy_requeued"
@@ -646,7 +659,9 @@ class Worker:
                 # Redis lock guarantees“同一时刻只有一个”，但不保证等待者按入队
                 # 顺序获得锁。以 durable inbound_event.id 作单调序列门禁，后到消息
                 # 若发现同用户仍有更早未完成事件，只重入队而不触碰 session/DB。
-                if self._has_earlier_unfinished_event(userid, inbound_event_id):
+                if self._has_earlier_unfinished_event(
+                    userid, inbound_event_id, ordering_key=ordering_key,
+                ):
                     outcome = "out_of_order_requeued"
                     try:
                         enqueue_message(
@@ -678,20 +693,24 @@ class Worker:
             )
 
     def _has_earlier_unfinished_event(
-        self, userid: str, inbound_event_id: Any,
+        self, userid: str, inbound_event_id: Any, *, ordering_key: str | None = None,
     ) -> bool:
         """Whether a durable earlier message for this user still owns sequence priority."""
         if not inbound_event_id:
             return False
         db = SessionLocal()
         try:
-            return db.query(WecomInboundEvent.id).filter(
-                WecomInboundEvent.from_userid == userid,
+            query = db.query(WecomInboundEvent.id).filter(
                 WecomInboundEvent.id < int(inbound_event_id),
                 WecomInboundEvent.status.in_(
                     ("received", "processing", "session_pending", "failed"),
                 ),
-            ).first() is not None
+            )
+            if ordering_key and ordering_key != userid:
+                query = query.filter(WecomInboundEvent.ordering_key == ordering_key)
+            else:
+                query = query.filter(WecomInboundEvent.from_userid == userid)
+            return query.first() is not None
         except Exception:
             # Availability must not silently defeat ordering. Requeue and retry the
             # read rather than process a possibly stale turn.
@@ -1647,6 +1666,20 @@ class Worker:
         replies: list[ReplyMessage],
     ) -> None:
         """在 router 业务事务中持久化有序回复意图。"""
+        source_channel = LEGACY_CHANNEL
+        conversation_type = "single"
+        conversation_id = None
+        chat_id = None
+        ordering_key = None
+        provider_req_id = None
+        inbound = db.get(WecomInboundEvent, int(inbound_event_id)) if inbound_event_id else None
+        if inbound is not None:
+            source_channel = inbound.source_channel or LEGACY_CHANNEL
+            conversation_type = inbound.conversation_type or "single"
+            conversation_id = inbound.conversation_id
+            chat_id = inbound.chat_id
+            ordering_key = inbound.ordering_key
+            provider_req_id = inbound.provider_req_id
         for index, reply in enumerate(replies):
             if reply.recommendation_context:
                 from app.services.recommendation_delivery_service import prepare_delivery
@@ -1696,6 +1729,13 @@ class Worker:
                 intent=reply.intent,
                 criteria_snapshot=reply.criteria_snapshot,
                 status="pending",
+                channel=source_channel,
+                conversation_type=conversation_type,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                ordering_key=ordering_key,
+                provider_req_id=provider_req_id,
+                reply_command=("aibot_respond_msg" if source_channel == "wecom_aibot" else None),
             ))
 
     def _claim_outbox(
@@ -1719,7 +1759,7 @@ class Worker:
             candidates = (
                 _build_outbox_claim_query(
                     discovery,
-                    self._outbox_due_predicate(func.now(6)),
+                    self._outbox_due_predicate(func.now(6), channel=LEGACY_CHANNEL),
                     inbound_event_id=inbound_event_id,
                     limit=limit,
                     lock_rows=False,
@@ -1752,11 +1792,11 @@ class Worker:
         return claimed
 
     @staticmethod
-    def _outbox_due_predicate(now: Any):
+    def _outbox_due_predicate(now: Any, *, channel: str | None = None):
         stale_before = func.timestampadd(
             text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
         )
-        return or_(
+        predicate = or_(
             and_(
                 WecomOutboundOutbox.status == "pending",
                 or_(
@@ -1770,6 +1810,17 @@ class Worker:
                 WecomOutboundOutbox.recommendation_delivery_id.is_(None),
             ),
         )
+        if channel == LEGACY_CHANNEL:
+            predicate = and_(
+                or_(
+                    WecomOutboundOutbox.channel == LEGACY_CHANNEL,
+                    WecomOutboundOutbox.channel.is_(None),
+                ),
+                predicate,
+            )
+        elif channel:
+            predicate = and_(WecomOutboundOutbox.channel == channel, predicate)
+        return predicate
 
     def _recover_stale_outbox_claims(self) -> bool:
         """在独立事务收敛陈旧 lease，不把这些锁带入目标复核。"""
@@ -1780,6 +1831,10 @@ class Worker:
                 text("SECOND"), -OUTBOX_SENDING_STALE_SECONDS, now,
             )
             ambiguous = db.query(WecomOutboundOutbox).filter(
+                or_(
+                    WecomOutboundOutbox.channel == LEGACY_CHANNEL,
+                    WecomOutboundOutbox.channel.is_(None),
+                ),
                 WecomOutboundOutbox.status == "sending",
                 WecomOutboundOutbox.locked_at <= stale_before,
                 WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
@@ -1788,6 +1843,7 @@ class Worker:
                 # outbox 自己的枚举里 dead_letter 是合法终态（phase8 DDL），保持不变。
                 stale.status = "dead_letter"
                 stale.locked_at = None
+                stale.lease_owner = None
                 stale.last_error = "ambiguous provider outcome; automatic resend disabled"
                 delivery = db.get(
                     RecommendationDelivery, stale.recommendation_delivery_id,
@@ -1865,7 +1921,7 @@ class Worker:
             row = (
                 _build_outbox_claim_query(
                     db,
-                    self._outbox_due_predicate(now),
+                    self._outbox_due_predicate(now, channel=LEGACY_CHANNEL),
                     inbound_event_id=inbound_event_id,
                     outbox_id=outbox_id,
                     limit=1,
@@ -1963,6 +2019,7 @@ class Worker:
             else:
                 row.status = "sending"
                 row.locked_at = now
+                row.lease_owner = self._lease_owner
                 row.attempt_count = int(row.attempt_count or 0) + 1
             item = {
                 "id": int(row.id),
@@ -1971,6 +2028,10 @@ class Worker:
                 "recommendation_delivery_id": row.recommendation_delivery_id,
                 "contact_delivery_id": row.contact_delivery_id,
                 "attempt_count": int(row.attempt_count),
+                "channel": row.channel or LEGACY_CHANNEL,
+                "lease_owner": row.lease_owner,
+                "provider_req_id": row.provider_req_id,
+                "reply_command": row.reply_command,
             }
             db.commit()
             return item
@@ -2170,6 +2231,7 @@ class Worker:
 
         row.status = "sending"
         row.locked_at = now
+        row.lease_owner = self._lease_owner
         row.attempt_count = int(row.attempt_count or 0) + 1
         return content
 
@@ -2240,6 +2302,7 @@ class Worker:
         )
         row.status = "pending"
         row.locked_at = None
+        row.lease_owner = None
         row.next_attempt_at = func.timestampadd(
             text("SECOND"), backoff, func.now(6),
         )
@@ -2283,6 +2346,7 @@ class Worker:
             updated = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.id == outbox_id,
                 WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.lease_owner == self._lease_owner,
             ).update({
                 "status": "sent",
                 "provider_msg_id": (provider_msg_id or "")[:128] or None,
@@ -2290,6 +2354,7 @@ class Worker:
                 "locked_at": None,
                 "next_attempt_at": None,
                 "last_error": None,
+                "lease_owner": None,
             })
             return updated == 1
 
@@ -2323,6 +2388,7 @@ class Worker:
             updated = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.id == item["id"],
                 WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.lease_owner == self._lease_owner,
             ).update({
                 "status": "sent",
                 "provider_msg_id": (str(msgid or ""))[:128] or None,
@@ -2330,6 +2396,7 @@ class Worker:
                 "locked_at": None,
                 "next_attempt_at": None,
                 "last_error": None,
+                "lease_owner": None,
             })
             # 条件 UPDATE + lease owner：租约过期后被别人接管的旧 Worker
             # 不能把新状态覆盖回 sent（§10.4）。
@@ -2429,6 +2496,7 @@ class Worker:
             values: dict = {
                 "status": "dead_letter" if dead else "pending",
                 "locked_at": None,
+                "lease_owner": None,
                 "last_error": f"{type(error).__name__}: {error}"[:1000],
             }
             if dead:
@@ -2441,6 +2509,7 @@ class Worker:
             db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.id == item["id"],
                 WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.lease_owner == self._lease_owner,
             ).update(values)
             delivery_id = item.get("recommendation_delivery_id")
             if delivery_id:
@@ -2504,9 +2573,13 @@ class Worker:
 
     def _deliver_outbox_item(self, item: dict) -> bool:
         try:
-            response = self._wecom_client.send_text(
-                item["userid"], item["content"],
-            )
+            channel = item.get("channel") or LEGACY_CHANNEL
+            if channel != LEGACY_CHANNEL:
+                # Ordinary Worker is intentionally legacy-only. AIBot rows are
+                # owned by the standalone connection writer and remain pending.
+                logger.warning("worker: refusing non-legacy outbox id=%s channel=%s", item.get("id"), channel)
+                return False
+            response = self._delivery_registry.for_channel(LEGACY_CHANNEL).send(item)
         except WeComError as exc:
             if getattr(exc, "errcode", 0) == 42001:
                 try:
@@ -3253,6 +3326,7 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
     - content 只对 text/event 类型有意义；媒体类型 content_brief 只是类型标签，
       不要把它当 text content 传给 router（否则 message_router 会当成用户在发字面文本）
     """
+<<<<<<< HEAD
     def _text(value: object, default: str = "") -> str:
         return value if isinstance(value, str) else default
 
@@ -3284,6 +3358,7 @@ def _inbound_event_to_queue_msg(row: WecomInboundEvent) -> dict:
         "media_storage_ref": _text(getattr(row, "media_storage_ref", None)),
         "provider_req_id": _text(getattr(row, "provider_req_id", None)) or None,
         "aibot_id": _text(getattr(row, "aibot_id", None)) or None,
+        "actor_id_kind": _text(getattr(row, "actor_id_kind", None), "plain"),
         "created_at_epoch": int(row.created_at.timestamp()) if hasattr(row.created_at, "timestamp") else 0,
         "create_time": int(row.created_at.timestamp()) if hasattr(row.created_at, "timestamp") else 0,
         "_retry_count": _integer(row.retry_count),
