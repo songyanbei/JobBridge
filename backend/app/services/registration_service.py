@@ -53,6 +53,10 @@ def ensure_binding(
 ) -> AibotIdentityBinding:
     if not canonical_userid or len(canonical_userid) > 64:
         raise ValueError("canonical userid is required")
+    # The binding table has an FK to User.external_userid.  Ensure the
+    # canonical User row is present before flushing the binding, otherwise a
+    # first-touch verified actor fails with an FK violation.
+    _ensure_canonical_user(db, canonical_userid)
     existing = db.query(AibotIdentityBinding).filter(
         AibotIdentityBinding.bot_id == bot_id,
         AibotIdentityBinding.opaque_actor_digest == opaque_actor_digest_value,
@@ -87,14 +91,7 @@ def auto_register_worker(db: Session, canonical_userid: str, binding: AibotIdent
     """Create the minimum worker account for a verified canonical member."""
     if not canonical_userid or canonical_userid != binding.canonical_userid:
         raise ValueError("canonical binding mismatch")
-    user = db.query(User).filter(User.external_userid == canonical_userid).first()
-    if user is None:
-        user = User(
-            external_userid=canonical_userid, role="worker", status="active",
-            can_search_jobs=1, can_search_workers=0,
-        )
-        db.add(user)
-        db.flush()
+    user = _ensure_canonical_user(db, canonical_userid)
     registration = db.query(AibotRegistration).filter(
         AibotRegistration.identity_binding_id == binding.binding_id,
     ).first()
@@ -110,6 +107,19 @@ def auto_register_worker(db: Session, canonical_userid: str, binding: AibotIdent
     elif registration.registration_status not in {"active", "revoked"}:
         registration.registration_status = "active"
         registration.granted_role = "worker"
+    return user
+
+
+def _ensure_canonical_user(db: Session, canonical_userid: str) -> User:
+    """Return an existing User or create the minimal worker account."""
+    user = db.query(User).filter(User.external_userid == canonical_userid).first()
+    if user is None:
+        user = User(
+            external_userid=canonical_userid, role="worker", status="active",
+            can_search_jobs=1, can_search_workers=0,
+        )
+        db.add(user)
+        db.flush()
     return user
 
 

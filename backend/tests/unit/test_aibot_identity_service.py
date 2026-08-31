@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from app.services import aibot_identity_service as service
+from app.services import registration_service
 from app.wecom.identity_client import ConversionResult, IdentityClientError
 
 
@@ -49,3 +50,20 @@ def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatc
     assert result.status == "conversion_pending"
     assert result.reason_code == "conversion_unavailable"
     assert row.identity_status == "conversion_pending"
+
+
+def test_binding_ensures_canonical_user_before_flush(monkeypatch):
+    db = Mock()
+    calls = []
+    canonical_user = SimpleNamespace(external_userid="zhangsan", role="worker", can_search_jobs=1, can_search_workers=0)
+    monkeypatch.setattr(registration_service, "_ensure_canonical_user", lambda _db, userid: calls.append(("user", userid)) or canonical_user)
+    db.query.return_value.filter.return_value.first.return_value = None
+    db.flush.side_effect = lambda: calls.append(("flush", "binding"))
+
+    binding = registration_service.ensure_binding(
+        db, bot_id="bot", opaque_actor_digest_value="d" * 64, canonical_userid="zhangsan",
+    )
+
+    assert binding.canonical_userid == "zhangsan"
+    assert calls[0] == ("user", "zhangsan")
+    assert calls.index(("user", "zhangsan")) < calls.index(("flush", "binding"))
