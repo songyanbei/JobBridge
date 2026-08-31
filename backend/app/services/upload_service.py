@@ -884,6 +884,11 @@ def _create_job(
 
     job = Job(
         owner_userid=user_ctx.external_userid,
+        # Initialize both version columns explicitly.  Relying on server
+        # defaults leaves a mixed-version fleet able to activate a row after
+        # only the legacy version has been materialized.
+        version=1,
+        aggregate_version=1,
         hiring_company=_extract_scalar(data, "hiring_company", "") or None,
         city=_extract_scalar(data, "city", ""),
         job_category=data.get("job_category", ""),
