@@ -886,6 +886,11 @@ def _reject_resume(
         after=_snapshot(candidate, "resume"),
         reason=reason,
     )
+    from app.services.resume_mutation_service import append_resume_domain_event
+    append_resume_domain_event(
+        db, candidate, "resume.rejected",
+        payload={"status": "rejected", "reason_code": "manual_reject"},
+    )
     if block_user:
         user = db.query(User).filter(User.external_userid == candidate.owner_userid).first()
         if user and user.status != "blocked":
@@ -962,7 +967,8 @@ def edit_action(
 
     if target_type == "resume":
         from app.services.resume_mutation_service import (
-            increment_resume_version, lock_resume, reject_if_replacement_in_progress,
+            append_resume_domain_event, increment_resume_version, lock_resume,
+            reject_if_replacement_in_progress,
         )
         relation_hint = db.query(ResumeReplacement).filter(
             ResumeReplacement.new_resume_id == target_id,
@@ -996,6 +1002,10 @@ def edit_action(
         write_admin_log(
             db, target_type=target_type, target_id=target_id,
             action="manual_edit", operator=operator, before=before, after=after,
+        )
+        append_resume_domain_event(
+            db, obj, "resume.updated",
+            payload={"reason": "audit_edit", "fields": sorted(fields)},
         )
         db.commit()
         save_undo(target_type, target_id, {
@@ -1141,6 +1151,12 @@ def undo(db: Session, target_type: str, target_id: int, operator: str) -> None:
         after=_snapshot(obj, target_type),
         reason=f"undo previous action: {payload.get('action')}",
     )
+    if target_type == "resume":
+        from app.services.resume_mutation_service import append_resume_domain_event
+        append_resume_domain_event(
+            db, obj, "resume.updated",
+            payload={"status": "updated", "reason_code": "audit_undo"},
+        )
     db.commit()
     try:
         consume_result = consume_undo_if_unchanged(

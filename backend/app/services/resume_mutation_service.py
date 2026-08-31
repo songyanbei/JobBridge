@@ -27,6 +27,50 @@ def increment_resume_version(resume: Resume) -> None:
         resume.aggregate_version = max(current_version, current_aggregate) + 1
 
 
+def append_resume_domain_event(
+    db: Session,
+    resume: Resume,
+    event_type: str,
+    *,
+    payload: dict | None = None,
+    tombstone: bool = False,
+) -> None:
+    """Append a PII-free Resume event without breaking legacy deployments."""
+    if db is None or getattr(resume, "id", None) is None:
+        return
+    try:
+        from sqlalchemy import inspect
+
+        bind = getattr(db, "bind", None)
+        if bind is None:
+            return
+        if getattr(db, "in_transaction", lambda: False)():
+            available = bool(inspect(db.connection()).has_table("domain_outbox_event"))
+        else:
+            available = bool(inspect(bind).has_table("domain_outbox_event"))
+    except Exception:
+        available = False
+    version = int(getattr(resume, "aggregate_version", None) or resume.version or 1)
+    body = dict(payload or {})
+    body.setdefault("resume_id", int(resume.id))
+    if not available:
+        pending = getattr(db, "info", {}).setdefault("pending_resume_lifecycle_events", [])
+        pending.append({
+            "aggregate_type": "resume", "aggregate_id": int(resume.id),
+            "aggregate_version": version, "event_type": event_type,
+            "payload": body, "tombstone": bool(tombstone),
+        })
+        return
+    from app.services.domain_outbox_service import append_domain_event
+
+    db.flush()
+    append_domain_event(
+        db, aggregate_type="resume", aggregate_id=int(resume.id),
+        aggregate_version=version, event_type=event_type,
+        payload=body, tombstone=tombstone,
+    )
+
+
 def lock_resume(db: Session, resume_id: int) -> Resume:
     resume = (
         db.query(Resume)

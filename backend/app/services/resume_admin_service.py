@@ -13,7 +13,7 @@ from app.core.exceptions import BusinessException
 from app.models import Resume, ResumeReplacement, SystemConfig
 from app.services.admin_log_service import _json_safe, write_admin_log
 from app.services.resume_mutation_service import (
-    close_active_replacement, increment_resume_version, lock_resume,
+    append_resume_domain_event, close_active_replacement, increment_resume_version, lock_resume,
     reject_if_replacement_in_progress, resume_is_online, utc_now_naive,
 )
 
@@ -232,10 +232,19 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
 
     # 原子 UPDATE + version 递增
     new_version = int(version) + 1
-    patch = {**payload, "version": new_version}
+    current_aggregate = int(getattr(resume, "aggregate_version", None) or 0)
+    patch = {
+        **payload,
+        "version": new_version,
+        "aggregate_version": max(current_aggregate, int(version)) + 1,
+    }
     rowcount = (
         db.query(Resume)
-        .filter(Resume.id == resume_id, Resume.version == version)
+        .filter(
+            Resume.id == resume_id,
+            Resume.version == version,
+            Resume.aggregate_version == current_aggregate,
+        )
         .update(patch, synchronize_session=False)
     )
     if rowcount == 0:
@@ -254,6 +263,10 @@ def update_resume(db: Session, resume_id: int, version: int, payload: dict, oper
         target_type="resume", target_id=resume.id,
         action="manual_edit", operator=operator,
         before=before, after=after,
+    )
+    append_resume_domain_event(
+        db, resume, "resume.updated",
+        payload={"status": "updated", "reason_code": "manual_edit"},
     )
     db.commit()
     return resume
@@ -304,6 +317,10 @@ def delist(db: Session, resume_id: int, version: int, reason: str, operator: str
         after=_snapshot(resume) | {"deleted_at": now.isoformat()},
         reason=f"delist:{reason}",
     )
+    append_resume_domain_event(
+        db, resume, "resume.delisted",
+        payload={"status": "delisted", "reason_code": "manual_delist"}, tombstone=True,
+    )
     db.commit()
 
 
@@ -336,6 +353,10 @@ def extend(db: Session, resume_id: int, version: int, days: int, operator: str) 
         target_type="resume", target_id=resume.id,
         action="manual_edit", operator=operator,
         before=before, after=_snapshot(resume), reason=f"extend:{days}d",
+    )
+    append_resume_domain_event(
+        db, resume, "resume.updated",
+        payload={"reason": "extend", "days": int(days)},
     )
     db.commit()
     return resume
