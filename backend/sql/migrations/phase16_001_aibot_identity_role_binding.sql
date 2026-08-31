@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS aibot_identity_binding (
   updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   PRIMARY KEY (binding_id),
   UNIQUE KEY uk_aibot_binding_identity_status (bot_id, opaque_actor_digest, binding_status),
+  UNIQUE KEY uk_aibot_binding_canonical_status (bot_id, canonical_userid, binding_status),
   KEY idx_aibot_binding_canonical (bot_id, canonical_userid, binding_status),
   CONSTRAINT fk_aibot_binding_user FOREIGN KEY (canonical_userid) REFERENCES user(external_userid) ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -96,6 +97,15 @@ CREATE TABLE IF NOT EXISTS aibot_identity_audit (
 -- Backfill only non-sensitive metadata.  Existing phase14 rows remain valid.
 UPDATE wecom_aibot_identity SET canonical_userid=COALESCE(canonical_userid, mapped_external_userid)
  WHERE canonical_userid IS NULL AND mapped_external_userid IS NOT NULL;
+
+-- Duplicate preflight is intentionally fail-closed: the unique-index DDL
+-- below must fail if historical duplicate active rows exist.  Operators must
+-- reconcile those rows explicitly; this migration never deletes or picks a
+-- winner silently.
+SET @ddl = IF((SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=@schema_name AND table_name='aibot_identity_binding' AND index_name='uk_aibot_binding_canonical_status')=0,
+  'ALTER TABLE aibot_identity_binding ADD UNIQUE KEY uk_aibot_binding_canonical_status (bot_id, canonical_userid, binding_status)', 'SELECT 1'); PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
+SET @ddl = IF((SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=@schema_name AND table_name='aibot_registration' AND index_name='uk_aibot_registration_binding')=0,
+  'ALTER TABLE aibot_registration ADD UNIQUE KEY uk_aibot_registration_binding (identity_binding_id)', 'SELECT 1'); PREPARE s FROM @ddl; EXECUTE s; DEALLOCATE PREPARE s;
 
 -- DOWN is intentionally manual and guarded: export identity/audit rows first,
 -- stop AIBot, then drop only these additive tables/columns.  Never alter User.

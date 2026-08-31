@@ -1265,6 +1265,7 @@ class AibotIdentityBinding(Base):
 
     __table_args__ = (
         sa.UniqueConstraint("bot_id", "opaque_actor_digest", "binding_status", name="uk_aibot_binding_identity_status"),
+        sa.UniqueConstraint("bot_id", "canonical_userid", "binding_status", name="uk_aibot_binding_canonical_status"),
         sa.Index("idx_aibot_binding_canonical", "bot_id", "canonical_userid", "binding_status"),
     )
 
@@ -1283,7 +1284,10 @@ class AibotRegistration(Base):
     created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"))
     updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.text("CURRENT_TIMESTAMP(6)"), onupdate=sa.func.now())
 
-    __table_args__ = (sa.Index("idx_aibot_registration_user_status", "canonical_userid", "registration_status"),)
+    __table_args__ = (
+        sa.UniqueConstraint("identity_binding_id", name="uk_aibot_registration_binding"),
+        sa.Index("idx_aibot_registration_user_status", "canonical_userid", "registration_status"),
+    )
 
 
 class AibotRoleInvite(Base):
