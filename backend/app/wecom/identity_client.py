@@ -172,9 +172,9 @@ class WeComIdentityAppClient:
         if not isinstance(payload, dict):
             return False, "directory_invalid_response"
         try:
-            errcode = int(payload.get("errcode", 0) or 0)
-        except (TypeError, ValueError):
-            return False, "directory_invalid_response"
+            errcode = _errcode(payload, "directory")
+        except IdentityClientError as exc:
+            return False, exc.code
         if errcode == 0:
             # Do not expose/return payload fields such as name, mobile or
             # department; errcode=0 is the only visibility signal required.
@@ -183,7 +183,10 @@ class WeComIdentityAppClient:
             return False, "directory_not_visible"
         if 500 <= errcode <= 599 or 50000 <= errcode <= 59999:
             return False, "directory_unavailable"
-        return False, f"directory_err_{errcode}"
+        try:
+            raise _provider_error("directory", errcode)
+        except IdentityClientError as exc:
+            return False, "directory_unavailable" if exc.retryable else exc.code
 
     def _convert_batch(self, chunk: list[str]) -> tuple[dict[str, str], set[str]]:
         token = self.get_access_token()

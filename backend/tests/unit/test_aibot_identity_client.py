@@ -63,6 +63,32 @@ def test_directory_not_visible_and_timeout_fail_closed():
     assert timeout_client.is_canonical_user_visible("canonical-a") == (False, "directory_unavailable")
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, (False, "directory_invalid")),
+        ({"errcode": "0"}, (False, "directory_invalid")),
+        ({"errcode": True}, (False, "directory_invalid")),
+        ({"errcode": 1.0}, (False, "directory_invalid")),
+        ({"errcode": -1}, (False, "unknown_errcode")),
+        ({"errcode": 999999}, (False, "unknown_errcode")),
+        ({"errcode": 500}, (False, "directory_unavailable")),
+        ({"errcode": 50002}, (False, "directory_unavailable")),
+        ({"errcode": 0, "userid": "canonical-a"}, (True, "visible")),
+    ],
+)
+def test_directory_errcode_response_matrix(payload, expected):
+    class _MatrixTransport(_Transport):
+        def get(self, url, **kwargs):
+            self.gets += 1
+            if url.endswith("/gettoken"):
+                return _Response({"errcode": 0, "access_token": "token", "expires_in": 7200})
+            return _Response(payload)
+
+    client = WeComIdentityAppClient("corp", "secret", transport=_MatrixTransport({}))
+    assert client.is_canonical_user_visible("canonical-a") == expected
+
+
 def test_batch_maps_by_open_userid_and_caches_token():
     transport = _Transport({
         "errcode": 0,
