@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from app.api.admin import accounts
+from app.models import AibotIdentityAudit
 from app.schemas.account import AibotPreRegisterRequest
 from app.services import account_service
 from app.core.exceptions import BusinessException
@@ -51,6 +52,8 @@ def test_preregister_creates_minimum_user_and_reuses_pending_registration(monkey
 
 def test_preregister_rejects_conflicting_pending_role_and_audits(monkeypatch):
     db = Mock()
+    audit_db = Mock()
+    monkeypatch.setattr(account_service, "SessionLocal", lambda: audit_db)
     binding = SimpleNamespace(
         binding_id="b1",
         bot_id="bot-1",
@@ -73,12 +76,14 @@ def test_preregister_rejects_conflicting_pending_role_and_audits(monkeypatch):
     assert exc_info.value.code == 40904
     assert "冲突" in exc_info.value.message
     assert pending.requested_role == "factory"
-    audit = db.add.call_args.args[0]
+    audit = audit_db.add.call_args.args[0]
     assert audit.action == "registration_role_conflict"
     assert audit.result == "rejected"
     assert audit.reason_code == "pending_role_conflict"
     assert audit.audit_metadata["existing_role"] == "factory"
     assert audit.audit_metadata["requested_role"] == "broker"
+    audit_db.commit.assert_called_once_with()
+    audit_db.close.assert_called_once_with()
 
 
 def test_preregister_route_propagates_role_conflict_and_rolls_back(monkeypatch):
@@ -101,3 +106,69 @@ def test_preregister_route_propagates_role_conflict_and_rolls_back(monkeypatch):
 
     assert exc_info.value.code == 40904
     db.rollback.assert_called_once_with()
+
+
+def test_preregister_route_conflict_audit_survives_outer_rollback(monkeypatch):
+    class _AuditSession:
+        def __init__(self):
+            self.rows = []
+
+        def add(self, row):
+            self.rows.append(row)
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            self.rows.clear()
+
+        def close(self):
+            return None
+
+        def query(self, _model):
+            query = Mock()
+            query.filter.return_value = query
+            query.first.return_value = self.rows[0] if self.rows else None
+            return query
+
+    db = Mock()
+    binding = SimpleNamespace(
+        binding_id="b1",
+        bot_id="bot-1",
+        opaque_actor_digest="d" * 64,
+        canonical_userid="canonical-1",
+        binding_status="active",
+    )
+    pending = SimpleNamespace(
+        registration_id="r1", registration_status="pending_role", requested_role="factory",
+    )
+    user = SimpleNamespace(external_userid="canonical-1", role="worker", can_search_jobs=1, can_search_workers=0)
+    monkeypatch.setattr(account_service.registration_service, "_ensure_canonical_user", lambda _db, _userid: user)
+    results = [binding, pending]
+
+    def query(_model):
+        query = Mock()
+        query.filter.return_value = query
+        query.first.side_effect = lambda: results.pop(0)
+        return query
+
+    db.query.side_effect = query
+    audit_db = _AuditSession()
+    monkeypatch.setattr(account_service, "SessionLocal", lambda: audit_db)
+
+    with pytest.raises(BusinessException) as exc_info:
+        accounts.pre_register_aibot_binding(
+            "b1",
+            AibotPreRegisterRequest(role="broker"),
+            db=db,
+            current=SimpleNamespace(username="admin"),
+        )
+
+    assert exc_info.value.code == 40904
+    db.rollback.assert_called_once_with()
+    saved = audit_db.query(AibotIdentityAudit).filter(
+        AibotIdentityAudit.action == "registration_role_conflict",
+    ).first()
+    assert saved is not None
+    assert saved.result == "rejected"
+    assert saved.reason_code == "pending_role_conflict"

@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
+from app.db import SessionLocal
 from app.models import AibotIdentityBinding, AibotRegistration, SystemConfig, User
 from app.services import registration_service
 from app.services.admin_log_service import write_admin_log
@@ -28,6 +29,44 @@ logger = logging.getLogger(__name__)
 
 def _gen_external_userid(role: str) -> str:
     return f"pre_{role}_{uuid.uuid4().hex[:8]}"
+
+
+def _persist_aibot_role_conflict_audit(
+    *,
+    binding: AibotIdentityBinding,
+    registration: AibotRegistration,
+    requested_role: str,
+    operator: str,
+) -> None:
+    """Persist role-conflict evidence outside the request transaction.
+
+    The admin route rolls back its request session when the conflict is raised;
+    using a dedicated session keeps the audit row durable without committing
+    unrelated work.  Only the binding digest and canonical userid are stored.
+    """
+    audit_db = SessionLocal()
+    try:
+        registration_service._audit(
+            audit_db,
+            bot_id=getattr(binding, "bot_id", ""),
+            digest=getattr(binding, "opaque_actor_digest", ""),
+            action="registration_role_conflict",
+            result="rejected",
+            canonical=binding.canonical_userid,
+            actor=operator,
+            reason="pending_role_conflict",
+            metadata={
+                "registration_id": registration.registration_id,
+                "existing_role": registration.requested_role,
+                "requested_role": requested_role,
+            },
+        )
+        audit_db.commit()
+    except Exception:
+        audit_db.rollback()
+        logger.exception("aibot role conflict audit persistence failed")
+    finally:
+        audit_db.close()
 
 
 def _sanitize_cell(value: Any) -> Any:
@@ -198,20 +237,11 @@ def pre_register_aibot(
     ).first()
     if existing and existing.registration_status not in {"rejected", "revoked"}:
         if existing.registration_status == "pending_role" and existing.requested_role != role:
-            registration_service._audit(
-                db,
-                bot_id=getattr(binding, "bot_id", ""),
-                digest=getattr(binding, "opaque_actor_digest", ""),
-                action="registration_role_conflict",
-                result="rejected",
-                canonical=binding.canonical_userid,
-                actor=operator,
-                reason="pending_role_conflict",
-                metadata={
-                    "registration_id": existing.registration_id,
-                    "existing_role": existing.requested_role,
-                    "requested_role": role,
-                },
+            _persist_aibot_role_conflict_audit(
+                binding=binding,
+                registration=existing,
+                requested_role=role,
+                operator=operator,
             )
             raise BusinessException(40904, "已有待审核角色申请，申请角色冲突")
         return existing
