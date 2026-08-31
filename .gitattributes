@@ -5,6 +5,9 @@
 # Pin them to LF so the checksum is platform-independent.
 backend/sql/migrations/** text eol=lf
 
+# Phase11 manifest hashes Python migration helpers byte-for-byte too.
+backend/scripts/phase11_resume_*.py text eol=lf
+
 # WSL entrypoints must remain executable as LF files even on Windows checkouts.
 mock-testbed/scripts/wsl-e2e-smoke.sh text eol=lf
 mock-testbed/scripts/wsl-e2e-full-smoke.sh text eol=lf
