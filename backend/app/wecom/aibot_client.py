@@ -38,6 +38,8 @@ class AibotClient:
     def respond_welcome(self, req_id: str, content: str) -> dict[str, Any]:
         return self._text_frame("aibot_respond_welcome_msg", req_id, content)
 
+    respond_welcome_msg = respond_welcome
+
     def respond_msg(self, req_id: str, content: str) -> dict[str, Any]:
         return self._text_frame("aibot_respond_msg", req_id, content)
 
@@ -74,6 +76,14 @@ class AibotClient:
             self._streams[stream_id] = "__finished__"
         return self._frame("aibot_respond_update_msg", req_id, {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": content}})
 
+    # Explicit builder aliases make the command names easy to discover for
+    # callers that construct frames without retaining a client instance.
+    build_subscribe = subscribe
+    build_ping = ping
+    build_respond_msg = respond_msg
+    build_respond_update_msg = respond_update_msg
+    build_send_msg = send_msg
+
     @staticmethod
     def parse_ack(payload: str | bytes | dict[str, Any]) -> tuple[str, int, str]:
         import json
@@ -86,4 +96,3 @@ class AibotClient:
 
 
 AIBotClient = AibotClient
-
