@@ -100,9 +100,16 @@ class AibotOutboxWriter:
             )
             claimed = []
             for row in rows:
-                if row.reply_expires_at is not None and row.reply_expires_at <= datetime.utcnow():
+                now_utc = datetime.utcnow()
+                expired_reply = row.reply_expires_at is not None and row.reply_expires_at <= now_utc
+                expired_stream = (
+                    row.stream_id is not None
+                    and row.stream_deadline_at is not None
+                    and row.stream_deadline_at <= now_utc
+                )
+                if expired_reply or expired_stream:
                     row.status = "dead_letter"
-                    row.last_error = "reply_window_expired"
+                    row.last_error = "stream_deadline_expired" if expired_stream else "reply_window_expired"
                     continue
                 row.status = "sending"
                 command = row.reply_command or "aibot_respond_msg"
@@ -145,6 +152,25 @@ class AibotOutboxWriter:
         try:
             now = func.now(6)
             stale_before = func.timestampadd(text("SECOND"), -OUTBOX_LEASE_SECONDS, now)
+            expired = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                or_(
+                    WecomOutboundOutbox.reply_expires_at <= now,
+                    and_(
+                        WecomOutboundOutbox.stream_id.isnot(None),
+                        WecomOutboundOutbox.stream_deadline_at <= now,
+                    ),
+                ),
+            ).update({
+                "status": "dead_letter",
+                "uncertain_at": None,
+                "locked_at": None,
+                "last_error": "reply_window_expired",
+                "lease_owner": None,
+                "fencing_token": None,
+            }, synchronize_session=False)
             count = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.channel == AIBOT_CHANNEL,
                 WecomOutboundOutbox.status == "sending",
@@ -158,7 +184,7 @@ class AibotOutboxWriter:
                 "fencing_token": None,
             }, synchronize_session=False)
             db.commit()
-            return int(count or 0)
+            return int((count or 0) + (expired or 0))
         except Exception:
             db.rollback()
             logger.exception("aibot: stale outbox recovery failed")

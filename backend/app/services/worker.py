@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from sqlalchemy import and_, exists, func, null, or_, text
@@ -1785,6 +1785,11 @@ class Worker:
             chat_id = inbound.chat_id
             ordering_key = inbound.ordering_key
             provider_req_id = inbound.provider_req_id
+        base_time = (
+            getattr(inbound, "created_at", None)
+            if inbound is not None else None
+        ) or datetime.now(timezone.utc).replace(tzinfo=None)
+        reply_expires_at = base_time + timedelta(hours=24)
         for index, reply in enumerate(replies):
             if reply.recommendation_context:
                 from app.services.recommendation_delivery_service import prepare_delivery
@@ -1841,6 +1846,14 @@ class Worker:
                 ordering_key=ordering_key,
                 provider_req_id=provider_req_id,
                 reply_command=("aibot_respond_msg" if source_channel == "wecom_aibot" else None),
+                stream_id=getattr(reply, "stream_id", None),
+                finish=getattr(reply, "finish", None),
+                reply_expires_at=reply_expires_at if source_channel == "wecom_aibot" else None,
+                stream_deadline_at=(
+                    base_time + timedelta(minutes=10)
+                    if source_channel == "wecom_aibot" and getattr(reply, "stream_id", None)
+                    else None
+                ),
             ))
 
     def _claim_outbox(
