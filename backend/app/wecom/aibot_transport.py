@@ -210,7 +210,13 @@ class AibotTransport:
         finally:
             self._ack_waiters.pop(req_id, None)
 
-    async def send(self, frame: dict[str, Any], *, timeout: float | None = None) -> tuple[int, str]:
+    async def send(
+        self,
+        frame: dict[str, Any],
+        *,
+        timeout: float | None = None,
+        on_written: Callable[[], Any] | None = None,
+    ) -> tuple[int, str]:
         """Send one command and require a matching successful protocol ACK."""
         if self.state != TransportState.ACTIVE or not self.is_fenced:
             raise AibotTransportError("active fenced connection required")
@@ -225,6 +231,8 @@ class AibotTransport:
         self._ack_waiters[req_id] = waiter
         try:
             await self._send_raw(frame)
+            if on_written is not None:
+                await _maybe_await(on_written())
             deadline = self.ack_timeout if timeout is None else timeout
             # The Reader task is the sole owner of socket.recv().  It resolves
             # this Future when the matching ACK arrives.
@@ -265,7 +273,10 @@ class AibotTransport:
             frame = self.client.respond_msg(req_id, content)
         else:
             raise AibotClientError(f"unsupported AIBot outbox command: {command}")
-        errcode, errmsg = await self.send(frame)
+        on_written = item.get("_on_frame_written")
+        if on_written is not None and not callable(on_written):
+            raise AibotClientError("_on_frame_written must be callable")
+        errcode, errmsg = await self.send(frame, on_written=on_written)
         return {"headers": {"req_id": req_id}, "errcode": errcode, "errmsg": errmsg}
 
     async def handle_frame(self, payload: Any) -> None:

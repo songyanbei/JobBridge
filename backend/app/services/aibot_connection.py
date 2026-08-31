@@ -134,6 +134,7 @@ class AibotOutboxWriter:
                     "reply_command": command,
                     "stream_id": row.stream_id,
                     "finish": row.finish,
+                    "first_sent_at": row.first_sent_at,
                     "attempt_count": int(row.attempt_count),
                     "lease_owner": self.lease_owner,
                     "fencing_token": self.fencing_token,
@@ -148,7 +149,7 @@ class AibotOutboxWriter:
             db.close()
 
     def recover_stale(self) -> int:
-        """Fence stale AIBot claims into ``uncertain``; never auto-resend them."""
+        """Recover stale claims based on whether a frame was durably written."""
         db = SessionLocal()
         try:
             now = func.now(6)
@@ -172,20 +173,33 @@ class AibotOutboxWriter:
                 "lease_owner": None,
                 "fencing_token": None,
             }, synchronize_session=False)
-            count = db.query(WecomOutboundOutbox).filter(
+            pending = db.query(WecomOutboundOutbox).filter(
                 WecomOutboundOutbox.channel == AIBOT_CHANNEL,
                 WecomOutboundOutbox.status == "sending",
                 WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.first_sent_at.is_(None),
+            ).update({
+                "status": "pending",
+                "locked_at": None,
+                "lease_owner": None,
+                "fencing_token": None,
+                "last_error": "aibot sender crashed before frame write; safe to retry",
+            }, synchronize_session=False)
+            uncertain = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.locked_at <= stale_before,
+                WecomOutboundOutbox.first_sent_at.isnot(None),
             ).update({
                 "status": "uncertain",
                 "uncertain_at": now,
                 "locked_at": None,
-                "last_error": "aibot sending lease expired; provider outcome unknown",
+                "last_error": "aibot frame written; provider outcome unknown",
                 "lease_owner": None,
                 "fencing_token": None,
             }, synchronize_session=False)
             db.commit()
-            return int((count or 0) + (expired or 0))
+            return int((pending or 0) + (uncertain or 0) + (expired or 0))
         except Exception:
             db.rollback()
             logger.exception("aibot: stale outbox recovery failed")
@@ -194,8 +208,10 @@ class AibotOutboxWriter:
             db.close()
 
     def deliver(self, item: Mapping[str, Any]) -> bool:
+        send_item = dict(item)
+        send_item["_on_frame_written"] = lambda: self._mark_frame_written(item)
         try:
-            response = self.sender.send(item)
+            response = self.sender.send(send_item)
         except AibotAckTimeout as exc:
             return self._mark_uncertain(item, str(exc))
         except Exception as exc:
@@ -210,8 +226,13 @@ class AibotOutboxWriter:
 
     async def deliver_async(self, item: Mapping[str, Any]) -> bool:
         """Async counterpart used by the connector owning an async socket."""
+        async def mark_frame_written() -> None:
+            await asyncio.to_thread(self._mark_frame_written, item)
+
+        send_item = dict(item)
+        send_item["_on_frame_written"] = mark_frame_written
         try:
-            response = self.sender.send(item)
+            response = self.sender.send(send_item)
             if inspect.isawaitable(response):
                 response = await response
         except AibotAckTimeout as exc:
@@ -276,6 +297,11 @@ class AibotOutboxWriter:
             "lease_owner": None,
             "fencing_token": None,
             "last_error": None,
+        })
+
+    def _mark_frame_written(self, item: Mapping[str, Any]) -> bool:
+        return self._update(item, {
+            "first_sent_at": func.coalesce(WecomOutboundOutbox.first_sent_at, func.now(6)),
         })
 
     def _mark_uncertain(self, item: Mapping[str, Any], reason: str) -> bool:
