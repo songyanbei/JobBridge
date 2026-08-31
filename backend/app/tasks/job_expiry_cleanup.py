@@ -37,6 +37,17 @@ def expire_locked_batch(db, *, now: datetime, batch_size: int = BATCH_SIZE) -> l
     expired_ids: list[int] = []
     for row in rows:
         job_id = int(row[0])
+        if isinstance(db, OrmSession):
+            # The ORM path owns both legacy and aggregate versions and emits
+            # the tombstone in the same transaction as the lifecycle change.
+            from app.services.job_lifecycle_service import transition_job
+            try:
+                transition_job(db, job_id, action="expire")
+            except Exception:
+                continue
+            expired_ids.append(job_id)
+            ensure_job_cleanup_task(db, job_id, reason="expired")
+            continue
         result = db.execute(text(
             "UPDATE `job` SET delist_reason='expired', deleted_at=:now, "
             "version=version+1 WHERE id=:job_id AND expires_at <= :now "

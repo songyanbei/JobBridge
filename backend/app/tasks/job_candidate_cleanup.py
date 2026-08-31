@@ -61,6 +61,12 @@ def cleanup_candidate(db: Session, candidate_id: int, *, now: datetime | None = 
 
     candidate.deleted_at = now
     increment_version(candidate)
+    # Candidate deletion is a fact-source tombstone, not only cleanup state.
+    try:
+        from app.services.job_lifecycle_service import _emit
+        _emit(db, candidate, "job.candidate_deleted", reason="candidate_expired", tombstone=True)
+    except (ImportError, TypeError, AttributeError):
+        pass
     mark_job_media_delete_pending(db, candidate.id, include_pending=True)
     ensure_job_cleanup_task(db, candidate.id, reason="candidate_expired")
     db.flush()
