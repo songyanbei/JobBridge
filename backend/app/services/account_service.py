@@ -197,6 +197,23 @@ def pre_register_aibot(
         AibotRegistration.identity_binding_id == binding.binding_id,
     ).first()
     if existing and existing.registration_status not in {"rejected", "revoked"}:
+        if existing.registration_status == "pending_role" and existing.requested_role != role:
+            registration_service._audit(
+                db,
+                bot_id=getattr(binding, "bot_id", ""),
+                digest=getattr(binding, "opaque_actor_digest", ""),
+                action="registration_role_conflict",
+                result="rejected",
+                canonical=binding.canonical_userid,
+                actor=operator,
+                reason="pending_role_conflict",
+                metadata={
+                    "registration_id": existing.registration_id,
+                    "existing_role": existing.requested_role,
+                    "requested_role": role,
+                },
+            )
+            raise BusinessException(40904, "已有待审核角色申请，申请角色冲突")
         return existing
     registration = existing or AibotRegistration(
         registration_id=str(uuid.uuid4()), canonical_userid=binding.canonical_userid,
