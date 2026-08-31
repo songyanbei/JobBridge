@@ -118,7 +118,6 @@ def test_expiry_cleanup_dispatcher_lock_order_has_no_three_session_cycle(monkeyp
         db.flush()
         delivery = RecommendationDelivery(
             delivery_id=delivery_id,
-            delivery_order=1,
             source_inbound_msg_id=source_id,
             reply_index=0,
             request_id=request_id,
