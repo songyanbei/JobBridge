@@ -52,10 +52,11 @@ def test_job_level_values_win_and_source_metadata_is_preserved(monkeypatch) -> N
     assert candidate["hiring_company_source"] == "job.hiring_company"
     assert candidate["address"] == "工厂工作地址"
     assert candidate["address_source"] == "job.address"
-    assert candidate["contact_person"] == "岗位联系人"
-    assert candidate["contact_source"] == "job_override"
-    assert candidate["phone"] == "岗位电话"
-    assert candidate["phone_source"] == "job_override"
+    # Search projections must never carry plaintext contact PII; Contact is
+    # obtained through the opaque grant flow instead.
+    assert "contact_person" not in candidate
+    assert "phone" not in candidate
+    assert candidate["contact_available"] is False
 
 
 def test_old_job_uses_explicit_publisher_fallbacks_and_blank_normalization(monkeypatch) -> None:
@@ -71,9 +72,9 @@ def test_old_job_uses_explicit_publisher_fallbacks_and_blank_normalization(monke
     assert candidate["hiring_company_source"] == "publisher_company_fallback"
     assert candidate["address"] == "发布方经营地址"
     assert candidate["address_source"] == "publisher_address_fallback"
-    assert candidate["contact_source"] == "publisher_fallback"
-    assert candidate["phone_source"] == "publisher_fallback"
-    assert candidate["phone"] == "账号电话"
+    assert "contact_person" not in candidate
+    assert "phone" not in candidate
+    assert candidate["contact_available"] is False
 
     monkeypatch.setattr(search_service, "_build_users_map", lambda _ids, _db: _user_map({
         "company": " ", "address": "", "contact_person": None, "phone": "  ",
@@ -82,8 +83,9 @@ def test_old_job_uses_explicit_publisher_fallbacks_and_blank_normalization(monke
     assert empty["hiring_company"] is None
     assert empty["hiring_company_source"] == "none"
     assert empty["address_source"] == "none"
-    assert empty["contact_source"] == "none"
-    assert empty["phone_source"] == "none"
+    assert "contact_person" not in empty
+    assert "phone" not in empty
+    assert empty["contact_available"] is False
 
 
 def test_source_aware_job_rendering_never_mislabels_fallbacks() -> None:
@@ -92,14 +94,14 @@ def test_source_aware_job_rendering_never_mislabels_fallbacks() -> None:
             "id": 1, "hiring_company": "历史中介", "hiring_company_source": "publisher_company_fallback",
             "job_category": "普工", "salary_floor_monthly": 6000, "pay_type": "月薪",
             "city": "苏州市", "address": "经营地址", "address_source": "publisher_address_fallback",
-            "contact_person": None, "phone": None, "phone_placeholder": "联系方式待补充",
+            "contact_person": None, "phone": None, "contact_placeholder": "联系方式需通过联系请求获取",
         },
     ], 0)
     assert "发布主体：历史中介（历史回退）" in text
     assert "招聘工厂：历史中介" not in text
     assert "发布方经营地址：经营地址（岗位地址缺失）" in text
     assert "工作地址：经营地址" not in text
-    assert "联系方式待补充" in text
+    assert "联系方式需通过联系请求获取" in text
 
 
 def test_worker_legacy_filter_does_not_expose_new_sensitive_job_fields() -> None:
