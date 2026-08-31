@@ -62,6 +62,19 @@ def test_activate_resume_uses_one_naive_utc_instant_and_is_idempotent(_ttl):
     assert db.flush.call_count == 1
 
 
+@patch("app.services.resume_activation_service.get_resume_ttl_days", return_value=30)
+def test_activate_resume_backfills_attached_media_entity_version(_ttl):
+    db = MagicMock()
+    row = _resume(id=7, aggregate_version=1)
+
+    activate_resume(db, row, now=NOW)
+
+    db.query.return_value.filter.return_value.update.assert_called_once_with(
+        {"entity_version": 2}, synchronize_session=False,
+    )
+    assert row.aggregate_version == 2
+
+
 @pytest.mark.parametrize("status", ["pending", "rejected"])
 @patch("app.services.lifecycle_config_service.get_resume_candidate_ttl_days", return_value=7)
 def test_first_publish_candidate_has_no_business_ttl(_candidate_ttl, status):
@@ -77,6 +90,23 @@ def test_first_publish_candidate_has_no_business_ttl(_candidate_ttl, status):
     assert row.expires_at is None
     assert row.candidate_expires_at is not None
     assert row.candidate_expires_at.tzinfo is None
+
+
+@patch("app.services.lifecycle_config_service.get_resume_candidate_ttl_days", return_value=7)
+@patch("app.services.job_media_service.attach_media", return_value=["media/resume-1.jpg"])
+def test_first_publish_resume_binds_pending_media_ids(_attach_media, _candidate_ttl):
+    db = MagicMock()
+    row = _create_resume(
+        _data(), SimpleNamespace(external_userid="worker-1"),
+        SimpleNamespace(status="pending", reason="review"),
+        30, "完整简历", [], db, media_ids=[31],
+    )
+
+    _attach_media.assert_called_once_with(
+        db, [31], "resume", row.id,
+        owner_userid="worker-1", entity_version=1,
+    )
+    assert row.images == ["media/resume-1.jpg"]
 
 
 @patch("app.services.resume_activation_service.get_resume_ttl_days", return_value=30)

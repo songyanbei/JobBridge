@@ -50,6 +50,20 @@ def activate_resume(
     resume.candidate_expires_at = None
     resume.delist_reason = None
     increment_resume_version(resume)
+    try:
+        from app.models import MediaAssetLifecycle
+
+        db.query(MediaAssetLifecycle).filter(
+            MediaAssetLifecycle.entity_type == "resume",
+            MediaAssetLifecycle.entity_id == resume.id,
+            MediaAssetLifecycle.state == "attached",
+        ).update(
+            {"entity_version": int(resume.aggregate_version)},
+            synchronize_session=False,
+        )
+    except Exception:
+        # Legacy deployments may not have the additive media table/column.
+        pass
     db.flush()
     if _domain_outbox_available(db) and getattr(resume, "id", None) is not None:
         from app.services.domain_outbox_service import append_domain_event

@@ -277,6 +277,46 @@ def test_unit_a_auto_pass_candidate_enters_atomic_activation(db, monkeypatch):
     assert activated == [(relation, old, candidate, 5, relation.reviewed_at)]
 
 
+def test_unit_a_replacement_binds_media_to_candidate_version(db, monkeypatch):
+    old = _resume(db, active=True, version=4)
+    db.commit()
+    monkeypatch.setattr("app.config.settings.resume_replacement_enabled", True)
+    monkeypatch.setattr(
+        resume_replace_service,
+        "lock_replacement_creation",
+        lambda *_args, **_kwargs: (None, old),
+    )
+    monkeypatch.setattr(
+        resume_replace_service, "get_resume_candidate_ttl_days", lambda _db: 7,
+    )
+    attach_media = MagicMock(return_value=["media/resume-candidate.jpg"])
+    monkeypatch.setattr(resume_replace_service, "attach_media", attach_media)
+    _, candidate = resume_replace_service.create_replacement_candidate(
+        db,
+        owner_userid="worker-1",
+        target_resume_id=old.id,
+        expected_version=4,
+        operation_id="00000000-0000-0000-0000-000000000100",
+        source_msg_id="stage4-media-binding",
+        complete_data={
+            "expected_cities": ["苏州"],
+            "expected_job_categories": ["普工"],
+            "salary_expect_floor_monthly": 6000,
+            "gender": "男",
+            "age": 31,
+        },
+        raw_text="带媒体的新简历",
+        media_ids=[17],
+        audit_result=type("Audit", (), {"status": "pending", "reason": ""})(),
+    )
+
+    assert candidate.images == ["media/resume-candidate.jpg"]
+    attach_media.assert_called_once_with(
+        db, [17], "resume", candidate.id,
+        owner_userid="worker-1", entity_version=1,
+    )
+
+
 def test_unit_a_retry_reuses_review_clock_for_activation(db, monkeypatch):
     relation, old, candidate = _graph(db)
     relation.lifecycle_status = "conflict"
