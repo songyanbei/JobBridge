@@ -7,6 +7,8 @@ from typing import Callable
 
 from loguru import logger
 from sqlalchemy import text
+from sqlalchemy import inspect
+from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
 from app.services.target_cleanup_service import ensure_target_cleanup_task
@@ -14,6 +16,24 @@ from app.tasks.common import log_event, renewable_task_lock
 
 BATCH_SIZE = 500
 MAX_RUNTIME_SECONDS = 8 * 60
+
+
+def _emit_expired_event(db, resume_id: int, aggregate_version: int) -> None:
+    payload = {"aggregate_type": "resume", "aggregate_id": resume_id,
+               "aggregate_version": aggregate_version, "event_type": "resume.expired",
+               "tombstone": True, "reason": "expired"}
+    try:
+        bind = getattr(db, "bind", None)
+        connection = db.connection() if bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite" and db.in_transaction() else bind
+        if bind is None or not inspect(connection).has_table("domain_outbox_event"):
+            db.info.setdefault("pending_resume_lifecycle_events", []).append(payload)
+            return
+        from app.services.domain_outbox_service import append_domain_event
+        append_domain_event(db, aggregate_type="resume", aggregate_id=resume_id,
+                            aggregate_version=aggregate_version,
+                            event_type="resume.expired", payload={"resume_id": resume_id, "reason": "expired"}, tombstone=True)
+    except ImportError:
+        db.info.setdefault("pending_resume_lifecycle_events", []).append(payload)
 
 
 def _utcnow() -> datetime:
@@ -38,13 +58,16 @@ def expire_locked_batch(db, *, now: datetime, batch_size: int = BATCH_SIZE) -> l
         resume_id = int(row[0])
         result = db.execute(text(
             "UPDATE `resume` SET delist_reason='expired',deleted_at=:now,"
-            "version=version+1 WHERE id=:resume_id AND audit_status='passed' "
+            "version=version+1,aggregate_version=COALESCE(aggregate_version,version)+1 WHERE id=:resume_id AND audit_status='passed' "
             "AND activated_at IS NOT NULL AND candidate_expires_at IS NULL "
             "AND expires_at IS NOT NULL AND expires_at <= :now "
             "AND deleted_at IS NULL AND delist_reason IS NULL"
         ), {"resume_id": resume_id, "now": now})
         if int(result.rowcount or 0) != 1:
             continue
+        if isinstance(db, Session):
+            aggregate_version = db.execute(text("SELECT aggregate_version FROM `resume` WHERE id=:resume_id"), {"resume_id": resume_id}).scalar_one()
+            _emit_expired_event(db, resume_id, int(aggregate_version))
         ensure_target_cleanup_task(db, "resume", resume_id, reason="expired")
         expired.append(resume_id)
     db.commit()

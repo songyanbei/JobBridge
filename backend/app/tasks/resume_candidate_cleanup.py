@@ -7,6 +7,7 @@ from typing import Callable
 
 from loguru import logger
 from sqlalchemy import and_, or_
+from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
@@ -19,6 +20,24 @@ from app.tasks.common import log_event, renewable_task_lock
 
 BATCH_SIZE = 500
 MAX_RUNTIME_SECONDS = 8 * 60
+
+
+def _emit_candidate_event(db: Session, candidate: Resume) -> None:
+    payload = {"aggregate_type": "resume", "aggregate_id": int(candidate.id),
+               "aggregate_version": int(getattr(candidate, "aggregate_version", None) or candidate.version),
+               "event_type": "resume.deleted", "tombstone": True, "reason": "candidate_expired"}
+    bind = getattr(db, "bind", None)
+    try:
+        connection = db.connection() if bind is not None and getattr(getattr(bind, "dialect", None), "name", None) == "sqlite" and db.in_transaction() else bind
+        if bind is None or not inspect(connection).has_table("domain_outbox_event"):
+            db.info.setdefault("pending_resume_lifecycle_events", []).append(payload)
+            return
+        from app.services.domain_outbox_service import append_domain_event
+        append_domain_event(db, aggregate_type="resume", aggregate_id=int(candidate.id),
+                            aggregate_version=int(getattr(candidate, "aggregate_version", None) or candidate.version),
+                            event_type="resume.deleted", payload={"resume_id": int(candidate.id), "reason": "candidate_expired"}, tombstone=True)
+    except ImportError:
+        db.info.setdefault("pending_resume_lifecycle_events", []).append(payload)
 
 
 def _utcnow() -> datetime:
@@ -62,6 +81,7 @@ def cleanup_candidate(db: Session, candidate_id: int, *, now: datetime) -> bool:
     mark_resume_media_delete_pending(db, candidate.id, include_pending=True)
     ensure_target_cleanup_task(db, "resume", candidate.id, reason="candidate_expired")
     db.flush()
+    _emit_candidate_event(db, candidate)
     return True
 
 
