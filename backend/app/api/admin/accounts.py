@@ -11,6 +11,7 @@ from app.models import AdminUser
 from app.schemas.account import (
     AibotBindingRevoke,
     AibotInviteCreate,
+    AibotPreRegisterRequest,
     AibotRoleApproval,
     BlockRequest,
     BrokerCreate,
@@ -30,6 +31,33 @@ _MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024  # 2MB
 
 def _serialize_user(user) -> dict:
     return UserAdminRead.model_validate(user).model_dump(mode="json")
+
+
+@router.post("/aibot/bindings/{binding_id}/pre-register", summary="AIBot 身份预注册角色")
+def pre_register_aibot_binding(
+    binding_id: str,
+    req: AibotPreRegisterRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin),
+):
+    """Create an auditable pending factory/broker registration.
+
+    The service locks the active binding and returns the existing pending row
+    for retries.  Opaque actor values and invitation tokens are never returned.
+    """
+    try:
+        registration = account_service.pre_register_aibot_for_binding(
+            db, binding_id=binding_id, role=req.role, operator=current.username,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return ok({
+        "registration_id": registration.registration_id,
+        "status": registration.registration_status,
+        "requested_role": registration.requested_role,
+    })
 
 
 @router.post("/aibot/invites", summary="创建 AIBot 角色邀请码")

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import BusinessException
 from app.models import AibotIdentityBinding, AibotRegistration, SystemConfig, User
+from app.services import registration_service
 from app.services.admin_log_service import write_admin_log
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,9 @@ def pre_register_aibot(
         raise BusinessException(40101, "仅厂家/中介可申请角色")
     if binding.binding_status != "active" or not binding.canonical_userid:
         raise BusinessException(40101, "需要已验证的 canonical userid")
+    # Pre-registration is allowed to create only the canonical minimum worker;
+    # it must never manufacture a replaceable/pseudo external_userid.
+    registration_service._ensure_canonical_user(db, binding.canonical_userid)
     existing = db.query(AibotRegistration).filter(
         AibotRegistration.identity_binding_id == binding.binding_id,
     ).first()
@@ -211,6 +215,24 @@ def pre_register_aibot(
         reason="aibot_pre_register",
     )
     return registration
+
+
+def pre_register_aibot_for_binding(
+    db: Session,
+    *,
+    binding_id: str,
+    role: str,
+    operator: str,
+) -> AibotRegistration:
+    """Lock and pre-register an active verified AIBot binding."""
+    query = db.query(AibotIdentityBinding).filter(
+        AibotIdentityBinding.binding_id == binding_id,
+        AibotIdentityBinding.binding_status == "active",
+    )
+    binding = registration_service._for_update(query).first()
+    if binding is None:
+        raise BusinessException(40401, "AIBot 身份绑定不存在或已撤销")
+    return pre_register_aibot(db, binding=binding, role=role, operator=operator)
 
 
 def update_user(db: Session, userid: str, payload: dict, operator: str) -> User:

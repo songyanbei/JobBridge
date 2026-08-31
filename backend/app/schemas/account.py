@@ -91,3 +91,7 @@ class AibotRoleApproval(BaseModel):
 
 class AibotBindingRevoke(BaseModel):
     reason: str = Field(default="admin_revoked", min_length=1, max_length=255)
+
+
+class AibotPreRegisterRequest(BaseModel):
+    role: Literal["factory", "broker"]
