@@ -96,6 +96,7 @@ class AibotTransport:
         self.fencing_token: int | str | None = None
         self._stop = asyncio.Event()
         self._ack_waiters: dict[str, asyncio.Future[tuple[int, str]]] = {}
+        self._callback_tasks: set[asyncio.Task[Any]] = set()
         self._reader_task: asyncio.Task[Any] | None = None
         self._heartbeat_task: asyncio.Task[Any] | None = None
         self._attempt = 0
@@ -296,7 +297,9 @@ class AibotTransport:
                 logger.warning("aibot websocket rejected callback")
                 return
             if self.on_callback is not None:
-                await _maybe_await(self.on_callback(callback))
+                task = asyncio.create_task(_maybe_await(self.on_callback(callback)))
+                self._callback_tasks.add(task)
+                task.add_done_callback(self._callback_done)
             return
         if frame.cmd in {"ping", "pong"}:
             return
@@ -360,6 +363,11 @@ class AibotTransport:
             self.transition(TransportState.BACKOFF)
 
     async def close(self) -> None:
+        for task in tuple(self._callback_tasks):
+            task.cancel()
+        if self._callback_tasks:
+            await asyncio.gather(*self._callback_tasks, return_exceptions=True)
+            self._callback_tasks.clear()
         if self._heartbeat_task is not None and self._heartbeat_task is not asyncio.current_task():
             self._heartbeat_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -377,6 +385,14 @@ class AibotTransport:
             except Exception:  # noqa: BLE001
                 logger.debug("aibot websocket close failed", exc_info=True)
         await self._release()
+
+    def _callback_done(self, task: asyncio.Task[Any]) -> None:
+        self._callback_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error(
+                "aibot callback task failed",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def run(self) -> None:
         """Reconnect until ``request_stop`` is called."""

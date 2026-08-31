@@ -35,6 +35,7 @@ LEASE_RENEW_SECONDS = 15
 OUTBOX_LEASE_SECONDS = 180
 OUTBOX_BATCH_SIZE = 20
 EVENT_RESPONSE_TIMEOUT_SECONDS = 5.0
+ACCEPTANCE_TIMEOUT_SECONDS = 5.0
 WELCOME_RESPONSE_CONTENT = "您好！我是智能助手。"
 
 
@@ -419,7 +420,16 @@ class AibotConnection:
         defined locally; unknown card events are logged and ignored rather
         than guessed into a potentially invalid protocol command.
         """
-        result = await asyncio.to_thread(self.accept_callback, callback)
+        from app.services.inbound_acceptance import AcceptanceResult
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self.accept_callback, callback),
+                timeout=ACCEPTANCE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("aibot callback acceptance timed out")
+            return AcceptanceResult("retryable", reason="acceptance timeout")
         if not getattr(result, "acknowledged", False):
             logger.warning("aibot callback not acknowledged status=%s reason=%s", getattr(result, "status", "unknown"), getattr(result, "reason", ""))
             return result
