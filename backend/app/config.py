@@ -459,6 +459,15 @@ class Settings(BaseSettings):
     role_binding_mode: Literal["shadow", "on"] = "shadow"
     aibot_identity_digest_key: SecretStr = SecretStr("")
 
+    # ---- 独立演示模式（仅 development/test，默认关闭） ----
+    # The bot allowlist is intentionally mandatory when the feature is enabled;
+    # actor membership is then granted per workspace by the control plane.
+    demo_mode_enabled: bool = False
+    demo_allowed_bot_ids: str = ""
+    demo_allowed_actor_digests: str = ""
+    demo_session_ttl_seconds: int = 1800
+    demo_max_active_workspaces: int = 1
+
     @field_validator("wecom_aibot_ws_url", mode="after")
     @classmethod
     def _valid_aibot_ws_url(cls, value: str) -> str:
@@ -482,6 +491,11 @@ class Settings(BaseSettings):
     )
     @classmethod
     def _valid_aibot_positive_int(cls, value: int) -> int:
+        return max(1, int(value))
+
+    @field_validator("demo_session_ttl_seconds", "demo_max_active_workspaces", mode="after")
+    @classmethod
+    def _valid_demo_positive_int(cls, value: int) -> int:
         return max(1, int(value))
 
     @model_validator(mode="after")
@@ -511,6 +525,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "WECOM_AIBOT_IDENTITY_APP_SECRET is required when identity resolution is enabled"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_demo_mode(self) -> "Settings":
+        """Keep demo mode explicitly disabled outside development/test.
+
+        A bot allowlist is required before enabling the feature.  Actor
+        allowlisting remains optional because an operator may authorize a new
+        actor through an active workspace membership without changing config.
+        """
+        env = self.app_env.lower().strip()
+        if not self.demo_mode_enabled:
+            return self
+        if env not in {"development", "test"}:
+            raise ValueError("DEMO_MODE_ENABLED is allowed only in development/test")
+        bots = self.demo_allowed_bot_id_list
+        if not bots:
+            raise ValueError("DEMO_ALLOWED_BOT_IDS is required when demo mode is enabled")
+        for digest in self.demo_allowed_actor_digest_list:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise ValueError("DEMO_ALLOWED_ACTOR_DIGESTS must contain 64-character hex digests")
         return self
 
     # ---- LLM（对应方案 §4.3 抽象层）----
@@ -1032,6 +1067,18 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() == "production"
+
+    @staticmethod
+    def _csv_values(value: str) -> tuple[str, ...]:
+        return tuple(item.strip() for item in str(value or "").split(",") if item.strip())
+
+    @property
+    def demo_allowed_bot_id_list(self) -> tuple[str, ...]:
+        return self._csv_values(self.demo_allowed_bot_ids)
+
+    @property
+    def demo_allowed_actor_digest_list(self) -> tuple[str, ...]:
+        return tuple(item.lower() for item in self._csv_values(self.demo_allowed_actor_digests))
 
     @property
     def cors_origin_list(self) -> list[str]:
