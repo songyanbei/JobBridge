@@ -554,6 +554,8 @@ def seed_jobs(conn: pymysql.connections.Connection,
         if audit_status == "passed":
             activated_at = audited_at or created_at
             candidate_expires_at = None
+            # 正式岗位 TTL 从业务激活时间起算，而不是从提交创建时间起算。
+            expires_at = activated_at + timedelta(days=30)
         else:
             activated_at = None
             candidate_expires_at = created_at + timedelta(days=7)
