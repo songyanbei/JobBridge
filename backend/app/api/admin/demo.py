@@ -1,6 +1,9 @@
 """独立演示工作区管理 API。"""
 from __future__ import annotations
 
+import re
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
@@ -8,7 +11,8 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db, require_admin_role
 from app.core.exceptions import BusinessException
 from app.core.responses import ok
-from app.models import AdminUser
+from app.models import AdminUser, DemoWorkspaceMember
+from app.services.admin_log_service import write_admin_log
 from app.services import demo_mode_service, demo_workspace_admin_service as service
 
 router = APIRouter(prefix="/admin/demo", tags=["admin-demo"])
@@ -39,6 +43,49 @@ class DemoCreateRequest(BaseModel):
     @classmethod
     def strip_values(cls, value: str) -> str:
         return value.strip()
+
+
+class DemoMemberRequest(BaseModel):
+    bot_id: str = Field(..., min_length=1, max_length=128)
+    actor_digest: str = Field(..., min_length=64, max_length=64)
+    canonical_actor_userid: str | None = Field(default=None, max_length=64)
+    expires_at: datetime | None = None
+
+    @field_validator("bot_id", "actor_digest")
+    @classmethod
+    def strip_member_values(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value must not be blank")
+        return value
+
+    @field_validator("actor_digest")
+    @classmethod
+    def validate_actor_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ValueError("actor_digest must be a 64-character hex digest")
+        return value.lower()
+
+    @field_validator("expires_at")
+    @classmethod
+    def normalize_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+
+class DemoMemberRevokeRequest(BaseModel):
+    reason: str = Field(default="operator_revoked", min_length=1, max_length=255)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_revoke_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value or any(ord(char) < 32 for char in value):
+            raise ValueError("reason must be a non-empty printable string")
+        return value
 
 
 def _translate(exc: Exception) -> None:
@@ -111,6 +158,122 @@ def preview_demo_workspace(
         _translate(exc)
 
 
+@router.post("/{demo_id}/members", summary="授权企微账号进入演示工作区")
+def grant_demo_member(
+    demo_id: str,
+    req: DemoMemberRequest,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
+):
+    try:
+        existing = db.query(DemoWorkspaceMember).filter(
+            DemoWorkspaceMember.demo_id == demo_id,
+            DemoWorkspaceMember.bot_id == req.bot_id,
+            DemoWorkspaceMember.opaque_actor_digest == req.actor_digest,
+        ).first()
+        before = None if existing is None else {
+            "membership_status": existing.membership_status,
+            "expires_at": existing.expires_at,
+        }
+        member = demo_mode_service.authorize_member(
+            db, demo_id=demo_id, bot_id=req.bot_id,
+            actor_digest_value=req.actor_digest, granted_by=current.username,
+            canonical_actor_userid=req.canonical_actor_userid,
+            expires_at=req.expires_at,
+        )
+        write_admin_log(
+            db, target_type="system", target_id=demo_id, action="manual_edit",
+            operator=current.username,
+            before=before,
+            after={"membership_status": member.membership_status, "expires_at": member.expires_at},
+            reason=f"demo_member_grant:actor_digest={req.actor_digest}",
+        )
+        db.commit()
+        return ok({
+            "demo_id": demo_id,
+            "member_id": member.member_id,
+            "bot_id": member.bot_id,
+            "actor_digest": member.opaque_actor_digest,
+            "status": member.membership_status,
+            "expires_at": member.expires_at,
+        })
+    except Exception as exc:
+        db.rollback()
+        _translate(exc)
+
+
+def _revoke_demo_member(
+    demo_id: str,
+    actor_digest: str,
+    db: Session,
+    current: AdminUser,
+    reason: str,
+):
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", actor_digest or ""):
+        raise BusinessException(40101, "actor_digest must be a 64-character hex digest")
+    actor_digest = actor_digest.lower()
+    try:
+        # Read the existing row only for a privacy-safe before snapshot; the
+        # digest is opaque and no plaintext actor identifier is ever logged.
+        existing = db.query(DemoWorkspaceMember).filter(
+            DemoWorkspaceMember.demo_id == demo_id,
+            DemoWorkspaceMember.opaque_actor_digest == actor_digest,
+        ).first()
+        before = None if existing is None else {
+            "membership_status": existing.membership_status,
+            "expires_at": existing.expires_at,
+        }
+        bot_id = existing.bot_id if existing is not None else ""
+        if bot_id:
+            demo_mode_service.revoke_member(
+                db, demo_id=demo_id, bot_id=bot_id,
+                actor_digest_value=actor_digest,
+            )
+        else:
+            # Still invoke the control-plane gate and workspace lookup for a
+            # deterministic not-found/disabled response.
+            service.workspace_status(db, demo_id=demo_id)
+        after = None if existing is None else {
+            "membership_status": existing.membership_status,
+            "expires_at": existing.expires_at,
+        }
+        write_admin_log(
+            db, target_type="system", target_id=demo_id, action="manual_edit",
+            operator=current.username, before=before, after=after,
+            reason=f"demo_member_revoke:actor_digest={actor_digest};{reason[:180]}",
+        )
+        db.commit()
+        return ok({
+            "demo_id": demo_id,
+            "actor_digest": actor_digest,
+            "status": "revoked" if existing is not None else "absent",
+        })
+    except Exception as exc:
+        db.rollback()
+        _translate(exc)
+
+
+@router.post("/{demo_id}/members/{actor_digest}", summary="撤销企微账号演示权限")
+def revoke_demo_member_post(
+    demo_id: str,
+    actor_digest: str,
+    req: DemoMemberRevokeRequest | None = None,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
+):
+    return _revoke_demo_member(demo_id, actor_digest, db, current, req.reason if req else "operator_revoked")
+
+
+@router.delete("/{demo_id}/members/{actor_digest}", summary="撤销企微账号演示权限")
+def revoke_demo_member_delete(
+    demo_id: str,
+    actor_digest: str,
+    db: Session = Depends(get_db),
+    current: AdminUser = Depends(require_admin_role(*_SUPER)),
+):
+    return _revoke_demo_member(demo_id, actor_digest, db, current, "operator_revoked")
+
+
 @router.post("/{demo_id}/disable", summary="禁用并下架演示工作区")
 def disable_demo_workspace(
     demo_id: str, req: DemoReasonRequest, db: Session = Depends(get_db),
@@ -152,4 +315,3 @@ def retry_demo_workspace_cleanup(
         ))
     except Exception as exc:
         _translate(exc)
-

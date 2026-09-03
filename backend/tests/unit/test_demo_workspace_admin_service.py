@@ -1,11 +1,15 @@
+from types import SimpleNamespace
+
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.models import DemoPrincipal, DemoResource, DemoWorkspace, DemoWorkspaceMember, User
+from app.models import AuditLog, DemoPrincipal, DemoResource, DemoWorkspace, DemoWorkspaceMember, User
 from app.services import demo_mode_service
 from app.services import demo_workspace_admin_service as admin_service
+from app.api.admin.demo import DemoMemberRequest, grant_demo_member, revoke_demo_member_delete, router
 
 
 class _FakeRedis:
@@ -96,3 +100,42 @@ def test_cleanup_is_idempotent_after_completion(db, monkeypatch):
         db, demo_id=workspace.demo_id, reason="second", operator="admin",
     )
     assert first["status"] == second["status"] == "cleaned"
+
+
+def test_admin_can_grant_and_revoke_member_without_plaintext_actor(db, monkeypatch):
+    owner_digest = demo_mode_service.actor_digest_for_lookup("owner")
+    monkeypatch.setattr(admin_service.settings, "demo_allowed_actor_digests", owner_digest)
+    workspace = demo_mode_service.create_workspace(
+        db, name="demo", bot_id="bot-1", actor_digest_value=owner_digest,
+        created_by="admin", demo_id="demo-members",
+    )
+    db.commit()
+    member_digest = demo_mode_service.actor_digest_for_lookup("another-actor")
+    req = DemoMemberRequest(
+        bot_id="bot-1", actor_digest=member_digest,
+        canonical_actor_userid="another-real-user",
+    )
+    result = grant_demo_member(
+        workspace.demo_id, req, db, SimpleNamespace(username="admin"),
+    )
+    assert result["data"]["status"] == "active"
+    assert db.query(DemoWorkspaceMember).filter_by(
+        demo_id=workspace.demo_id, opaque_actor_digest=member_digest,
+    ).one().membership_status == "active"
+
+    revoke_demo_member_delete(
+        workspace.demo_id, member_digest, db, SimpleNamespace(username="admin"),
+    )
+    assert db.query(DemoWorkspaceMember).filter_by(
+        demo_id=workspace.demo_id, opaque_actor_digest=member_digest,
+    ).one().membership_status == "revoked"
+    audit_text = " ".join(str(row.reason) for row in db.query(AuditLog).all())
+    assert "another-actor" not in audit_text
+
+
+def test_member_request_rejects_non_digest_and_exposes_management_routes():
+    with pytest.raises(ValidationError):
+        DemoMemberRequest(bot_id="bot-1", actor_digest="plaintext-actor")
+    paths = {route.path for route in router.routes}
+    assert "/admin/demo/{demo_id}/members" in paths
+    assert "/admin/demo/{demo_id}/members/{actor_digest}" in paths
