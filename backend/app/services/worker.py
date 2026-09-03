@@ -1014,7 +1014,14 @@ class Worker:
                 self._download_and_attach_aibot_media(msg, inbound_event_id)
             # Legacy image path remains unchanged.
             elif msg.msg_type == "image" and msg.media_id:
-                self._download_and_attach_image(msg)
+                self._download_and_attach_image(
+                    msg,
+                    owner_userid=(
+                        demo_context.effective_userid
+                        if demo_context is not None else None
+                    ),
+                    session_key=session_key if demo_context is not None else None,
+                )
 
             # 调路由；把 pop 后的队列深度作为 turn-scoped hint 传给 reranker。
             # ContextVar 隔离 future thread/task，避免每次排序再额外访问 Redis。
@@ -1181,8 +1188,12 @@ class Worker:
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _media_operation_id(msg: WeComMessage) -> str | None:
-        session = conversation_service.load_session(msg.from_user)
+    def _media_operation_id(
+        msg: WeComMessage,
+        *,
+        session_key: str | None = None,
+    ) -> str | None:
+        session = conversation_service.load_session(session_key or msg.from_user)
         if session is None:
             return msg.msg_id
         if (
@@ -1207,23 +1218,30 @@ class Worker:
             raise RuntimeError("replacement_media_operation_id_invalid")
         return operation_id
 
-    def _download_and_attach_image(self, msg: WeComMessage) -> None:
+    def _download_and_attach_image(
+        self,
+        msg: WeComMessage,
+        *,
+        owner_userid: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
         media_id = None
         try:
             from app.storage import get_storage
             from app.services.job_media_service import record_pending_media
 
-            operation_id = self._media_operation_id(msg)
+            operation_id = self._media_operation_id(msg, session_key=session_key)
             if operation_id is None:
                 return
             blob = self._wecom_client.download_media(msg.media_id)
             storage = get_storage()
-            key = f"images/{msg.from_user}/{msg.msg_id}.jpg"
+            owner = owner_userid or msg.from_user
+            key = f"images/{owner}/{msg.msg_id}.jpg"
             with SessionLocal() as media_db:
                 media = record_pending_media(
                     media_db,
                     key,
-                    owner_userid=msg.from_user,
+                    owner_userid=owner,
                     operation_id=operation_id,
                 )
                 media_db.commit()
