@@ -11,14 +11,27 @@ def _query_chain(update_result):
     return query
 
 
+def _select_chain(values):
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = values
+    return query
+
+
 def test_recover_stale_splits_prewrite_and_written_claims():
     expired_query = _query_chain(0)
     pending_query = _query_chain(1)
     uncertain_query = _query_chain(1)
+    recommendation_select_query = _select_chain([("recommendation-1",)])
+    contact_select_query = _select_chain([("contact-1",)])
     delivery_query = _query_chain(1)
     contact_query = _query_chain(1)
     db = MagicMock()
-    db.query.side_effect = [expired_query, pending_query, uncertain_query, delivery_query, contact_query]
+    db.query.side_effect = [
+        expired_query, pending_query, uncertain_query,
+        recommendation_select_query, contact_select_query,
+        delivery_query, contact_query,
+    ]
     with patch("app.services.aibot_connection.SessionLocal", return_value=db):
         writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
         assert writer.recover_stale() == 2
@@ -30,10 +43,8 @@ def test_recover_stale_splits_prewrite_and_written_claims():
     assert "first_sent_at" in uncertain_filter
     assert delivery_query.update.call_args.args[0]["status"] == "unknown"
     delivery_filter = " ".join(str(value) for value in delivery_query.filter.call_args.args)
-    assert "wecom_outbound_outbox.channel" in delivery_filter
-    assert "WecomOutboundOutbox.channel == AIBOT_CHANNEL" in inspect.getsource(
-        AibotOutboxWriter.recover_stale,
-    )
+    assert "recommendation_delivery.delivery_id IN" in delivery_filter
+    assert "exists().where" not in inspect.getsource(AibotOutboxWriter.recover_stale)
     assert contact_query.update.call_args.args[0]["status"] == "retry_wait"
 
 

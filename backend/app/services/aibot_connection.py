@@ -311,34 +311,45 @@ class AibotOutboxWriter:
                 "lease_owner": None,
                 "fencing_token": None,
             }, synchronize_session=False)
+            # Resolve provider references using only the outbox collation, then
+            # update each business table by its own primary-key column. Do not
+            # compare the utf8mb4 outbox IDs directly with delivery IDs: the
+            # deployed legacy schemas use different collations.
+            recommendation_ids = [value[0] for value in db.query(
+                WecomOutboundOutbox.recommendation_delivery_id,
+            ).filter(
+                WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                WecomOutboundOutbox.status == "uncertain",
+                WecomOutboundOutbox.recommendation_delivery_id.isnot(None),
+            ).all()]
+            contact_ids = [value[0] for value in db.query(
+                WecomOutboundOutbox.contact_delivery_id,
+            ).filter(
+                WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                WecomOutboundOutbox.status == "uncertain",
+                WecomOutboundOutbox.contact_delivery_id.isnot(None),
+            ).all()]
             # Keep the business delivery state aligned with AIBot's ambiguous
             # provider outcome. Without this companion update a failed DB
             # commit after ACK would leave delivery stuck in ``sending`` even
             # after the outbox lease has been fenced to ``uncertain``.
-            db.query(RecommendationDelivery).filter(
-                RecommendationDelivery.status == "sending",
-                RecommendationDelivery.lease_expires_at <= now,
-                exists().where(and_(
-                    WecomOutboundOutbox.recommendation_delivery_id
-                    == RecommendationDelivery.delivery_id,
-                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
-                    WecomOutboundOutbox.status == "uncertain",
-                )),
-            ).update({
-                "status": "unknown",
-                "last_error_code": "sending_lease_expired",
-                "last_error": "aibot frame written; provider outcome unknown",
-                "lease_owner": None,
-                "lease_expires_at": None,
-            }, synchronize_session=False)
-            db.query(ContactDelivery).filter(
-                ContactDelivery.status == "sending",
-                exists().where(and_(
-                    WecomOutboundOutbox.contact_delivery_id == ContactDelivery.delivery_id,
-                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
-                    WecomOutboundOutbox.status == "uncertain",
-                )),
-            ).update({"status": "retry_wait"}, synchronize_session=False)
+            if recommendation_ids:
+                db.query(RecommendationDelivery).filter(
+                    RecommendationDelivery.status == "sending",
+                    RecommendationDelivery.lease_expires_at <= now,
+                    RecommendationDelivery.delivery_id.in_(recommendation_ids),
+                ).update({
+                    "status": "unknown",
+                    "last_error_code": "sending_lease_expired",
+                    "last_error": "aibot frame written; provider outcome unknown",
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }, synchronize_session=False)
+            if contact_ids:
+                db.query(ContactDelivery).filter(
+                    ContactDelivery.status == "sending",
+                    ContactDelivery.delivery_id.in_(contact_ids),
+                ).update({"status": "retry_wait"}, synchronize_session=False)
             db.commit()
             return int((pending or 0) + (uncertain or 0) + (expired or 0))
         except Exception:
