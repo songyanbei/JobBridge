@@ -106,6 +106,11 @@ def _apply_demo_scope(query, model, db: Session, demo_id: str | None):
         return query
     if not demo_id:
         return query.filter(sa.false())
+    # Business tables carry the explicit workspace discriminator.  The owner
+    # principal check below is retained as a defense-in-depth guard against a
+    # row being assigned to the wrong synthetic user.
+    if hasattr(model, "demo_id"):
+        query = query.filter(model.demo_id == demo_id)
     principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
         DemoPrincipal.demo_id == demo_id,
         DemoPrincipal.principal_status == "active",
@@ -3113,6 +3118,9 @@ def _validate_job_ids(
         User.status == "active",
     ).all()
     if demo_id is not None:
+        if not demo_id:
+            return []
+        rows = [row for row in rows if getattr(row, "demo_id", None) == demo_id]
         principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
             DemoPrincipal.demo_id == demo_id,
             DemoPrincipal.principal_status == "active",
@@ -3141,6 +3149,9 @@ def _validate_resume_ids(
         User.status == "active",
     ).all()
     if demo_id is not None:
+        if not demo_id:
+            return []
+        rows = [row for row in rows if getattr(row, "demo_id", None) == demo_id]
         principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
             DemoPrincipal.demo_id == demo_id,
             DemoPrincipal.principal_status == "active",

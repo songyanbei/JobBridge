@@ -156,6 +156,7 @@ def create_workspace(
     for role in _ROLES:
         synthetic_userid = f"demo_{role}_{uuid.uuid4().hex[:16]}"
         db.add(User(
+            demo_id=workspace.demo_id,
             external_userid=synthetic_userid,
             role=role,
             display_name=f"演示-{role}",
