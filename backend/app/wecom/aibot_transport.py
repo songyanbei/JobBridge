@@ -434,7 +434,17 @@ class AibotTransport:
         if self.state == TransportState.DRAINING:
             self.transition(TransportState.BACKOFF)
 
+    def _fail_ack_waiters(self) -> None:
+        """Wake pending sends when the socket closes before ACKs arrive."""
+        for waiter in tuple(self._ack_waiters.values()):
+            if not waiter.done():
+                waiter.set_exception(AibotTransportError(
+                    "ack timeout; connection closed; delivery is uncertain",
+                ))
+        self._ack_waiters.clear()
+
     async def close(self) -> None:
+        self._fail_ack_waiters()
         for task in tuple(self._callback_tasks):
             task.cancel()
         if self._callback_tasks:
