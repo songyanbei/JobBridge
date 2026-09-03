@@ -361,6 +361,23 @@ def _delete_exact(db: Session, resource_type: str, ids: set[str]) -> int:
         model, key_name = _EXACT_RESOURCE_MODELS[resource_type]
     else:
         return 0
+    if resource_type == "user":
+        # Use a table-level DELETE for synthetic users. ORM bulk-delete
+        # synchronization can inspect stale User instances kept in the
+        # session from workspace creation and, on SQLite, issue the DELETE
+        # before the just-flushed principal removal is visible to its FK
+        # bookkeeping. The table-level statement is still parameterized and
+        # exact-id scoped, while avoiding ORM identity-map side effects.
+        # Use DBAPI-bound placeholders instead of ORM/Core compilation here.
+        # SQLite's FK checker can otherwise retain a stale mapped-table
+        # dependency during this same-transaction checkpoint delete.
+        placeholders = ", ".join("?" for _ in ids)
+        result = db.connection().exec_driver_sql(
+            f"DELETE FROM `{model.__tablename__}` "
+            f"WHERE `{key_name}` IN ({placeholders})",
+            tuple(ids),
+        )
+        return int(result.rowcount or 0)
     if not _table_exists(db, model):
         return 0
     column = getattr(model, key_name)
@@ -439,13 +456,31 @@ def cleanup_workspace(
         for resource_type in _CLEANUP_ORDER:
             if resource_type == "user":
                 # ``demo_principal.synthetic_userid`` is an explicit RESTRICT
-                # FK to user.external_userid. Principals must be removed in
-                # the same durable stage immediately before synthetic users.
-                db.query(DemoPrincipal).filter(
-                    DemoPrincipal.demo_id == row.demo_id,
-                ).delete(synchronize_session=False)
-                db.commit()
-                deleted.update(_delete_user_scoped(db, userids))
+                # FK to user.external_userid.  Keep principal deletion and
+                # synthetic-user deletion in one transaction: if either side
+                # fails, the rollback preserves the principal rows so a retry
+                # can reconstruct the exact same cleanup scope.  Committing
+                # the principal delete first would make a later failure leave
+                # orphaned synthetic users with no durable owner list.
+                user_scoped_deleted = _delete_user_scoped(db, userids)
+                # Delete through the same connection as the subsequent User
+                # delete. This keeps the FK transition deterministic even
+                # when this Session still has principal objects in its
+                # identity map from a previous status read.
+                for identity_obj in tuple(db.identity_map.values()):
+                    if isinstance(identity_obj, (DemoPrincipal, User)):
+                        db.expunge(identity_obj)
+                db.connection().execute(
+                    DemoPrincipal.__table__.delete().where(
+                        DemoPrincipal.__table__.c.demo_id == row.demo_id,
+                    )
+                )
+                # Force the FK-visible delete to reach the database before
+                # deleting synthetic users. This is still one transaction;
+                # the explicit flush makes the ordering deterministic across
+                # SQLite test databases and MySQL production databases.
+                db.flush()
+                deleted.update(user_scoped_deleted)
                 deleted["user"] = _delete_exact(db, "user", targets.get("user", set()))
             elif resource_type in {"job", "resume"}:
                 deleted[resource_type] = _delete_exact(db, resource_type, targets.get(resource_type, set()))
