@@ -241,9 +241,9 @@ def get_active_workspace_for_actor(
 ) -> DemoWorkspace | None:
     ensure_demo_enabled(bot_id=bot_id)
     digest = _require_digest(actor_digest_value)
-    if actor_is_allowlisted(digest):
-        # Prefer an explicitly active membership if multiple workspaces exist.
-        pass
+    # Static actor allowlisting is only a provisioning gate.  Runtime ingress
+    # still requires an active workspace membership, so an allowlisted actor
+    # cannot enter an unprovisioned workspace by itself.
     rows = db.query(DemoWorkspace).join(
         DemoWorkspaceMember, DemoWorkspaceMember.demo_id == DemoWorkspace.demo_id,
     ).filter(
