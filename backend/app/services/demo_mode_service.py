@@ -152,6 +152,7 @@ def create_workspace(
     db.add(workspace)
     db.flush()
 
+    synthetic_principals: list[tuple[str, str]] = []
     for role in _ROLES:
         synthetic_userid = f"demo_{role}_{uuid.uuid4().hex[:16]}"
         db.add(User(
@@ -163,6 +164,13 @@ def create_workspace(
             status="active",
             extra={"demo_id": workspace.demo_id, "demo_synthetic": True, "demo_role": role},
         ))
+        synthetic_principals.append((role, synthetic_userid))
+
+    # DemoPrincipal.synthetic_userid has an explicit RESTRICT FK to User. Do
+    # not rely on SQLAlchemy's table ordering here: the two ORM objects are
+    # intentionally decoupled, so flush the synthetic users first.
+    db.flush()
+    for role, synthetic_userid in synthetic_principals:
         db.add(DemoPrincipal(
             principal_id=str(uuid.uuid4()), demo_id=workspace.demo_id,
             role=role, synthetic_userid=synthetic_userid,

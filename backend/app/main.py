@@ -68,6 +68,7 @@ OPENAPI_TAGS = [
     {"name": "admin-config", "description": "系统配置读取与单项更新；危险项变更会写 audit_log。"},
     {"name": "admin-reports", "description": "数据看板：dashboard / trends / top / funnel / export。"},
     {"name": "admin-logs", "description": "对话日志查询与导出（必须带 userid + 时间范围）。"},
+    {"name": "admin-demo", "description": "演示工作区创建、预览、禁用、清理与重试；仅 super_admin。"},
     {"name": "events", "description": "外部事件回传（小程序点击等），走 X-Event-Api-Key 鉴权。"},
     {"name": "wecom-webhook", "description": "企业微信回调入口（内部使用，非后台用户直连）。"},
 ]

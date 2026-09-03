@@ -14,6 +14,7 @@ from . import (
     resumes,
     recommendation_strategies,
     recommendation_metrics,
+    demo,
 )
 
 router = APIRouter()
@@ -29,3 +30,4 @@ router.include_router(reports.router)
 router.include_router(logs.router)
 router.include_router(recommendation_strategies.router)
 router.include_router(recommendation_metrics.router)
+router.include_router(demo.router)
