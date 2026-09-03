@@ -503,6 +503,20 @@ class TestDurableSessionCommit:
         assert values["session_payload"]["__jobbridge_session_key"] == commit.userid
         assert values["session_payload"]["role"] == "factory"
 
+    def test_demo_delete_commit_keeps_session_key_for_recovery(self, worker):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.update.return_value = 1
+        commit = SimpleNamespace(
+            userid="demo:session:demo-1:single:wecom-1:worker",
+            operation="delete", expected_version=4, payload=None,
+        )
+        with patch.object(worker, "_stage_session_patch", return_value=False):
+            worker._stage_session_commit(db, 42, commit)
+        values = db.query.return_value.filter.return_value.update.call_args.args[0]
+        assert values["session_payload"] == {
+            "__jobbridge_session_key": commit.userid,
+        }
+
     def test_demo_recovery_does_not_compare_against_canonical_fallback(self, worker):
         item = {
             "event_id": 42,
