@@ -43,10 +43,19 @@ class AibotClient:
     def respond_msg(self, req_id: str, content: str) -> dict[str, Any]:
         return self._text_frame("aibot_respond_msg", req_id, content)
 
-    def send_msg(self, req_id: str, content: str, *, chat_id: str | None = None) -> dict[str, Any]:
+    def send_msg(
+        self,
+        req_id: str,
+        content: str,
+        *,
+        chat_id: str | None = None,
+        chat_type: int | None = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"msgtype": "text", "text": {"content": content}}
         if chat_id:
             body["chatid"] = chat_id
+        if chat_type in {1, 2}:
+            body["chat_type"] = chat_type
         return self._frame("aibot_send_msg", req_id, body)
 
     def _text_frame(self, cmd: str, req_id: str, content: str) -> dict[str, Any]:
@@ -67,14 +76,30 @@ class AibotClient:
             self._streams[stream_id] = "__finished__"
         return self._frame("aibot_respond_msg", req_id, {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": content}})
 
-    def respond_update_msg(self, req_id: str, stream_id: str, content: str, *, finish: bool = False) -> dict[str, Any]:
-        if stream_id not in self._streams or self._streams[stream_id] != req_id:
-            raise AibotClientError("unknown stream or req_id mismatch")
-        if self._streams[stream_id] == "__finished__":
-            raise AibotClientError("stream already finished")
-        if finish:
-            self._streams[stream_id] = "__finished__"
-        return self._frame("aibot_respond_update_msg", req_id, {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": content}})
+    def respond_update_msg(
+        self,
+        req_id: str,
+        template_card: dict[str, Any],
+        *,
+        userids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Build the official template-card update command.
+
+        Stream updates intentionally use :meth:`stream` and the
+        ``aibot_respond_msg`` command.  ``aibot_respond_update_msg`` is only
+        valid for ``template_card_event`` callbacks.
+        """
+        if not isinstance(template_card, dict) or not template_card:
+            raise AibotClientError("template_card is required")
+        body: dict[str, Any] = {
+            "response_type": "update_template_card",
+            "template_card": template_card,
+        }
+        if userids:
+            if not isinstance(userids, list) or not all(isinstance(value, str) and value for value in userids):
+                raise AibotClientError("userids must be a list of non-empty strings")
+            body["userids"] = userids
+        return self._frame("aibot_respond_update_msg", req_id, body)
 
     # Explicit builder aliases make the command names easy to discover for
     # callers that construct frames without retaining a client instance.

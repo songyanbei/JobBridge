@@ -448,10 +448,11 @@ class AibotConnection:
         """
         from app.services.inbound_acceptance import AcceptanceResult
 
+        deadline = asyncio.get_running_loop().time() + min(EVENT_RESPONSE_TIMEOUT_SECONDS, ACCEPTANCE_TIMEOUT_SECONDS)
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self.accept_callback, callback),
-                timeout=ACCEPTANCE_TIMEOUT_SECONDS,
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
             )
         except asyncio.TimeoutError:
             logger.warning("aibot callback acceptance timed out")
@@ -469,9 +470,13 @@ class AibotConnection:
         if event_type != "enter_chat":
             logger.warning("aibot event response unsupported event_type=%s; fail-closed", event_type)
             return result
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            logger.warning("aibot enter_chat welcome deadline exceeded")
+            return result
         frame = transport.client.respond_welcome(callback.req_id, WELCOME_RESPONSE_CONTENT)
         try:
-            await transport.send(frame, timeout=EVENT_RESPONSE_TIMEOUT_SECONDS)
+            await transport.send(frame, timeout=remaining)
         except Exception:
             logger.exception("aibot event response failed event_type=%s req_id=%s", event_type, callback.req_id)
         return result

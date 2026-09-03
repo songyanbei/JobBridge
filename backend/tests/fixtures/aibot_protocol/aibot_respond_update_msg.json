@@ -1,1 +1,1 @@
-{"cmd":"aibot_respond_update_msg","headers":{"req_id":"msg-1"},"body":{"msgtype":"stream","stream":{"id":"STREAMID","finish":false,"content":"增量"}}}
+{"cmd":"aibot_respond_update_msg","headers":{"req_id":"evt-1"},"body":{"response_type":"update_template_card","template_card":{"card_type":"button_interaction"}}}

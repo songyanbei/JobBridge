@@ -162,6 +162,7 @@ class AibotTransport:
                 self.ws_url,
                 open_timeout=self.connect_timeout,
                 ping_interval=None,
+                ping_timeout=None,
             )
         return await _maybe_await(self.connect_factory(self.ws_url))
 
@@ -313,6 +314,16 @@ class AibotTransport:
             logger.warning("aibot websocket ignored malformed frame")
             return
         if frame.cmd in {"aibot_msg_callback", "aibot_event_callback"}:
+            # The provider's disconnected_event is a connection lifecycle
+            # notification and intentionally omits chat/user fields.  It is
+            # not a business message and must not enter the durable inbox.
+            if frame.cmd == "aibot_event_callback":
+                value = decode_frame(payload)
+                body = value.get("body") if isinstance(value, dict) else {}
+                event = body.get("event") if isinstance(body, dict) else {}
+                if isinstance(event, dict) and event.get("eventtype") == "disconnected_event":
+                    logger.info("aibot websocket disconnected_event received")
+                    return
             try:
                 callback = parse_callback(payload)
             except AibotProtocolError as exc:

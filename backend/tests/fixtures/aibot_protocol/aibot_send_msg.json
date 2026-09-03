@@ -1,1 +1,1 @@
-{"cmd":"aibot_send_msg","headers":{"req_id":"push-1"},"body":{"msgtype":"text","text":{"content":"主动推送"}}}
+{"cmd":"aibot_send_msg","headers":{"req_id":"push-1"},"body":{"chatid":"CHATID","chat_type":1,"msgtype":"markdown","markdown":{"content":"主动推送"}}}
