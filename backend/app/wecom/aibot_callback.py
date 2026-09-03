@@ -116,6 +116,8 @@ class AibotCallback:
 
 
 def _bounded_id(value: Any, name: str, *, required: bool = True) -> str:
+    if value is None and not required:
+        return ""
     if not isinstance(value, str) or (required and not value):
         raise AibotProtocolError(f"missing {name}")
     if len(value) > MAX_ID_LENGTH:
@@ -180,9 +182,12 @@ def _parse_parts(body: dict[str, Any], msg_type: str, chat_type: str) -> tuple[A
         text = part_text.get("content", "") if part_type == "text" else ""
         if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
             raise AibotProtocolError("text exceeds size limit")
-        media_id = raw.get("media_id", "") or ""
-        media_url = raw.get("url", "") or ""
-        media_aes_key = raw.get("aeskey", "") or ""
+        media_body = raw.get(part_type, {}) if part_type != "text" else {}
+        if not isinstance(media_body, dict):
+            raise AibotProtocolError("mixed media body must be an object")
+        media_id = media_body.get("media_id", raw.get("media_id", "")) or ""
+        media_url = media_body.get("url", raw.get("url", "")) or ""
+        media_aes_key = media_body.get("aeskey", raw.get("aeskey", "")) or ""
         if not all(isinstance(value, str) for value in (media_id, media_url, media_aes_key)):
             raise AibotProtocolError("mixed media fields must be strings")
         parts.append(AibotMediaPart(part_type, media_id, media_url, media_aes_key, text))
@@ -239,7 +244,14 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
     text_body = body.get("text", {}) if msg_type == "text" else {}
     if msg_type == "text" and not isinstance(text_body, dict):
         raise AibotProtocolError("body.text must be an object")
-    text = text_body.get("content", "") if msg_type == "text" else ""
+    voice_body = body.get("voice", {}) if msg_type == "voice" else {}
+    if msg_type == "voice" and not isinstance(voice_body, dict):
+        raise AibotProtocolError("body.voice must be an object")
+    text = (
+        text_body.get("content", "") if msg_type == "text"
+        else voice_body.get("content", "") if msg_type == "voice"
+        else ""
+    )
     if not isinstance(text, str) or len(text) > MAX_TEXT_CHARS:
         raise AibotProtocolError("text exceeds size limit")
     media = body.get(msg_type, {}) if msg_type in {"image", "voice", "file", "video"} else {}

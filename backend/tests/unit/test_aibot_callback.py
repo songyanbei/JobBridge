@@ -43,3 +43,28 @@ def test_malformed_protocol_types_are_normalized_to_protocol_error(body_update):
     with pytest.raises(AibotProtocolError):
         parse_callback({**FIXTURE, "body": body})
 
+
+
+def test_official_single_message_may_omit_chatid():
+    body = {**FIXTURE["body"], "chatid": None, "chattype": "single"}
+    callback = parse_callback({**FIXTURE, "body": body})
+    assert callback.chat_id == ""
+    assert callback.conversation_id == "USERID"
+
+
+def test_voice_content_is_projected():
+    body = {**FIXTURE["body"], "chattype": "single", "chatid": None, "msgtype": "voice", "voice": {"content": "语音转写"}}
+    body.pop("text", None)
+    callback = parse_callback({**FIXTURE, "body": body})
+    assert callback.content == "语音转写"
+
+
+def test_mixed_media_uses_nested_official_payload():
+    body = {**FIXTURE["body"], "chattype": "single", "chatid": None, "msgtype": "mixed", "mixed": {"msg_item": [
+        {"msgtype": "text", "text": {"content": "说明"}},
+        {"msgtype": "image", "image": {"url": "https://example.invalid/image", "aeskey": "AESKEY"}},
+    ]}}
+    body.pop("text", None)
+    callback = parse_callback({**FIXTURE, "body": body})
+    assert callback.parts[1].media_url == "https://example.invalid/image"
+    assert callback.parts[1].media_aes_key == "AESKEY"
