@@ -52,6 +52,26 @@ def test_official_single_message_may_omit_chatid():
     assert callback.conversation_id == "USERID"
 
 
+def test_official_enter_chat_event_omits_chat_type_and_chatid():
+    callback = parse_callback({
+        "cmd": "aibot_event_callback",
+        "headers": {"req_id": "evt-1"},
+        "body": {
+            "msgid": "EVENTID",
+            "create_time": 1700000000,
+            "aibotid": "AIBOTID",
+            "from": {"userid": "USERID"},
+            "msgtype": "event",
+            "event": {"eventtype": "enter_chat"},
+        },
+    })
+
+    assert callback.event_type == "enter_chat"
+    assert callback.chat_type == "single"
+    assert callback.chat_id == ""
+    assert callback.conversation_id == "USERID"
+
+
 def test_voice_content_is_projected():
     body = {**FIXTURE["body"], "chattype": "single", "chatid": None, "msgtype": "voice", "voice": {"content": "语音转写"}}
     body.pop("text", None)

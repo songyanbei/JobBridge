@@ -158,7 +158,7 @@ def test_aibot_media_is_encrypted_during_durable_acceptance():
     assert "aes-key" not in queued[0]
 
 
-def test_aibot_media_missing_url_or_expiry_is_invalid():
+def test_aibot_media_missing_url_is_invalid():
     db = FakeDB()
     result = InboundAcceptanceService(
         db_factory=lambda: db,
@@ -168,6 +168,37 @@ def test_aibot_media_missing_url_or_expiry_is_invalid():
 
     assert result.status == "invalid"
     assert db.added is None
+
+
+def test_aibot_media_without_provider_expiry_uses_five_minute_url_window():
+    db = FakeDB()
+    msg = _aibot_message(
+        msg_type="image",
+        media_id="media-1",
+        media_url="https://example.invalid/media",
+        media_aes_key="aes-key",
+        media_expires_at=None,
+    )
+    with patch("app.services.inbound_acceptance.time.time", return_value=1_900_000_000):
+        result = InboundAcceptanceService(
+            db_factory=lambda: db,
+            duplicate_check=lambda _key: False,
+            enqueue=lambda *_args: None,
+        ).accept(msg)
+
+    assert result.status == "accepted"
+    assert db.added.media_expires_at == datetime.fromtimestamp(1_900_000_300, timezone.utc).replace(tzinfo=None)
+
+
+def test_aibot_voice_transcript_does_not_require_download_media_fields():
+    db = FakeDB()
+    result = InboundAcceptanceService(
+        db_factory=lambda: db,
+        duplicate_check=lambda _key: False,
+        enqueue=lambda *_args: None,
+    ).accept(_aibot_message(msg_type="voice", content="语音转写"))
+
+    assert result.status == "accepted"
 
 
 def test_aibot_rate_limit_uses_conversation_and_actor_keys_and_never_enqueues():

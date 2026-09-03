@@ -217,13 +217,35 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
     body = frame.body
     provider_msg_id = _bounded_id(body.get("msgid"), "body.msgid")
     aibot_id = _bounded_id(body.get("aibotid"), "body.aibotid")
-    chat_type = body.get("chattype")
+    msg_type = _bounded_id(body.get("msgtype"), "body.msgtype")
+    if msg_type not in ALLOWED_MESSAGE_TYPES:
+        raise AibotProtocolError(f"unsupported msgtype {msg_type}")
+
+    # The official enter_chat/template-card event payloads do not carry the
+    # message callback's ``chattype``/``chatid`` fields.  Events are scoped to
+    # the user's single-chat session unless the provider explicitly supplies a
+    # type.  Keep disconnected_event parseable as a lifecycle-only event too;
+    # the transport filters it before durable acceptance.
+    event_body = body.get("event", {}) if msg_type == "event" else {}
+    if msg_type == "event" and not isinstance(event_body, dict):
+        raise AibotProtocolError("body.event must be an object")
+    event_type = event_body.get("eventtype", "") if msg_type == "event" else ""
+    if not isinstance(event_type, str):
+        raise AibotProtocolError("invalid event type")
+    raw_chat_type = body.get("chattype")
+    chat_type = "single" if msg_type == "event" and raw_chat_type is None else raw_chat_type
     if chat_type not in ALLOWED_CHAT_TYPES:
         raise AibotProtocolError("body.chattype must be single or group")
     sender = body.get("from")
     if not isinstance(sender, dict):
-        raise AibotProtocolError("missing body.from")
-    from_user = _bounded_id(sender.get("userid"), "body.from.userid")
+        if not (msg_type == "event" and event_type == "disconnected_event"):
+            raise AibotProtocolError("missing body.from")
+        sender = {}
+    from_user = _bounded_id(
+        sender.get("userid"),
+        "body.from.userid",
+        required=not (msg_type == "event" and event_type == "disconnected_event"),
+    )
     # The protocol does not guarantee whether userid is encrypted.  Only an
     # explicit provider/test-enterprise assertion may mark it plain; never
     # infer plainness from the string's shape.
@@ -231,9 +253,6 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
     if actor_id_kind not in {"plain", "opaque", "open_userid"}:
         actor_id_kind = "opaque"
     chat_id = _bounded_id(body.get("chatid"), "body.chatid", required=chat_type == "group")
-    msg_type = _bounded_id(body.get("msgtype"), "body.msgtype")
-    if msg_type not in ALLOWED_MESSAGE_TYPES:
-        raise AibotProtocolError(f"unsupported msgtype {msg_type}")
     if msg_type != "text" and msg_type != "event" and chat_type != "single":
         raise AibotProtocolError("media is only supported in single chat")
     create_time = body.get("create_time", 0)
@@ -260,12 +279,6 @@ def parse_callback(payload: str | bytes | bytearray | dict[str, Any]) -> AibotCa
     parts = _parse_parts(body, msg_type, chat_type)
     if msg_type == "mixed":
         text = "".join(p.content for p in parts if p.msg_type == "text")
-    event_body = body.get("event", {}) if msg_type == "event" else {}
-    if msg_type == "event" and not isinstance(event_body, dict):
-        raise AibotProtocolError("body.event must be an object")
-    event_type = event_body.get("eventtype", "") if msg_type == "event" else ""
-    if not isinstance(event_type, str):
-        raise AibotProtocolError("invalid event type")
     media_id = media.get("media_id", body.get("media_id", "")) or ""
     media_url = media.get("url", "") or ""
     media_aes_key = media.get("aeskey", "") or ""

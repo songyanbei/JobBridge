@@ -217,14 +217,21 @@ class InboundAcceptanceService:
             return None
         if source == "wecom_app" and not msg.msg_id:
             return None
-        if source == "wecom_aibot" and msg.msg_type in {"image", "voice", "video", "file"}:
-            if not msg.media_url or msg.media_expires_at is None:
+        media_expires_at = msg.media_expires_at
+        if source == "wecom_aibot" and msg.msg_type in {"image", "video", "file"}:
+            if not msg.media_url:
                 return None
             parsed_media_url = urlparse(msg.media_url)
             if parsed_media_url.scheme != "https" or not parsed_media_url.netloc:
                 return None
-            if msg.msg_type in {"image", "video", "file"} and not msg.media_aes_key:
+            if not msg.media_aes_key:
                 return None
+            # The official AIBot callback exposes only ``url`` and ``aeskey``;
+            # unlike legacy media callbacks it does not include expires_at.
+            # The URL is documented as valid for five minutes, so establish a
+            # bounded internal deadline when the provider omits the field.
+            if media_expires_at is None:
+                media_expires_at = int(time.time()) + 300
         dedupe = hashlib.sha256(f"{source}\0{provider_id}".encode()).hexdigest() if provider_id else None
         internal_msg_id = (
             "aibot_" + hashlib.sha256(f"{source}\0{provider_id}".encode()).hexdigest()[:58]
@@ -245,7 +252,7 @@ class InboundAcceptanceService:
             "aibot_id": msg.aibot_id or None,
             "actor_id_kind": msg.actor_id_kind or "plain",
             "turn_id": msg.turn_id or str(uuid.uuid4()),
-            "media_expires_at": _aibot_media_expiry(msg.media_expires_at)
+            "media_expires_at": _aibot_media_expiry(media_expires_at)
             if source == "wecom_aibot" else None,
         }
 
