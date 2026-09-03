@@ -404,3 +404,25 @@ def test_contact_send_failure_returns_to_retry_wait_without_empty_payload():
 
     assert delivery_query.update.call_args.args[0]["status"] == "retry_wait"
     assert outbox_query.update.call_args.args[0]["status"] == "pending"
+
+
+def test_contact_ack_timeout_fences_outbox_and_releases_delivery_for_manual_retry():
+    outbox_query = MagicMock()
+    outbox_query.filter.return_value = outbox_query
+    outbox_query.update.return_value = 1
+    delivery_query = MagicMock()
+    delivery_query.filter.return_value = delivery_query
+    delivery_query.update.return_value = 1
+    db = MagicMock()
+    db.query.side_effect = [outbox_query, delivery_query]
+    writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
+
+    with patch("app.services.aibot_connection.SessionLocal", return_value=db):
+        assert writer._mark_uncertain(
+            {"id": 190, "contact_delivery_id": "contact-1"},
+            "ack timeout; delivery is uncertain",
+        ) is True
+
+    assert outbox_query.update.call_args.args[0]["status"] == "uncertain"
+    assert delivery_query.update.call_args.args[0]["status"] == "retry_wait"
+    db.commit.assert_called_once()

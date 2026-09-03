@@ -265,6 +265,22 @@ class ContactService:
         if actor_status is not None and str(actor_status).lower() in {"blocked", "deleted", "disabled"}:
             self.audit_contact_event("grant_redeem", "denied", "actor_not_allowed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant_id, trace_id=trace_id, db=session)
             return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
+        inbound = None
+        if inbound_event_id is not None:
+            # B0 callers/tests may use a reduced contact schema without the
+            # durable inbox table. Preserve the historical legacy fallback in
+            # that case; the production Worker always supplies the full row.
+            try:
+                inbound = session.get(WecomInboundEvent, int(inbound_event_id))
+            except Exception:
+                inbound = None
+        if inbound is not None and str(getattr(inbound, "conversation_type", "single")) == "group":
+            self.audit_contact_event(
+                "grant_redeem", "denied", "group_contact_unsupported",
+                actor_id=actor_id, listing_ref=grant.listing_ref,
+                grant_id=grant_id, trace_id=trace_id, db=session,
+            )
+            return ContactResponse(success=False, code="forbidden", message=CONTACT_UNAVAILABLE_MESSAGE)
         if grant.expires_at <= _now():
             grant.status = "expired"
             return ContactResponse(success=False, code="expired", message=CONTACT_UNAVAILABLE_MESSAGE)
@@ -278,15 +294,6 @@ class ContactService:
         # dispatcher never falls back to legacy phone or WeChat columns.
         now = _now()
         grant.status, grant.used_at = "used", now
-        inbound = None
-        if inbound_event_id is not None:
-            # B0 callers/tests may use a reduced contact schema without the
-            # durable inbox table. Preserve the historical legacy fallback in
-            # that case; the production Worker always supplies the full row.
-            try:
-                inbound = session.get(WecomInboundEvent, int(inbound_event_id))
-            except Exception:
-                inbound = None
         source_channel = getattr(inbound, "source_channel", None) or "wecom_app"
         conversation_type = getattr(inbound, "conversation_type", None) or "single"
         conversation_id = getattr(inbound, "conversation_id", None)

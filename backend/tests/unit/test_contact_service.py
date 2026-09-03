@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
 from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest
+from app.models import WecomInboundEvent
 from app.listing.contact import CONTACT_UNAVAILABLE_MESSAGE, ContactService
 
 
@@ -78,3 +80,28 @@ def test_direction_bound_grant_requires_matching_direction_at_redeem():
         listing_status="passed",
     )
     assert allowed.success
+
+
+def test_group_contact_redeem_is_fail_closed_before_consuming_grant():
+    db = _db()
+    service = ContactService(db, mode="on")
+    request = service.create_contact_request("actor-1", "recruitment.job:1")
+    grant = service.issue_one_time_grant(request.request_id, "actor-1", "recruitment.job:1")
+    real_get = db.get
+    db.get = lambda entity, key: (
+        SimpleNamespace(
+            conversation_type="group", source_channel="wecom_aibot",
+            conversation_id="chat-1", chat_id="chat-1",
+        )
+        if entity is WecomInboundEvent else real_get(entity, key)
+    )
+
+    result = service.redeem_grant(
+        grant.grant_id, grant.token, "actor-1", inbound_event_id=42,
+        userid="actor-1",
+    )
+
+    assert not result.success
+    assert result.code == "forbidden"
+    assert db.query(ContactGrant).one().status == "issued"
+    assert db.query(ContactDelivery).count() == 0

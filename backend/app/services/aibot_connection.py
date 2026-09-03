@@ -331,6 +331,14 @@ class AibotOutboxWriter:
                 "lease_owner": None,
                 "lease_expires_at": None,
             }, synchronize_session=False)
+            db.query(ContactDelivery).filter(
+                ContactDelivery.status == "sending",
+                exists().where(and_(
+                    WecomOutboundOutbox.contact_delivery_id == ContactDelivery.delivery_id,
+                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                    WecomOutboundOutbox.status == "uncertain",
+                )),
+            ).update({"status": "retry_wait"}, synchronize_session=False)
             db.commit()
             return int((pending or 0) + (uncertain or 0) + (expired or 0))
         except Exception:
@@ -351,6 +359,8 @@ class AibotOutboxWriter:
             # A transport that reports a write/ack ambiguity should raise
             # AibotAckTimeout. Other failures happen before a frame is written,
             # so the row remains retryable pending.
+            if "ack timeout" in str(exc).lower() and "uncertain" in str(exc).lower():
+                return self._mark_uncertain(item, str(exc))
             return self._mark_pending(item, str(exc))
 
         if not self._valid_ack(response, item):
@@ -561,6 +571,39 @@ class AibotOutboxWriter:
         return self._update(item, values)
 
     def _mark_uncertain(self, item: Mapping[str, Any], reason: str) -> bool:
+        contact_delivery_id = item.get("contact_delivery_id")
+        if contact_delivery_id:
+            db = SessionLocal()
+            try:
+                outbox_updated = db.query(WecomOutboundOutbox).filter(
+                    WecomOutboundOutbox.id == int(item["id"]),
+                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                    WecomOutboundOutbox.status == "sending",
+                    WecomOutboundOutbox.lease_owner == self.lease_owner,
+                    WecomOutboundOutbox.fencing_token == self.fencing_token,
+                ).update({
+                    "status": "uncertain",
+                    "uncertain_at": func.now(6),
+                    "locked_at": None,
+                    "lease_owner": None,
+                    "fencing_token": None,
+                    "last_error": reason[:1000],
+                }, synchronize_session=False)
+                delivery_updated = db.query(ContactDelivery).filter(
+                    ContactDelivery.delivery_id == str(contact_delivery_id),
+                    ContactDelivery.status == "sending",
+                ).update({"status": "retry_wait"}, synchronize_session=False)
+                if outbox_updated != 1 or delivery_updated != 1:
+                    db.rollback()
+                    return False
+                db.commit()
+                return True
+            except Exception:
+                db.rollback()
+                logger.exception("aibot: contact uncertain update failed id=%s", item.get("id"))
+                return False
+            finally:
+                db.close()
         return self._update(item, {
             "status": "uncertain",
             "uncertain_at": func.now(6),
