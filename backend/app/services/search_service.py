@@ -113,6 +113,13 @@ def _apply_demo_scope(query, model, db: Session, demo_id: str | None):
     return query.filter(model.owner_userid.in_(sa.select(principal_ids.c.synthetic_userid)))
 
 
+def _scoped_query(query_fn, criteria: dict, limit: int, db: Session, demo_id: str | None):
+    """Call query helpers compatibly for legacy callers and test doubles."""
+    if demo_id is None:
+        return query_fn(criteria, limit, db)
+    return query_fn(criteria, limit, db, demo_id=demo_id)
+
+
 def _visibility_snapshot(db: Session, direction: str, role: str) -> EffectivePolicySnapshot:
     scene = VisibilityScene.JOB_SEARCH if direction == "search_job" else VisibilityScene.CANDIDATE_SEARCH
     snapshot = load_visibility_policy(db, scene, role)
@@ -1161,7 +1168,7 @@ def search_jobs(
 
     # 硬过滤
     initial_query_started = time.perf_counter()
-    candidates = _query_jobs(criteria, max_candidates, db, demo_id=demo_id)
+    candidates = _scoped_query(_query_jobs, criteria, max_candidates, db, demo_id)
     initial_query_record = _query_attempt_record(
         step="initial",
         criteria=criteria,
@@ -1493,7 +1500,7 @@ def search_workers(
     demo_id = _demo_scope_id(user_ctx)
 
     initial_query_started = time.perf_counter()
-    candidates = _query_resumes(criteria, max_candidates, db, demo_id=demo_id)
+    candidates = _scoped_query(_query_resumes, criteria, max_candidates, db, demo_id)
     initial_query_record = _query_attempt_record(
         step="initial",
         criteria=criteria,
@@ -2185,7 +2192,7 @@ def _run_job_fallback_steps(
 
     for step_name, step_criteria in steps:
         started = time.perf_counter()
-        candidates = _query_jobs(step_criteria, limit, db, demo_id=demo_id)
+        candidates = _scoped_query(_query_jobs, step_criteria, limit, db, demo_id)
         probe_results.append(_query_attempt_record(
             step=step_name,
             criteria=step_criteria,
@@ -2264,7 +2271,7 @@ def _run_resume_fallback_steps(
 
     for step_name, step_criteria in steps:
         started = time.perf_counter()
-        candidates = _query_resumes(step_criteria, limit, db, demo_id=demo_id)
+        candidates = _scoped_query(_query_resumes, step_criteria, limit, db, demo_id)
         probe_results.append(_query_attempt_record(
             step=step_name,
             criteria=step_criteria,
@@ -2397,7 +2404,7 @@ def _probe_relax_steps(
             # 该 step 不会改变 criteria（如薪资字段缺失 → relax_salary_10pct 无效）
             continue
         started = time.perf_counter()
-        candidates = query_fn(relaxed, limit, db, demo_id=demo_id)
+        candidates = _scoped_query(query_fn, relaxed, limit, db, demo_id)
         available.append(step)
         record = _query_attempt_record(
             step=step,
@@ -2478,9 +2485,9 @@ def execute_relaxed_search(
     demo_id = _demo_scope_id(user_ctx)
 
     if direction == "search_job":
-        candidates = _query_jobs(relaxed, max_candidates, db, demo_id=demo_id)
+        candidates = _scoped_query(_query_jobs, relaxed, max_candidates, db, demo_id)
     else:
-        candidates = _query_resumes(relaxed, max_candidates, db, demo_id=demo_id)
+        candidates = _scoped_query(_query_resumes, relaxed, max_candidates, db, demo_id)
     initial_count = len(candidates)
 
     if not candidates:
@@ -2848,7 +2855,7 @@ def _collect_suggestions(
         if not has_effective_search_criteria(c):
             continue
         started = time.perf_counter()
-        cands = query_fn(c, limit, db, demo_id=demo_id)
+        cands = _scoped_query(query_fn, c, limit, db, demo_id)
         if attempt_records is not None:
             attempt_records.append(_query_attempt_record(
                 step=name,
