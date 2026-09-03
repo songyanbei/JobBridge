@@ -19,7 +19,7 @@ def db():
     with engine.begin() as conn:
         conn.exec_driver_sql(
             "CREATE TABLE user ("
-            "external_userid VARCHAR(64) PRIMARY KEY, role VARCHAR(16) NOT NULL, "
+            "external_userid VARCHAR(64) PRIMARY KEY, demo_id VARCHAR(64), role VARCHAR(16) NOT NULL, "
             "display_name VARCHAR(64), company VARCHAR(128), address VARCHAR(255), "
             "contact_person VARCHAR(64), phone VARCHAR(32), phone_ciphertext BLOB, "
             "phone_key_version INTEGER, phone_digest VARCHAR(64), contact_person_ciphertext BLOB, "
