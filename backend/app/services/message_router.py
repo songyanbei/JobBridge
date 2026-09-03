@@ -63,6 +63,10 @@ from app.services.search_permission import (
     denied_search_response,
 )
 from app.services.user_service import UserContext
+from app.services.demo_message_context import (
+    DEMO_DISABLED_WORKSPACE_REPLY,
+    DemoActorContext,
+)
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 
@@ -548,12 +552,53 @@ def process(
     user_context=None,
     inbound_event_id=None,
     resolved_actor=None,
+    demo_context: DemoActorContext | None = None,
+    demo_command_reply: str | None = None,
+) -> list[ReplyMessage]:
+    """Route a turn and restore the real actor as every delivery target.
+
+    The inner legacy router operates on ``effective_userid`` so all existing
+    permission, owner and session code remains unchanged.  A demo turn is
+    normalized back to ``real_actor_userid`` at this boundary; synthetic IDs
+    therefore can never leak to WeCom.
+    """
+    replies = _process(
+        msg,
+        db,
+        action_context=action_context,
+        user_context=user_context,
+        inbound_event_id=inbound_event_id,
+        resolved_actor=resolved_actor,
+        demo_context=demo_context,
+        demo_command_reply=demo_command_reply,
+    )
+    if demo_context is not None:
+        for reply in replies:
+            reply.userid = demo_context.reply_userid
+    return replies
+
+
+def _process(
+    msg: WeComMessage,
+    db: Session,
+    action_context=None,
+    user_context=None,
+    inbound_event_id=None,
+    resolved_actor=None,
+    demo_context: DemoActorContext | None = None,
+    demo_command_reply: str | None = None,
 ) -> list[ReplyMessage]:
     """消息路由主入口。Worker 调用，返回待发送的回复列表。"""
     userid = msg.from_user
     if not userid:
         logger.warning("message_router: empty from_user in msg_id=%s", msg.msg_id)
         return []
+
+    # Deterministic demo commands are handled before LLM/legacy intent
+    # classification.  The Worker has already authenticated the actor and
+    # resolved/validated the control-plane command.
+    if demo_command_reply is not None:
+        return [_reply(userid, demo_command_reply)]
 
     # AIBot business routing requires the Worker identity gate to provide an
     # explicit resolved actor.  This prevents callers from bypassing the gate
@@ -574,6 +619,16 @@ def process(
         if not aibot_identity.verified:
             return [_reply(userid, AIBOT_IDENTITY_BINDING_REPLY)]
         userid = aibot_identity.mapped_external_userid or userid
+
+    # Demo context is applied only after the AIBot identity gate above.  The
+    # opaque actor must never be replaced before verification.  The synthetic
+    # principal is the business identity; delivery is normalized by the outer
+    # process() wrapper.
+    if demo_context is not None:
+        if not demo_context.is_usable() or demo_context.real_actor_userid != userid:
+            return [_reply(userid, DEMO_DISABLED_WORKSPACE_REPLY)]
+        msg = dataclasses.replace(msg, from_user=demo_context.effective_userid)
+        userid = demo_context.effective_userid
 
     # 1. 用户识别 / 注册
     if user_context is not None:

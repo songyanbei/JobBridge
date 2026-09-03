@@ -13,6 +13,7 @@ import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -485,6 +486,36 @@ class TestDurableSessionCommit:
 
         mark_applied.assert_called_once_with(42, "claim-1")
         mark_retry.assert_not_called()
+
+    def test_demo_session_commit_persists_exact_role_scoped_key(self, worker):
+        db = MagicMock()
+        db.query.return_value.filter.return_value.update.return_value = 1
+        commit = SimpleNamespace(
+            userid="demo:session:demo-1:single:wecom-1:factory",
+            operation="save",
+            expected_version=3,
+            payload={"role": "factory", "search_criteria": {}},
+        )
+        with patch.object(worker, "_stage_session_patch", return_value=False):
+            worker._stage_session_commit(db, 42, commit)
+
+        values = db.query.return_value.filter.return_value.update.call_args.args[0]
+        assert values["session_payload"]["__jobbridge_session_key"] == commit.userid
+        assert values["session_payload"]["role"] == "factory"
+
+    def test_demo_recovery_does_not_compare_against_canonical_fallback(self, worker):
+        item = {
+            "event_id": 42,
+            "attempts": 1,
+            "lease_owner": "claim-1",
+            "userid": "demo:session:demo-1:single:wecom-1:broker",
+            "commit": MagicMock(),
+        }
+        with patch.object(worker, "_claim_session_commits", return_value=[item]), patch.object(
+            worker, "_apply_session_commit_item", return_value=True,
+        ) as apply_item:
+            assert worker._apply_session_commit_for_event(42, None) is True
+        apply_item.assert_called_once_with(item)
 
     @patch("app.services.worker.SessionLocal")
     def test_stale_session_claim_owner_cannot_mark_commit_applied(

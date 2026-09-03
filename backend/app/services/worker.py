@@ -73,6 +73,11 @@ from app.services import (
     upload_service,
 )
 from app.services.aibot_identity_service import AibotIdentityService
+from app.services.demo_message_context import (
+    DemoActorContext,
+    handle_command as handle_demo_command,
+    resolve_active_context,
+)
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
 from app.wecom.aibot_client import stable_aibot_stream_id
@@ -791,10 +796,10 @@ class Worker:
                     persisted_event = db.query(WecomInboundEvent).filter(
                         WecomInboundEvent.id == inbound_event_id,
                     ).first()
-                    recovery_session_key = (
-                        _session_key_for_inbound_event(persisted_event, db)
-                        if persisted_event is not None else session_key
-                    )
+                    # The durable claim carries the exact role-scoped key in
+                    # its reserved session payload metadata.  Do not derive a
+                    # demo key from the canonical actor during recovery.
+                    recovery_session_key = None
                     applied = self._apply_session_commit_for_event(
                         inbound_event_id, recovery_session_key,
                     )
@@ -812,6 +817,8 @@ class Worker:
             msg = _build_wecom_message(msg_data)
 
             aibot_identity = None
+            demo_context: DemoActorContext | None = None
+            demo_command_reply: str | None = None
             if msg.source_channel == "wecom_aibot":
                 # Identity resolution is deliberately worker-side.  The WSS
                 # reader only persists/enqueues the opaque actor.  No failure
@@ -847,6 +854,32 @@ class Worker:
                     session_key = userid
                 aibot_identity = resolved
 
+            # Resolve demo control only after the verified identity boundary.
+            # userid remains the real actor for locking and delivery; the
+            # effective userid is used by business routing.
+            if msg.msg_type == "text" and msg.conversation_type == "single":
+                demo_command = handle_demo_command(
+                    msg.content,
+                    db=db,
+                    real_actor_userid=userid,
+                    bot_id=msg.aibot_id,
+                    conversation_type=msg.conversation_type,
+                    conversation_id=msg.conversation_id,
+                )
+                if demo_command.handled:
+                    demo_command_reply = demo_command.reply_text
+                    demo_context = demo_command.context
+                else:
+                    demo_context = resolve_active_context(
+                        db=db,
+                        real_actor_userid=userid,
+                        bot_id=msg.aibot_id,
+                        conversation_type=msg.conversation_type,
+                        conversation_id=msg.conversation_id,
+                    )
+                if demo_context is not None:
+                    session_key = demo_context.session_key
+
             # Workstream A pre-routing: parse once before entering the Router.
             # The default remains off; legacy turns never create Action rows.
             action_context = None
@@ -867,11 +900,23 @@ class Worker:
                     if aibot_identity is not None and aibot_identity.verified
                     else userid
                 )
+                if demo_context is not None:
+                    action_userid = demo_context.effective_userid
                 if action_userid == userid:
                     # Preserve the legacy registration boundary verbatim.
                     gateway_user = user_service.identify_or_register(userid, db)
                 else:
                     gateway_user = user_service.identify_or_register(action_userid, db)
+                if demo_context is not None:
+                    if gateway_user.role != demo_context.active_role:
+                        logger.warning(
+                            "worker: demo principal role mismatch actor_hash=%s",
+                            identifier_hash(userid),
+                        )
+                        return "demo_principal_role_mismatch"
+                    gateway_user.reply_userid = demo_context.reply_userid
+                    gateway_user.real_actor_userid = demo_context.real_actor_userid
+                    gateway_user.demo_context = demo_context
                 preloaded_user_context = gateway_user
                 role = gateway_user.role
                 session_hint = conversation_service.load_session(session_key)
@@ -991,6 +1036,8 @@ class Worker:
                     user_context=preloaded_user_context,
                     inbound_event_id=inbound_event_id,
                     resolved_actor=(resolved if msg.source_channel == "wecom_aibot" else None),
+                    demo_context=demo_context,
+                    demo_command_reply=demo_command_reply,
                 )
             finally:
                 submitted_shadow_request_ids.update(
@@ -1276,14 +1323,23 @@ class Worker:
         # P1-14/§10.1.1：staged payload 含搜索条件、候选快照和 history，绝不能以明文
         # JSON 落 wecom_inbound_event。本轮存在推荐 delivery 时改写加密的
         # session_patch_ciphertext，inbound 事件只保留 operation/expected_version。
-        patched = self._stage_session_patch(db, inbound_event_id, commit)
+        persisted_payload = None
+        if commit.payload is not None:
+            persisted_payload = dict(commit.payload)
+            # This non-PII routing marker lets crash recovery restore a demo
+            # role session. For recommendation turns it is encrypted together
+            # with the normal session patch.
+            persisted_payload["__jobbridge_session_key"] = commit.userid
+        patched = self._stage_session_patch(
+            db, inbound_event_id, commit, payload=persisted_payload,
+        )
         updated = db.query(WecomInboundEvent).filter(
             WecomInboundEvent.id == inbound_event_id,
         ).update({
             "status": "session_pending",
             "session_operation": commit.operation,
             "session_expected_version": commit.expected_version,
-            "session_payload": null() if patched else commit.payload,
+            "session_payload": null() if patched else persisted_payload,
             "session_apply_attempts": 0,
             "session_apply_locked_at": None,
             "session_apply_lease_owner": None,
@@ -1304,22 +1360,24 @@ class Worker:
         db: Session,
         inbound_event_id: Any,
         commit: conversation_service.StagedSessionCommit,
+        *,
+        payload: dict | None = None,
     ) -> bool:
         """把 session patch 加密写入本轮 delivery（§9.6 / §10.1.1）。
 
         返回是否已经落到密文列。非推荐回合没有 delivery 行可承载 patch，保持既有
         非推荐合同（§10.1 行 2210）不变。
         """
-        if commit.payload is None:
+        if payload is None:
             return False
         deliveries = self._deliveries_for_event(db, inbound_event_id)
         if not deliveries:
             return False
         from app.services.recommendation_delivery_service import store_session_patch
 
-        payload = json.dumps(commit.payload, ensure_ascii=False)
+        payload_json = json.dumps(payload, ensure_ascii=False)
         for delivery in deliveries:
-            store_session_patch(delivery, payload)
+            store_session_patch(delivery, payload_json)
             delivery.session_expected_version = int(commit.expected_version or 0)
             delivery.session_commit_state = "not_applied"
         return True
@@ -1430,7 +1488,6 @@ class Worker:
             )
             claimed: list[dict] = []
             for row, raw_deadline_epoch, reached in rows:
-                session_key = _session_key_for_inbound_event(row, db)
                 operation = str(row.session_operation or "")
                 payload_available = True
                 try:
@@ -1450,6 +1507,21 @@ class Worker:
                             RuntimeError("durable session save payload is missing"),
                         )
                         continue
+                session_key = None
+                if isinstance(payload, dict):
+                    stored_key = payload.get("__jobbridge_session_key")
+                    if isinstance(stored_key, str) and stored_key.strip():
+                        session_key = stored_key.strip()
+                        payload = {
+                            key: value for key, value in payload.items()
+                            if key != "__jobbridge_session_key"
+                        }
+                session_key = session_key or _session_key_for_inbound_event(row, db)
+                if not session_key:
+                    self._backoff_session_commit(
+                        row, RuntimeError("durable session key is missing"),
+                    )
+                    continue
                 claim_owner = uuid.uuid4().hex
                 row.session_apply_locked_at = now
                 row.session_apply_lease_owner = claim_owner
@@ -1773,7 +1845,7 @@ class Worker:
             finally:
                 db.close()
         item = claimed[0]
-        if item["userid"] != userid:
+        if userid and item["userid"] != userid:
             self._mark_session_commit_retry(
                 item, RuntimeError("session commit userid mismatch"),
             )
