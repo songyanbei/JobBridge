@@ -1341,12 +1341,19 @@ class Worker:
         # P1-14/§10.1.1：staged payload 含搜索条件、候选快照和 history，绝不能以明文
         # JSON 落 wecom_inbound_event。本轮存在推荐 delivery 时改写加密的
         # session_patch_ciphertext，inbound 事件只保留 operation/expected_version。
-        # This non-PII routing marker lets crash recovery restore a demo role
-        # session. For recommendation turns it is encrypted together with
-        # the normal session patch. It is also persisted for delete commits,
-        # whose payload is otherwise None.
-        persisted_payload = dict(commit.payload or {})
-        persisted_payload["__jobbridge_session_key"] = commit.userid
+        # This marker is needed only for role-scoped demo sessions. Keep the
+        # legacy real-user event payload contract byte-for-byte unchanged,
+        # especially delete commits whose payload is None.
+        is_demo_session = str(commit.userid or "").startswith("demo:session:")
+        persisted_payload = (
+            dict(commit.payload or {})
+            if commit.payload is not None or is_demo_session else None
+        )
+        if is_demo_session and persisted_payload is not None:
+            # For recommendation turns this is encrypted together with the
+            # normal session patch; non-recommendation turns retain the marker
+            # in the existing event payload until the CAS is applied.
+            persisted_payload["__jobbridge_session_key"] = commit.userid
         patched = self._stage_session_patch(
             db, inbound_event_id, commit, payload=persisted_payload,
         )
