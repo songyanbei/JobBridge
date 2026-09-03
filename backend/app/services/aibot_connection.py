@@ -792,9 +792,16 @@ class AibotConnection:
         if not getattr(result, "acknowledged", False):
             logger.warning("aibot callback not acknowledged status=%s reason=%s", getattr(result, "status", "unknown"), getattr(result, "reason", ""))
             return result
-        # A duplicate/replayed durable event is acknowledged for protocol
-        # retry purposes, but it must not trigger a second business response.
-        if getattr(result, "status", "") != "accepted":
+        # A duplicate enter_chat can be a provider retry after the first
+        # welcome write failed or its ACK was lost. The durable inbox cannot
+        # infer whether the protocol response reached the user, so replay the
+        # welcome on this narrow event path instead of silently dropping it.
+        duplicate_enter = (
+            getattr(result, "status", "") == "duplicate"
+            and getattr(callback, "command", "") == "aibot_event_callback"
+            and str(getattr(callback, "event_type", "") or "") == "enter_chat"
+        )
+        if getattr(result, "status", "") != "accepted" and not duplicate_enter:
             return result
         if getattr(callback, "command", "") != "aibot_event_callback":
             return result

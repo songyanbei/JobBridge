@@ -91,7 +91,7 @@ async def test_retryable_or_unknown_event_does_not_send_response(caplog):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_enter_chat_is_acknowledged_without_second_welcome():
+async def test_duplicate_enter_chat_retries_welcome_after_uncertain_first_delivery():
     socket = EventSocket()
     transport = AibotTransport(
         AibotClient("BOTID", "SECRET"),
@@ -112,5 +112,5 @@ async def test_duplicate_enter_chat_is_acknowledged_without_second_welcome():
     await connection.handle_callback(_event(), transport=transport)
 
     welcomes = [frame for frame in socket.sent if frame["cmd"] == "aibot_respond_welcome_msg"]
-    assert len(welcomes) == 1
+    assert len(welcomes) == 2
     await transport.close()
