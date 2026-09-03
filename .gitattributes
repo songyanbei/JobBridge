@@ -13,3 +13,4 @@ mock-testbed/scripts/wsl-e2e-smoke.sh text eol=lf
 mock-testbed/scripts/wsl-e2e-full-smoke.sh text eol=lf
 mock-testbed/scripts/wsl-demo-start.sh text eol=lf
 mock-testbed/scripts/wsl-stack-restart.sh text eol=lf
+scripts/apply_sql_migration_compose.sh text eol=lf
