@@ -23,7 +23,7 @@ from sqlalchemy.orm import aliased
 from app.config import settings
 from app.core.redis_client import get_redis
 from app.db import SessionLocal
-from app.models import RecommendationDelivery, WecomOutboundOutbox
+from app.models import ContactDelivery, RecommendationDelivery, WecomOutboundOutbox
 from app.services.delivery_registry import AIBOT_CHANNEL, AibotSender
 from app.wecom.aibot_client import AibotClient
 from app.wecom.aibot_transport import AibotTransport
@@ -119,6 +119,10 @@ class AibotOutboxWriter:
                         # The recommendation helper has already persisted a
                         # retry/dead-letter decision in this transaction.
                         continue
+                elif row.contact_delivery_id:
+                    content = self._claim_contact_body(db, row, now)
+                    if content is None:
+                        continue
                 row.status = "sending"
                 command = row.reply_command or "aibot_respond_msg"
                 if command == "aibot_send_msg" and not row.ack_req_id:
@@ -132,6 +136,8 @@ class AibotOutboxWriter:
                     "reply_index": int(row.reply_index),
                     "userid": row.userid,
                     "content": content,
+                    "recommendation_delivery_id": row.recommendation_delivery_id,
+                    "contact_delivery_id": row.contact_delivery_id,
                     "channel": row.channel,
                     "conversation_type": row.conversation_type,
                     "conversation_id": row.conversation_id,
@@ -312,6 +318,12 @@ class AibotOutboxWriter:
             db.query(RecommendationDelivery).filter(
                 RecommendationDelivery.status == "sending",
                 RecommendationDelivery.lease_expires_at <= now,
+                exists().where(and_(
+                    WecomOutboundOutbox.recommendation_delivery_id
+                    == RecommendationDelivery.delivery_id,
+                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                    WecomOutboundOutbox.status == "uncertain",
+                )),
             ).update({
                 "status": "unknown",
                 "last_error_code": "sending_lease_expired",
@@ -421,14 +433,15 @@ class AibotOutboxWriter:
             "last_error": None,
         }
         delivery_id = item.get("recommendation_delivery_id")
-        if not delivery_id:
+        contact_delivery_id = item.get("contact_delivery_id")
+        if not delivery_id and not contact_delivery_id:
             return self._update(item, values)
 
-        # The provider ACK is the irreversible boundary.  Commit the opaque
-        # outbox row and the business delivery fact together, fenced by both
-        # leases.  If either conditional update misses, rollback so stale
-        # recovery can record an ambiguous outcome instead of falsely marking
-        # only one side as sent.
+        # The provider ACK is the irreversible boundary. Commit the opaque
+        # outbox row and its business delivery fact together, fenced by the
+        # outbox lease and the delivery state. If either conditional update
+        # misses, rollback so stale recovery can record an ambiguous outcome
+        # instead of falsely marking only one side as sent.
         db = SessionLocal()
         try:
             outbox_updated = db.query(WecomOutboundOutbox).filter(
@@ -438,23 +451,33 @@ class AibotOutboxWriter:
                 WecomOutboundOutbox.lease_owner == self.lease_owner,
                 WecomOutboundOutbox.fencing_token == self.fencing_token,
             ).update(values, synchronize_session=False)
-            delivery_updated = db.query(RecommendationDelivery).filter(
-                RecommendationDelivery.delivery_id == str(delivery_id),
-                RecommendationDelivery.status == "sending",
-                RecommendationDelivery.lease_owner == self.lease_owner,
-            ).update({
-                "status": "sent",
-                "wecom_msgid": (str(response.get("msgid") or ""))[:128] or None,
-                "wecom_response": summary or None,
-                "invalid_recipients": None,
-                "last_error_code": None,
-                "last_error": None,
-                "sent_at": func.now(6),
-                "lease_owner": None,
-                "lease_expires_at": None,
-                "next_attempt_at": func.now(6),
-                "session_patch_ciphertext": None,
-            }, synchronize_session=False)
+            if delivery_id:
+                delivery_updated = db.query(RecommendationDelivery).filter(
+                    RecommendationDelivery.delivery_id == str(delivery_id),
+                    RecommendationDelivery.status == "sending",
+                    RecommendationDelivery.lease_owner == self.lease_owner,
+                ).update({
+                    "status": "sent",
+                    "wecom_msgid": (str(response.get("msgid") or ""))[:128] or None,
+                    "wecom_response": summary or None,
+                    "invalid_recipients": None,
+                    "last_error_code": None,
+                    "last_error": None,
+                    "sent_at": func.now(6),
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "next_attempt_at": func.now(6),
+                    "session_patch_ciphertext": None,
+                }, synchronize_session=False)
+            else:
+                delivery_updated = db.query(ContactDelivery).filter(
+                    ContactDelivery.delivery_id == str(contact_delivery_id),
+                    ContactDelivery.status == "sending",
+                ).update({
+                    "status": "sent",
+                    "sent_at": func.now(6),
+                    "revoked_at": None,
+                }, synchronize_session=False)
             if outbox_updated != 1 or delivery_updated != 1:
                 db.rollback()
                 logger.warning(
@@ -470,6 +493,59 @@ class AibotOutboxWriter:
             return False
         finally:
             db.close()
+
+    def _claim_contact_body(
+        self,
+        db: Any,
+        row: WecomOutboundOutbox,
+        now: Any,
+    ) -> str | None:
+        """Claim a ContactDelivery and materialize only its safe payload.
+
+        B0 ``platform_request`` is intentionally a fixed, PII-free message;
+        actual contact payloads remain fail-closed until their channel-specific
+        encrypted delivery adapter is available.
+        """
+        delivery = (
+            db.query(ContactDelivery)
+            .populate_existing()
+            .filter(ContactDelivery.delivery_id == row.contact_delivery_id)
+            .with_for_update()
+            .first()
+        )
+        if delivery is None:
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "contact delivery missing"
+            return None
+        if delivery.status in {"sent", "revoked", "expired"}:
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = f"contact delivery not sendable: {delivery.status}"[:1000]
+            return None
+        if delivery.expires_at is not None and delivery.expires_at <= datetime.utcnow():
+            delivery.status = "expired"
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "contact delivery expired"
+            return None
+        if delivery.status not in {"prepared", "retry_wait"}:
+            self._defer_recommendation_row(row, f"contact delivery not sendable: {delivery.status}")
+            return None
+        if delivery.channel != "platform_request":
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "unsupported contact delivery channel"
+            return None
+
+        from app.listing.contact import CONTACT_PLATFORM_REQUEST_MESSAGE
+
+        delivery.status = "sending"
+        return CONTACT_PLATFORM_REQUEST_MESSAGE
 
     def _mark_frame_written(self, item: Mapping[str, Any]) -> bool:
         values: dict[str, Any] = {
@@ -495,6 +571,39 @@ class AibotOutboxWriter:
         })
 
     def _mark_pending(self, item: Mapping[str, Any], reason: str) -> bool:
+        contact_delivery_id = item.get("contact_delivery_id")
+        if contact_delivery_id:
+            db = SessionLocal()
+            try:
+                outbox_updated = db.query(WecomOutboundOutbox).filter(
+                    WecomOutboundOutbox.id == int(item["id"]),
+                    WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                    WecomOutboundOutbox.status == "sending",
+                    WecomOutboundOutbox.lease_owner == self.lease_owner,
+                    WecomOutboundOutbox.fencing_token == self.fencing_token,
+                ).update({
+                    "status": "pending",
+                    "locked_at": None,
+                    "lease_owner": None,
+                    "fencing_token": None,
+                    "next_attempt_at": func.timestampadd(text("SECOND"), 30, func.now(6)),
+                    "last_error": reason[:1000],
+                }, synchronize_session=False)
+                delivery_updated = db.query(ContactDelivery).filter(
+                    ContactDelivery.delivery_id == str(contact_delivery_id),
+                    ContactDelivery.status == "sending",
+                ).update({"status": "retry_wait"}, synchronize_session=False)
+                if outbox_updated != 1 or delivery_updated != 1:
+                    db.rollback()
+                    return False
+                db.commit()
+                return True
+            except Exception:
+                db.rollback()
+                logger.exception("aibot: contact pending update failed id=%s", item.get("id"))
+                return False
+            finally:
+                db.close()
         return self._update(item, {
             "status": "pending",
             "locked_at": None,

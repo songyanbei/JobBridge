@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -190,6 +190,68 @@ def test_recommendation_claim_decrypts_ciphertext_before_aibot_send():
     assert delivery.status == "pending"  # conditional UPDATE is the source of truth
 
 
+def test_claimed_recommendation_item_keeps_delivery_reference_for_ack_commit():
+    row = SimpleNamespace(
+        id=188,
+        reply_index=0,
+        userid="actor-1",
+        content=None,
+        recommendation_delivery_id="delivery-1",
+        contact_delivery_id=None,
+        channel="wecom_aibot",
+        conversation_type="single",
+        conversation_id="actor-1",
+        chat_id=None,
+        ordering_key="wecom:wecom_aibot:single:actor-1",
+        provider_req_id="req-188",
+        reply_command="aibot_respond_msg",
+        stream_id="stream-188",
+        finish=True,
+        reply_expires_at=None,
+        stream_deadline_at=None,
+        next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        attempt_count=0,
+        ack_req_id=None,
+        locked_at=None,
+        lease_owner=None,
+        fencing_token=None,
+        first_sent_at=None,
+        status="pending",
+    )
+    delivery = SimpleNamespace(
+        delivery_id="delivery-1",
+        status="pending",
+        content_ciphertext=b"encrypted",
+        attempt_count=0,
+        next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    outbox_query = MagicMock()
+    outbox_query.filter.return_value = outbox_query
+    outbox_query.order_by.return_value = outbox_query
+    outbox_query.with_for_update.return_value = outbox_query
+    outbox_query.limit.return_value = outbox_query
+    outbox_query.all.return_value = [row]
+    delivery_query = MagicMock()
+    delivery_query.populate_existing.return_value = delivery_query
+    delivery_query.filter.return_value = delivery_query
+    delivery_query.with_for_update.return_value = delivery_query
+    delivery_query.first.return_value = delivery
+    delivery_query.update.return_value = 1
+    db = MagicMock()
+    db.query.side_effect = [outbox_query, delivery_query, delivery_query]
+    writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
+
+    with patch("app.services.aibot_connection.SessionLocal", return_value=db), patch(
+        "app.services.recommendation_delivery_service.decrypt_delivery_body",
+        return_value="推荐正文",
+    ):
+        claimed = writer.claim(limit=1)
+
+    assert claimed[0]["content"] == "推荐正文"
+    assert claimed[0]["recommendation_delivery_id"] == "delivery-1"
+    assert claimed[0]["contact_delivery_id"] is None
+
+
 def test_recommendation_decrypt_failure_is_retryable_and_never_returns_plaintext():
     delivery = SimpleNamespace(
         delivery_id="delivery-1",
@@ -277,3 +339,68 @@ def test_recommendation_ack_fencing_mismatch_rolls_back_without_partial_sent():
 
     db.rollback.assert_called_once()
     db.commit.assert_not_called()
+
+
+def test_contact_platform_request_is_hydrated_and_claimed_before_send():
+    delivery = SimpleNamespace(
+        delivery_id="contact-1",
+        status="prepared",
+        channel="platform_request",
+        expires_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5),
+    )
+    db, _query = _recommendation_claim_db(delivery)
+    row = SimpleNamespace(
+        contact_delivery_id="contact-1",
+        status="pending",
+        locked_at=None,
+        next_attempt_at=None,
+    )
+    writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
+
+    content = writer._claim_contact_body(db, row, datetime.now())
+
+    assert content == "联系请求已提交，请通过平台联系对方。"
+    assert delivery.status == "sending"
+
+
+def test_contact_ack_marks_contact_delivery_sent_atomically():
+    outbox_query = MagicMock()
+    outbox_query.filter.return_value = outbox_query
+    outbox_query.update.return_value = 1
+    delivery_query = MagicMock()
+    delivery_query.filter.return_value = delivery_query
+    delivery_query.update.return_value = 1
+    db = MagicMock()
+    db.query.side_effect = [outbox_query, delivery_query]
+    writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
+
+    with patch("app.services.aibot_connection.SessionLocal", return_value=db):
+        assert writer._mark_sent(
+            {"id": 190, "contact_delivery_id": "contact-1"},
+            {"headers": {"req_id": "req-190"}, "errcode": 0, "errmsg": "ok", "msgid": "wx-190"},
+        ) is True
+
+    contact_values = delivery_query.update.call_args.args[0]
+    assert contact_values["status"] == "sent"
+    assert contact_values["sent_at"] is not None
+    db.commit.assert_called_once()
+
+
+def test_contact_send_failure_returns_to_retry_wait_without_empty_payload():
+    outbox_query = MagicMock()
+    outbox_query.filter.return_value = outbox_query
+    outbox_query.update.return_value = 1
+    delivery_query = MagicMock()
+    delivery_query.filter.return_value = delivery_query
+    delivery_query.update.return_value = 1
+    db = MagicMock()
+    db.query.side_effect = [outbox_query, delivery_query]
+    writer = AibotOutboxWriter(transport=MagicMock(), lease_owner="owner", fencing_token=7)
+
+    with patch("app.services.aibot_connection.SessionLocal", return_value=db):
+        assert writer._mark_pending(
+            {"id": 190, "contact_delivery_id": "contact-1"}, "transport unavailable",
+        ) is True
+
+    assert delivery_query.update.call_args.args[0]["status"] == "retry_wait"
+    assert outbox_query.update.call_args.args[0]["status"] == "pending"

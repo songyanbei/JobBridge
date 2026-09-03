@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest, WecomOutboundOutbox
+from app.models import ContactAccessAudit, ContactDelivery, ContactGrant, ContactRequest, WecomInboundEvent, WecomOutboundOutbox
 from app.schemas.contact import (
     ContactGrantMetadata,
     ContactRequestCreate,
@@ -26,6 +26,7 @@ from app.schemas.contact import (
     ContactResponse,
 )
 from app.services.job_lifecycle_service import contact_version_is_current
+from app.wecom.aibot_client import stable_aibot_stream_id
 
 CONTACT_UNAVAILABLE_MESSAGE = "暂时无法提供联系方式，请稍后重试。"
 CONTACT_PLATFORM_REQUEST_MESSAGE = "联系请求已提交，请通过平台联系对方。"
@@ -277,6 +278,31 @@ class ContactService:
         # dispatcher never falls back to legacy phone or WeChat columns.
         now = _now()
         grant.status, grant.used_at = "used", now
+        inbound = None
+        if inbound_event_id is not None:
+            # B0 callers/tests may use a reduced contact schema without the
+            # durable inbox table. Preserve the historical legacy fallback in
+            # that case; the production Worker always supplies the full row.
+            try:
+                inbound = session.get(WecomInboundEvent, int(inbound_event_id))
+            except Exception:
+                inbound = None
+        source_channel = getattr(inbound, "source_channel", None) or "wecom_app"
+        conversation_type = getattr(inbound, "conversation_type", None) or "single"
+        conversation_id = getattr(inbound, "conversation_id", None)
+        chat_id = getattr(inbound, "chat_id", None)
+        ordering_key = getattr(inbound, "ordering_key", None)
+        provider_req_id = getattr(inbound, "provider_req_id", None)
+        aibot_reply = source_channel == "wecom_aibot"
+        if conversation_type == "single" and not conversation_id:
+            conversation_id = str(userid or actor_id)
+        if conversation_type == "group" and not chat_id:
+            chat_id = conversation_id
+        base_time = getattr(inbound, "created_at", None) or now
+        stream_id = (
+            stable_aibot_stream_id(inbound_event_id, reply_index)
+            if aibot_reply else None
+        )
         delivery = ContactDelivery(
             delivery_id="cd_" + secrets.token_urlsafe(24).rstrip("="), grant_id=grant.grant_id,
             actor_id=grant.actor_id, listing_ref=grant.listing_ref, channel="platform_request",
@@ -289,8 +315,19 @@ class ContactService:
             # reference and a template marker, never a token or PII value.
             session.add(WecomOutboundOutbox(
                 inbound_event_id=int(inbound_event_id), reply_index=max(0, int(reply_index)),
-                userid=str(userid or actor_id), msg_type="text", content=None,
+                userid=(None if conversation_type == "group" else str(userid or actor_id)),
+                msg_type="text", content=None,
                 contact_delivery_id=delivery.delivery_id, intent="contact_request",
+                channel=source_channel,
+                conversation_type=conversation_type,
+                conversation_id=conversation_id,
+                chat_id=chat_id,
+                ordering_key=ordering_key,
+                provider_req_id=provider_req_id,
+                reply_command=("aibot_respond_msg" if aibot_reply else None),
+                stream_id=stream_id,
+                finish=(True if aibot_reply else None),
+                reply_expires_at=(base_time + timedelta(hours=24) if aibot_reply else None),
                 status="pending",
             ))
         self.audit_contact_event("grant_redeem", "allowed", "redeemed", actor_id=actor_id, listing_ref=grant.listing_ref, grant_id=grant.grant_id, trace_id=trace_id, db=session)

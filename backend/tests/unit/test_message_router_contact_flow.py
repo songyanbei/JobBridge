@@ -11,6 +11,7 @@ from app.models import (
     ContactRequest,
     Job,
     Resume,
+    WecomInboundEvent,
     WecomOutboundOutbox,
 )
 from app.schemas.conversation import CandidateSnapshot, SessionState
@@ -132,6 +133,63 @@ def test_contact_command_without_search_context_is_guidance(monkeypatch):
     )
     assert len(replies) == 1
     assert "先搜索岗位" in replies[0].content
+
+
+def test_aibot_contact_redeem_inherits_conversation_metadata():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine, tables=[
+        ContactRequest.__table__, ContactGrant.__table__,
+        ContactDelivery.__table__, ContactAccessAudit.__table__,
+    ])
+    db = Session(engine)
+    inbound = SimpleNamespace(
+        id=301,
+        msg_id="aibot-contact-msg",
+        turn_id="aibot-contact-turn",
+        source_channel="wecom_aibot",
+        provider_msg_id="provider-contact-msg",
+        from_userid="opaque-actor",
+        conversation_type="single",
+        conversation_id="opaque-actor",
+        ordering_key="wecom:wecom_aibot:single:opaque-actor",
+        provider_req_id="req-contact",
+        msg_type="text",
+        status="done",
+    )
+    captured_outbox = []
+    real_add = db.add
+
+    def add(obj, *args, **kwargs):
+        if isinstance(obj, WecomOutboundOutbox):
+            captured_outbox.append(obj)
+            return None
+        return real_add(obj, *args, **kwargs)
+
+    db.add = add
+    real_get = db.get
+    db.get = lambda entity, key: inbound if entity is WecomInboundEvent else real_get(entity, key)
+
+    service = __import__("app.listing.contact", fromlist=["ContactService"]).ContactService(
+        db, mode="on", rate_limit=3,
+    )
+    request = service.create_contact_request("actor-1", "recruitment.job:1")
+    grant = service.issue_one_time_grant(request.request_id, "actor-1", "recruitment.job:1")
+    result = service.redeem_grant(
+        grant.grant_id, grant.token, "actor-1", inbound_event_id=inbound.id,
+        userid="actor-1",
+    )
+
+    assert result.success
+    outbox = captured_outbox[0]
+    assert outbox.channel == "wecom_aibot"
+    assert outbox.conversation_type == "single"
+    assert outbox.conversation_id == "opaque-actor"
+    assert outbox.ordering_key == inbound.ordering_key
+    assert outbox.provider_req_id == "req-contact"
+    assert outbox.reply_command == "aibot_respond_msg"
+    assert outbox.stream_id
+    assert outbox.finish is True
+    assert outbox.reply_expires_at is not None
 
 
 def test_resume_contact_command_uses_explicit_resume_ref_and_direction(monkeypatch):

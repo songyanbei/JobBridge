@@ -1,3 +1,4 @@
+import inspect
 from unittest.mock import MagicMock, patch
 
 from app.services.aibot_connection import AibotOutboxWriter
@@ -27,6 +28,11 @@ def test_recover_stale_splits_prewrite_and_written_claims():
     assert "first_sent_at" in pending_filter
     assert "first_sent_at" in uncertain_filter
     assert delivery_query.update.call_args.args[0]["status"] == "unknown"
+    delivery_filter = " ".join(str(value) for value in delivery_query.filter.call_args.args)
+    assert "wecom_outbound_outbox.channel" in delivery_filter
+    assert "WecomOutboundOutbox.channel == AIBOT_CHANNEL" in inspect.getsource(
+        AibotOutboxWriter.recover_stale,
+    )
 
 
 def test_frame_write_callback_persists_first_sent_at_before_ack():
