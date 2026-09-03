@@ -75,9 +75,10 @@
           {{ row.salary_floor_monthly || '-' }} ~ {{ row.salary_ceiling_monthly || '-' }}
         </template>
       </el-table-column>
-      <el-table-column label="发布方" width="180" show-overflow-tooltip>
+      <el-table-column label="招聘公司" width="180" show-overflow-tooltip>
         <template #default="{ row }">
-          <span v-if="row.owner_company">{{ row.owner_company }}</span>
+          <span v-if="row.hiring_company">{{ row.hiring_company }}</span>
+          <span v-else-if="row.owner_company">{{ row.owner_company }}</span>
           <span v-else-if="row.owner_role === 'broker'" class="jb-muted">中介 · {{ row.owner_display_name || row.owner_userid }}</span>
           <span v-else class="jb-muted">{{ row.owner_display_name || row.owner_userid }}</span>
         </template>

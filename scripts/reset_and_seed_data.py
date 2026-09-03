@@ -179,6 +179,22 @@ def gen_company(city: str) -> str:
     return f"{short}{park}{brand}{industry}{suffix}"
 
 
+def gen_hiring_company(city: str, owner: dict[str, Any]) -> str:
+    """生成与岗位城市一致的岗位级招聘公司名。
+
+    发布账号可能是跨城市中介/厂家，岗位级主体必须以岗位城市为准；
+    保留原公司品牌、园区和行业后缀，只替换其城市前缀。
+    """
+    short = COMPANY_CITY_SHORT.get(city, city.replace("市", ""))
+    owner_company = (owner.get("company") or "").strip()
+    if not owner_company:
+        return f"{short}汇通人力资源服务有限公司"
+    for source_short in sorted(set(COMPANY_CITY_SHORT.values()), key=len, reverse=True):
+        if owner_company.startswith(source_short):
+            return f"{short}{owner_company[len(source_short):]}"
+    return f"{short}{owner_company}"
+
+
 def gen_district(city: str) -> str | None:
     """从城市的常见区县中随机抽一个。城市未在词典里时返回 None。"""
     pool = DISTRICTS_BY_CITY.get(city)
@@ -581,7 +597,8 @@ def seed_jobs(conn: pymysql.connections.Connection,
         description = raw_text  # 简化：用 raw_text 作清洗后描述
 
         rows.append((
-            owner["external_userid"], city, cat, salary_floor, pay_type, headcount,
+            owner["external_userid"], gen_hiring_company(city, owner), city, cat,
+            salary_floor, pay_type, headcount,
             gender, age_min, age_max, is_long_term,
             district, job_address,
             salary_ceiling, provide_meal, provide_housing, shift,
@@ -592,7 +609,7 @@ def seed_jobs(conn: pymysql.connections.Connection,
 
     sql = """
     INSERT INTO `job`
-      (owner_userid, city, job_category, salary_floor_monthly, pay_type, headcount,
+      (owner_userid, hiring_company, city, job_category, salary_floor_monthly, pay_type, headcount,
        gender_required, age_min, age_max, is_long_term,
        district, address,
        salary_ceiling_monthly, provide_meal, provide_housing, shift_pattern,
