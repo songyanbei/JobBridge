@@ -185,3 +185,50 @@ def test_message_provider_contract_keeps_real_actor_as_reply_target(db, demo_set
     assert context.reply_userid == "actor-one"
     assert context.effective_userid.startswith("demo_broker_")
     assert context.demo_id == workspace.demo_id
+
+
+def test_message_provider_keeps_redis_pointer_workspace_when_newer_workspace_exists(
+    db, demo_settings,
+):
+    from unittest.mock import patch
+
+    from app.services import demo_workspace_service as provider
+    from app.services.demo_message_context import DemoActorContext, save_active_context
+
+    first = service.create_workspace(
+        db, name="演示批次A", bot_id="bot-1", actor_digest_value=demo_settings,
+        canonical_actor_userid="actor-one", created_by="admin",
+    )
+    second = service.create_workspace(
+        db, name="演示批次B", bot_id="bot-1", actor_digest_value=demo_settings,
+        canonical_actor_userid="actor-one", created_by="admin",
+    )
+    first_principal = db.query(DemoPrincipal).filter(
+        DemoPrincipal.demo_id == first.demo_id, DemoPrincipal.role == "worker",
+    ).one()
+    pointer = DemoActorContext(
+        demo_mode=True, demo_id=first.demo_id, real_actor_userid="actor-one",
+        effective_userid=first_principal.synthetic_userid, active_role="worker",
+        bot_id="bot-1",
+    )
+
+    class Redis:
+        values = {}
+        def setex(self, key, ttl, value):
+            self.values[key] = value
+        def get(self, key):
+            return self.values.get(key)
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    redis = Redis()
+    with patch("app.services.demo_message_context.get_redis", return_value=redis):
+        save_active_context(pointer)
+        resolved = provider.resolve_for_actor(
+            db, "actor-one", "bot-1", "single", "actor-one",
+        )
+
+    assert resolved is not None
+    assert resolved.demo_id == first.demo_id
+    assert resolved.demo_id != second.demo_id
+    assert resolved.effective_userid == first_principal.synthetic_userid

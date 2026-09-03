@@ -75,7 +75,9 @@ from app.services import (
 from app.services.aibot_identity_service import AibotIdentityService
 from app.services.demo_message_context import (
     DemoActorContext,
+    demo_mode_enabled,
     handle_command as handle_demo_command,
+    load_active_context,
     resolve_active_context,
 )
 from app.tasks.common import log_event
@@ -819,6 +821,7 @@ class Worker:
             aibot_identity = None
             demo_context: DemoActorContext | None = None
             demo_command_reply: str | None = None
+            demo_pointer = None
             if msg.source_channel == "wecom_aibot":
                 # Identity resolution is deliberately worker-side.  The WSS
                 # reader only persists/enqueues the opaque actor.  No failure
@@ -858,6 +861,16 @@ class Worker:
             # userid remains the real actor for locking and delivery; the
             # effective userid is used by business routing.
             if msg.msg_type == "text" and msg.conversation_type == "single":
+                # Capture the pointer before authoritative resolution.  The
+                # resolver may clear a stale/disabled pointer; retaining this
+                # fact for the current turn prevents an already-enqueued demo
+                # event from falling back to the real actor's business path.
+                if demo_mode_enabled():
+                    demo_pointer = load_active_context(
+                        userid,
+                        conversation_type=msg.conversation_type,
+                        conversation_id=msg.conversation_id,
+                    )
                 demo_command = handle_demo_command(
                     msg.content,
                     db=db,
@@ -879,6 +892,18 @@ class Worker:
                     )
                 if demo_context is not None:
                     session_key = demo_context.session_key
+                elif demo_pointer is not None and not demo_command.handled:
+                    self._mark_event_fail(
+                        inbound_event_id,
+                        "dead_letter",
+                        "demo_workspace_unavailable",
+                        retry_count,
+                    )
+                    logger.warning(
+                        "worker: refused demo event without usable workspace actor_hash=%s",
+                        identifier_hash(userid),
+                    )
+                    return "demo_workspace_unavailable"
 
             # Workstream A pre-routing: parse once before entering the Router.
             # The default remains off; legacy turns never create Action rows.
