@@ -315,8 +315,10 @@ class AibotTransport:
         if frame.cmd in {"aibot_msg_callback", "aibot_event_callback"}:
             try:
                 callback = parse_callback(payload)
-            except AibotProtocolError:
-                logger.warning("aibot websocket rejected callback")
+            except AibotProtocolError as exc:
+                # Keep the raw callback out of logs, but retain the bounded
+                # validation reason so provider schema drift is diagnosable.
+                logger.warning("aibot websocket rejected callback reason=%s", str(exc))
                 return
             if self.on_callback is not None:
                 task = asyncio.create_task(_maybe_await(self.on_callback(callback)))
