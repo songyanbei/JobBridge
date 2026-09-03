@@ -85,7 +85,11 @@ class AibotClient:
         chat_id: str | None = None,
         chat_type: int | None = None,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"msgtype": "text", "text": {"content": content}}
+        # Active push (aibot_send_msg) does not use the welcome-only text
+        # shape. Markdown is the documented string-based push format.
+        if not isinstance(content, str) or not content:
+            raise AibotClientError("content is required")
+        body: dict[str, Any] = {"msgtype": "markdown", "markdown": {"content": content}}
         if chat_id:
             body["chatid"] = chat_id
         if chat_type in {1, 2}:
