@@ -3,10 +3,12 @@
 对照方案 §9.4 / §9.5 / §9.6 / §9.11 / §10.1.1 / §10.6。
 """
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
 from app.config import settings
+from app.models import WecomInboundEvent
 from app.schemas.recommendation import (
     DELIVERY_CONTEXT_ITEM_KEYS,
     DELIVERY_CONTEXT_KEYS,
@@ -302,6 +304,35 @@ def test_served_attempt_id_is_backfilled_after_the_attempt_insert(content_keys):
     request, attempt = db.added[0], db.added[1]
     assert request.served_attempt_id == attempt.attempt_id
     assert attempt.request_id == request.request_id
+
+
+def test_aibot_recommendation_outbox_inherits_inbound_conversation_contract(content_keys):
+    db = _FakeSession()
+    created = datetime(2026, 9, 3, 1, 2, 3)
+    db.rows[(WecomInboundEvent.__name__, 1)] = SimpleNamespace(
+        source_channel="wecom_aibot",
+        conversation_type="single",
+        conversation_id="u1",
+        chat_id=None,
+        ordering_key="wecom:wecom_aibot:single:u1",
+        provider_req_id="req-aibot-1",
+        created_at=created,
+    )
+
+    _prepare(db, content_keys)
+
+    outbox = db.added[-1]
+    assert isinstance(outbox, svc.WecomOutboundOutbox)
+    assert outbox.channel == "wecom_aibot"
+    assert outbox.conversation_type == "single"
+    assert outbox.conversation_id == "u1"
+    assert outbox.chat_id is None
+    assert outbox.ordering_key == "wecom:wecom_aibot:single:u1"
+    assert outbox.provider_req_id == "req-aibot-1"
+    assert outbox.reply_command == "aibot_respond_msg"
+    assert outbox.stream_id
+    assert outbox.finish is True
+    assert outbox.reply_expires_at == created + timedelta(hours=24)
 
 
 def test_attempt_uses_legal_enums_and_a_real_64_char_digest(content_keys):

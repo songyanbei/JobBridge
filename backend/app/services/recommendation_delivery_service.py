@@ -25,6 +25,7 @@ from app.models import (
     RecommendationRequest,
     RecommendationSearchAttempt,
     Resume,
+    WecomInboundEvent,
     WecomOutboundOutbox,
 )
 from app.schemas.recommendation import (
@@ -33,6 +34,7 @@ from app.schemas.recommendation import (
     LlmAttemptStatus,
     project_delivery_context,
 )
+from app.wecom.aibot_client import stable_aibot_stream_id
 
 # ---------------------------------------------------------------------------
 # §9.6 / §9.11 版本化信封加密
@@ -760,6 +762,25 @@ def prepare_delivery(
     request_index = fact.get("request_index")
     request_index = reply_index if request_index is None else int(request_index)
 
+    # The inbound event is the source of truth for the delivery channel and
+    # conversation target.  Recommendation delivery used to create a bare
+    # legacy outbox row here, which made an AIBot search reply default to
+    # ``wecom_app`` and violate the outbox conversation contract.
+    inbound = db.get(WecomInboundEvent, int(inbound_event_id))
+    source_channel = getattr(inbound, "source_channel", None) or "wecom_app"
+    conversation_type = getattr(inbound, "conversation_type", None) or "single"
+    conversation_id = getattr(inbound, "conversation_id", None)
+    chat_id = getattr(inbound, "chat_id", None)
+    ordering_key = getattr(inbound, "ordering_key", None)
+    provider_req_id = getattr(inbound, "provider_req_id", None)
+    aibot_reply = source_channel == "wecom_aibot"
+    outbox_stream_id = stable_aibot_stream_id(inbound_event_id, reply_index) if aibot_reply else None
+    outbox_finish = True if aibot_reply else None
+    outbox_reply_expires_at = (
+        (getattr(inbound, "created_at", None) or naive_moment) + timedelta(hours=24)
+        if aibot_reply else None
+    )
+
     lock_and_validate_recommendation_targets(
         db, ctx=ctx, fact=fact, now=moment,
     )
@@ -809,10 +830,20 @@ def prepare_delivery(
     db.add(WecomOutboundOutbox(
         inbound_event_id=inbound_event_id,
         reply_index=reply_index,
-        userid=userid,
+        userid=(None if conversation_type == "group" else userid),
         msg_type="text",
         content=None,
         recommendation_delivery_id=delivery.delivery_id,
+        channel=source_channel,
+        conversation_type=conversation_type,
+        conversation_id=conversation_id,
+        chat_id=chat_id,
+        ordering_key=ordering_key,
+        provider_req_id=provider_req_id,
+        reply_command=("aibot_respond_msg" if aibot_reply else None),
+        stream_id=outbox_stream_id,
+        finish=outbox_finish,
+        reply_expires_at=outbox_reply_expires_at,
         status="pending",
     ))
     return delivery
