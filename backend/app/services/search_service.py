@@ -23,7 +23,7 @@ from app.core.exceptions import LLMError, LLMParseError, LLMTimeout
 from app.core.time_utils import rotation_date, utc_now
 from app.llm import get_reranker
 from app.llm.base import RerankResult
-from app.models import Job, Resume, SystemConfig, User
+from app.models import DemoPrincipal, Job, Resume, SystemConfig, User
 from app.schemas.conversation import SessionState
 # Phase 5 §5.0：DTO 中立模块迁移。本模块仍可作为 search_service.SearchResult 等旧名
 # 的访问入口（re-export），避免破坏 backend/tests/unit/test_search_service.py 等
@@ -80,6 +80,37 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def _demo_scope_id(user_ctx: UserContext) -> str | None:
+    """Return the exact demo workspace scope for this turn.
+
+    ``None`` means a normal production/search request and preserves the
+    historical query path.  An empty string is an invalid demo request and is
+    intentionally fail-closed by the query helpers below.
+    """
+    context = getattr(user_ctx, "demo_context", None)
+    if context is None:
+        return None
+    try:
+        if context.is_usable() and context.workspace_status == "active":
+            return str(context.demo_id or "").strip() or ""
+    except AttributeError:
+        pass
+    return ""
+
+
+def _apply_demo_scope(query, model, db: Session, demo_id: str | None):
+    """Restrict business rows to synthetic principals in one demo workspace."""
+    if demo_id is None:
+        return query
+    if not demo_id:
+        return query.filter(sa.false())
+    principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
+        DemoPrincipal.demo_id == demo_id,
+        DemoPrincipal.principal_status == "active",
+    ).subquery()
+    return query.filter(model.owner_userid.in_(sa.select(principal_ids.c.synthetic_userid)))
 
 
 def _visibility_snapshot(db: Session, direction: str, role: str) -> EffectivePolicySnapshot:
@@ -1126,10 +1157,11 @@ def search_jobs(
         else legacy_max_candidates
     )
     flags = _normalize_experience_flags(experience_flags)
+    demo_id = _demo_scope_id(user_ctx)
 
     # 硬过滤
     initial_query_started = time.perf_counter()
-    candidates = _query_jobs(criteria, max_candidates, db)
+    candidates = _query_jobs(criteria, max_candidates, db, demo_id=demo_id)
     initial_query_record = _query_attempt_record(
         step="initial",
         criteria=criteria,
@@ -1150,12 +1182,12 @@ def search_jobs(
     if phase5_takeover:
         outcome = FallbackOutcome(candidates=candidates)
         available_steps, probe_results = _probe_relax_steps(
-            criteria, "search_job", max_candidates, db,
+            criteria, "search_job", max_candidates, db, demo_id=demo_id,
         )
     elif len(candidates) < top_n:
         # 旧 Stage B fallback：0 命中或低召回时按显式 fallback 步骤逐步放宽
         outcome = _run_job_fallback_steps(
-            criteria, candidates, top_n, max_candidates, db,
+            criteria, candidates, top_n, max_candidates, db, demo_id=demo_id,
         )
         candidates = outcome.candidates
         probe_results = list(outcome.probe_results)
@@ -1458,9 +1490,10 @@ def search_workers(
         else legacy_max_candidates
     )
     flags = _normalize_experience_flags(experience_flags)
+    demo_id = _demo_scope_id(user_ctx)
 
     initial_query_started = time.perf_counter()
-    candidates = _query_resumes(criteria, max_candidates, db)
+    candidates = _query_resumes(criteria, max_candidates, db, demo_id=demo_id)
     initial_query_record = _query_attempt_record(
         step="initial",
         criteria=criteria,
@@ -1481,11 +1514,11 @@ def search_workers(
     if phase5_takeover:
         outcome = FallbackOutcome(candidates=candidates)
         available_steps, probe_results = _probe_relax_steps(
-            criteria, "search_worker", max_candidates, db,
+            criteria, "search_worker", max_candidates, db, demo_id=demo_id,
         )
     elif len(candidates) < top_n:
         outcome = _run_resume_fallback_steps(
-            criteria, candidates, top_n, max_candidates, db,
+            criteria, candidates, top_n, max_candidates, db, demo_id=demo_id,
         )
         candidates = outcome.candidates
         probe_results = list(outcome.probe_results)
@@ -1758,6 +1791,7 @@ def show_more(
     snapshot_is_v1 = _snapshot_is_v1(session.candidate_snapshot)
     top_n = V1_DISPLAY_TOP_N if snapshot_is_v1 else _get_config_int("match.top_n", db, 3)
     flags = _normalize_experience_flags(experience_flags)
+    demo_id = _demo_scope_id(user_ctx)
 
     # §7.5: while the kill switch is on, a v1 snapshot must be invalidated
     # immediately rather than continuing to page out a v1 ordering that the
@@ -1822,11 +1856,11 @@ def show_more(
 
         if is_job_search:
             # 重新查询验证有效性
-            valid = _validate_job_ids(batch_ids, db)
+            valid = _validate_job_ids(batch_ids, db, demo_id=demo_id)
             valid_dicts = _jobs_to_dicts(valid, db)
             filtered = permission_service.filter_jobs_batch(valid_dicts, user_ctx.role, visibility)
         else:
-            valid = _validate_resume_ids(batch_ids, db)
+            valid = _validate_resume_ids(batch_ids, db, demo_id=demo_id)
             valid_dicts = _resumes_to_dicts(valid)
             owner_ids = list({r.get("owner_userid", "") for r in valid_dicts})
             users_map = _build_users_map(owner_ids, db)
@@ -1971,7 +2005,9 @@ def has_effective_search_criteria(criteria: dict) -> bool:
     return bool(criteria.get("city") or criteria.get("job_category"))
 
 
-def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
+def _query_jobs(
+    criteria: dict, limit: int, db: Session, *, demo_id: str | None = None,
+) -> list:
     """构建岗位硬过滤查询。"""
     if not has_effective_search_criteria(criteria):
         return []
@@ -1983,6 +2019,7 @@ def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
         Job.delist_reason.is_(None),
         User.status == "active",
     )
+    q = _apply_demo_scope(q, Job, db, demo_id)
 
     # 业务条件
     cities = criteria.get("city", [])
@@ -2022,7 +2059,9 @@ def _query_jobs(criteria: dict, limit: int, db: Session) -> list:
     return q.limit(limit).all()
 
 
-def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
+def _query_resumes(
+    criteria: dict, limit: int, db: Session, *, demo_id: str | None = None,
+) -> list:
     """构建简历硬过滤查询。"""
     if not has_effective_search_criteria(criteria):
         return []
@@ -2035,6 +2074,7 @@ def _query_resumes(criteria: dict, limit: int, db: Session) -> list:
         *online_resume_filters(now=now),
         User.status == "active",
     )
+    q = _apply_demo_scope(q, Resume, db, demo_id)
 
     # 城市：检索条件的 city 需要与简历的 expected_cities JSON 数组匹配
     # 使用 JSON_CONTAINS + OR 逻辑：简历期望城市包含搜索条件中的任一城市即命中
@@ -2105,6 +2145,8 @@ def _run_job_fallback_steps(
     top_n: int,
     limit: int,
     db: Session,
+    *,
+    demo_id: str | None = None,
 ) -> FallbackOutcome:
     """岗位搜索 0/低召回时的分步 fallback。
 
@@ -2143,7 +2185,7 @@ def _run_job_fallback_steps(
 
     for step_name, step_criteria in steps:
         started = time.perf_counter()
-        candidates = _query_jobs(step_criteria, limit, db)
+        candidates = _query_jobs(step_criteria, limit, db, demo_id=demo_id)
         probe_results.append(_query_attempt_record(
             step=step_name,
             criteria=step_criteria,
@@ -2168,7 +2210,7 @@ def _run_job_fallback_steps(
     suggestions: list[FallbackSuggestion] = []
     if not best:
         suggestions = _probe_job_suggestions(
-            criteria, limit, db, attempt_records=probe_results,
+            criteria, limit, db, demo_id=demo_id, attempt_records=probe_results,
         )
 
     return FallbackOutcome(
@@ -2186,6 +2228,8 @@ def _run_resume_fallback_steps(
     top_n: int,
     limit: int,
     db: Session,
+    *,
+    demo_id: str | None = None,
 ) -> FallbackOutcome:
     """简历搜索 0/低召回时的分步 fallback。
 
@@ -2220,7 +2264,7 @@ def _run_resume_fallback_steps(
 
     for step_name, step_criteria in steps:
         started = time.perf_counter()
-        candidates = _query_resumes(step_criteria, limit, db)
+        candidates = _query_resumes(step_criteria, limit, db, demo_id=demo_id)
         probe_results.append(_query_attempt_record(
             step=step_name,
             criteria=step_criteria,
@@ -2245,7 +2289,7 @@ def _run_resume_fallback_steps(
     suggestions: list[FallbackSuggestion] = []
     if not best:
         suggestions = _probe_resume_suggestions(
-            criteria, limit, db, attempt_records=probe_results,
+            criteria, limit, db, demo_id=demo_id, attempt_records=probe_results,
         )
 
     return FallbackOutcome(
@@ -2324,6 +2368,8 @@ def _probe_relax_steps(
     direction: str,
     limit: int,
     db: Session,
+    *,
+    demo_id: str | None = None,
 ) -> tuple[list[str], list[dict]]:
     """phased-plan §5.2.3 search_service 行：探查每步放宽下的候选数。
 
@@ -2351,7 +2397,7 @@ def _probe_relax_steps(
             # 该 step 不会改变 criteria（如薪资字段缺失 → relax_salary_10pct 无效）
             continue
         started = time.perf_counter()
-        candidates = query_fn(relaxed, limit, db)
+        candidates = query_fn(relaxed, limit, db, demo_id=demo_id)
         available.append(step)
         record = _query_attempt_record(
             step=step,
@@ -2429,11 +2475,12 @@ def execute_relaxed_search(
         else legacy_max_candidates
     )
     flags = _normalize_experience_flags(experience_flags)
+    demo_id = _demo_scope_id(user_ctx)
 
     if direction == "search_job":
-        candidates = _query_jobs(relaxed, max_candidates, db)
+        candidates = _query_jobs(relaxed, max_candidates, db, demo_id=demo_id)
     else:
-        candidates = _query_resumes(relaxed, max_candidates, db)
+        candidates = _query_resumes(relaxed, max_candidates, db, demo_id=demo_id)
     initial_count = len(candidates)
 
     if not candidates:
@@ -2718,6 +2765,7 @@ def _probe_job_suggestions(
     limit: int,
     db: Session,
     *,
+    demo_id: str | None = None,
     attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     """温和放宽全 0 后，探查激进方向给用户做选择（Bug 3）。
@@ -2747,7 +2795,7 @@ def _probe_job_suggestions(
 
     return _collect_suggestions(
         probes, limit, db, _query_jobs, "search_job",
-        attempt_records=attempt_records,
+        demo_id=demo_id, attempt_records=attempt_records,
     )
 
 
@@ -2756,6 +2804,7 @@ def _probe_resume_suggestions(
     limit: int,
     db: Session,
     *,
+    demo_id: str | None = None,
     attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     probes: list[tuple[str, dict]] = []
@@ -2778,7 +2827,7 @@ def _probe_resume_suggestions(
 
     return _collect_suggestions(
         probes, limit, db, _query_resumes, "search_worker",
-        attempt_records=attempt_records,
+        demo_id=demo_id, attempt_records=attempt_records,
     )
 
 
@@ -2789,6 +2838,7 @@ def _collect_suggestions(
     query_fn,
     direction: str,
     *,
+    demo_id: str | None = None,
     attempt_records: list[dict] | None = None,
 ) -> list[FallbackSuggestion]:
     """跑探查并打日志，返回命中数 ≥1 的方向，按命中数降序，截到 _MAX_SUGGESTIONS。"""
@@ -2798,7 +2848,7 @@ def _collect_suggestions(
         if not has_effective_search_criteria(c):
             continue
         started = time.perf_counter()
-        cands = query_fn(c, limit, db)
+        cands = query_fn(c, limit, db, demo_id=demo_id)
         if attempt_records is not None:
             attempt_records.append(_query_attempt_record(
                 step=name,
@@ -3039,7 +3089,9 @@ def _restore_input_order(rows: list, requested_ids: list[str]) -> list:
     return [by_id[cid] for cid in requested_ids if cid in by_id]
 
 
-def _validate_job_ids(job_ids: list[str], db: Session) -> list:
+def _validate_job_ids(
+    job_ids: list[str], db: Session, *, demo_id: str | None = None,
+) -> list:
     """重新查询 ID 列表，过滤已失效的，并按输入顺序恢复。"""
     now = datetime.now(timezone.utc)
     int_ids = [int(i) for i in job_ids if i.isdigit()]
@@ -3053,10 +3105,20 @@ def _validate_job_ids(job_ids: list[str], db: Session) -> list:
         Job.delist_reason.is_(None),
         User.status == "active",
     ).all()
+    if demo_id is not None:
+        principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
+            DemoPrincipal.demo_id == demo_id,
+            DemoPrincipal.principal_status == "active",
+        ).subquery()
+        rows = [row for row in rows if row.owner_userid in {
+            value for value, in db.query(principal_ids.c.synthetic_userid).all()
+        }]
     return _restore_input_order(rows, job_ids)
 
 
-def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
+def _validate_resume_ids(
+    resume_ids: list[str], db: Session, *, demo_id: str | None = None,
+) -> list:
     """重新查询 ID 列表，过滤已失效的，并按输入顺序恢复。"""
     from app.services.resume_mutation_service import online_resume_filters, utc_now_naive
 
@@ -3071,6 +3133,14 @@ def _validate_resume_ids(resume_ids: list[str], db: Session) -> list:
         *online_resume_filters(now=now),
         User.status == "active",
     ).all()
+    if demo_id is not None:
+        principal_ids = db.query(DemoPrincipal.synthetic_userid).filter(
+            DemoPrincipal.demo_id == demo_id,
+            DemoPrincipal.principal_status == "active",
+        ).subquery()
+        rows = [row for row in rows if row.owner_userid in {
+            value for value, in db.query(principal_ids.c.synthetic_userid).all()
+        }]
     return _restore_input_order(rows, resume_ids)
 
 
