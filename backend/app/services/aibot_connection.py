@@ -23,7 +23,7 @@ from sqlalchemy.orm import aliased
 from app.config import settings
 from app.core.redis_client import get_redis
 from app.db import SessionLocal
-from app.models import WecomOutboundOutbox
+from app.models import RecommendationDelivery, WecomOutboundOutbox
 from app.services.delivery_registry import AIBOT_CHANNEL, AibotSender
 from app.wecom.aibot_client import AibotClient
 from app.wecom.aibot_transport import AibotTransport
@@ -112,6 +112,13 @@ class AibotOutboxWriter:
                     row.status = "dead_letter"
                     row.last_error = "stream_deadline_expired" if expired_stream else "reply_window_expired"
                     continue
+                content = row.content or ""
+                if row.recommendation_delivery_id:
+                    content = self._claim_recommendation_body(db, row, now)
+                    if content is None:
+                        # The recommendation helper has already persisted a
+                        # retry/dead-letter decision in this transaction.
+                        continue
                 row.status = "sending"
                 command = row.reply_command or "aibot_respond_msg"
                 if command == "aibot_send_msg" and not row.ack_req_id:
@@ -124,7 +131,7 @@ class AibotOutboxWriter:
                     "id": int(row.id),
                     "reply_index": int(row.reply_index),
                     "userid": row.userid,
-                    "content": row.content or "",
+                    "content": content,
                     "channel": row.channel,
                     "conversation_type": row.conversation_type,
                     "conversation_id": row.conversation_id,
@@ -148,6 +155,105 @@ class AibotOutboxWriter:
             return []
         finally:
             db.close()
+
+    @staticmethod
+    def _defer_recommendation_row(row: WecomOutboundOutbox, reason: str, *, attempts: int = 1) -> None:
+        row.status = "pending"
+        row.locked_at = None
+        row.lease_owner = None
+        row.fencing_token = None
+        row.next_attempt_at = func.timestampadd(text("SECOND"), min(600, 30 * max(1, attempts)), func.now(6))
+        row.last_error = reason[:1000]
+
+    def _claim_recommendation_body(
+        self,
+        db: Any,
+        row: WecomOutboundOutbox,
+        now: Any,
+    ) -> str | None:
+        """Claim and decrypt one recommendation body before any provider write.
+
+        Recommendation outboxes deliberately keep ``content`` NULL.  The
+        encrypted body is owned by ``RecommendationDelivery`` and must be
+        decrypted only after the delivery row is locked and conditionally
+        moved to ``sending`` under this writer's lease.
+        """
+        delivery = (
+            db.query(RecommendationDelivery)
+            .populate_existing()
+            .filter(RecommendationDelivery.delivery_id == row.recommendation_delivery_id)
+            .with_for_update()
+            .first()
+        )
+        if delivery is None:
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = "recommendation delivery missing"
+            return None
+
+        status = str(delivery.status or "")
+        if status == "prepared":
+            self._defer_recommendation_row(row, "recommendation delivery still prepared")
+            return None
+        if status not in {"pending", "retry_wait"}:
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = f"recommendation delivery not sendable: {status}"[:1000]
+            return None
+        if not delivery.content_ciphertext:
+            from app.services.recommendation_delivery_service import purge_delivery_content
+
+            delivery.status = "permanent_failed"
+            delivery.last_error_code = "content_unavailable"
+            delivery.last_error = "recommendation delivery body unavailable"
+            delivery.lease_owner = None
+            delivery.lease_expires_at = None
+            purge_delivery_content(delivery)
+            row.status = "dead_letter"
+            row.locked_at = None
+            row.next_attempt_at = None
+            row.last_error = delivery.last_error
+            return None
+
+        try:
+            from app.services.recommendation_delivery_service import decrypt_delivery_body
+
+            content = decrypt_delivery_body(delivery)
+        except Exception as exc:  # noqa: BLE001 - fail closed, keep retryable
+            attempts = int(delivery.attempt_count or 0) + 1
+            delivery.status = "retry_wait"
+            delivery.attempt_count = attempts
+            delivery.next_attempt_at = func.timestampadd(
+                text("SECOND"), min(600, 30 * max(1, attempts)), func.now(6),
+            )
+            delivery.last_error_code = "content_decrypt_failed"
+            delivery.last_error = f"recommendation decrypt failed: {type(exc).__name__}"[:500]
+            delivery.lease_owner = None
+            delivery.lease_expires_at = None
+            self._defer_recommendation_row(row, delivery.last_error, attempts=attempts)
+            return None
+
+        attempts = int(delivery.attempt_count or 0) + 1
+        updated = db.query(RecommendationDelivery).filter(
+            RecommendationDelivery.delivery_id == delivery.delivery_id,
+            RecommendationDelivery.status.in_(("pending", "retry_wait")),
+            RecommendationDelivery.next_attempt_at <= now,
+        ).update({
+            "status": "sending",
+            "attempt_count": attempts,
+            "lease_owner": self.lease_owner,
+            "lease_expires_at": func.timestampadd(
+                text("SECOND"), OUTBOX_LEASE_SECONDS, func.now(6),
+            ),
+            "last_error": None,
+            "last_error_code": None,
+        }, synchronize_session=False)
+        if updated != 1:
+            self._defer_recommendation_row(row, "recommendation delivery claimed elsewhere", attempts=attempts)
+            return None
+        return content
 
     def recover_stale(self) -> int:
         """Recover stale claims based on whether a frame was durably written."""
@@ -198,6 +304,20 @@ class AibotOutboxWriter:
                 "last_error": "aibot frame written; provider outcome unknown",
                 "lease_owner": None,
                 "fencing_token": None,
+            }, synchronize_session=False)
+            # Keep the business delivery state aligned with AIBot's ambiguous
+            # provider outcome. Without this companion update a failed DB
+            # commit after ACK would leave delivery stuck in ``sending`` even
+            # after the outbox lease has been fenced to ``uncertain``.
+            db.query(RecommendationDelivery).filter(
+                RecommendationDelivery.status == "sending",
+                RecommendationDelivery.lease_expires_at <= now,
+            ).update({
+                "status": "unknown",
+                "last_error_code": "sending_lease_expired",
+                "last_error": "aibot frame written; provider outcome unknown",
+                "lease_owner": None,
+                "lease_expires_at": None,
             }, synchronize_session=False)
             db.commit()
             return int((pending or 0) + (uncertain or 0) + (expired or 0))
@@ -287,9 +407,10 @@ class AibotOutboxWriter:
             key: response[key] for key in ("errcode", "errmsg", "msgid", "response_code")
             if key in response
         }
-        return self._update(item, {
+        values = {
             "status": "sent",
             "provider_response": summary or None,
+            "provider_msg_id": (str(response.get("msgid") or ""))[:128] or None,
             "ack_req_id": item.get("ack_req_id") or req_id,
             "ack_received_at": func.now(6),
             "first_sent_at": func.coalesce(WecomOutboundOutbox.first_sent_at, func.now(6)),
@@ -298,7 +419,57 @@ class AibotOutboxWriter:
             "lease_owner": None,
             "fencing_token": None,
             "last_error": None,
-        })
+        }
+        delivery_id = item.get("recommendation_delivery_id")
+        if not delivery_id:
+            return self._update(item, values)
+
+        # The provider ACK is the irreversible boundary.  Commit the opaque
+        # outbox row and the business delivery fact together, fenced by both
+        # leases.  If either conditional update misses, rollback so stale
+        # recovery can record an ambiguous outcome instead of falsely marking
+        # only one side as sent.
+        db = SessionLocal()
+        try:
+            outbox_updated = db.query(WecomOutboundOutbox).filter(
+                WecomOutboundOutbox.id == int(item["id"]),
+                WecomOutboundOutbox.channel == AIBOT_CHANNEL,
+                WecomOutboundOutbox.status == "sending",
+                WecomOutboundOutbox.lease_owner == self.lease_owner,
+                WecomOutboundOutbox.fencing_token == self.fencing_token,
+            ).update(values, synchronize_session=False)
+            delivery_updated = db.query(RecommendationDelivery).filter(
+                RecommendationDelivery.delivery_id == str(delivery_id),
+                RecommendationDelivery.status == "sending",
+                RecommendationDelivery.lease_owner == self.lease_owner,
+            ).update({
+                "status": "sent",
+                "wecom_msgid": (str(response.get("msgid") or ""))[:128] or None,
+                "wecom_response": summary or None,
+                "invalid_recipients": None,
+                "last_error_code": None,
+                "last_error": None,
+                "sent_at": func.now(6),
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "next_attempt_at": func.now(6),
+                "session_patch_ciphertext": None,
+            }, synchronize_session=False)
+            if outbox_updated != 1 or delivery_updated != 1:
+                db.rollback()
+                logger.warning(
+                    "aibot: sent commit fenced id=%s delivery_id=%s outbox=%s delivery=%s",
+                    item.get("id"), delivery_id, outbox_updated, delivery_updated,
+                )
+                return False
+            db.commit()
+            return True
+        except Exception:
+            db.rollback()
+            logger.exception("aibot: sent commit failed id=%s", item.get("id"))
+            return False
+        finally:
+            db.close()
 
     def _mark_frame_written(self, item: Mapping[str, Any]) -> bool:
         values: dict[str, Any] = {
