@@ -272,9 +272,17 @@ class AibotTransport:
         if command == "aibot_respond_welcome_msg":
             frame = self.client.respond_welcome(req_id, content)
         elif command == "aibot_send_msg":
-            frame = self.client.send_msg(req_id, content, chat_id=item.get("chat_id"))
+            if not item.get("chat_id"):
+                raise AibotClientError("aibot_send_msg requires chat_id")
+            conversation_type = item.get("conversation_type")
+            chat_type = 1 if conversation_type == "single" else 2 if conversation_type == "group" else None
+            frame = self.client.send_msg(req_id, content, chat_id=item.get("chat_id"), chat_type=chat_type)
         elif command == "aibot_respond_update_msg":
-            frame = self.client.respond_update_msg(req_id, str(stream_id or ""), content, finish=finish)
+            template_card = item.get("template_card")
+            if not isinstance(template_card, dict):
+                raise AibotClientError("aibot_respond_update_msg requires template_card")
+            userids = item.get("userids")
+            frame = self.client.respond_update_msg(req_id, template_card, userids=userids)
         elif stream_id:
             frame = self.client.stream(req_id, str(stream_id), content, finish=finish)
         elif command == "aibot_respond_msg":
@@ -361,7 +369,9 @@ class AibotTransport:
                 if not await self._renew():
                     await self.lease_lost()
                     return
-                await self._send_raw(self.client.ping())
+                # The protocol heartbeat has a JSON ACK; wait for it so a
+                # half-open socket is detected promptly and reconnected.
+                await self.send(self.client.ping(), timeout=self.ack_timeout)
             except asyncio.CancelledError:
                 return
 
