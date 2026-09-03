@@ -4,6 +4,7 @@
 其它模块统一 `from app.config import settings` 使用。
 """
 import os
+import re
 from typing import Literal
 from urllib.parse import quote, quote_plus
 
@@ -451,6 +452,10 @@ class Settings(BaseSettings):
     # disabled until the test-enterprise visibility checks are complete.
     identity_resolution_enabled: bool = False
     wecom_aibot_identity_app_secret: SecretStr = SecretStr("")
+    wecom_aibot_identity_mode: Literal["directory", "simulated"] = "directory"
+    # Development-only canonical actor used by the simulated identity mode.
+    # It must never be enabled in production.
+    wecom_aibot_simulated_userid: str = ""
     role_binding_mode: Literal["shadow", "on"] = "shadow"
     aibot_identity_digest_key: SecretStr = SecretStr("")
 
@@ -481,6 +486,15 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_aibot_enabled(self) -> "Settings":
+        if self.wecom_aibot_identity_mode == "simulated":
+            if self.app_env.lower() not in {"development", "test"}:
+                raise ValueError(
+                    "WECOM_AIBOT_IDENTITY_MODE=simulated is allowed only in development/test"
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", self.wecom_aibot_simulated_userid.strip()):
+                raise ValueError(
+                    "WECOM_AIBOT_SIMULATED_USERID must be a canonical userid when simulated identity is enabled"
+                )
         if not self.wecom_aibot_enabled:
             return self
         if not self.wecom_aibot_bot_id.strip():

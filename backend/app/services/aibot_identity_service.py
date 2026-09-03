@@ -145,6 +145,32 @@ class AibotIdentityService:
         if getattr(revoked_binding, "binding_status", None) == "revoked":
             aibot_identity_metrics.record_resolution("rejected", "binding_revoked")
             return ResolvedActor(actor_id, actor_id_kind, "revoked", reason_code="binding_revoked")
+        if getattr(settings, "wecom_aibot_identity_mode", "directory") == "simulated":
+            # This branch is guarded by Settings so it can only run in a
+            # development/test environment with an explicit synthetic actor.
+            # Keep the same durable identity, binding, and registration writes
+            # as the real resolver so business-path tests exercise production
+            # boundaries without trusting an opaque provider id.
+            canonical = str(getattr(settings, "wecom_aibot_simulated_userid", "")).strip()
+            if not _CANONICAL_RE.fullmatch(canonical):
+                row.identity_status = "rejected"
+                row.last_error_code = "simulated_userid_invalid"
+                self._audit(db, bot, digest, actor_id, "identity_simulated", "rejected", "simulated_userid_invalid")
+                db.flush()
+                aibot_identity_metrics.record_resolution("rejected", "simulated_userid_invalid")
+                return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="simulated_userid_invalid")
+            row.mapped_external_userid = canonical
+            row.canonical_userid = canonical
+            row.identity_status = "verified"
+            row.verified_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            row.last_error_code = None
+            binding = ensure_binding(db, bot_id=bot, opaque_actor_digest_value=digest, canonical_userid=canonical)
+            if auto_register:
+                auto_register_worker(db, canonical, binding)
+            self._audit(db, bot, digest, actor_id, "identity_simulated", "verified", "development_only", canonical=canonical)
+            db.flush()
+            aibot_identity_metrics.record_resolution("verified", "development_only")
+            return ResolvedActor(actor_id, actor_id_kind, "verified", canonical_userid=canonical, binding_id=binding.binding_id)
         if actor_id_kind == "plain":
             ok, reason = self.verify_plain_userid(actor_id)
             if not ok:

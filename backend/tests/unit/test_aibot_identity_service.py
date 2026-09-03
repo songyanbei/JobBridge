@@ -8,6 +8,13 @@ from app.services import registration_service
 from app.wecom.identity_client import ConversionResult, IdentityClientError
 
 
+@pytest.fixture(autouse=True)
+def _default_to_directory_identity_mode(monkeypatch):
+    # The repository .env is configured for the local WSL smoke test, while
+    # the resolver unit tests must explicitly exercise the real branches.
+    monkeypatch.setattr(service.settings, "wecom_aibot_identity_mode", "directory")
+
+
 def _row(**overrides):
     values = dict(
         opaque_actor_digest="d" * 64, bot_id="bot", identity_status="unverified",
@@ -35,6 +42,28 @@ def test_open_userid_success_reaches_verified(monkeypatch):
     assert result.canonical_userid == "zhangsan"
     assert row.identity_status == "verified"
     registered.assert_called_once_with(db, "zhangsan", binding)
+
+
+def test_simulated_identity_reaches_verified_without_directory_client(monkeypatch):
+    db = Mock()
+    row = _row()
+    svc = service.AibotIdentityService(client=Mock(), bot_id="bot")
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+    binding = SimpleNamespace(binding_id="binding-simulated")
+    monkeypatch.setattr(service, "ensure_binding", lambda *args, **kwargs: binding)
+    registered = Mock()
+    monkeypatch.setattr(service, "auto_register_worker", registered)
+    monkeypatch.setattr(service.settings, "wecom_aibot_identity_mode", "simulated")
+    monkeypatch.setattr(service.settings, "wecom_aibot_simulated_userid", "wecom-test-user")
+
+    result = svc.resolve_for_event(db, actor_id="opaque-from-wecom", actor_id_kind="open_userid")
+
+    assert result.verified
+    assert result.canonical_userid == "wecom-test-user"
+    assert row.identity_status == "verified"
+    assert row.canonical_userid == "wecom-test-user"
+    registered.assert_called_once_with(db, "wecom-test-user", binding)
+    assert db.add.call_args.args[0].action == "identity_simulated"
 
 
 def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatch):

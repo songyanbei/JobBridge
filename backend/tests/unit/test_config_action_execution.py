@@ -60,3 +60,22 @@ def test_action_configuration_preserves_rollout_and_limit_validators():
         Settings(_env_file=None, monitor_action_replay_backlog_threshold=-1)
     with pytest.raises(ValidationError):
         Settings(_env_file=None, action_execution_mode="invalid")
+
+
+def test_simulated_aibot_identity_is_development_only():
+    configured = Settings(
+        _env_file=None,
+        app_env="development",
+        wecom_aibot_identity_mode="simulated",
+        wecom_aibot_simulated_userid="wecom-test-user",
+    )
+    assert configured.wecom_aibot_identity_mode == "simulated"
+    assert configured.wecom_aibot_simulated_userid == "wecom-test-user"
+
+    with pytest.raises(ValidationError, match="development/test"):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            wecom_aibot_identity_mode="simulated",
+            wecom_aibot_simulated_userid="wecom-test-user",
+        )
