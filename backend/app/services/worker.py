@@ -886,7 +886,7 @@ class Worker:
             action_claim = None
             preloaded_user_context = None
             mode = getattr(settings, "action_execution_mode", "off")
-            if msg.msg_type == "text" and mode in {"on", "shadow"} and (
+            if msg.msg_type == "text" and demo_command_reply is None and mode in {"on", "shadow"} and (
                 msg.source_channel != "wecom_aibot"
                 or msg.actor_id_kind != "opaque"
                 or (aibot_identity is not None and aibot_identity.verified)
