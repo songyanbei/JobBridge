@@ -80,4 +80,3 @@ def test_disabled_or_missing_pointer_fails_closed():
         assert resolve_active_context(
             db=SimpleNamespace(), real_actor_userid="wecom-1", bot_id="bot-1",
         ) is None
-
