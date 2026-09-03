@@ -316,9 +316,21 @@ class AibotTransport:
             try:
                 callback = parse_callback(payload)
             except AibotProtocolError as exc:
-                # Keep the raw callback out of logs, but retain the bounded
-                # validation reason so provider schema drift is diagnosable.
-                logger.warning("aibot websocket rejected callback reason=%s", str(exc))
+                # Keep the raw callback out of logs, but retain bounded shape
+                # metadata so provider schema drift is diagnosable.
+                try:
+                    value = decode_frame(payload)
+                    headers = value.get("headers") if isinstance(value, dict) else {}
+                    body = value.get("body") if isinstance(value, dict) else {}
+                    logger.warning(
+                        "aibot websocket rejected callback reason=%s cmd=%s headers=%s body_keys=%s",
+                        str(exc),
+                        value.get("cmd") if isinstance(value, dict) else None,
+                        sorted(headers.keys()) if isinstance(headers, dict) else [],
+                        sorted(body.keys()) if isinstance(body, dict) else [],
+                    )
+                except Exception:
+                    logger.warning("aibot websocket rejected callback reason=%s", str(exc))
                 return
             if self.on_callback is not None:
                 task = asyncio.create_task(_maybe_await(self.on_callback(callback)))
