@@ -75,4 +75,8 @@ def assert_protocol_fixture(name: str, payload: dict[str, Any] | None = None) ->
     if name == "aibot_respond_update_msg":
         assert body["response_type"] == "update_template_card"
         assert body["template_card"]["card_type"] == "button_interaction"
-
+    if name == "aibot_respond_msg":
+        assert body["msgtype"] == "stream"
+        assert body["stream"]["id"]
+        assert body["stream"]["finish"] is True
+        assert body["stream"]["content"] == "收到"

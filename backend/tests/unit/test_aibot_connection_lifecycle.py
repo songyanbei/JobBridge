@@ -47,6 +47,8 @@ async def test_real_transport_adapts_outbox_to_protocol_frame_and_ack():
 
     assert await transport.connect_once()
     result = await transport.send_outbox({
+        "id": 9,
+        "reply_index": 0,
         "content": "hello",
         "provider_req_id": "req-1",
         "reply_command": "aibot_respond_msg",
@@ -55,6 +57,9 @@ async def test_real_transport_adapts_outbox_to_protocol_frame_and_ack():
     assert result == {"headers": {"req_id": "req-1"}, "errcode": 0, "errmsg": "ok"}
     assert socket.sent[-1]["cmd"] == "aibot_respond_msg"
     assert socket.sent[-1]["headers"]["req_id"] == "req-1"
+    assert socket.sent[-1]["body"]["msgtype"] == "stream"
+    assert socket.sent[-1]["body"]["stream"]["finish"] is True
+    assert socket.sent[-1]["body"]["stream"]["id"]
     await transport.close()
     assert transport.state == TransportState.ACTIVE
 

@@ -122,6 +122,7 @@ class AibotOutboxWriter:
                 row.attempt_count = int(row.attempt_count or 0) + 1
                 claimed.append({
                     "id": int(row.id),
+                    "reply_index": int(row.reply_index),
                     "userid": row.userid,
                     "content": row.content or "",
                     "channel": row.channel,
@@ -300,9 +301,17 @@ class AibotOutboxWriter:
         })
 
     def _mark_frame_written(self, item: Mapping[str, Any]) -> bool:
-        return self._update(item, {
+        values: dict[str, Any] = {
             "first_sent_at": func.coalesce(WecomOutboundOutbox.first_sent_at, func.now(6)),
-        })
+        }
+        if item.get("stream_id"):
+            # Officially the ten-minute stream window starts at the first
+            # provider write, not at inbound acceptance or outbox creation.
+            values["stream_deadline_at"] = func.coalesce(
+                WecomOutboundOutbox.stream_deadline_at,
+                func.timestampadd(text("SECOND"), 600, func.now(6)),
+            )
+        return self._update(item, values)
 
     def _mark_uncertain(self, item: Mapping[str, Any], reason: str) -> bool:
         return self._update(item, {

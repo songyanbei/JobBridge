@@ -75,6 +75,7 @@ from app.services import (
 from app.services.aibot_identity_service import AibotIdentityService
 from app.tasks.common import log_event
 from app.wecom.callback import WeComMessage
+from app.wecom.aibot_client import stable_aibot_stream_id
 from app.wecom.client import (
     WeComClient,
     WeComError,
@@ -1889,6 +1890,19 @@ class Worker:
                     request_fact=reply.recommendation_request.model_dump(mode="json"),
                     source_inbound_msg_id=reply.recommendation_request.source_inbound_msg_id,
                 )
+            aibot_reply = source_channel == "wecom_aibot"
+            stream_id = (
+                (
+                    getattr(reply, "stream_id", None)
+                    or stable_aibot_stream_id(inbound_event_id, index)
+                )
+                if aibot_reply else None
+            )
+            finish = (
+                bool(getattr(reply, "finish", True))
+                if aibot_reply
+                else getattr(reply, "finish", None)
+            )
             db.add(WecomOutboundOutbox(
                 inbound_event_id=int(inbound_event_id),
                 reply_index=index,
@@ -1904,15 +1918,16 @@ class Worker:
                 chat_id=chat_id,
                 ordering_key=ordering_key,
                 provider_req_id=provider_req_id,
-                reply_command=("aibot_respond_msg" if source_channel == "wecom_aibot" else None),
-                stream_id=getattr(reply, "stream_id", None),
-                finish=getattr(reply, "finish", None),
+                reply_command=("aibot_respond_msg" if aibot_reply else None),
+                stream_id=stream_id,
+                finish=finish,
                 reply_expires_at=reply_expires_at if source_channel == "wecom_aibot" else None,
-                stream_deadline_at=(
-                    base_time + timedelta(minutes=10)
-                    if source_channel == "wecom_aibot" and getattr(reply, "stream_id", None)
-                    else None
-                ),
+                # The provider's 10-minute stream window starts when the
+                # first frame is written, not when the inbound row was
+                # created.  AibotOutboxWriter records that deadline at write
+                # time; keeping this NULL also avoids expiring a queued row
+                # before it has ever reached the socket.
+                stream_deadline_at=None,
             ))
 
     def _claim_outbox(

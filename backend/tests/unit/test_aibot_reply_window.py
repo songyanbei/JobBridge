@@ -35,12 +35,14 @@ def test_aibot_outbox_persists_reply_window_from_inbound_time():
     worker._stage_outbox(db, 7, [reply])
 
     row = db.rows[0]
+    assert row.stream_id
+    assert row.finish is True
     assert isinstance(row, WecomOutboundOutbox)
     assert row.reply_expires_at == created + timedelta(hours=24)
     assert row.stream_deadline_at is None
 
 
-def test_stream_reply_outbox_gets_ten_minute_deadline():
+def test_stream_reply_deadline_is_deferred_until_first_frame_write():
     created = datetime(2026, 8, 31, 12, 0, 0)
     db = _Db(SimpleNamespace(
         source_channel="wecom_aibot", conversation_type="single",
@@ -58,4 +60,6 @@ def test_stream_reply_outbox_gets_ten_minute_deadline():
     worker._stage_outbox(db, 7, [reply])
 
     row = db.rows[0]
-    assert row.stream_deadline_at == created + timedelta(minutes=10)
+    assert row.stream_id == "stream-1"
+    assert row.finish is True
+    assert row.stream_deadline_at is None

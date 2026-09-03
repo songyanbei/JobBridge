@@ -1,6 +1,6 @@
 import pytest
 
-from app.wecom.aibot_client import AibotClient, AibotClientError
+from app.wecom.aibot_client import AibotClient, AibotClientError, stable_aibot_stream_id
 
 
 def test_official_subscribe_fixture_and_secret_only_in_body():
@@ -17,6 +17,28 @@ def test_stream_req_id_and_finish_constraints():
     assert final["cmd"] == "aibot_respond_msg"
     with pytest.raises(AibotClientError):
         client.stream("msg-1", "stream-1", "again")
+
+
+def test_ordinary_message_reply_is_one_shot_final_stream():
+    client = AibotClient("BOTID", "SECRET")
+    frame = client.respond_msg("msg-1", "收到")
+    assert frame == {
+        "cmd": "aibot_respond_msg",
+        "headers": {"req_id": "msg-1"},
+        "body": {
+            "msgtype": "stream",
+            "stream": {
+                "id": stable_aibot_stream_id("msg-1", 0),
+                "finish": True,
+                "content": "收到",
+            },
+        },
+    }
+
+
+def test_stable_stream_id_distinguishes_reply_indexes_and_retries():
+    assert stable_aibot_stream_id(7, 0) == stable_aibot_stream_id(7, 0)
+    assert stable_aibot_stream_id(7, 0) != stable_aibot_stream_id(7, 1)
 
 
 def test_template_card_update_uses_official_response_shape():

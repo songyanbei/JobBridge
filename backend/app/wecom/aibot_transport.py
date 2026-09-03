@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any, Awaitable, Callable
 
 from app.wecom.aibot_callback import AibotProtocolError, decode_frame, parse_callback, parse_frame
-from app.wecom.aibot_client import AibotClient, AibotClientError
+from app.wecom.aibot_client import AibotClient, AibotClientError, stable_aibot_stream_id
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +268,7 @@ class AibotTransport:
             req_id = str(item.get("provider_req_id") or item.get("ack_req_id") or f"out-{uuid.uuid4().hex}")
         content = str(item.get("content") or "")
         stream_id = item.get("stream_id")
-        finish = bool(item.get("finish", False))
+        finish = True if item.get("finish") is None else bool(item.get("finish"))
         if command == "aibot_respond_welcome_msg":
             frame = self.client.respond_welcome(req_id, content)
         elif command == "aibot_send_msg":
@@ -283,16 +283,39 @@ class AibotTransport:
                 raise AibotClientError("aibot_respond_update_msg requires template_card")
             userids = item.get("userids")
             frame = self.client.respond_update_msg(req_id, template_card, userids=userids)
+        elif command == "aibot_respond_msg":
+            if not stream_id:
+                if item.get("id") is None:
+                    raise AibotClientError("aibot_respond_msg requires persisted stream_id")
+                stream_id = stable_aibot_stream_id(item["id"], int(item.get("reply_index") or 0))
+            frame = self.client.stream(req_id, str(stream_id), content, finish=finish)
         elif stream_id:
             frame = self.client.stream(req_id, str(stream_id), content, finish=finish)
-        elif command == "aibot_respond_msg":
-            frame = self.client.respond_msg(req_id, content)
         else:
             raise AibotClientError(f"unsupported AIBot outbox command: {command}")
         on_written = item.get("_on_frame_written")
         if on_written is not None and not callable(on_written):
             raise AibotClientError("_on_frame_written must be callable")
-        errcode, errmsg = await self.send(frame, on_written=on_written)
+        frame_written = False
+
+        async def mark_written() -> None:
+            nonlocal frame_written
+            # The provider frame is already on the socket before this hook is
+            # invoked.  A hook failure therefore must not make a stream
+            # reusable, even though the outbox row will become uncertain.
+            frame_written = True
+            if on_written is not None:
+                await _maybe_await(on_written())
+
+        try:
+            errcode, errmsg = await self.send(frame, on_written=mark_written)
+        except Exception:
+            # A stream builder records finish=True before the actual socket
+            # write.  Only a pre-write failure is safe to retry; after a write
+            # the provider outcome is uncertain and the writer fences it.
+            if stream_id and not frame_written:
+                self.client.rollback_stream(str(stream_id), req_id)
+            raise
         return {"headers": {"req_id": req_id}, "errcode": errcode, "errmsg": errmsg}
 
     async def handle_frame(self, payload: Any) -> None:
