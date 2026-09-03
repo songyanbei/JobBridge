@@ -4,6 +4,7 @@
 """
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -39,6 +40,10 @@ class UserContext:
     can_search_workers: bool
     is_first_touch: bool
     should_welcome: bool
+    # Message-side demo adapter fields. Defaults preserve existing callers.
+    reply_userid: str | None = None
+    real_actor_userid: str | None = None
+    demo_context: Any | None = None
 
 
 # ---------------------------------------------------------------------------

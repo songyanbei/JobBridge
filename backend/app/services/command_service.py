@@ -693,7 +693,12 @@ def _write_audit_log(
 
 
 def _reply(user_ctx: UserContext, content: str) -> ReplyMessage:
-    return ReplyMessage(userid=user_ctx.external_userid, content=content)
+    # Demo mode uses a synthetic business principal; delivery must target the
+    # verified real actor instead.
+    return ReplyMessage(
+        userid=user_ctx.reply_userid or user_ctx.external_userid,
+        content=content,
+    )
 
 
 def _status_display(status: str) -> str:
