@@ -104,6 +104,8 @@ class AibotClient:
     def stream(self, req_id: str, stream_id: str, content: str, *, finish: bool = False) -> dict[str, Any]:
         if not stream_id:
             raise AibotClientError("stream.id is required")
+        if not isinstance(content, str) or not content:
+            raise AibotClientError("stream.content is required")
         previous_req = self._streams.get(stream_id)
         if previous_req is not None and previous_req != req_id:
             raise AibotClientError("stream must reuse its original req_id")

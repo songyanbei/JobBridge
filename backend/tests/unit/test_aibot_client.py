@@ -52,3 +52,8 @@ def test_template_card_update_uses_official_response_shape():
             "template_card": {"card_type": "button_interaction"},
         },
     }
+
+
+def test_stream_rejects_empty_content_before_provider_write():
+    with pytest.raises(AibotClientError, match="stream.content"):
+        AibotClient("BOTID", "SECRET").stream("msg-1", "stream-1", "")
