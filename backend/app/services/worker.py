@@ -55,6 +55,7 @@ from app.models import (
     Resume,
     WecomInboundEvent,
     WecomOutboundOutbox,
+    WecomAibotIdentity,
     RecommendationDelivery,
     ContactDelivery,
     User,
@@ -786,8 +787,15 @@ class Worker:
                     )
                     return "duplicate_terminal_skipped"
                 if event_status == "session_pending":
+                    persisted_event = db.query(WecomInboundEvent).filter(
+                        WecomInboundEvent.id == inbound_event_id,
+                    ).first()
+                    recovery_session_key = (
+                        _session_key_for_inbound_event(persisted_event, db)
+                        if persisted_event is not None else session_key
+                    )
                     applied = self._apply_session_commit_for_event(
-                        inbound_event_id, session_key,
+                        inbound_event_id, recovery_session_key,
                     )
                     if applied:
                         self._deliver_outbox_for_event(inbound_event_id)
@@ -835,7 +843,7 @@ class Worker:
                 msg.from_user = userid
                 msg.actor_id_kind = "plain"
                 if msg.conversation_type == "single":
-                    session_key = f"session:{userid}"
+                    session_key = userid
                 aibot_identity = resolved
 
             # Workstream A pre-routing: parse once before entering the Router.
@@ -1421,7 +1429,7 @@ class Worker:
             )
             claimed: list[dict] = []
             for row, raw_deadline_epoch, reached in rows:
-                session_key = _session_key_for_inbound_event(row)
+                session_key = _session_key_for_inbound_event(row, db)
                 operation = str(row.session_operation or "")
                 payload_available = True
                 try:
@@ -3483,11 +3491,19 @@ def _session_key_from_message_data(msg_data: dict, userid: str) -> str:
     return userid
 
 
-def _session_key_for_inbound_event(row: WecomInboundEvent) -> str:
+def _session_key_for_inbound_event(row: WecomInboundEvent, db: Session | None = None) -> str:
     source = getattr(row, "source_channel", None) or LEGACY_CHANNEL
     conversation_type = getattr(row, "conversation_type", None) or "single"
     conversation_id = getattr(row, "conversation_id", None) or getattr(row, "from_userid", None) or ""
     if source == "wecom_aibot":
+        if conversation_type == "single" and db is not None:
+            identity = db.query(WecomAibotIdentity).filter(
+                WecomAibotIdentity.opaque_actor_id == getattr(row, "from_userid", None),
+                WecomAibotIdentity.identity_status == "verified",
+            ).first()
+            canonical = getattr(identity, "mapped_external_userid", None) if identity is not None else None
+            if isinstance(canonical, str) and canonical.strip():
+                return canonical.strip()
         return f"wecom:aibot:{conversation_type}:{conversation_id}"
     return str(getattr(row, "from_userid", None) or "")
 
