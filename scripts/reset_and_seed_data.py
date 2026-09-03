@@ -546,6 +546,18 @@ def seed_jobs(conn: pymysql.connections.Connection,
             ])
             audited_by = random.choice(["system", "system", "admin001"])
             audited_at = created_at + timedelta(minutes=random.randint(1, 600))
+
+        # 保持与生产发布链路一致的岗位生命周期：
+        #   passed   -> activated_at + expires_at
+        #   pending/rejected -> candidate_expires_at，不能提前带正式 expires_at
+        # 之前种子只写了 expires_at，导致后台默认的 active/candidate 过滤得到 0 条。
+        if audit_status == "passed":
+            activated_at = audited_at or created_at
+            candidate_expires_at = None
+        else:
+            activated_at = None
+            candidate_expires_at = created_at + timedelta(days=7)
+            expires_at = None
         # pending: 全 None
 
         # 下架原因（仅对 passed 抽样 5+3+2%）
@@ -573,7 +585,7 @@ def seed_jobs(conn: pymysql.connections.Connection,
             salary_ceiling, provide_meal, provide_housing, shift,
             raw_text, description,
             audit_status, audit_reason, audited_by, audited_at,
-            created_at, expires_at, delist_reason,
+            created_at, expires_at, activated_at, candidate_expires_at, delist_reason,
         ))
 
     sql = """
@@ -584,14 +596,14 @@ def seed_jobs(conn: pymysql.connections.Connection,
        salary_ceiling_monthly, provide_meal, provide_housing, shift_pattern,
        raw_text, description,
        audit_status, audit_reason, audited_by, audited_at,
-       created_at, expires_at, delist_reason)
+       created_at, expires_at, activated_at, candidate_expires_at, delist_reason)
     VALUES (%s, %s, %s, %s, %s, %s,
             %s, %s, %s, %s,
             %s, %s,
             %s, %s, %s, %s,
             %s, %s,
             %s, %s, %s, %s,
-            %s, %s, %s)
+            %s, %s, %s, %s, %s)
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)
@@ -684,6 +696,15 @@ def seed_resumes(conn: pymysql.connections.Connection,
             audited_by = random.choice(["system", "admin001"])
             audited_at = created_at + timedelta(minutes=random.randint(1, 600))
 
+        # 与线上简历生命周期保持一致：通过后正式激活，其余状态保留候选回收时间。
+        if audit_status == "passed":
+            activated_at = audited_at or created_at
+            candidate_expires_at = None
+        else:
+            activated_at = None
+            candidate_expires_at = created_at + timedelta(days=7)
+            expires_at = None
+
         rows.append((
             worker["external_userid"],
             json.dumps(cities, ensure_ascii=False),
@@ -692,7 +713,7 @@ def seed_resumes(conn: pymysql.connections.Connection,
             accept_long, accept_short,
             raw_text, description,
             audit_status, audit_reason, audited_by, audited_at,
-            created_at, expires_at,
+            created_at, expires_at, activated_at, candidate_expires_at,
         ))
 
     sql = """
@@ -702,13 +723,13 @@ def seed_resumes(conn: pymysql.connections.Connection,
        accept_long_term, accept_short_term,
        raw_text, description,
        audit_status, audit_reason, audited_by, audited_at,
-       created_at, expires_at)
+       created_at, expires_at, activated_at, candidate_expires_at)
     VALUES (%s, %s, %s,
             %s, %s, %s,
             %s, %s,
             %s, %s,
             %s, %s, %s, %s,
-            %s, %s)
+            %s, %s, %s, %s)
     """
     with conn.cursor() as cur:
         cur.executemany(sql, rows)

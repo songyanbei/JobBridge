@@ -33,35 +33,35 @@ INSERT INTO job (
   district, address, provide_meal, provide_housing, shift_pattern,
   raw_text, description,
   audit_status, audited_by, audited_at,
-  expires_at, extra
+  activated_at, expires_at, extra
 ) VALUES
 -- 第 5 步候选（"5500 包吃住"）
 ('seed_factory_014', '苏州市', '电子厂', 5500, 7200, '月薪', 30, '不限', 18, 45, 1,
  '工业园区', '工业园区星湖街 168 号',1, 1, '两班倒',
  '苏州工业园电子厂招普工 30 人，5500-7200，包吃住，两班倒',
  '苏州工业园电子厂普工 5500-7200 包吃住 两班倒',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','5')),
 
 ('seed_factory_018', '苏州市', '电子厂', 6500, 8500, '月薪', 20, '不限', 18, 45, 1,
  '高新区', '高新区科技路 88 号',1, 1, '白班+小夜班',
  '苏州高新区电子厂招 20 人，6500-8500，包吃住，白班+小夜班',
  '苏州高新区电子厂 6500-8500 包吃住',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','5')),
 
 ('seed_factory_014', '苏州市', '电子厂', 7000, 9000, '月薪', 15, '不限', 20, 42, 1,
  '昆山市', '昆山市花桥经济开发区祥和路 32 号',1, 1, '两班倒',
  '苏州昆山电子厂招熟练工 15 人，7000-9000，包吃住',
  '苏州昆山电子厂熟练工 7000-9000',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','6')),
 
 ('seed_factory_018', '苏州市', '电子厂', 7500, 9800, '月薪', 10, '不限', 22, 45, 1,
  '吴中区', '吴中区东吴南路 666 号',1, 1, '白班',
  '苏州吴中电子厂招技术员 10 人，7500-9800，包吃住，白班',
  '苏州吴中电子厂技术员 7500-9800 白班',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','6')),
 
 -- 第 8 步候选（按薪资区间上限覆盖 9500 直接命中）
@@ -69,21 +69,21 @@ INSERT INTO job (
  '工业园区', '工业园区现代大道 2008 号',1, 1, '白班',
  '苏州工业园电子厂招高级技工 8 人，8600-11000，包吃住，白班',
  '苏州工业园电子厂高级技工 8600-11000',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','8')),
 
 ('seed_factory_018', '苏州市', '电子厂', 8800, 11500, '月薪', 5, '不限', 24, 45, 1,
  '相城区', '相城区华阳路 99 号',1, 1, '白班',
  '苏州相城电子厂招资深工程师 5 人，8800-11500，包吃住，白班',
  '苏州相城电子厂资深工程师 8800-11500',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','8')),
 
 ('seed_factory_014', '苏州市', '电子厂', 9000, 12000, '月薪', 3, '不限', 25, 45, 1,
  '工业园区', '工业园区苏虹中路 1188 号',1, 1, '白班',
  '苏州工业园电子厂招组长 3 人，9000-12000，包吃住，白班',
  '苏州工业园电子厂组长 9000-12000',
- 'passed', 'system', NOW(),
+ 'passed', 'system', NOW(), NOW(),
  DATE_ADD(NOW(), INTERVAL 60 DAY), JSON_OBJECT('demo_tag','demo_supp_v1','demo_step','8'));
 
 -- ---------- 验证 ----------
