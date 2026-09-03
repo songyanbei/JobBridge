@@ -155,7 +155,14 @@ class AibotTransport:
                 import websockets  # type: ignore
             except ImportError as exc:
                 raise AibotTransportError("websockets package is required for the default connector") from exc
-            return await websockets.connect(self.ws_url, open_timeout=self.connect_timeout)
+            # The WeCom AIBot protocol has its own JSON ``ping`` command.
+            # Disable the websocket library's control-frame keepalive so it
+            # does not race with or get misinterpreted by the provider.
+            return await websockets.connect(
+                self.ws_url,
+                open_timeout=self.connect_timeout,
+                ping_interval=None,
+            )
         return await _maybe_await(self.connect_factory(self.ws_url))
 
     async def connect_once(self) -> bool:
