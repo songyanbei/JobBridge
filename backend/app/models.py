@@ -1578,3 +1578,114 @@ class RecommendationExposureDaily(Base):
     target_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True)
     impression_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+
+# ============================================================================
+# Demo mode control plane
+# ============================================================================
+
+class DemoWorkspace(Base):
+    """独立演示批次；不改变真实 User.role 或 AIBot 身份绑定。"""
+
+    __tablename__ = "demo_workspace"
+
+    demo_id = sa.Column(sa.String(64), primary_key=True)
+    name = sa.Column(sa.String(128), nullable=False)
+    status = sa.Column(
+        sa.Enum("active", "disabled", "cleaning", "cleaned", "failed", name="demo_workspace_status"),
+        nullable=False,
+        server_default="active",
+    )
+    bot_id = sa.Column(sa.String(128), nullable=False)
+    opaque_actor_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    canonical_actor_userid = sa.Column(sa.String(64), nullable=True)
+    created_by = sa.Column(sa.String(64), nullable=False)
+    reason = sa.Column(sa.String(255), nullable=True)
+    version = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("1"))
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    disabled_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    cleaned_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.Index("idx_demo_workspace_status", "status", "created_at"),
+        sa.Index("idx_demo_workspace_bot_actor", "bot_id", "opaque_actor_digest", "status"),
+    )
+
+
+class DemoWorkspaceMember(Base):
+    """演示批次授权成员，以 bot_id + actor digest 定位，不保存 opaque actor 明文。"""
+
+    __tablename__ = "demo_workspace_member"
+
+    member_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), sa.ForeignKey("demo_workspace.demo_id", ondelete="RESTRICT"), nullable=False)
+    bot_id = sa.Column(sa.String(128), nullable=False)
+    opaque_actor_digest = sa.Column(mysql.CHAR(64), nullable=False)
+    canonical_actor_userid = sa.Column(sa.String(64), nullable=True)
+    membership_status = sa.Column(
+        sa.Enum("active", "revoked", "expired", name="demo_membership_status"),
+        nullable=False,
+        server_default="active",
+    )
+    granted_by = sa.Column(sa.String(64), nullable=False)
+    expires_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("demo_id", "bot_id", "opaque_actor_digest", name="uk_demo_member_actor"),
+        sa.Index("idx_demo_member_lookup", "bot_id", "opaque_actor_digest", "membership_status"),
+        sa.Index("idx_demo_member_workspace", "demo_id", "membership_status"),
+    )
+
+
+class DemoPrincipal(Base):
+    """演示业务主体；每个 workspace 固定 worker/factory/broker 各一个。"""
+
+    __tablename__ = "demo_principal"
+
+    principal_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), sa.ForeignKey("demo_workspace.demo_id", ondelete="RESTRICT"), nullable=False)
+    role = sa.Column(sa.Enum("worker", "factory", "broker", name="demo_principal_role"), nullable=False)
+    synthetic_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid", ondelete="RESTRICT"), nullable=False)
+    principal_status = sa.Column(
+        sa.Enum("active", "revoked", name="demo_principal_status"),
+        nullable=False,
+        server_default="active",
+    )
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    revoked_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("demo_id", "role", name="uk_demo_principal_role"),
+        sa.UniqueConstraint("synthetic_userid", name="uk_demo_principal_user"),
+        sa.Index("idx_demo_principal_workspace_status", "demo_id", "principal_status"),
+    )
+
+
+class DemoResource(Base):
+    """演示资源登记表；用于清理时按批次追踪多态业务资源。"""
+
+    __tablename__ = "demo_resource"
+
+    resource_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), sa.ForeignKey("demo_workspace.demo_id", ondelete="RESTRICT"), nullable=False)
+    resource_type = sa.Column(sa.String(48), nullable=False)
+    target_id = sa.Column(sa.String(128), nullable=False)
+    lifecycle_status = sa.Column(
+        sa.Enum("active", "delisted", "cleaning", "cleaned", "failed", name="demo_resource_status"),
+        nullable=False,
+        server_default="active",
+    )
+    metadata_json = sa.Column("metadata", sa.JSON, nullable=True)
+    created_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now())
+    cleaned_at = sa.Column(mysql.DATETIME(fsp=6), nullable=True)
+    last_error = sa.Column(sa.String(255), nullable=True)
+
+    __table_args__ = (
+        sa.UniqueConstraint("demo_id", "resource_type", "target_id", name="uk_demo_resource_target"),
+        sa.Index("idx_demo_resource_cleanup", "demo_id", "lifecycle_status", "resource_type"),
+    )
