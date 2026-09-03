@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from app.models import DemoPrincipal, DemoWorkspace, DemoWorkspaceMember
 from app.services.demo_message_context import DemoActorContext, load_active_context
 from app.services.demo_mode_service import (
     DemoModeError,
+    _now,
     actor_digest_for_lookup,
     get_active_workspace_for_actor,
     switch_role,
@@ -68,8 +70,43 @@ def resolve_for_actor(
     )
     if pointer is None or not pointer.active_role:
         return None
-    refreshed = activate_for_actor(db, actor_userid, bot_id, pointer.active_role)
-    if refreshed is None:
+    # The Redis pointer names the exact isolated workspace.  Do not resolve
+    # through get_active_workspace_for_actor(), which intentionally selects the
+    # newest workspace and can make a long-lived conversation drift between
+    # demo datasets when the actor has multiple workspaces.
+    try:
+        digest = actor_digest_for_lookup(actor_userid)
+        workspace = db.query(DemoWorkspace).filter(
+            DemoWorkspace.demo_id == pointer.demo_id,
+        ).first()
+        if workspace is None or workspace.bot_id != bot_id.strip():
+            return None
+        principal = db.query(DemoPrincipal).filter(
+            DemoPrincipal.demo_id == workspace.demo_id,
+            DemoPrincipal.role == pointer.active_role,
+        ).first()
+        if principal is None:
+            return None
+        member = db.query(DemoWorkspaceMember).filter(
+            DemoWorkspaceMember.demo_id == workspace.demo_id,
+            DemoWorkspaceMember.bot_id == bot_id.strip(),
+            DemoWorkspaceMember.opaque_actor_digest == digest,
+        ).first()
+        if workspace.status == "active":
+            if member is None or member.membership_status != "active":
+                return None
+            if member.expires_at is not None and member.expires_at <= _now():
+                return None
+        refreshed = DemoActorContext(
+            demo_mode=True,
+            demo_id=workspace.demo_id,
+            real_actor_userid=actor_userid,
+            effective_userid=principal.synthetic_userid,
+            active_role=pointer.active_role,
+            bot_id=bot_id.strip(),
+            workspace_status=workspace.status,
+        )
+    except DemoModeError:
         return None
     return replace(
         refreshed,
