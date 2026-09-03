@@ -333,7 +333,9 @@ def seed_users(conn: pymysql.connections.Connection) -> dict[str, list[dict[str,
     for i in range(1, NUM_FACTORY + 1):
         gender = random.choice(["男", "女"])
         name = gen_name(gender)
-        city = random.choice(list(COMPANY_CITY_SHORT.keys()))
+        # 演示脚本依赖 014/018 提供苏州电子厂岗位，固定其经营地为苏州，
+        # 其余厂家继续使用随机城市分布。
+        city = "苏州市" if i in (14, 18) else random.choice(list(COMPANY_CITY_SHORT.keys()))
         factory_district = gen_district(city)
         factory_addr = f"{city}{factory_district or ''}{gen_street_address()}"
         factories.append({
@@ -374,7 +376,8 @@ def seed_users(conn: pymysql.connections.Connection) -> dict[str, list[dict[str,
             "can_search_jobs": 1,
             "can_search_workers": 1,
             "status": status_dist(0.90, 0.05, 0.05),
-            "city": None,
+            "city": broker_city if broker_company else None,
+            "district": broker_district if broker_company else None,
         })
 
     for i in range(1, NUM_WORKER + 1):
@@ -502,7 +505,7 @@ def seed_jobs(conn: pymysql.connections.Connection,
         owner = owners[i % len(owners)]
         # 厂家更倾向用自家城市作岗位地
         same_city_as_owner = False
-        if owner["role"] == "factory" and owner.get("city") and random.random() < 0.7:
+        if owner.get("city"):
             city = owner["city"]
             same_city_as_owner = True
 
