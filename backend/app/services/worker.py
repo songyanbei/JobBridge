@@ -66,6 +66,7 @@ from app.services import (
     action_execution_service,
     action_parse_artifact_service,
     conversation_service,
+    demo_scope,
     message_router,
     recommendation_shadow_service,
     search_service,
@@ -822,6 +823,7 @@ class Worker:
             demo_context: DemoActorContext | None = None
             demo_command_reply: str | None = None
             demo_pointer = None
+            demo_scope_token = None
             if msg.source_channel == "wecom_aibot":
                 # Identity resolution is deliberately worker-side.  The WSS
                 # reader only persists/enqueues the opaque actor.  No failure
@@ -860,7 +862,7 @@ class Worker:
             # Resolve demo control only after the verified identity boundary.
             # userid remains the real actor for locking and delivery; the
             # effective userid is used by business routing.
-            if msg.msg_type == "text" and msg.conversation_type == "single":
+            if msg.conversation_type == "single":
                 # Capture the pointer before authoritative resolution.  The
                 # resolver may clear a stale/disabled pointer; retaining this
                 # fact for the current turn prevents an already-enqueued demo
@@ -871,17 +873,26 @@ class Worker:
                         conversation_type=msg.conversation_type,
                         conversation_id=msg.conversation_id,
                     )
-                demo_command = handle_demo_command(
-                    msg.content,
-                    db=db,
-                    real_actor_userid=userid,
-                    bot_id=msg.aibot_id,
-                    conversation_type=msg.conversation_type,
-                    conversation_id=msg.conversation_id,
-                )
-                if demo_command.handled:
-                    demo_command_reply = demo_command.reply_text
-                    demo_context = demo_command.context
+                if msg.msg_type == "text":
+                    demo_command = handle_demo_command(
+                        msg.content,
+                        db=db,
+                        real_actor_userid=userid,
+                        bot_id=msg.aibot_id,
+                        conversation_type=msg.conversation_type,
+                        conversation_id=msg.conversation_id,
+                    )
+                    if demo_command.handled:
+                        demo_command_reply = demo_command.reply_text
+                        demo_context = demo_command.context
+                    else:
+                        demo_context = resolve_active_context(
+                            db=db,
+                            real_actor_userid=userid,
+                            bot_id=msg.aibot_id,
+                            conversation_type=msg.conversation_type,
+                            conversation_id=msg.conversation_id,
+                        )
                 else:
                     demo_context = resolve_active_context(
                         db=db,
@@ -892,6 +903,18 @@ class Worker:
                     )
                 if demo_context is not None:
                     session_key = demo_context.session_key
+                    if demo_context.is_usable():
+                        demo_scope_token = demo_scope.bind(
+                            demo_scope.from_context(demo_context),
+                        )
+                        if inbound_event_id:
+                            db.query(WecomInboundEvent).filter(
+                                WecomInboundEvent.id == int(inbound_event_id),
+                            ).update({"demo_id": demo_context.demo_id})
+                    elif demo_context.demo_id and inbound_event_id:
+                        db.query(WecomInboundEvent).filter(
+                            WecomInboundEvent.id == int(inbound_event_id),
+                        ).update({"demo_id": demo_context.demo_id})
                 elif demo_pointer is not None and not demo_command.handled:
                     self._mark_event_fail(
                         inbound_event_id,
@@ -1206,6 +1229,8 @@ class Worker:
             self._handle_error(msg_data, inbound_event_id, retry_count, exc)
             return "processing_failed"
         finally:
+            if demo_scope_token is not None:
+                demo_scope.reset(demo_scope_token)
             db.close()
 
     # -----------------------------------------------------------------------
