@@ -33,8 +33,11 @@ JobBridge 的目标架构是：
 | [08 求职搜索 v1 实施方案](08-job-search-v1-implementation-plan.md) | 首版求职搜索的详细实施、代码范围、测试和灰度 | 后端、AI、测试、运维 |
 | [09 求职搜索 v1 Action Execution 审计](09-job-search-v1-action-execution-audit.md) | v1 Action 幂等、事务边界和生产接入前风险审计 | 架构、后端、测试、运维 |
 | [10 v1 后续 Action/Contact 实施方案](10-post-v1-action-contact-implementation-plan.md) | Action Execution 生产接入、Contact/PII 闭环、灰度演练和 S4 前置门禁 | 架构、后端、AI、测试、运维、安全 |
+| [12 企业微信智能机器人 WebSocket 长连接改造说明](12-wecom-aibot-websocket-migration.md) | 基于当前代码的 AIBot 长连接适配、单活连接、入站/出站可靠性、测试与上线计划 | 架构、后端、测试、运维 |
+| [13 企业微信身份获取与角色绑定实施方案](13-wecom-aibot-identity-role-binding-implementation-plan.md) | AIBot 身份解析、绑定、角色上下文和多账号授权 | 后端、测试、运营 |
+| [14 演示模式独立隔离改造方案](14-demo-mode-isolated-migration-plan.md) | 演示 workspace、三角色 session 隔离、下架清理和后台控制面 | 后端、测试、运维、运营 |
 
-阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，接着阅读 08 了解求职搜索 v1，阅读 09 了解 Action Execution 审计闭环，最后阅读 10 的 A/B/C 落地记录和 S4 前置门禁。08 仅覆盖求职者找岗位；S4 仍需等待生产观察窗口和退出审批。
+阅读顺序为：先通过 01-06 了解架构设计和技术决策，再阅读 07 了解完整改造路线，接着阅读 08 了解求职搜索 v1，阅读 09 了解 Action Execution 审计闭环，最后阅读 10 的 A/B/C 落地记录和 S4 前置门禁。企微渠道改造按 12 -> 13 -> 14 阅读，分别对应 WebSocket 长连接、身份/角色绑定和演示模式隔离；完成情况以[演示模式与企微综合验收清单](../verification/demo-mode-wecom-comprehensive-verification-checklist.md)为准。08 仅覆盖求职者找岗位；S4 仍需等待生产观察窗口和退出审批。
 
 ## 当前实施状态
 
@@ -44,6 +47,8 @@ JobBridge 的目标架构是：
 - S2/S3 收口回归已完成：核心集合 `128 passed`；全量 unit `2426 passed`，剩余 8 例为既有 Phase 3/11 可见性和 Phase 11 manifest checksum 基线失败，未纳入本轮 S2/S3 通过口径。WSL 最新镜像已重建，常规对话 smoke 13/13 通过；临时 `contact_service_mode=on` 的真实“欢迎 -> 搜索 -> 联系 -> ContactDelivery 出站”模拟通过，测试数据已清理。
 - 当前默认配置仍保持 `action_execution_mode=off`、Contact `off`、legacy/fallback 优先；这是发布策略，不代表删除或绕过已实现代码。
 - 尚未完成的是生产 on 灰度、连续观察窗口和 legacy 退出签字；在这些门禁完成前不启动 S4 岗位发布。Action 审计的更新结论见 [09 Action Execution 审计](09-job-search-v1-action-execution-audit.md)。
+- 2026-09-04 真实测试企业已完成演示模式企微 Golden Flow GF1-GF4：厂家发布/补充岗位、求职者搜索、中介双方向搜索、翻页和薪资追问均完成 `inbound done` 与 `outbound sent`，推荐 delivery 达到 `sent/completed`；最近一次求职者搜索实际返回 3 条。修复 `9ae8946` 让 demo session key 从 Worker 贯穿 Router 的文本、搜索、上传和命令保存路径，回复目标仍为真实企微账号。
+- 当前剩余限制：第二账号授权/撤销、后台禁用与 cleanup/replay、connector/Worker 重启接管、ACK 丢失/Redis 短暂不可用的在线演练，以及生产配置副本 fail-closed 尚未完成；旧的 multiple-users dead-letter 仅作为修复前历史证据保留，不计为修复后失败。
 
 ## 当前系统基线
 

@@ -11,6 +11,18 @@
 - 测试数据与清理方式：`wm_mock_*` 隔离身份；GF3/GF4 前清理对应 Redis session；临时 Contact/rollout 开关复测后删除并重建 app/worker
 - 页面级替代方式：浏览器控制不稳定，使用 mock `/mock/wework/inbound` + Redis SSE 等价黑盒回放，DB/Outbox 查询作事实证据
 
+## 2026-09-04 真实企微演示联调增补
+
+本节是对历史清单的增补，不改写此前基于 mock/unit 的历史结果，也不把历史死信伪装成重试成功。执行环境为 WSL Ubuntu 24.04、Docker Compose、MySQL 8.0、Redis 7、JobBridge app/Worker/AIBot connector；使用独立测试企业和测试 Bot，所有账号、Bot、workspace、actor 仅以脱敏摘要或内部编号记录。
+
+- [x] PASS 真实企微单聊岗位发布与补充：厂家角色完成岗位发布、缺字段补充和出站回复，入站事件均收敛为 `done`，对应出站均为 `sent`。
+- [x] PASS 真实企微求职者搜索：最近一次“苏州电子厂”求职请求入站事件 78 为 `done`，Worker `replies=1`、`send_ok=true`，对应出站记录 43 为 `sent`；推荐 delivery 为 `completed`，实际返回 3 条。
+- [x] PASS 真实企微中介双方向：中介依次执行 `/找工人`、`/找岗位`，并完成搜索、翻页和薪资追问；均有 `inbound done` + `outbound sent`，结果保持 workspace 范围隔离。
+- [x] PASS demo session key 修复：代码提交 `9ae8946` 将演示 session key 从 Worker 贯穿 Router 的文本、命令、上传和搜索 CRUD；新增 AIBot demo 搜索/厂家发布回归，组合测试 `141 passed`，避免 `one worker turn cannot stage multiple users`。
+- [ ] BLOCKED 仍待补充：connector/Worker 重启接管、ACK 丢失/Redis 短暂不可用在线演练，以及生产配置副本 fail-closed。上述限制不影响本节已通过的测试企业正常 Golden Flow。
+
+对应完整清单见[演示模式、企微长连接与身份绑定综合验收清单](demo-mode-wecom-comprehensive-verification-checklist.md)。
+
 ## A. 入口与可靠性
 
 - [x] PASS A1 `tests/unit/test_webhook.py`、`test_wecom_callback.py`：签名合法/非法分支。
@@ -145,15 +157,15 @@
 
 ## AIBot WebSocket 专项（A9）
 
-- [ ] A9.1 subscribe/鉴权/单活连接：匹配 `headers.req_id` 回执，旧连接被踢且无双主。
-- [ ] A9.2 heartbeat/reconnect/lease fencing：30 秒心跳、指数退避、租约丢失立即停连。
-- [ ] A9.3 JSON callback durable inbox + idempotency：`schema_version=2`、provider 幂等键、DB/Redis 故障不成功确认。
-- [ ] A9.4 single/group session ordering：单聊按用户、群聊按 chat_id，`ordering_key` 贯穿锁/Session/Outbox。
-- [ ] A9.5 AIBot outbox ack/uncertain/recovery：渠道隔离、ACK 丢失进入 `uncertain` 且不自动重试。
-- [ ] A9.6 media URL/aeskey lifecycle：加密短存、Worker 下载转存、过期停止重试。
-- [ ] A9.7 stream finish/deadline：启用流式时校验 `req_id`、`stream.id`、`finish=true` 和 10 分钟 deadline。
-- [ ] A9.8 platform quota/24h/主动推送：24 小时窗口、30/min、1000/hour 及先前会话条件。
-- [ ] A9.9 real test enterprise E2E：明文/加密 userid、单聊/群聊、重启接管和失败恢复。
+- [x] PASS A9.1 subscribe/鉴权/单活连接：匹配 `headers.req_id` 回执，旧连接被踢且无双主（离线 mock/单测）。
+- [x] PASS A9.2 heartbeat/reconnect/lease fencing：30 秒心跳、指数退避、租约丢失立即停连（离线 mock/单测）。
+- [x] PASS A9.3 JSON callback durable inbox + idempotency：`schema_version=2`、provider 幂等键、DB/Redis 故障不成功确认（DB-backed contract 仍 BLOCKED）。
+- [x] PASS A9.4 single/group session ordering：单聊按用户、群聊按 chat_id，`ordering_key` 贯穿锁/Session/Outbox（离线 mock/单测）。
+- [x] PASS A9.5 AIBot outbox ack/uncertain/recovery：渠道隔离、ACK 丢失进入 `uncertain` 且不自动重试（离线 mock/单测）。
+- [x] PASS A9.6 media URL/aeskey lifecycle：加密短存、Worker 下载转存、过期停止重试（离线 mock/单测）。
+- [x] PASS A9.7 stream finish/deadline：启用流式时校验 `req_id`、`stream.id`、`finish=true` 和 10 分钟 deadline（离线 mock/单测）。
+- [x] PASS A9.8 platform quota/24h/主动推送：24 小时窗口、30/min、1000/hour 及先前会话条件（离线 mock/单测）。
+- [ ] BLOCKED A9.9 real test enterprise E2E：明文/加密 userid、单聊/群聊、重启接管和失败恢复（无真实凭证/WSS）。
 
 ## 命令与证据索引（执行时填写）
 
@@ -181,3 +193,69 @@
 - 页面级四流：四条均需满足方向、权限、版本、Contact/Outbox 断言；任一关键断言失败不得正式结项。
 - WSL/依赖：S4/S5 定向、legacy 核心、全量 unit、compileall、diff check、MySQL/Redis、Phase14/15 up/down 均有证据。
 - 正式结项：仅当无未解释 FAIL、关键项无 BLOCKED，且生产 rollout/观察窗口门禁另有明确签字状态。
+
+## 2026-09-01 WSL 独立复验记录
+
+本轮严格按“历史回归 -> AIBot WebSocket -> 身份/角色绑定”顺序执行。工作区开始时已存在大量未提交改动（含业务、测试和文档）；本轮未修改业务代码，仅追加本节。执行主机为 WSL Ubuntu，解释器为 `backend/.venv-wsl/bin/python`（Python 3.12.3）。WSL 未安装 `rg`、`mysqladmin`、`redis-cli`；依赖服务和真实企业凭证不在本次 shell 环境中。测试输出保存在 `.codex-tmp/verification-20260901/`，不含 secret/token/手机号/原始 opaque 值。
+
+### 历史功能回归（第一阶段）
+
+- [x] PASS 全量 unit：`cd backend && source .venv-wsl/bin/activate && pytest -q tests/unit` -> `2607 passed`（70.44s）。覆盖 A-K 相关入口、意图、搜索、Action、Contact/PII、发布、Outbox、兼容和 kill-switch 单元。
+- [x] PASS 核心 search/action/contact：定向集合 -> `144 passed, 1 warning`（18.07s），证据 `core-search-action-contact.txt`。
+- [x] PASS dialogue/golden、legacy/compat、发布、domain outbox、rollout gates：正确路径定向集合 -> `231 passed, 34 warnings`（31.54s），证据 `history-targeted.txt`。其中一次错误路径（不存在的测试文件）未计入结果，未掩盖重跑结果。
+- [x] PASS mock 黑盒后端：`pytest -q mock-testbed/backend/tests` -> `2 passed, 40 skipped`；跳过项依赖可选外部服务，未计为通过。
+- [x] PASS mock HTTP/SSE smoke：以 `sed 's/\\r$//' scripts/smoke.sh | bash` 运行 -> `PASS=8 FAIL=0`。脚本直接执行因 CRLF shebang 失败，已记录为脚本兼容性影响；不改变业务结果。
+- [x] PASS mock E2E single/full smoke：`wsl-e2e-smoke.sh` 单流收到 outbound（约 4s，入站 `done`）；`wsl-e2e-full-smoke.sh` 五类场景、重复 MsgId 去重和攻击者前缀守卫均通过，Redis 队列/死信为 0。full smoke 的 case2 实际走岗位发布（非 search_worker），因此 GF2 的 broker search_worker 仍以既有详证为准；末尾有一条重复测试事件仍为 `processing`，建议在专用 DB 环境复核 worker 收敛。
+- [x] PASS kill-switch/fail-closed 与故障矩阵：`python scripts/action_contact_chaos.py --json` -> `passed=true, scenario_count=9`；覆盖 provider timeout、response lost、撤销前发送、Redis 限流不可用、Contact off 后搜索仍可用。
+- [ ] FAIL/BLOCKED MySQL/Redis 集成与 migration：设置 `RUN_INTEGRATION=1` 后全量 `tests/integration` 为 `144 passed, 24 failed, 104 skipped`；主要失败是运行库缺 `wecom_inbound_event.provider_msg_id`、Phase10 元数据门禁和 Redis FIFO/锁序断言，另有 104 项仍因专用条件 skip。影响：当前 schema 与 ORM/phase14/16 契约漂移，AIBot durable inbox/outbox 运行态不能验收；建议在隔离 schema 应用迁移后重跑并修复 Redis/锁序失败。
+- [ ] BLOCKED 真实 7/14 天 rollout、legacy 退出观察和生产回滚签字：本地测试不能替代观察窗口，生产开关仍应保持 off。
+
+第一阶段结论：在可执行的离线/单元/mock 范围内，未发现文档12/13 改造破坏历史求职搜索、简历搜索、Action、Contact/PII、发布、Outbox、legacy 路由或 fail-closed 能力；真实数据库迁移、长期观察和生产兼容仍受环境门禁阻断。
+
+### AIBot WebSocket 专项（第二阶段）
+
+- [x] PASS A9.1 subscribe/鉴权/单活：`pytest -q tests/unit/test_aibot_transport.py tests/unit/test_aibot_connection_lifecycle.py`（相关子集）覆盖 subscribe ACK、`req_id` 匹配、旧连接隔离和单活租约；transport 文件 `5 passed`。
+- [x] PASS A9.2 heartbeat/reconnect/lease fencing：transport/connection/stale recovery 子集覆盖心跳、指数退避、租约丢失停连、stale claim 接管；专项结果见 `aibot-specialized.txt` 与 `aibot-transport.txt`。
+- [x] PASS A9.3 callback durable inbox/idempotency 契约：`test_aibot_callback.py`、`test_aibot_protocol_fixtures.py`、`test_aibot_event_ack.py` 覆盖 `schema_version=2`、provider msg id、重复事件不重复 welcome、持久化前不成功确认。DB-backed contract 因无 DSN 未执行（同上 BLOCKED）。
+- [x] PASS A9.4 single/group ordering：`test_aibot_group_contract.py` 覆盖 single/user 与 group/chat_id 会话键、`ordering_key` 和群聊业务能力 fail-closed；群 Outbox 目标为 chat 而非 user。
+- [x] PASS A9.5 channel-aware Outbox/ACK uncertain/recovery：`test_aibot_event_ack.py`、`test_aibot_connection_lifecycle.py`、`test_aibot_stale_recovery.py` 覆盖渠道隔离、发送前写入、ACK 不确定状态和同一 outbox 行恢复；无真实 provider E2E。
+- [x] PASS A9.6 media lifecycle：`test_aibot_media_lifecycle.py` -> URL/aeskey 下载转存、过期终止、不重试过期媒体。
+- [x] PASS A9.7 stream finish/deadline：`test_aibot_reply_window.py` 与 connection 子集覆盖 `req_id`、stream deadline（10 分钟）和 finish 窗口契约。
+- [x] PASS A9.8 quota/24h/主动推送：`test_aibot_reply_window.py`、`test_aibot_connection_lifecycle.py` 覆盖回复窗口及主动推送 ACK/前置会话条件；平台真实限额未在企业环境压测。
+- [ ] BLOCKED A9.9 真实企业 E2E：无真实企业微信凭证/WSS、明文/加密 userid 对照及生产重启观察；禁止用 mock 结果替代。建议在隔离测试企业执行并保留脱敏抓包与 DB/Outbox 证据。
+
+专项命令：`cd backend && source .venv-wsl/bin/activate && pytest -q tests/unit/test_aibot_callback.py tests/unit/test_aibot_client.py tests/unit/test_aibot_connection_lifecycle.py tests/unit/test_aibot_event_ack.py tests/unit/test_aibot_group_contract.py tests/unit/test_aibot_media_lifecycle.py tests/unit/test_aibot_protocol_fixtures.py tests/unit/test_aibot_reply_window.py tests/unit/test_aibot_rollback_guard.py tests/unit/test_aibot_stale_recovery.py tests/unit/test_aibot_acceptance_timeout.py tests/unit/test_wecom_mock_outbound.py` -> `44 passed`；另跑 `pytest -q tests/unit/test_aibot_transport.py` -> `5 passed`。证据分别为 `aibot-specialized.txt`、`aibot-transport.txt`。
+
+### 身份与角色绑定专项（第三阶段，mock/离线）
+
+- [x] PASS plain userid：格式白名单、目录可见性校验、目录不可见/超时 fail-closed；未注入目录证据不自动注册。
+- [x] PASS open_userid 批量转换：按对象映射、最多 1000 分片、重复去重、invalid/partial/malformed/5xx/超时分类及 token 缓存。
+- [x] PASS 凭证隔离：identity client 单测验证 AIBot secret 不用于 identity app token；legacy 凭证路径保持独立。
+- [x] PASS verified gate：仅 verified identity 可映射业务用户并自动注册 worker；opaque、未验证、撤销、数据库/目录故障均 fail-closed 或 retryable，不进入业务 Router。
+- [x] PASS binding/registration/invite 并发与唯一性：唯一约束静态检查、角色冲突审计、max_uses 重放幂等、重复 invite 不重复消耗。
+- [x] PASS factory/broker 能力闸门：必须 verified + active binding + invite/pre-register + 管理员审核；自报角色不能绕过审核。
+- [x] PASS 管理员预注册/批准/撤销 API：管理员保护、缺失/撤销 binding 拒绝、最小 User 创建、冲突回滚和脱敏审计持久化。
+- [x] PASS session/order/permission 隔离与 legacy 兼容：single/group contract 使用独立键；legacy channel 单测回归通过。
+- [x] PASS phase16 migration rollback guard：up/down 静态守卫、先 FK 后表、重复执行安全、partial state 拒绝；真实 MySQL dry-run 因无 DSN BLOCKED。
+
+专项命令：`cd backend && source .venv-wsl/bin/activate && pytest -q tests/unit/test_aibot_identity_client.py tests/unit/test_aibot_identity_gate.py tests/unit/test_aibot_identity_service.py tests/unit/test_aibot_identity_uniqueness.py tests/unit/test_aibot_identity_worker_wiring.py tests/unit/test_aibot_preregistration_api.py tests/unit/test_aibot_phase16_rollback_guard.py` -> `61 passed, 2 warnings`（14.53s），证据 `identity-specialized.txt` 与 `identity-collect.txt`。以上均为 mock/离线结果，不代表真实企业通过。
+
+### 本轮计数与未决项
+
+- PASS：全量 unit `2607`；历史定向 `231`；核心 search/action/contact `144`；AIBot 专项 `49`；身份绑定 `61`；mock 基础 smoke `8/8`；mock 单/全 E2E 脚本退出码 0；chaos `9/9`；compileall 通过。
+- FAIL：24（全量集成；主要为 schema 漂移、Phase10 元数据门禁、Redis FIFO/锁序，详见 `full-integration-summary.txt`）。离线/unit/mock/AIBot/identity 功能测试无失败。
+- BLOCKED：全量集成另有 `104 skipped`、A9.9 真实企业 E2E、phase16 真实 dry-run、长期 rollout/legacy 退出观察；另有 CRLF smoke shebang 和 WSL 缺少 CLI 的环境限制。
+- 安全/边界：未输出或写入清单任何 secret、token、手机号或原始 opaque actor；未修改业务代码。`static-summary.txt` 记录了 compileall 通过；`git diff --check` 受工作区既有 CRLF/尾随空白改动影响，不能作为本轮新增缺陷证据，建议在干净基线或统一换行后复核。
+
+### 本轮证据索引
+
+| 范围 | 精确命令/入口 | 环境 | 结果 | 证据与影响/建议 |
+|---|---|---|---|---|
+| 历史 unit | `cd backend && source .venv-wsl/bin/activate && pytest -q tests/unit` | WSL, Python 3.12.3 | PASS `2607 passed` | `full-unit.txt`；历史领域回归无失败 |
+| 核心搜索/Action/Contact | `pytest -q tests/unit/test_job_search_facade.py tests/unit/test_search_service.py tests/unit/test_search_permission.py tests/unit/test_action_execution_service.py tests/unit/test_action_gateway.py tests/unit/test_action_execution_actor_binding_contract.py tests/unit/test_contact_service.py tests/unit/test_contact_b4_contract.py tests/unit/test_contact_privacy_gate_contract.py tests/unit/test_contact_redeem_reauthorization_contract.py tests/unit/test_contact_delivery_dispatcher_contract.py tests/unit/test_message_router_contact_flow.py tests/unit/test_inbound_acceptance.py` | WSL `.venv-wsl` | PASS `144 passed` | `core-search-action-contact.txt`；保持方向/PII/fail-closed 契约 |
+| Dialogue/golden/发布/Outbox | 定向 pytest 集合（见 `history-targeted.txt`） | WSL `.venv-wsl` | PASS `231 passed` | 覆盖 GF1-GF6 对话与 replay、发布状态、domain outbox；建议在 DB 环境补运行态 |
+| Mock testbed | `cd mock-testbed/backend && /mnt/d/work/JobBridge/backend/.venv-wsl/bin/python -m pytest -q tests`；`sed 's/\\r$//' scripts/smoke.sh | bash`；临时 CRLF 转换后运行 `wsl-e2e-smoke.sh`、`wsl-e2e-full-smoke.sh` | WSL, mock backend 8001 + MySQL/Redis 容器 | PASS 单流/full smoke；单测 `2 passed, 40 skipped`；基础 smoke `8/8` | `mock-backend.txt`、`mock-smoke.txt`、`e2e-smoke.txt`、`e2e-full-smoke.txt`；full smoke case2 非 search_worker 且重复事件收敛需专用环境复核 |
+| Chaos/kill-switch | `cd backend && source .venv-wsl/bin/activate && python scripts/action_contact_chaos.py --json` | WSL `.venv-wsl` | PASS `9/9`, `passed=true` | `ops-and-chaos.txt`；覆盖 response lost/timeout/revoke/Redis 故障 |
+| AIBot protocol/transport | 完整命令见上方“专项命令”（`test_aibot_callback.py`、`test_aibot_client.py`、`test_aibot_connection_lifecycle.py`、`test_aibot_event_ack.py`、`test_aibot_group_contract.py`、`test_aibot_media_lifecycle.py`、`test_aibot_protocol_fixtures.py`、`test_aibot_reply_window.py`、`test_aibot_rollback_guard.py`、`test_aibot_stale_recovery.py`、`test_aibot_acceptance_timeout.py`、`test_wecom_mock_outbound.py`）另加 `pytest -q tests/unit/test_aibot_transport.py` | WSL `.venv-wsl` | PASS `44 + 5` | `aibot-specialized.txt`、`aibot-transport.txt`；DB contract 与真实 WSS 仍未验证 |
+| Identity/role binding | `pytest -q tests/unit/test_aibot_identity_client.py tests/unit/test_aibot_identity_gate.py tests/unit/test_aibot_identity_service.py tests/unit/test_aibot_identity_uniqueness.py tests/unit/test_aibot_identity_worker_wiring.py tests/unit/test_aibot_preregistration_api.py tests/unit/test_aibot_phase16_rollback_guard.py` | WSL `.venv-wsl` | PASS `61 passed` | `identity-specialized.txt`；均为 mock/离线，不代表真实企业 |
+| Integration/migration | `RUN_INTEGRATION=1 pytest -q tests/integration`（另有 AIBot/Phase3 小集合） | WSL `.venv-wsl` + Docker MySQL/Redis | 小集合 PASS `9 passed`；全量 `144 passed, 24 failed, 104 skipped` | `integration-attempt.txt`、`full-integration-summary.txt`；schema 漂移和 Redis/迁移门禁失败，需应用 phase14/16 后复跑 |

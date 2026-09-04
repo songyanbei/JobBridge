@@ -7,7 +7,7 @@
 
 ## 执行元数据
 
-- 分支/提交：`codex/unified-listing-flow-architecture`；当前 HEAD `9b23b51`（已推送远端）。应用/Worker/AIBot 镜像已按该提交重建。
+- 分支/提交：`codex/unified-listing-flow-architecture`；当前 HEAD `9ae8946`（已推送远端）。应用/Worker/AIBot 镜像已按该提交重建。
 - 验收日期（含时区）：2026-09-04（Asia/Shanghai）。
 - 执行环境：WSL Ubuntu 24.04、Python 3.12、`backend/.venv-wsl`、Docker、MySQL、Redis。
 - 企微环境：独立测试企业、测试 Bot；不使用生产企业和生产凭证。
@@ -24,7 +24,11 @@
 - [x] 历史全量单元测试：`2671 passed`；演示/推荐/Worker/Cleanup 专项：`777 passed`。
 - [x] 独立最终审查通过：无新增 P0/P1 阻断问题；`compileall`、`git diff --check` 均通过。
 - [x] 代码已推送至远端分支 `codex/unified-listing-flow-architecture`。
-- [ ] BLOCKED 真实企业微信 WSS Golden Flow 尚未完成在线账号实测；不得用自动化/mock 结果替代。
+- [x] 真实测试企业 Golden Flow（GF1-GF4）已完成在线验证：厂家发布/补充岗位、求职者搜索、中介双方向搜索、翻页、薪资追问均出现 `inbound done` 与 `outbound sent`；推荐 delivery 已 sent/completed。
+- [x] 最近求职者搜索复验：入站事件 78（内容为苏州电子厂求职请求）已 `done`；Worker `replies=1`、`send_ok=true`；对应出站记录 43 为 `sent`；推荐 delivery 已 `completed`，实际返回 3 条。
+- [x] 已提交 `9ae8946` 修复 demo turn 的 session key 贯穿 Router/Worker；新增真实 AIBot demo 搜索与厂家发布回归，避免 `one worker turn cannot stage multiple users`。
+- [ ] BLOCKED GF5-GF10：第二企微账号授权/撤销、后台禁用、preview/cleanup/replay、connector/Worker 重启接管、ACK 丢失/Redis 短暂不可用，以及生产配置副本 fail-closed 尚未完成在线演练；不得用自动化/mock 结果替代。
+- [x] 旧的 `multiple users` dead-letter 记录保留为修复前历史证据，未伪装成已重试成功；修复后的新事件单独核对 `done/sent`。
 
 ## 0. 硬门禁与停止条件
 
@@ -157,14 +161,14 @@
 
 每条 flow 必须记录：企微账号脱敏标识、bot_id 脱敏值、demo_id、输入、逐条回复、inbound/outbox/event 状态、active role、effective userid 摘要、Redis key、资源数量和清理结果。
 
-- [ ] BLOCKED/PASS GF1 首次真实单聊：AIBot callback -> identity resolve -> verified/binding -> 欢迎/帮助；确认不把 opaque actor 当明文 userid。
-- [ ] BLOCKED/PASS GF2 已授权账号进入 worker，搜索当前 workspace 岗位，返回结果并确认 real actor 收到回复。
-- [ ] BLOCKED/PASS GF3 同一账号切换 factory，搜索当前 workspace 简历；确认不能看到 worker 的 session 草稿或真实简历。
-- [ ] BLOCKED/PASS GF4 同一账号切换 broker，依次执行 search_job/search_worker；方向和权限正确，数据仍限于 workspace。
-- [ ] BLOCKED/PASS GF5 第二企微账号通过快速授权加入同一 workspace；无需改真实角色即可完成 GF2/GF3 的最小流程。
-- [ ] BLOCKED/PASS GF6 撤销第二账号后立即发消息；收到拒绝，DB/Redis/Outbox 无新增演示业务副作用。
-- [ ] BLOCKED/PASS GF7 管理后台禁用 workspace；第一个账号发送切换/搜索/上传/联系，全部被阻断。
-- [ ] BLOCKED/PASS GF8 执行 preview -> cleanup；清理后重放旧消息和重启 Worker，仍不能产生业务副作用；真实业务计数不变。
+- [x] PASS GF1 首次真实单聊：AIBot callback -> identity resolve -> verified/binding -> 欢迎/帮助；未把 opaque actor 当明文 userid。
+- [x] PASS GF2 已授权账号进入 worker，搜索当前 workspace 岗位并收到真实回复；最近一次复验为 inbound 78 `done`、Worker `replies=1`、outbound 43 `sent`、recommendation delivery `completed`，实际 3 条。
+- [x] PASS GF3 同一账号切换 factory，完成岗位发布/补充岗位；岗位写入、补充轮次和出站消息均已完成，未复用 worker session。
+- [x] PASS GF4 同一账号切换 broker，依次执行 `/找工人`、`/找岗位`、搜索、翻页和薪资追问；各方向均有 `inbound done` + `outbound sent`，结果仍限于 workspace。
+- [ ] BLOCKED GF5 第二企微账号通过快速授权加入同一 workspace；当前没有真实企微在线授权证据（自动化授权测试不替代在线 E2E）。
+- [ ] BLOCKED GF6 撤销第二账号后立即发消息；当前没有真实企微在线撤销证据（自动化撤销测试不替代在线 E2E）。
+- [ ] BLOCKED GF7 管理后台禁用 workspace；当前没有真实企微在线禁用后消息证据（后台自动化测试不替代在线 E2E）。
+- [ ] BLOCKED GF8 执行 preview -> cleanup；当前没有真实企微在线 cleanup/replay 证据（清理专项测试不替代在线 E2E）。
 - [ ] BLOCKED GF9 重启 connector/Worker、模拟 ACK 丢失和 Redis 短暂不可用；恢复后不重复业务执行，不向 synthetic userid 发消息。
 - [ ] BLOCKED GF10 在生产配置副本验证演示开关 fail-closed；不连接真实生产 Bot，不执行生产写入。
 
@@ -181,15 +185,16 @@
 | H5-H7 | 后台 disable/preview | 测试后台 | PASS（自动化） | 后台生命周期专项通过 | 记录 RBAC 和审计 |
 | I2-I8 | cleanup runner/retry/replay | 隔离 MySQL/Redis | PASS（自动化） | cleanup/retry/replay 专项通过 | 记录 checkpoint、孤立行和 key |
 | J1-J8 | 历史回归集合 | WSL .venv-wsl | PASS | `2671 passed`，静态校验通过 | 不得用 demo 通过掩盖历史失败 |
-| GF1-GF10 | 真实企微 E2E | 测试企业 | BLOCKED | 尚无在线 WSS Golden Flow 证据 | 无凭证/WSS 时必须 BLOCKED |
+| GF1-GF4 | 真实企微 E2E | 测试企业 | PASS | 厂家发布/补充、求职者搜索、中介双方向/翻页/追问均有 inbound `done` + outbound `sent`；最近求职者流为事件 78、出站 43、推荐 delivery `completed`、3 条 | 保留脱敏事件/Outbox/Delivery 对账；旧 dead-letter 仅作为修复前历史证据 |
+| GF5-GF10 | 真实企微 E2E | 测试企业/生产配置副本 | BLOCKED | 尚无第二账号授权/撤销、后台禁用/清理重放、重启接管、ACK/Redis 故障在线演练和生产副本门禁证据 | 不得用 unit/mock 结果替代；生产 Bot 不接入 |
 
 ## 完成判定
 
-- 可执行项无未解释 FAIL；关键安全、身份、隔离、回复目标、授权撤销和清理项不得 BLOCKED 才能宣称演示模式通过。
+- GF1-GF4 已在测试企业真实在线验证；GF5-GF10 尚缺真实在线证据，未完成前不得宣称全部 Golden Flow 结项。
 - 同一企微账号三角色体验通过，且真实 User.role、真实 AIBot binding、legacy channel 不变。
 - 第二及后续企微账号可以按 bot_id + actor digest 快速授权和撤销；授权不修改真实业务角色，撤销即时生效。
 - 演示数据可预览、下架、分批清理、失败重试和重建；清理不影响真实数据，旧消息重放无副作用。
-- 生产环境演示模式保持关闭并 fail-closed；测试企业真实 WSS/明文或加密 userid 对照另行记录，不以 mock/unit 结果替代。
+- 生产环境演示模式保持关闭并 fail-closed；测试企业真实 WSS 已有脱敏对账，明文或加密 userid、重启接管和生产副本门禁仍分别记录，不以 mock/unit 结果替代。
 - 最终报告必须附命令、版本、脱敏 DB/Redis 对账、审计摘要、失败影响、回滚结果和复核人签字。
 
 ## 证据与敏感信息处理
