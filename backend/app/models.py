@@ -12,6 +12,7 @@ from sqlalchemy.dialects import mysql
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.mutable import MutableDict
 from sqlalchemy.orm import deferred
+from sqlalchemy import event
 
 from app.db import Base
 
@@ -1618,6 +1619,13 @@ class RecommendationImpression(Base):
     )
 
 
+def _recommendation_exposure_scope_key_default(context=None):
+    """Return a deterministic non-null scope key for the aggregate identity."""
+    params = context.get_current_parameters() if context is not None else {}
+    demo_id = params.get("demo_id")
+    return "" if demo_id is None else str(demo_id)
+
+
 class RecommendationExposureDaily(Base):
     __tablename__ = "recommendation_exposure_daily"
 
@@ -1625,12 +1633,31 @@ class RecommendationExposureDaily(Base):
     demo_id = sa.Column(sa.String(64), nullable=True)
     target_type = sa.Column(sa.String(16), primary_key=True)
     target_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True)
+    scope_key = sa.Column(
+        sa.String(64),
+        primary_key=True,
+        nullable=False,
+        default=_recommendation_exposure_scope_key_default,
+        server_default=sa.text("''"),
+        comment="non-null scope key: empty for legacy, demo_id for demo rows",
+    )
     impression_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
 
     __table_args__ = (
+        sa.CheckConstraint(
+            "scope_key = COALESCE(demo_id, '')",
+            name="ck_recommendation_exposure_scope_key",
+        ),
         sa.Index("idx_recommendation_exposure_demo", "demo_id", "stat_date", "target_type", "target_id"),
     )
+
+
+@event.listens_for(RecommendationExposureDaily, "before_insert")
+@event.listens_for(RecommendationExposureDaily, "before_update")
+def _sync_recommendation_exposure_scope_key(_mapper, _connection, target):
+    """Keep ORM writes aligned with the database scope CHECK constraint."""
+    target.scope_key = "" if target.demo_id is None else str(target.demo_id)
 
 
 # ============================================================================

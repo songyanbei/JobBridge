@@ -60,6 +60,9 @@ def _upsert_batch(
             "demo_id": demo_id,
             "target_type": target_type,
             "target_id": target_id,
+            # The aggregate table keeps legacy demo_id=NULL semantics while
+            # using a non-null scope key for cross-dialect conflict handling.
+            "scope_key": demo_id or "",
             "impression_count": count,
             "updated_at": updated_at,
         }
@@ -81,7 +84,7 @@ def _upsert_batch(
 
         statement = sqlite_insert(table).values(payload)
         statement = statement.on_conflict_do_update(
-            index_elements=["stat_date", "target_type", "target_id"],
+            index_elements=["stat_date", "target_type", "target_id", "scope_key"],
             set_={
                 "demo_id": statement.excluded.demo_id,
                 "impression_count": statement.excluded.impression_count,
