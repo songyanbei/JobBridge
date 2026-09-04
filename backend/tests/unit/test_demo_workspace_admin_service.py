@@ -6,7 +6,16 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.models import AuditLog, DemoPrincipal, DemoResource, DemoWorkspace, DemoWorkspaceMember, User
+from app.models import (
+    AuditLog,
+    DemoPrincipal,
+    DemoResource,
+    DemoWorkspace,
+    DemoWorkspaceMember,
+    RecommendationRequest,
+    RecommendationSearchAttempt,
+    User,
+)
 from app.services import demo_mode_service
 from app.services import demo_workspace_admin_service as admin_service
 from app.api.admin.demo import DemoMemberRequest, grant_demo_member, revoke_demo_member_delete, router
@@ -100,6 +109,45 @@ def test_cleanup_is_idempotent_after_completion(db, monkeypatch):
         db, demo_id=workspace.demo_id, reason="second", operator="admin",
     )
     assert first["status"] == second["status"] == "cleaned"
+
+
+def test_scoped_targets_collect_attempts_by_request_relation(monkeypatch):
+    class _Query:
+        def __init__(self, model):
+            self.model = getattr(model, "class_", model)
+
+        def filter(self, *args, **kwargs):
+            return self
+
+        def all(self):
+            if self.model is RecommendationRequest:
+                return [SimpleNamespace(
+                    request_id="request-cleanup", viewer_userid="demo-worker",
+                )]
+            if self.model is RecommendationSearchAttempt:
+                return [("attempt-cleanup",)]
+            return []
+
+    class _Db:
+        def query(self, model):
+            return _Query(model)
+
+    monkeypatch.setattr(
+        admin_service, "_principal_userids", lambda _db, _demo_id: ["demo-worker"],
+    )
+    monkeypatch.setattr(
+        admin_service, "_resource_rows", lambda _db, _demo_id: [],
+    )
+    monkeypatch.setattr(
+        admin_service,
+        "_table_exists",
+        lambda _db, model: model in {RecommendationRequest, RecommendationSearchAttempt},
+    )
+
+    targets = admin_service._scoped_targets(_Db(), "demo-recommendation-cleanup")
+
+    assert targets["recommendation_request"] == {"request-cleanup"}
+    assert targets["recommendation_search_attempt"] == {"attempt-cleanup"}
 
 
 def test_cleanup_failure_keeps_principals_for_retry(db, monkeypatch):

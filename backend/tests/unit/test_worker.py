@@ -34,6 +34,8 @@ from app.services.worker import (
     _build_wecom_message,
     _coerce_log_msg_type,
 )
+from app.services import demo_scope
+from app.services.demo_scope import DemoScope
 from app.wecom.client import WeComError
 
 
@@ -1548,6 +1550,27 @@ class TestConversationLog:
         assert db.begin_nested.call_count == 2
         # 两次 add：入站 + 出站
         assert db.add.call_count == 2
+
+    def test_demo_logs_use_synthetic_owner_and_real_reply_target(self, worker, monkeypatch):
+        db = MagicMock()
+        monkeypatch.setattr(demo_scope, "register", MagicMock())
+        token = demo_scope.bind(DemoScope(
+            demo_id="demo-log",
+            real_actor_userid="real-actor",
+            effective_userid="demo_factory_principal",
+            active_role="factory",
+        ))
+        try:
+            msg = _build_wecom_message(_basic_msg_data(msg_id="demo-msg", userid="real-actor"))
+            replies = [ReplyMessage(userid="demo_factory_principal", content="已收到")]
+            worker._write_conversation_log(db, msg, replies)
+        finally:
+            demo_scope.reset(token)
+
+        inbound_log, outbound_log = [call.args[0] for call in db.add.call_args_list]
+        assert inbound_log.userid == "demo_factory_principal"
+        assert outbound_log.userid == "real-actor"
+        assert inbound_log.demo_id == outbound_log.demo_id == "demo-log"
 
 
 class TestHeartbeat:

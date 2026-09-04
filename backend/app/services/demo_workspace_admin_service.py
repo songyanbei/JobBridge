@@ -207,12 +207,16 @@ def _scoped_targets(db: Session, demo_id: str) -> dict[str, set[str]]:
             column = getattr(model, column_name, None)
             if column is None:
                 continue
-            rows = db.query(getattr(model, "id", column)).filter(column.in_(userids)).all()
-            # ``id`` is not present on ActionParseArtifact, and using the
-            # owner column itself is correct for those string-primary-key rows.
-            key_name = "id" if hasattr(model, "id") else column_name
+            # The owner/actor column is only the scope predicate.  Cleanup
+            # needs the actual primary key (e.g. request_id for
+            # RecommendationRequest, parse_ref for ActionParseArtifact), not
+            # the userid itself.  ``id`` is not universal across these tables.
+            mapper = inspect(model)
+            primary_key = mapper.primary_key[0].key if mapper.primary_key else column_name
+            key_column = getattr(model, primary_key, column)
+            rows = db.query(key_column).filter(column.in_(userids)).all()
             result[model.__tablename__].update(
-                str(getattr(row, key_name)) for row in rows
+                str(getattr(row, primary_key)) for row in rows
             )
 
     # Search attempts have no viewer/owner column, so synthetic-principal

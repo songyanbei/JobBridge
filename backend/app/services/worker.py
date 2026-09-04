@@ -3466,17 +3466,27 @@ class Worker:
         log_msg_type = _coerce_log_msg_type(msg.msg_type)
         inbound_content = msg.content or msg.media_id or ""
 
+        scope = demo_scope.current()
+        # Demo business writes use the role-scoped synthetic principal.  The
+        # original AIBot actor is retained only as the external reply target
+        # below; it must never become the demo business owner.
+        inbound_userid = scope.effective_userid if scope is not None else msg.from_user
+
         # 入站：wecom_msg_id UNIQUE，需独立子事务保护
         try:
             with db.begin_nested():
-                db.add(ConversationLog(
-                    userid=msg.from_user,
+                inbound_log = ConversationLog(
+                    userid=inbound_userid,
                     direction="in",
                     msg_type=log_msg_type,
                     content=inbound_content,
                     wecom_msg_id=msg.msg_id,
                     expires_at=expires,
-                ))
+                )
+                demo_scope.stamp(inbound_log)
+                db.add(inbound_log)
+                db.flush()
+                demo_scope.register(db, "conversation_log", inbound_log.id)
         except IntegrityError:
             # 典型场景：重投或自检恢复，已有同 wecom_msg_id 记录
             logger.info(
@@ -3490,8 +3500,15 @@ class Worker:
         for reply in replies:
             try:
                 with db.begin_nested():
-                    db.add(ConversationLog(
-                        userid=reply.userid,
+                    # ``ReplyMessage.userid`` is normalized to the real actor
+                    # by message_router.process for demo turns.  Enforce the
+                    # same invariant here so the log cannot accidentally turn
+                    # a synthetic userid into a WeCom delivery target.
+                    outbound_userid = (
+                        scope.real_actor_userid if scope is not None else reply.userid
+                    )
+                    outbound_log = ConversationLog(
+                        userid=outbound_userid,
                         direction="out",
                         msg_type="text",
                         content=(
@@ -3509,7 +3526,11 @@ class Worker:
                             else None
                         ),
                         expires_at=expires,
-                    ))
+                    )
+                    demo_scope.stamp(outbound_log)
+                    db.add(outbound_log)
+                    db.flush()
+                    demo_scope.register(db, "conversation_log", outbound_log.id)
             except Exception:
                 logger.exception("worker: write outbound conversation_log failed")
 

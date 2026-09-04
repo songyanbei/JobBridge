@@ -19,6 +19,8 @@ from app.schemas.recommendation import (
     project_delivery_context,
 )
 from app.services import recommendation_delivery_service as svc
+from app.services import demo_scope
+from app.services.demo_scope import DemoScope
 
 
 @pytest.fixture
@@ -304,6 +306,43 @@ def test_served_attempt_id_is_backfilled_after_the_attempt_insert(content_keys):
     request, attempt = db.added[0], db.added[1]
     assert request.served_attempt_id == attempt.attempt_id
     assert attempt.request_id == request.request_id
+
+
+def test_demo_recommendation_rows_are_scoped_and_registered(content_keys, monkeypatch):
+    db = _FakeSession()
+    registered = []
+    monkeypatch.setattr(
+        demo_scope,
+        "register",
+        lambda _db, resource_type, target_id, **kwargs: registered.append(
+            (resource_type, str(target_id), kwargs.get("demo_id")),
+        ),
+    )
+    token = demo_scope.bind(DemoScope(
+        demo_id="demo-recommendation",
+        real_actor_userid="real-u1",
+        effective_userid="demo_worker_u1",
+        active_role="worker",
+    ))
+    try:
+        _prepare(db, content_keys, fact=_fact(additional_attempts=[{
+            "attempt_no": 1,
+            "attempt_kind": "relax_probe",
+            "candidate_ids": ["12"],
+            "precision_pool_ids": ["12"],
+        }]))
+    finally:
+        demo_scope.reset(token)
+
+    request, attempt, extra_attempt, delivery = db.added[:4]
+    assert request.demo_id == "demo-recommendation"
+    assert attempt.demo_id == extra_attempt.demo_id == delivery.demo_id == "demo-recommendation"
+    assert {(kind, target, explicit_demo) for kind, target, explicit_demo in registered} == {
+        ("recommendation_request", "r-1", None),
+        ("recommendation_search_attempt", attempt.attempt_id, None),
+        ("recommendation_search_attempt", extra_attempt.attempt_id, None),
+        ("recommendation_delivery", "d-1", None),
+    }
 
 
 def test_aibot_recommendation_outbox_inherits_inbound_conversation_contract(content_keys):
