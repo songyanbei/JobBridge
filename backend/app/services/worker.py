@@ -779,6 +779,8 @@ class Worker:
         business_committed = False
         submitted_shadow_request_ids: set[str] = set()
         committed_shadow_request_ids: set[str] = set()
+        demo_command = None
+        demo_scope_token = None
         try:
             # Redis is an at-least-once queue. A crash between enqueue and the DB
             # claim can leave a duplicate payload behind. The per-user lease
@@ -823,7 +825,6 @@ class Worker:
             demo_context: DemoActorContext | None = None
             demo_command_reply: str | None = None
             demo_pointer = None
-            demo_scope_token = None
             if msg.source_channel == "wecom_aibot":
                 # Identity resolution is deliberately worker-side.  The WSS
                 # reader only persists/enqueues the opaque actor.  No failure
@@ -915,7 +916,7 @@ class Worker:
                         db.query(WecomInboundEvent).filter(
                             WecomInboundEvent.id == int(inbound_event_id),
                         ).update({"demo_id": demo_context.demo_id})
-                elif demo_pointer is not None and not demo_command.handled:
+                elif demo_pointer is not None and (demo_command is None or not demo_command.handled):
                     self._mark_event_fail(
                         inbound_event_id,
                         "dead_letter",
