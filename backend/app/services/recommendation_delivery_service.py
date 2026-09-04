@@ -34,6 +34,7 @@ from app.schemas.recommendation import (
     LlmAttemptStatus,
     project_delivery_context,
 )
+from app.services import demo_scope
 from app.wecom.aibot_client import stable_aibot_stream_id
 
 # ---------------------------------------------------------------------------
@@ -575,6 +576,7 @@ def _persist_request_facts(
 
     request = RecommendationRequest(
         request_id=request_id,
+        demo_id=demo_scope.demo_id_or_none(),
         source_inbound_msg_id=source_inbound_msg_id,
         request_index=request_index,
         request_kind=request_kind,
@@ -605,6 +607,7 @@ def _persist_request_facts(
     )
     db.add(request)
     db.flush()
+    demo_scope.register(db, "recommendation_request", request.request_id)
 
     # §9.4：show_more 复用创建快照那次 request 的 served attempt，不建新候选池。
     served_attempt_id = parent.served_attempt_id if is_show_more and parent else None
@@ -618,8 +621,9 @@ def _persist_request_facts(
             ATTEMPT_KIND_BY_REQUEST_KIND.get(request_kind, "initial"),
         )
         attempt_id = str(uuid.uuid4())
-        db.add(RecommendationSearchAttempt(
+        attempt = RecommendationSearchAttempt(
             attempt_id=attempt_id,
+            demo_id=demo_scope.demo_id_or_none(),
             request_id=request_id,
             attempt_no=int(fact.get("attempt_no", 0) or 0),
             attempt_kind=attempt_kind,
@@ -649,8 +653,10 @@ def _persist_request_facts(
             total_latency_ms=int(
                 fact.get("attempt_latency_ms", fact.get("total_latency_ms", 0)) or 0,
             ),
-        ))
+        )
+        db.add(attempt)
         db.flush()
+        demo_scope.register(db, "recommendation_search_attempt", attempt.attempt_id)
         served_attempt_id = attempt_id
 
         # §9.5：一次 request 可能实际执行 initial、多个 relax_probe，最后再
@@ -668,8 +674,9 @@ def _persist_request_facts(
                 _ATTEMPT_KINDS,
                 "relax_probe",
             )
-            db.add(RecommendationSearchAttempt(
+            extra_attempt = RecommendationSearchAttempt(
                 attempt_id=str(uuid.uuid4()),
+                demo_id=demo_scope.demo_id_or_none(),
                 request_id=request_id,
                 attempt_no=max(0, int(extra.get("attempt_no", 0) or 0)),
                 attempt_kind=extra_kind,
@@ -717,7 +724,12 @@ def _persist_request_facts(
                         extra.get("ranking_latency_ms", 0),
                     ) or 0,
                 ),
-            ))
+            )
+            db.add(extra_attempt)
+            db.flush()
+            demo_scope.register(
+                db, "recommendation_search_attempt", extra_attempt.attempt_id,
+            )
         db.flush()
 
     request.served_attempt_id = served_attempt_id
@@ -803,6 +815,7 @@ def prepare_delivery(
     key_version = active_content_key_version()
     delivery = RecommendationDelivery(
         delivery_id=resolved_delivery_id,
+        demo_id=demo_scope.demo_id_or_none(),
         source_inbound_msg_id=resolved_inbound_msg_id,
         reply_index=reply_index,
         request_id=request_id,
@@ -827,6 +840,7 @@ def prepare_delivery(
     )
     db.add(delivery)
     db.flush()
+    demo_scope.register(db, "recommendation_delivery", delivery.delivery_id)
     db.add(WecomOutboundOutbox(
         inbound_event_id=inbound_event_id,
         reply_index=reply_index,

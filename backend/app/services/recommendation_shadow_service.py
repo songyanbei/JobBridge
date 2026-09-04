@@ -119,6 +119,7 @@ class ShadowJob:
     submitted_monotonic: float
     provider: str
     daily_token_limit: int
+    demo_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,7 @@ def _persist_shadow_result(
     """Persist one activated result using an independent DB session."""
     from app.db import SessionLocal
     from app.models import RecommendationRequest, RecommendationSearchAttempt
+    from app.services import demo_scope
 
     db = SessionLocal()
     try:
@@ -211,6 +213,7 @@ def _persist_shadow_result(
         attempt_id = str(uuid.uuid4())
         db.add(RecommendationSearchAttempt(
             attempt_id=attempt_id,
+            demo_id=job.demo_id,
             request_id=job.request_id,
             attempt_no=next_attempt_no,
             attempt_kind="shadow_candidate",
@@ -241,6 +244,10 @@ def _persist_shadow_result(
             total_latency_ms=result.queue_wait_ms + result.latency_ms,
             created_at=to_naive_utc(utc_now()),
         ))
+        db.flush()
+        demo_scope.register(
+            db, "recommendation_search_attempt", attempt_id, demo_id=job.demo_id,
+        )
 
         request.shadow_top_ids = list(result.top_ids)
         request.shadow_overlap_count = len(set(baseline_ids) & set(result.top_ids))

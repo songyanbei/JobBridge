@@ -40,7 +40,7 @@ from app.schemas.recommendation import (
     RecommendationScoreDetail,
     StrategyAssignment,
 )
-from app.services import conversation_service, permission_service
+from app.services import conversation_service, demo_scope, permission_service
 from app.services.recommendation_experience_gate import RecommendationExperienceFlags
 from app.services.recommendation_experience_gate import userid_hash
 from app.services.recommendation_reason_service import (
@@ -1071,6 +1071,7 @@ def _submit_shadow_candidate(
             submitted_monotonic=submitted,
             provider=settings.llm_provider,
             daily_token_limit=settings.recommendation_shadow_daily_token_budget(direction),
+            demo_id=demo_scope.demo_id_or_none(),
         ))
         if handle is None:
             logger.warning(

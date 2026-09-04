@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, or_
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -214,6 +214,24 @@ def _scoped_targets(db: Session, demo_id: str) -> dict[str, set[str]]:
             result[model.__tablename__].update(
                 str(getattr(row, key_name)) for row in rows
             )
+
+    # Search attempts have no viewer/owner column, so synthetic-principal
+    # ownership alone cannot discover them.  Collect both the explicit
+    # workspace discriminator and attempts linked to the scoped request ids;
+    # the request relation also covers rows written before demo_id stamping
+    # was introduced and keeps cleanup retryable for mixed-version data.
+    if _table_exists(db, RecommendationSearchAttempt):
+        request_ids = result.get("recommendation_request", set())
+        attempt_query = db.query(RecommendationSearchAttempt.attempt_id).filter(
+            or_(
+                RecommendationSearchAttempt.demo_id == demo_id,
+                RecommendationSearchAttempt.request_id.in_(list(request_ids))
+                if request_ids else RecommendationSearchAttempt.request_id.is_(None),
+            ),
+        )
+        result["recommendation_search_attempt"].update(
+            str(value) for (value,) in attempt_query.all()
+        )
     return result
 
 
