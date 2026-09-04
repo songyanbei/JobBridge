@@ -45,13 +45,22 @@ FROM (
     GROUP BY `stat_date`, `target_type`, `target_id`, `scope_key`
     HAVING COUNT(*) > 1
 ) AS phase19_duplicate_scopes;
-SET @ddl = CASE
-    WHEN @phase19_conflicts = 0 THEN 'SELECT 1'
-    ELSE 'SELECT * FROM phase19_scope_conflict_abort'
-END;
-PREPARE phase19_stmt FROM @ddl;
-EXECUTE phase19_stmt;
-DEALLOCATE PREPARE phase19_stmt;
+
+-- A migration script cannot use IF ... THEN directly.  Keep the safety gate
+-- in a short stored procedure so a conflict raises a real error and aborts
+-- before any primary-key change can merge or discard aggregate rows.
+DROP PROCEDURE IF EXISTS `phase19_assert_no_scope_conflicts`;
+DELIMITER $$
+CREATE PROCEDURE `phase19_assert_no_scope_conflicts`(IN p_conflicts BIGINT)
+BEGIN
+    IF p_conflicts > 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'phase19 scope identity conflicts detected';
+    END IF;
+END$$
+DELIMITER ;
+CALL `phase19_assert_no_scope_conflicts`(@phase19_conflicts);
+DROP PROCEDURE `phase19_assert_no_scope_conflicts`;
 
 -- Prevent future writes from diverging scope_key and demo_id.
 SELECT COUNT(*) INTO @phase19_has_scope_constraint

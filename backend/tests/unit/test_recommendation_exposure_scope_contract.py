@@ -80,10 +80,12 @@ def test_phase19_migration_has_guarded_scope_rekey_and_conflict_gate():
     ).read_text(encoding="utf-8").lower()
     assert "coalesce(`demo_id`, '')" in migration
     assert "group by `stat_date`, `target_type`, `target_id`, `scope_key" in migration
-    assert "select * from phase19_scope_conflict_abort" in migration
+    assert "create procedure `phase19_assert_no_scope_conflicts`" in migration
+    assert "signal sqlstate '45000'" in migration
+    assert "call `phase19_assert_no_scope_conflicts`(@phase19_conflicts)" in migration
     assert "drop primary key" in migration
     assert "add primary key (`stat_date`, `target_type`, `target_id`, `scope_key`)" in migration
-    assert migration.count("prepare phase19_stmt from @ddl") >= 5
+    assert migration.count("prepare phase19_stmt from @ddl") == 4
     # MySQL 8.0.45 rejects the previous form that embedded subqueries in a
     # dynamic IF expression.  Existence checks must be materialized first,
     # then only a single prepared statement is selected for execution.
