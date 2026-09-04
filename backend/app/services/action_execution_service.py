@@ -17,6 +17,7 @@ from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from app.models import ActionExecution
+from app.services import demo_scope
 
 ActionState = Literal[
     "acquired", "in_progress", "succeeded", "failed_retryable", "failed_terminal"
@@ -284,6 +285,7 @@ def claim_action_execution(
             fencing_token=1,
         )
         optional_values = {
+            "demo_id": demo_scope.demo_id_or_none(),
             "actor_userid": actor_userid,
             "action_version": action_version,
             "parse_ref": parse_ref,
@@ -305,6 +307,7 @@ def claim_action_execution(
             row = read_action_execution(db, turn_id, action_name, for_update=True)
             if row is None:
                 raise ActionExecutionStateError("action_insert_readback_missing")
+            demo_scope.register(db, "action_execution", row.id)
             return ActionClaim("acquired", _detach_claim_row(db, row), 1, None)
 
     if request_digest is not None and row.request_digest not in (None, request_digest):

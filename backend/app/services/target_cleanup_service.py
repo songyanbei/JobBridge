@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Job, Resume, TargetCleanupTask
+from app.services import demo_scope
 
 
 TARGET_CLEANUP_LEASE = timedelta(minutes=4)
@@ -63,6 +64,7 @@ def upsert_target_cleanup_task(
     created = False
     if task is None:
         task = TargetCleanupTask(
+            demo_id=demo_scope.demo_id_or_none(),
             operation_id=operation_id or str(uuid.uuid4()),
             target_type=target_type,
             target_id=target_id,
@@ -78,6 +80,7 @@ def upsert_target_cleanup_task(
                 db.add(task)
                 db.flush()
             created = True
+            demo_scope.register(db, "target_cleanup_task", task.id)
         except IntegrityError:
             task = _lock_cleanup_task(db, target_type, target_id)
             if task is None:

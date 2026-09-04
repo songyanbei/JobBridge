@@ -20,6 +20,7 @@ from app.services.resume_mutation_service import (
     increment_resume_version, to_utc_naive, utc_now_naive,
 )
 from app.services.resume_replacement_lock_service import lock_replacement_creation, lock_replacement_graph
+from app.services import demo_scope
 from app.services.target_cleanup_service import ensure_target_cleanup_task
 from app.tasks.common import log_event
 
@@ -103,6 +104,7 @@ def _candidate(
 ) -> Resume:
     values = {field: data.get(field) for field in _COPY_FIELDS if field in data}
     values.update(
+        demo_id=demo_scope.demo_id_or_none(),
         owner_userid=owner_userid,
         expected_cities=data["expected_cities"],
         expected_job_categories=data["expected_job_categories"],
@@ -165,6 +167,7 @@ def create_replacement_candidate(
     )
     db.add(candidate)
     db.flush()
+    demo_scope.register(db, "resume", candidate.id)
     if int(candidate.id) <= int(old.id):
         raise RuntimeError("resume_auto_increment_invariant_violated")
     if media_ids:
@@ -182,6 +185,7 @@ def create_replacement_candidate(
         )
     rejected = audit_result.status == "rejected"
     relation = ResumeReplacement(
+        demo_id=demo_scope.demo_id_or_none(),
         operation_id=operation_id,
         source_msg_id=source_msg_id,
         owner_userid=owner_userid,
@@ -200,6 +204,7 @@ def create_replacement_candidate(
     )
     db.add(relation)
     db.flush()
+    demo_scope.register(db, "resume_replacement", relation.id)
     if audit_result.status == "passed":
         activate_replacement_locked(
             db, relation, old, candidate,

@@ -26,6 +26,7 @@ from app.schemas.contact import (
     ContactResponse,
 )
 from app.services.job_lifecycle_service import contact_version_is_current
+from app.services import demo_scope
 from app.wecom.aibot_client import stable_aibot_stream_id
 
 CONTACT_UNAVAILABLE_MESSAGE = "暂时无法提供联系方式，请稍后重试。"
@@ -112,6 +113,7 @@ class ContactService:
         request_id = create_contact_request_id()
         nonce = secrets.token_urlsafe(32)
         request = ContactRequest(
+            demo_id=demo_scope.demo_id_or_none(),
             request_id=request_id,
             actor_id=actor_id,
             listing_ref=listing_ref,
@@ -129,6 +131,7 @@ class ContactService:
         if session is not None:
             session.add(request)
             session.flush()
+            demo_scope.register(session, "contact_request", request.request_id)
         return ContactRequestView(
             request_id=request.request_id,
             listing_ref=request.listing_ref,
@@ -214,6 +217,7 @@ class ContactService:
         policy_version = policy_version if policy_version is not None else request_row.policy_version
         token = secrets.token_urlsafe(32)
         grant = ContactGrant(
+            demo_id=demo_scope.demo_id_or_none(),
             grant_id=_new_grant_id(), request_id=str(request_id), actor_id=str(actor_id), listing_ref=str(listing_ref),
             action="request_contact", direction=direction, token_hash=_digest(token), nonce_digest=_digest(secrets.token_bytes(32)),
             listing_version=listing_version, policy_version=policy_version, status="issued",
@@ -222,6 +226,7 @@ class ContactService:
         session.add(grant)
         self.audit_contact_event("grant_issue", "allowed", "issued", actor_id=actor_id, listing_ref=listing_ref, request_id=request_id, grant_id=grant.grant_id, trace_id=trace_id, db=session)
         session.flush()
+        demo_scope.register(session, "contact_grant", grant.grant_id)
         return ContactGrantMetadata(grant_id=grant.grant_id, token=token, expires_at=grant.expires_at)
 
     def redeem_grant(self, grant_id: str, token: str, actor_id: str, *, db: Session | None = None, trace_id: str | None = None, inbound_event_id: int | None = None, reply_index: int = 0, userid: str | None = None, current_listing_version: int | None = None, current_policy_version: str | None = None, current_direction: str | None = None, listing_status: str | None = None, actor_status: str | None = None) -> ContactResponse:
@@ -311,16 +316,19 @@ class ContactService:
             if aibot_reply else None
         )
         delivery = ContactDelivery(
+            demo_id=demo_scope.demo_id_or_none(),
             delivery_id="cd_" + secrets.token_urlsafe(24).rstrip("="), grant_id=grant.grant_id,
             actor_id=grant.actor_id, listing_ref=grant.listing_ref, channel="platform_request",
             content_ciphertext=None, key_version=None, content_hash=None,
             status="prepared", expires_at=_now() + timedelta(seconds=max(1, int(getattr(settings, "contact_delivery_ttl_seconds", 300)))),
         )
         session.add(delivery)
+        demo_scope.register(session, "contact_delivery", delivery.delivery_id)
         if inbound_event_id is not None:
             # Same transaction: the outbox contains only an opaque delivery
             # reference and a template marker, never a token or PII value.
             session.add(WecomOutboundOutbox(
+                demo_id=demo_scope.demo_id_or_none(),
                 inbound_event_id=int(inbound_event_id), reply_index=max(0, int(reply_index)),
                 userid=(None if conversation_type == "group" else str(userid or actor_id)),
                 msg_type="text", content=None,
@@ -453,6 +461,7 @@ class ContactService:
         if session is None:
             return
         session.add(ContactAccessAudit(
+            demo_id=demo_scope.demo_id_or_none(),
             event_id=str(uuid.uuid4()), event_type=str(event_type)[:32], outcome=str(outcome)[:32], reason_code=str(reason_code)[:64],
             actor_hash=_digest(actor_id) if actor_id else None, listing_hash=_digest(listing_ref) if listing_ref else None,
             request_id=request_id, grant_id=grant_id, trace_id=trace_id,

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.models import MediaAssetLifecycle
+from app.services import demo_scope
 from app.services.storage_reference_service import normalize_storage_reference
 
 
@@ -22,6 +23,7 @@ def record_pending_media(
     row = db.query(MediaAssetLifecycle).filter_by(object_key=key).first()
     if row is None:
         row = MediaAssetLifecycle(
+            demo_id=demo_scope.demo_id_or_none(),
             object_key=key,
             owner_userid=owner_userid,
             operation_id=operation_id,
@@ -30,6 +32,7 @@ def record_pending_media(
         )
         db.add(row)
         db.flush()
+        demo_scope.register(db, "media_asset_lifecycle", row.id)
     elif row.owner_userid != owner_userid:
         raise ValueError("media_object_key_owned_by_another_user")
     return row

@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import ActionParseArtifact
+from app.services import demo_scope
 
 PARSE_SCHEMA_VERSION = "action-gateway.v1"
 _SENSITIVE_KEYS = frozenset({
@@ -53,6 +54,7 @@ def persist_parse_artifact(
     if expiry.tzinfo is not None:
         expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
     row = ActionParseArtifact(
+        demo_id=demo_scope.demo_id_or_none(),
         parse_ref=parse_ref, turn_id=turn_id, actor_userid=actor_userid,
         parse_digest=parse_digest_value, schema_version=schema_version,
         classifier_version=classifier_version, session_version=session_version,
@@ -62,6 +64,7 @@ def persist_parse_artifact(
         with db.begin_nested():
             db.add(row)
             db.flush()
+        demo_scope.register(db, "action_parse_artifact", row.parse_ref)
     except IntegrityError:
         row = read_parse_artifact(
             db, parse_ref, turn_id=turn_id, actor_userid=actor_userid,

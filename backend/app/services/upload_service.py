@@ -18,7 +18,7 @@ from app.llm.base import IntentResult
 from app.core.logging_setup import identifier_hash
 from app.llm.prompts import JOB_REQUIRED_FIELDS, RESUME_REQUIRED_FIELDS
 from app.models import Job, Resume
-from app.services import audit_service, conversation_service
+from app.services import audit_service, conversation_service, demo_scope
 from app.services.lifecycle_config_service import get_job_ttl_days, get_resume_ttl_days
 from app.services.user_service import UserContext
 from app.schemas.conversation import SessionState
@@ -883,6 +883,7 @@ def _create_job(
     from app.services.lifecycle_config_service import get_job_candidate_ttl_days
 
     job = Job(
+        demo_id=demo_scope.demo_id_or_none(),
         owner_userid=user_ctx.external_userid,
         # Initialize both version columns explicitly.  Relying on server
         # defaults leaves a mixed-version fleet able to activate a row after
@@ -934,6 +935,7 @@ def _create_job(
     )
     db.add(job)
     db.flush()
+    demo_scope.register(db, "job", job.id)
     if media_ids:
         from app.services.job_media_service import attach_media
         job.images = attach_media(
@@ -963,6 +965,7 @@ def _create_resume(
 
     now = utc_now_naive()
     resume = Resume(
+        demo_id=demo_scope.demo_id_or_none(),
         owner_userid=user_ctx.external_userid,
         expected_cities=data.get("expected_cities", []),
         expected_job_categories=data.get("expected_job_categories", []),
@@ -1000,6 +1003,7 @@ def _create_resume(
     )
     db.add(resume)
     db.flush()
+    demo_scope.register(db, "resume", resume.id)
     if media_ids:
         from app.services.job_media_service import attach_media
 

@@ -55,6 +55,7 @@ def _compile_mysql_current_timestamp_on_update(element, compiler, **kw):  # noqa
 class User(Base):
     __tablename__ = "user"
 
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     external_userid = sa.Column(sa.String(64), primary_key=True, comment="企微外部联系人 ID")
     role = sa.Column(
         sa.Enum("worker", "factory", "broker", name="user_role"),
@@ -88,6 +89,7 @@ class User(Base):
     __table_args__ = (
         sa.Index("idx_role_status", "role", "status"),
         sa.Index("idx_last_active", "last_active_at"),
+        sa.Index("idx_user_demo", "demo_id", "external_userid"),
     )
 
 
@@ -99,6 +101,7 @@ class Job(Base):
     __tablename__ = "job"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     owner_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid", ondelete="RESTRICT"), nullable=False, comment="发布者")
     hiring_company = sa.Column(sa.String(128), nullable=True, comment="实际招聘工厂名（岗位级）")
 
@@ -208,6 +211,7 @@ class Job(Base):
         sa.Index("idx_job_candidate_expiry", "audit_status", "candidate_expires_at"),
         sa.Index("idx_filter_hot", "city", "job_category", "is_long_term", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary", "salary_floor_monthly"),
+        sa.Index("idx_job_demo_owner", "demo_id", "owner_userid", "id"),
     )
 
 
@@ -217,6 +221,7 @@ class DomainOutboxEvent(Base):
     __tablename__ = "domain_outbox_event"
 
     id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     aggregate_type = sa.Column(sa.String(32), nullable=False)
     aggregate_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
     aggregate_version = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
@@ -239,6 +244,7 @@ class DomainOutboxEvent(Base):
         sa.UniqueConstraint("aggregate_type", "aggregate_id", "aggregate_version", "event_type", name="uq_domain_outbox_versioned_event"),
         sa.Index("idx_domain_outbox_pending", "status", "occurred_at", "id"),
         sa.Index("idx_domain_outbox_aggregate", "aggregate_type", "aggregate_id", "aggregate_version"),
+        sa.Index("idx_domain_outbox_demo", "demo_id", "created_at", "id"),
     )
 
 
@@ -252,6 +258,7 @@ class ContactRequest(Base):
     __tablename__ = "contact_request"
 
     request_id = sa.Column(sa.String(64), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     actor_id = sa.Column(sa.String(64), nullable=False)
     listing_ref = sa.Column(sa.String(200), nullable=False)
     direction = sa.Column(sa.String(32), nullable=True, comment="绑定的招聘搜索方向")
@@ -271,6 +278,7 @@ class ContactRequest(Base):
     __table_args__ = (
         sa.Index("idx_contact_request_actor", "actor_id", "created_at", "request_id"),
         sa.Index("idx_contact_request_listing", "listing_ref", "status", "expires_at"),
+        sa.Index("idx_contact_request_demo", "demo_id", "created_at", "request_id"),
     )
 
 
@@ -280,6 +288,7 @@ class ContactGrant(Base):
     __tablename__ = "contact_grant"
 
     grant_id = sa.Column(sa.String(64), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     request_id = sa.Column(sa.String(64), sa.ForeignKey("contact_request.request_id", ondelete="RESTRICT"), nullable=False)
     actor_id = sa.Column(sa.String(64), nullable=False)
     listing_ref = sa.Column(sa.String(200), nullable=False)
@@ -299,6 +308,7 @@ class ContactGrant(Base):
 
     __table_args__ = (
         sa.Index("idx_contact_grant_actor", "actor_id", "created_at", "grant_id"),
+        sa.Index("idx_contact_grant_demo", "demo_id", "created_at", "grant_id"),
         sa.Index("idx_contact_grant_due", "status", "expires_at", "grant_id"),
         sa.Index("idx_contact_grant_request", "request_id", "status"),
     )
@@ -316,6 +326,7 @@ class ContactAccessAudit(Base):
         primary_key=True,
         autoincrement=True,
     )
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     event_id = sa.Column(sa.String(36), nullable=False, unique=True)
     event_type = sa.Column(sa.String(32), nullable=False)
     outcome = sa.Column(sa.String(32), nullable=False)
@@ -331,6 +342,7 @@ class ContactAccessAudit(Base):
         sa.Index("idx_contact_audit_trace", "trace_id", "created_at"),
         sa.Index("idx_contact_audit_actor", "actor_hash", "created_at"),
         sa.Index("idx_contact_audit_request", "request_id", "created_at"),
+        sa.Index("idx_contact_audit_demo", "demo_id", "created_at", "id"),
     )
 
 
@@ -340,6 +352,7 @@ class ContactDelivery(Base):
     __tablename__ = "contact_delivery"
 
     delivery_id = sa.Column(sa.String(64), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     grant_id = sa.Column(sa.String(64), sa.ForeignKey("contact_grant.grant_id", ondelete="RESTRICT"), nullable=False, unique=True)
     actor_id = sa.Column(sa.String(64), nullable=False)
     listing_ref = sa.Column(sa.String(200), nullable=False)
@@ -357,12 +370,14 @@ class ContactDelivery(Base):
     __table_args__ = (
         sa.Index("idx_contact_delivery_due", "status", "expires_at", "delivery_id"),
         sa.Index("idx_contact_delivery_actor", "actor_id", "created_at", "delivery_id"),
+        sa.Index("idx_contact_delivery_demo", "demo_id", "created_at", "delivery_id"),
     )
 
 
 class JobReplacement(Base):
     __tablename__ = "job_replacement"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
     source_msg_id = sa.Column(sa.String(128), nullable=False, unique=True)
     owner_userid = sa.Column(sa.String(64), nullable=False)
@@ -388,12 +403,14 @@ class JobReplacement(Base):
         sa.Index("idx_replacement_owner_created", "owner_userid", "created_at"),
         sa.Index("idx_replacement_lifecycle_created", "lifecycle_status", "created_at"),
         sa.Index("idx_replacement_review_created", "review_outcome", "created_at"),
+        sa.Index("idx_replacement_demo_owner", "demo_id", "owner_userid", "created_at"),
     )
 
 
 class MediaAssetLifecycle(Base):
     __tablename__ = "media_asset_lifecycle"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     object_key = sa.Column(sa.String(512), nullable=False, unique=True)
     operation_id = sa.Column(sa.String(36), nullable=True, index=True)
     owner_userid = sa.Column(sa.String(64), nullable=False)
@@ -428,12 +445,14 @@ class MediaAssetLifecycle(Base):
         sa.Index("idx_media_entity_version", "entity_type", "entity_id", "entity_version", "state"),
         sa.Index("idx_media_cleanup", "state", "next_attempt_at"),
         sa.Index("idx_media_draft_expiry", "state", "draft_expires_at"),
+        sa.Index("idx_media_demo_owner", "demo_id", "owner_userid", "created_at"),
     )
 
 
 class TargetCleanupTask(Base):
     __tablename__ = "target_cleanup_task"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     operation_id = sa.Column(sa.String(36), nullable=False, unique=True)
     target_type = sa.Column(sa.String(32), nullable=False)
     target_id = sa.Column(mysql.BIGINT(unsigned=True), nullable=False)
@@ -459,6 +478,7 @@ class TargetCleanupTask(Base):
     __table_args__ = (
         sa.UniqueConstraint("target_type", "target_id", name="uq_cleanup_target"),
         sa.Index("idx_target_cleanup_ready", "status", "next_attempt_at"),
+        sa.Index("idx_target_cleanup_demo", "demo_id", "status", "id"),
     )
 
 
@@ -470,6 +490,7 @@ class Resume(Base):
     __tablename__ = "resume"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     owner_userid = sa.Column(sa.String(64), sa.ForeignKey("user.external_userid", ondelete="RESTRICT"), nullable=False, comment="工人 external_userid")
 
     # ---- 硬过滤字段（§7.2）----
@@ -550,6 +571,7 @@ class Resume(Base):
         sa.Index("idx_resume_hard_delete", "deleted_at", "id"),
         sa.Index("idx_filter_hot", "gender", "age", "audit_status", "deleted_at", "expires_at"),
         sa.Index("idx_salary_exp", "salary_expect_floor_monthly"),
+        sa.Index("idx_resume_demo_owner", "demo_id", "owner_userid", "id"),
     )
 
 
@@ -557,6 +579,7 @@ class ResumeReplacement(Base):
     """Durable relation between an old active resume and its replacement candidate."""
     __tablename__ = "resume_replacement"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     operation_id = sa.Column(mysql.CHAR(36), nullable=False)
     source_msg_id = sa.Column(sa.String(128), nullable=False)
     owner_userid = sa.Column(sa.String(64), nullable=False)
@@ -589,12 +612,14 @@ class ResumeReplacement(Base):
         sa.Index("idx_resume_replacement_old_status", "old_resume_id", "lifecycle_status"),
         sa.Index("idx_resume_replacement_owner_created", "owner_userid", "created_at"),
         sa.Index("idx_resume_replacement_lifecycle_created", "lifecycle_status", "created_at"),
+        sa.Index("idx_resume_replacement_demo_owner", "demo_id", "owner_userid", "created_at"),
     )
 
 
 class ResumeReplacementRolloutAssignment(Base):
     __tablename__ = "resume_replacement_rollout_assignment"
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     operation_id = sa.Column(mysql.CHAR(36), nullable=False)
     owner_userid = sa.Column(sa.String(64), nullable=False)
     cohort = sa.Column(sa.Enum("enabled", "control", name="resume_rollout_cohort"), nullable=False)
@@ -604,6 +629,7 @@ class ResumeReplacementRolloutAssignment(Base):
     __table_args__ = (
         sa.UniqueConstraint("operation_id", name="uq_resume_rollout_operation"),
         sa.UniqueConstraint("source_msg_id", name="uq_resume_rollout_message"),
+        sa.Index("idx_resume_rollout_demo_owner", "demo_id", "owner_userid", "created_at"),
     )
 
 
@@ -695,6 +721,7 @@ class ConversationLog(Base):
     __tablename__ = "conversation_log"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     userid = sa.Column(sa.String(64), nullable=False, comment="external_userid")
     direction = sa.Column(
         sa.Enum("in", "out", name="msg_direction"),
@@ -719,6 +746,7 @@ class ConversationLog(Base):
         # §10.1.1: deletion walks back from a delivery to every other user's
         # recommendation log, so this lookup must not be a full table scan.
         sa.Index("idx_conversation_recommendation_delivery", "recommendation_delivery_id"),
+        sa.Index("idx_conversation_demo_time", "demo_id", "created_at", "id"),
     )
 
 
@@ -730,6 +758,7 @@ class AuditLog(Base):
     __tablename__ = "audit_log"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     target_type = sa.Column(
         sa.Enum("job", "resume", "user", "system", "recommendation_strategy", name="audit_target_type"),
         nullable=False, comment="审核对象类型（system=系统配置）",
@@ -755,6 +784,7 @@ class AuditLog(Base):
     __table_args__ = (
         sa.Index("idx_target", "target_type", "target_id"),
         sa.Index("idx_time", "created_at"),
+        sa.Index("idx_audit_demo_time", "demo_id", "created_at", "id"),
     )
 
 
@@ -868,6 +898,7 @@ class EventLog(Base):
     __tablename__ = "event_log"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     event_type = sa.Column(
         sa.Enum("miniprogram_click", name="event_type"),
         nullable=False, comment="事件类型",
@@ -902,6 +933,7 @@ class EventLog(Base):
         sa.Index("idx_event_delivery_target", "delivery_id", "target_type", "target_id"),
         sa.Index("idx_event_attributed_version", "attributed_strategy_version_id", "event_type", "occurred_at"),
         sa.Index("idx_event_attribution_status", "attribution_status", "occurred_at"),
+        sa.Index("idx_event_demo_time", "demo_id", "occurred_at", "id"),
         sa.UniqueConstraint(
             "userid", "event_type", "client_event_id",
             name="uk_event_client_idempotency",
@@ -917,6 +949,7 @@ class WecomInboundEvent(Base):
     __tablename__ = "wecom_inbound_event"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     msg_id = sa.Column(sa.String(64), nullable=False, unique=True, comment="企微消息 ID，幂等键")
     turn_id = sa.Column(
         sa.String(36), nullable=False, unique=True,
@@ -1008,6 +1041,7 @@ class WecomInboundEvent(Base):
 
     __table_args__ = (
         sa.Index("idx_status_time", "status", "created_at"),
+        sa.Index("idx_inbound_demo_status", "demo_id", "status", "id"),
         sa.Index(
             "idx_inbound_dispatch", "status", "rate_limit_decision", "created_at", "id",
         ),
@@ -1044,6 +1078,7 @@ class ActionExecution(Base):
     __tablename__ = "action_execution"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     turn_id = sa.Column(sa.String(36), nullable=False, comment="不可变入站轮次 ID")
     actor_userid = deferred(sa.Column(sa.String(64), nullable=True, comment="Action actor 绑定"))
     action_name = sa.Column(sa.String(64), nullable=False, comment="稳定 Action 名称")
@@ -1092,6 +1127,7 @@ class ActionExecution(Base):
         sa.Index("idx_action_execution_turn", "turn_id", "id"),
         sa.Index("idx_action_execution_request_snapshot", "request_id", "snapshot_id"),
         sa.Index("idx_action_execution_replay", "status", "last_replayed_at", "id"),
+        sa.Index("idx_action_execution_demo", "demo_id", "created_at", "id"),
     )
 
 
@@ -1101,6 +1137,7 @@ class ActionParseArtifact(Base):
     __tablename__ = "action_parse_artifact"
 
     parse_ref = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     turn_id = sa.Column(sa.String(36), nullable=False)
     actor_userid = sa.Column(sa.String(64), nullable=False)
     parse_digest = sa.Column(mysql.CHAR(64), nullable=False)
@@ -1115,6 +1152,7 @@ class ActionParseArtifact(Base):
         sa.UniqueConstraint("turn_id", "parse_digest", name="uk_action_parse_turn_digest"),
         sa.Index("idx_action_parse_expires", "expires_at", "parse_ref"),
         sa.Index("idx_action_parse_turn", "turn_id", "created_at"),
+        sa.Index("idx_action_parse_demo", "demo_id", "created_at", "parse_ref"),
     )
 
 
@@ -1132,6 +1170,7 @@ class WecomOutboundOutbox(Base):
     __tablename__ = "wecom_outbound_outbox"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     inbound_event_id = sa.Column(
         mysql.BIGINT(unsigned=True), nullable=False,
         comment="来源 wecom_inbound_event.id",
@@ -1204,6 +1243,7 @@ class WecomOutboundOutbox(Base):
         ),
         sa.Index("idx_outbox_channel_status_due", "channel", "status", "next_attempt_at", "id"),
         sa.Index("idx_outbox_ordering_status", "ordering_key", "status", "id"),
+        sa.Index("idx_outbox_demo_status", "demo_id", "status", "id"),
     )
 
 
@@ -1400,6 +1440,7 @@ class RecommendationRequest(Base):
     __tablename__ = "recommendation_request"
 
     request_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     source_inbound_msg_id = sa.Column(sa.String(64), nullable=False)
     request_index = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False, server_default=sa.text("0"))
     request_kind = sa.Column(sa.String(32), nullable=False)
@@ -1442,6 +1483,7 @@ class RecommendationRequest(Base):
         sa.Index("idx_recommendation_request_mode_time", "created_at", "direction", "execution_mode"),
         sa.Index("idx_recommendation_request_kind_zero", "request_kind", "is_zero_result", "created_at"),
         sa.Index("idx_recommendation_request_version_time", "served_strategy_version_id", "created_at"),
+        sa.Index("idx_recommendation_request_demo_time", "demo_id", "created_at", "request_id"),
     )
 
 
@@ -1449,6 +1491,7 @@ class RecommendationSearchAttempt(Base):
     __tablename__ = "recommendation_search_attempt"
 
     attempt_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     request_id = sa.Column(sa.String(36), nullable=False)
     attempt_no = sa.Column(mysql.SMALLINT(unsigned=True), nullable=False)
     attempt_kind = sa.Column(sa.String(32), nullable=False)
@@ -1476,6 +1519,7 @@ class RecommendationSearchAttempt(Base):
         sa.Index("idx_recommendation_attempt_kind_time", "created_at", "attempt_kind"),
         sa.Index("idx_recommendation_attempt_version_time", "strategy_version_id", "created_at"),
         sa.Index("idx_recommendation_attempt_llm_status", "llm_status", "created_at"),
+        sa.Index("idx_recommendation_attempt_demo_time", "demo_id", "created_at", "attempt_id"),
     )
 
 
@@ -1483,6 +1527,7 @@ class RecommendationDelivery(Base):
     __tablename__ = "recommendation_delivery"
 
     delivery_id = sa.Column(sa.String(36), primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     delivery_order = sa.Column(
         mysql.BIGINT(unsigned=True), nullable=False, unique=True, autoincrement=True,
     )
@@ -1537,6 +1582,7 @@ class RecommendationDelivery(Base):
         sa.Index("idx_recommendation_delivery_impression_lease", "impression_lease_expires_at", "impression_state"),
         sa.Index("idx_recommendation_delivery_request", "request_id"),
         sa.Index("idx_recommendation_delivery_msgid", "wecom_msgid"),
+        sa.Index("idx_recommendation_delivery_demo_status", "demo_id", "status", "delivery_id"),
     )
 
 
@@ -1544,6 +1590,7 @@ class RecommendationImpression(Base):
     __tablename__ = "recommendation_impression"
 
     id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    demo_id = sa.Column(sa.String(64), nullable=True, comment="demo workspace id")
     delivery_id = sa.Column(sa.String(36), nullable=False)
     request_id = sa.Column(sa.String(36), nullable=False)
     snapshot_id = sa.Column(sa.String(36), nullable=False)
@@ -1567,6 +1614,7 @@ class RecommendationImpression(Base):
         sa.Index("idx_recommendation_impression_target_time", "target_type", "target_id", "exposed_at"),
         sa.Index("idx_recommendation_impression_version_time", "strategy_version_id", "exposed_at"),
         sa.Index("idx_recommendation_impression_snapshot_position", "snapshot_id", "position"),
+        sa.Index("idx_recommendation_impression_demo_time", "demo_id", "exposed_at", "id"),
     )
 
 
@@ -1574,10 +1622,15 @@ class RecommendationExposureDaily(Base):
     __tablename__ = "recommendation_exposure_daily"
 
     stat_date = sa.Column(sa.Date, primary_key=True)
+    demo_id = sa.Column(sa.String(64), nullable=True)
     target_type = sa.Column(sa.String(16), primary_key=True)
     target_id = sa.Column(mysql.BIGINT(unsigned=True), primary_key=True)
     impression_count = sa.Column(mysql.INTEGER(unsigned=True), nullable=False, server_default=sa.text("0"))
     updated_at = sa.Column(mysql.DATETIME(fsp=6), nullable=False, server_default=sa.func.now(), onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.Index("idx_recommendation_exposure_demo", "demo_id", "stat_date", "target_type", "target_id"),
+    )
 
 
 # ============================================================================

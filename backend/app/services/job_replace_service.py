@@ -19,6 +19,7 @@ from app.services.job_replacement_lock_service import (
     lock_replacement_creation,
     lock_replacement_graph,
 )
+from app.services import demo_scope
 from app.services.lifecycle_config_service import get_job_candidate_ttl_days
 from app.services.target_cleanup_service import ensure_job_cleanup_task
 from app.tasks.common import log_event
@@ -135,6 +136,7 @@ def _candidate_from_complete_data(
 ) -> Job:
     values = {field: data.get(field) for field in _COPY_FIELDS if field in data}
     values.update(
+        demo_id=demo_scope.demo_id_or_none(),
         owner_userid=owner_userid,
         city=data["city"],
         job_category=data["job_category"],
@@ -208,6 +210,7 @@ def create_replacement_candidate(
     )
     db.add(new_job)
     db.flush()
+    demo_scope.register(db, "job", new_job.id)
     if int(new_job.id) <= int(old.id):
         raise RuntimeError("job_auto_increment_invariant_violated")
     if media_ids:
@@ -218,6 +221,7 @@ def create_replacement_candidate(
         )
 
     relation = JobReplacement(
+        demo_id=demo_scope.demo_id_or_none(),
         operation_id=operation_id,
         source_msg_id=source_msg_id,
         owner_userid=owner_userid,
@@ -236,6 +240,7 @@ def create_replacement_candidate(
     )
     db.add(relation)
     db.flush()
+    demo_scope.register(db, "job_replacement", relation.id)
     if audit_result.status == "passed":
         activate_replacement_locked(
             db,
