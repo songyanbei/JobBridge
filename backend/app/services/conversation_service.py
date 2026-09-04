@@ -6,6 +6,7 @@
 import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -51,6 +52,34 @@ _session_stage: ContextVar[_SessionStage | None] = ContextVar(
     default=None,
 )
 
+# A demo turn has two deliberately different identities:
+# ``userid`` is the synthetic business principal used by the domain services,
+# while the Redis session must be isolated by demo/workspace/role.  Keep that
+# storage-key override turn-scoped so existing callers (including command and
+# upload services) can continue passing their business userid without ever
+# writing the staged turn under the shared synthetic principal.
+_session_key_override: ContextVar[str | None] = ContextVar(
+    "conversation_session_key_override",
+    default=None,
+)
+
+
+@contextmanager
+def session_key_scope(session_key: str):
+    """Bind the Redis session key for one isolated router turn."""
+    if not session_key or not str(session_key).strip():
+        raise ValueError("session_key must be non-empty")
+    token = _session_key_override.set(str(session_key))
+    try:
+        yield
+    finally:
+        _session_key_override.reset(token)
+
+
+def _storage_session_key(userid: str) -> str:
+    """Resolve the durable session key without changing business identity."""
+    return _session_key_override.get() or userid
+
 
 def begin_session_staging(userid: str) -> Token:
     """开始一个 Worker turn 的延迟 session 提交边界。"""
@@ -88,7 +117,7 @@ def load_session(userid: str) -> SessionState | None:
       2. 状态修复：每次 load 都跑一次 self-healing，修正 active_flow 与扁平字段的不一致组合，
          保证旧 session 的脏数据不会让 C1 路由错位。
     """
-    data = redis_get_session(userid)
+    data = redis_get_session(_storage_session_key(userid))
     if data is None:
         return None
     # Pydantic defaults supply dialogue.v1/recruitment.job for legacy payloads;
@@ -185,9 +214,10 @@ project_session_for_legacy = legacy_projection
 
 def save_session(userid: str, session: SessionState) -> None:
     """使用版本 CAS 保存 session（自动续期 TTL）。"""
+    storage_userid = _storage_session_key(userid)
     stage = _session_stage.get()
     if stage is not None:
-        if userid != stage.userid:
+        if storage_userid != stage.userid:
             raise RuntimeError("one worker turn cannot stage multiple users")
         # 删除用户数据的指令优先；route 末尾的惯例 save 不得把已删除 session 重建。
         if stage.operation == "delete":
@@ -214,7 +244,7 @@ def save_session(userid: str, session: SessionState) -> None:
     payload = projected.model_dump(mode="json")
     payload["legacy_projection"] = projected.get_legacy_projection()
     if not redis_save_session_if_version(
-        userid, payload, expected_version,
+        storage_userid, payload, expected_version,
         lock_fence=current_user_lock_fence(),
     ):
         logger.error(
@@ -231,14 +261,15 @@ def save_session(userid: str, session: SessionState) -> None:
 
 def clear_session(userid: str) -> None:
     """完全删除 Redis session。"""
+    storage_userid = _storage_session_key(userid)
     stage = _session_stage.get()
     if stage is not None:
-        if userid != stage.userid:
+        if storage_userid != stage.userid:
             raise RuntimeError("one worker turn cannot stage multiple users")
         stage.operation = "delete"
         stage.payload = None
         return
-    redis_delete_session(userid)
+    redis_delete_session(storage_userid)
 
 
 def apply_staged_session(commit: StagedSessionCommit) -> bool:

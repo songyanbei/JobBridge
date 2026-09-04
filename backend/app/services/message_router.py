@@ -562,9 +562,7 @@ def process(
     normalized back to ``real_actor_userid`` at this boundary; synthetic IDs
     therefore can never leak to WeCom.
     """
-    replies = _process(
-        msg,
-        db,
+    process_args = dict(
         action_context=action_context,
         user_context=user_context,
         inbound_event_id=inbound_event_id,
@@ -572,6 +570,14 @@ def process(
         demo_context=demo_context,
         demo_command_reply=demo_command_reply,
     )
+    if demo_context is not None:
+        # Worker stages against this exact key.  Bind it for the complete
+        # router turn so nested command/upload/search helpers that still pass
+        # the synthetic business userid use the same isolated session.
+        with conversation_service.session_key_scope(demo_context.session_key):
+            replies = _process(msg, db, **process_args)
+    else:
+        replies = _process(msg, db, **process_args)
     if demo_context is not None:
         for reply in replies:
             reply.userid = demo_context.reply_userid
