@@ -40,6 +40,7 @@ from app.models import (
     JobReplacement,
     MediaAssetLifecycle,
     RecommendationDelivery,
+    RecommendationExposureDaily,
     RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
@@ -92,6 +93,9 @@ _EXACT_RESOURCE_MODELS: dict[str, tuple[Any, str]] = {
     "recommendation_search_attempt": (RecommendationSearchAttempt, "attempt_id"),
     "recommendation_delivery": (RecommendationDelivery, "delivery_id"),
     "recommendation_impression": (RecommendationImpression, "id"),
+    # Daily exposure rows have no scalar business id. Their exact cleanup
+    # scope is the explicit demo_id column; legacy NULL rows stay untouched.
+    "recommendation_exposure_daily": (RecommendationExposureDaily, "demo_id"),
     "domain_outbox_event": (DomainOutboxEvent, "id"),
     "resume_media_isolation_issue": (ResumeMediaIsolationIssue, "id"),
     "audit_log": (AuditLog, "id"),
@@ -126,6 +130,7 @@ _CLEANUP_ORDER = (
     "contact_request",
     "contact_access_audit",
     "recommendation_impression",
+    "recommendation_exposure_daily",
     "wecom_outbound_outbox",
     "recommendation_delivery",
     "recommendation_search_attempt",
@@ -236,6 +241,11 @@ def _scoped_targets(db: Session, demo_id: str) -> dict[str, set[str]]:
         result["recommendation_search_attempt"].update(
             str(value) for (value,) in attempt_query.all()
         )
+    if _table_exists(db, RecommendationExposureDaily):
+        if db.query(RecommendationExposureDaily.demo_id).filter(
+            RecommendationExposureDaily.demo_id == demo_id,
+        ).first() is not None:
+            result["recommendation_exposure_daily"].add(demo_id)
     return result
 
 

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.time_utils import ensure_utc, exposure_window_start, to_naive_utc, utc_now
 from app.models import RecommendationDelivery, RecommendationImpression
+from app.services import demo_scope
 
 # §9.6 deliberately keeps `direction` out of the persisted context whitelist, so
 # it cannot be read back from the delivery JSON — it used to be, which left every
@@ -208,7 +209,7 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
         if key in existing_keys:
             continue
         target_type, target_id = key
-        db.add(RecommendationImpression(
+        impression = RecommendationImpression(
             delivery_id=delivery.delivery_id,
             request_id=delivery.request_id,
             snapshot_id=delivery.snapshot_id or "",
@@ -224,10 +225,26 @@ def derive_impressions(db: Session, delivery: RecommendationDelivery, *, exposed
             query_digest=context.get("query_digest", ""),
             score_detail=item.get("score_detail"),
             exposed_at=naive_moment,
-        ))
+        )
+        # Delivery rows are the authoritative scope for asynchronous
+        # derivation.  ``demo_scope`` is the fallback for older in-flight
+        # deliveries created inside a demo turn; normal/legacy turns leave
+        # this NULL and preserve the existing contract.
+        demo_scope.stamp(impression, demo_id=delivery.demo_id)
+        db.add(impression)
         existing_keys.add(key)
         inserted += 1
     db.flush()
+    for impression in db.query(RecommendationImpression).filter(
+        RecommendationImpression.delivery_id == delivery.delivery_id,
+        RecommendationImpression.demo_id.isnot(None),
+    ).all():
+        demo_scope.register(
+            db,
+            "recommendation_impression",
+            impression.id,
+            demo_id=impression.demo_id,
+        )
     expected = len(expected_keys)
     actual = db.query(RecommendationImpression.id).filter(
         RecommendationImpression.delivery_id == delivery.delivery_id,

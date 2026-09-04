@@ -495,6 +495,22 @@ class TestDirectionFilter:
 # ---------------------------------------------------------------------------
 
 class TestExposureDailyReconcile:
+    def test_demo_scope_is_carried_to_daily_aggregate_without_touching_legacy(self, db):
+        db.add(_impression("legacy-d1", 1, exposed_at=datetime(2026, 1, 1, 2, 0)))
+        db.add(_impression(
+            "demo-d1", 2, demo_id="demo-exposure", exposed_at=datetime(2026, 1, 1, 3, 0),
+        ))
+        db.commit()
+
+        result = reconcile.reconcile_day(db, date(2026, 1, 1), now=NOW)
+
+        assert result["rows"] == 2
+        rows = {
+            (row.demo_id, row.target_id): row.impression_count
+            for row in db.query(RecommendationExposureDaily).all()
+        }
+        assert rows == {(None, 1): 1, ("demo-exposure", 2): 1}
+
     def test_stat_date_uses_asia_shanghai_business_day(self, db):
         # 15:59:59Z = 北京 23:59:59 当天；16:00:00Z = 北京次日 00:00
         db.add(_impression("d1", 1, exposed_at=datetime(2026, 1, 1, 15, 59, 59)))

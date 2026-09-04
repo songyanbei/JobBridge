@@ -18,6 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql.functions import now as sql_now
 
 from app.models import Base, RecommendationDelivery, RecommendationImpression
+from app.services import demo_scope
 from app.services.recommendation_exposure_service import (
     batch_candidate_exposures,
     claim_impression_deliveries,
@@ -330,6 +331,44 @@ class TestDeriveImpressions:
         assert {row.target_id for row in rows} == {7, 8}
         # 曝光时间以真实发送时间为准，而不是派生时刻。
         assert {row.exposed_at for row in rows} == {_naive(sent_at)}
+
+    def test_demo_delivery_stamps_and_registers_impressions(self, db, monkeypatch):
+        registered = []
+        monkeypatch.setattr(
+            demo_scope,
+            "register",
+            lambda _db, resource_type, target_id, **kwargs: registered.append(
+                (resource_type, target_id, kwargs.get("demo_id"))
+            ),
+        )
+        delivery = _add_delivery(
+            db,
+            "demo-d1",
+            items=_items(7),
+            sent_at=datetime.now(timezone.utc),
+            demo_id="demo-exposure",
+        )
+
+        assert derive_impressions(db, delivery) == 1
+        row = db.query(RecommendationImpression).one()
+        assert row.demo_id == "demo-exposure"
+        assert registered == [("recommendation_impression", row.id, "demo-exposure")]
+
+    def test_legacy_delivery_keeps_impression_scope_null(self, db, monkeypatch):
+        registered = []
+        monkeypatch.setattr(
+            demo_scope,
+            "register",
+            lambda *args, **kwargs: registered.append((args, kwargs)),
+        )
+        delivery = _add_delivery(
+            db, "legacy-d1", items=_items(7), sent_at=datetime.now(timezone.utc),
+        )
+
+        assert derive_impressions(db, delivery) == 1
+        row = db.query(RecommendationImpression).one()
+        assert row.demo_id is None
+        assert registered == []
 
     def test_is_idempotent(self, db):
         delivery = _add_delivery(db, "d1", items=_items(7, 8), sent_at=datetime.now(timezone.utc))

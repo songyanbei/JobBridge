@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import and_, func, or_, tuple_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.time_utils import business_date, business_day_bounds, to_naive_utc, utc_now
@@ -41,8 +41,13 @@ DEFAULT_LOOKBACK_DAYS = 2
 MAX_LOOKBACK_DAYS = 90
 
 
-def _upsert_batch(db: Session, day: date, rows: list[tuple[str, int, int]], updated_at: datetime) -> int:
-    """按主键 ``(stat_date, target_type, target_id)`` UPSERT 一批聚合行。
+def _upsert_batch(
+    db: Session,
+    day: date,
+    rows: list[tuple[str | None, str, int, int]],
+    updated_at: datetime,
+) -> int:
+    """按 scope-aware 聚合键 UPSERT 一批聚合行。
 
     ``updated_at`` 由调用方统一传入本轮的时间戳，``_purge_stale_rows()`` 靠它区分
     "本轮写过"和"上一轮遗留"，所以这里不能让 DB 的 ``onupdate`` 自己填。
@@ -52,12 +57,13 @@ def _upsert_batch(db: Session, day: date, rows: list[tuple[str, int, int]], upda
     payload = [
         {
             "stat_date": day,
+            "demo_id": demo_id,
             "target_type": target_type,
             "target_id": target_id,
             "impression_count": count,
             "updated_at": updated_at,
         }
-        for target_type, target_id, count in rows
+        for demo_id, target_type, target_id, count in rows
     ]
     dialect = db.get_bind().dialect.name
     table = RecommendationExposureDaily.__table__
@@ -66,6 +72,7 @@ def _upsert_batch(db: Session, day: date, rows: list[tuple[str, int, int]], upda
 
         statement = mysql_insert(table).values(payload)
         statement = statement.on_duplicate_key_update(
+            demo_id=statement.inserted.demo_id,
             impression_count=statement.inserted.impression_count,
             updated_at=statement.inserted.updated_at,
         )
@@ -76,6 +83,7 @@ def _upsert_batch(db: Session, day: date, rows: list[tuple[str, int, int]], upda
         statement = statement.on_conflict_do_update(
             index_elements=["stat_date", "target_type", "target_id"],
             set_={
+                "demo_id": statement.excluded.demo_id,
                 "impression_count": statement.excluded.impression_count,
                 "updated_at": statement.excluded.updated_at,
             },
@@ -96,6 +104,7 @@ def _purge_stale_rows(db: Session, day: date, updated_at: datetime) -> int:
     total = 0
     while True:
         stale = db.query(
+            RecommendationExposureDaily.demo_id,
             RecommendationExposureDaily.target_type,
             RecommendationExposureDaily.target_id,
         ).filter(
@@ -106,10 +115,16 @@ def _purge_stale_rows(db: Session, day: date, updated_at: datetime) -> int:
             break
         deleted = db.query(RecommendationExposureDaily).filter(
             RecommendationExposureDaily.stat_date == day,
-            tuple_(
-                RecommendationExposureDaily.target_type,
-                RecommendationExposureDaily.target_id,
-            ).in_([(str(target_type), int(target_id)) for target_type, target_id in stale]),
+            or_(*(
+                and_(
+                    RecommendationExposureDaily.demo_id.is_(None)
+                    if demo_id is None
+                    else RecommendationExposureDaily.demo_id == str(demo_id),
+                    RecommendationExposureDaily.target_type == str(target_type),
+                    RecommendationExposureDaily.target_id == int(target_id),
+                )
+                for demo_id, target_type, target_id in stale
+            )),
         ).delete(synchronize_session=False)
         db.commit()
         total += int(deleted or 0)
@@ -138,9 +153,10 @@ def reconcile_day(db: Session, day: date, *, now: datetime | None = None) -> dic
     rows_written = 0
     impressions = 0
     batches = 0
-    cursor: tuple[str, int] | None = None
+    cursor: tuple[str | None, str, int] | None = None
     while True:
         query = db.query(
+            RecommendationImpression.demo_id,
             RecommendationImpression.target_type,
             RecommendationImpression.target_id,
             func.count(RecommendationImpression.id),
@@ -149,32 +165,55 @@ def reconcile_day(db: Session, day: date, *, now: datetime | None = None) -> dic
             RecommendationImpression.exposed_at < end,
         )
         if cursor is not None:
-            # keyset 翻页：OFFSET 会随天数线性劣化，而 (target_type, target_id)
-            # 正好是分组键，天然有序且唯一。
-            query = query.filter(or_(
-                RecommendationImpression.target_type > cursor[0],
-                and_(
-                    RecommendationImpression.target_type == cursor[0],
-                    RecommendationImpression.target_id > cursor[1],
-                ),
-            ))
+            # keyset 翻页：OFFSET 会随天数线性劣化；NULL demo_id（legacy）
+            # 按 ASC 排在显式 demo scope 前，三元组保持稳定有序。
+            demo_id, target_type, target_id = cursor
+            if demo_id is None:
+                query = query.filter(or_(
+                    RecommendationImpression.demo_id.isnot(None),
+                    and_(
+                        RecommendationImpression.demo_id.is_(None),
+                        RecommendationImpression.target_type > target_type,
+                    ),
+                    and_(
+                        RecommendationImpression.demo_id.is_(None),
+                        RecommendationImpression.target_type == target_type,
+                        RecommendationImpression.target_id > target_id,
+                    ),
+                ))
+            else:
+                query = query.filter(or_(
+                    RecommendationImpression.demo_id > demo_id,
+                    and_(
+                        RecommendationImpression.demo_id == demo_id,
+                        RecommendationImpression.target_type > target_type,
+                    ),
+                    and_(
+                        RecommendationImpression.demo_id == demo_id,
+                        RecommendationImpression.target_type == target_type,
+                        RecommendationImpression.target_id > target_id,
+                    ),
+                ))
         batch = query.group_by(
+            RecommendationImpression.demo_id,
             RecommendationImpression.target_type,
             RecommendationImpression.target_id,
         ).order_by(
+            RecommendationImpression.demo_id,
             RecommendationImpression.target_type,
             RecommendationImpression.target_id,
         ).limit(BATCH_SIZE).all()
         if not batch:
             break
         normalized = [
-            (str(target_type), int(target_id), int(count))
-            for target_type, target_id, count in batch
+            (str(demo_id) if demo_id is not None else None,
+             str(target_type), int(target_id), int(count))
+            for demo_id, target_type, target_id, count in batch
         ]
         rows_written += _upsert_batch(db, day, normalized, stamp)
-        impressions += sum(item[2] for item in normalized)
+        impressions += sum(item[3] for item in normalized)
         batches += 1
-        cursor = (normalized[-1][0], normalized[-1][1])
+        cursor = normalized[-1][:3]
         if len(batch) < BATCH_SIZE:
             break
 

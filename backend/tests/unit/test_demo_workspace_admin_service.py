@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,8 @@ from app.models import (
     DemoResource,
     DemoWorkspace,
     DemoWorkspaceMember,
+    RecommendationExposureDaily,
+    RecommendationImpression,
     RecommendationRequest,
     RecommendationSearchAttempt,
     User,
@@ -62,7 +65,8 @@ def db(monkeypatch):
     Base.metadata.create_all(
         engine,
         tables=[DemoWorkspace.__table__, DemoWorkspaceMember.__table__,
-                DemoPrincipal.__table__, DemoResource.__table__],
+                DemoPrincipal.__table__, DemoResource.__table__,
+                RecommendationImpression.__table__, RecommendationExposureDaily.__table__],
     )
 
     fake_redis = _FakeRedis()
@@ -92,6 +96,56 @@ def test_cleanup_removes_principals_before_synthetic_users(db, monkeypatch):
     assert db.query(DemoPrincipal).filter_by(demo_id=workspace.demo_id).count() == 0
     assert db.query(User).filter(User.external_userid.like("demo_%")).count() == 0
     assert db.query(DemoWorkspace).filter_by(demo_id=workspace.demo_id).one().status == "cleaned"
+
+
+def test_cleanup_removes_demo_exposure_facts_and_daily_rows_only(db, monkeypatch):
+    actor_digest = demo_mode_service.actor_digest_for_lookup("actor-exposure-cleanup")
+    monkeypatch.setattr(admin_service.settings, "demo_allowed_actor_digests", actor_digest)
+    workspace = demo_mode_service.create_workspace(
+        db, name="demo", bot_id="bot-1", actor_digest_value=actor_digest,
+        created_by="admin", demo_id="demo-exposure-cleanup",
+    )
+    demo_worker = db.query(DemoPrincipal.synthetic_userid).filter_by(
+        demo_id=workspace.demo_id, role="worker",
+    ).scalar()
+    db.add(RecommendationImpression(
+        id=1, demo_id=workspace.demo_id, delivery_id="demo-d1", request_id="demo-r1",
+        snapshot_id="demo-s1", viewer_userid=demo_worker, direction="search_job",
+        target_type="job", target_id=101, position=1, algorithm_version="test",
+        assignment="stable", query_digest="", exposed_at=datetime(2026, 9, 4),
+    ))
+    db.add(RecommendationImpression(
+        id=2, delivery_id="legacy-d1", request_id="legacy-r1", snapshot_id="legacy-s1",
+        viewer_userid="legacy-user", direction="search_job", target_type="job",
+        target_id=202, position=1, algorithm_version="test", assignment="stable",
+        query_digest="", exposed_at=datetime(2026, 9, 4),
+    ))
+    db.add(RecommendationExposureDaily(
+        stat_date=date(2026, 9, 4), demo_id=workspace.demo_id, target_type="job", target_id=101,
+        impression_count=1,
+    ))
+    db.add(RecommendationExposureDaily(
+        stat_date=date(2026, 9, 4), target_type="job", target_id=202, impression_count=1,
+    ))
+    db.commit()
+
+    result = admin_service.cleanup_workspace(
+        db, demo_id=workspace.demo_id, reason="exposure cleanup", operator="admin",
+    )
+
+    assert result["status"] == "cleaned"
+    assert db.query(RecommendationImpression).filter(
+        RecommendationImpression.demo_id == workspace.demo_id,
+    ).count() == 0
+    assert db.query(RecommendationExposureDaily).filter(
+        RecommendationExposureDaily.demo_id == workspace.demo_id,
+    ).count() == 0
+    assert db.query(RecommendationImpression).filter(
+        RecommendationImpression.demo_id.is_(None),
+    ).count() == 1
+    assert db.query(RecommendationExposureDaily).filter(
+        RecommendationExposureDaily.demo_id.is_(None),
+    ).count() == 1
 
 
 def test_cleanup_is_idempotent_after_completion(db, monkeypatch):
