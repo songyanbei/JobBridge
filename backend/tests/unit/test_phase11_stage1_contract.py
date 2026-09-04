@@ -202,6 +202,30 @@ def _orm_contract(model) -> dict:
     }
 
 
+def _phase11_contract(contract: dict) -> dict:
+    """Limit a current ORM contract to the phase11-owned schema surface.
+
+    ``demo_id`` and its workspace-first indexes were added by phase18 after
+    the phase11 additive migration.  The ORM intentionally carries the
+    current superset, while this acceptance test compares the phase11 DDL
+    sources only.  Keep the comparison explicit so a later additive scope
+    column cannot silently invalidate an older migration contract.
+    """
+    return {
+        "columns": {
+            name: value
+            for name, value in contract["columns"].items()
+            if name != "demo_id"
+        },
+        "primary_key": contract["primary_key"],
+        "indexes": {
+            name: value
+            for name, value in contract["indexes"].items()
+            if "demo_id" not in value[1]
+        },
+    }
+
+
 def test_candidate_ttl_range_is_frozen_to_one_through_365_days():
     assert Settings(ttl_resume_candidate_days=1).ttl_resume_candidate_days == 1
     assert Settings(ttl_resume_candidate_days=365).ttl_resume_candidate_days == 365
@@ -286,7 +310,7 @@ def test_phase11_additive_orm_matches_canonical_and_migration_table_shapes():
         canonical_contract = _ddl_contract(canonical, table_name)
         migration_contract = _ddl_contract(additive, table_name)
         assert migration_contract == canonical_contract, table_name
-        assert _orm_contract(model) == canonical_contract, table_name
+        assert _phase11_contract(_orm_contract(model)) == canonical_contract, table_name
         assert not list(model.__table__.foreign_keys), table_name
 
 

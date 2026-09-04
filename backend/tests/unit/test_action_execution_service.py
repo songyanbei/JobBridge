@@ -42,6 +42,7 @@ def db():
             """
             CREATE TABLE action_execution (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                demo_id VARCHAR(64),
                 turn_id VARCHAR(36) NOT NULL,
                 action_name VARCHAR(64) NOT NULL,
                 status VARCHAR(32) NOT NULL DEFAULT 'started',

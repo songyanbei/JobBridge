@@ -25,7 +25,8 @@ def db():
     with engine.begin() as connection:
         connection.exec_driver_sql(
             """CREATE TABLE action_parse_artifact (
-                parse_ref VARCHAR(36) PRIMARY KEY, turn_id VARCHAR(36) NOT NULL,
+                parse_ref VARCHAR(36) PRIMARY KEY, demo_id VARCHAR(64),
+                turn_id VARCHAR(36) NOT NULL,
                 actor_userid VARCHAR(64) NOT NULL, parse_digest CHAR(64) NOT NULL,
                 schema_version VARCHAR(32) NOT NULL, classifier_version VARCHAR(64) NOT NULL,
                 session_version INTEGER, payload JSON NOT NULL, expires_at DATETIME NOT NULL,
