@@ -7,13 +7,24 @@
 
 ## 执行元数据
 
-- 分支/提交：待填写；需同时记录应用、Worker、AIBot connector 和迁移提交。
-- 验收日期（含时区）：待填写（Asia/Shanghai）。
+- 分支/提交：`codex/unified-listing-flow-architecture`；当前 HEAD `9b23b51`（已推送远端）。应用/Worker/AIBot 镜像已按该提交重建。
+- 验收日期（含时区）：2026-09-04（Asia/Shanghai）。
 - 执行环境：WSL Ubuntu 24.04、Python 3.12、`backend/.venv-wsl`、Docker、MySQL、Redis。
 - 企微环境：独立测试企业、测试 Bot；不使用生产企业和生产凭证。
 - 测试数据：使用带 `demo_id` 的合成岗位、简历和虚构联系方式；不得混用真实业务数据。
 - 证据目录：`.codex-tmp/verification-demo-<date>/`；日志脱敏后再保存。
-- 负责人/复核人：待填写。
+- 负责人/复核人：master 调度会话 / 独立最终审查会话。
+
+## 本轮执行结果（2026-09-04）
+
+- [x] WSL Ubuntu 24.04、Docker Compose、app、Worker、AIBot connector、MySQL、Redis、nginx 已启动；容器 restart count 均为 `0`。
+- [x] `/health` 返回 `status=ok`；`/ready` 返回 `status=ready` 且数据库正常；`/admin/` 返回 HTTP 200。
+- [x] Phase17/18/19 数据库迁移已验证；Phase19 首次执行和重复执行均成功，主键为 `(stat_date, target_type, target_id, scope_key)`。
+- [x] Phase19 冲突场景已验证 fail-closed：返回 SQLSTATE `45000`，原始数据保留，未执行主键替换。
+- [x] 历史全量单元测试：`2671 passed`；演示/推荐/Worker/Cleanup 专项：`777 passed`。
+- [x] 独立最终审查通过：无新增 P0/P1 阻断问题；`compileall`、`git diff --check` 均通过。
+- [x] 代码已推送至远端分支 `codex/unified-listing-flow-architecture`。
+- [ ] BLOCKED 真实企业微信 WSS Golden Flow 尚未完成在线账号实测；不得用自动化/mock 结果替代。
 
 ## 0. 硬门禁与停止条件
 
@@ -161,16 +172,16 @@
 
 | 编号 | 命令/入口 | 环境 | 结果 | 证据路径/摘要 | 影响/建议 |
 |---|---|---|---|---|---|
-| A4 | `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build` | WSL/Docker | 待填写 | 待填写 | 记录镜像与服务版本 |
-| B2 | Phase 17 demo control-plane migration | 隔离 MySQL | 待填写 | 待填写 | 记录 SHA256、表/索引对账 |
-| C4 | production + DEMO_MODE_ENABLED=true 启动校验 | 配置副本 | 待填写 | 待填写 | 必须 fail-closed |
-| D1-D7 | AIBot callback/transport/connection 专项 pytest | WSL .venv-wsl | 待填写 | 待填写 | DB-backed/真实 WSS 分开标记 |
-| E4-E10 | 管理授权/撤销或服务契约测试 | 隔离 MySQL/Redis | 待填写 | 待填写 | 只记录 digest，不记录 actor 原文 |
-| F1-F10 | 企微单聊命令与 Redis/Outbox 对账 | 测试企业 | 待填写 | 待填写 | 记录三角色 session 隔离 |
-| H5-H7 | 后台 disable/preview | 测试后台 | 待填写 | 待填写 | 记录 RBAC 和审计 |
-| I2-I8 | cleanup runner/retry/replay | 隔离 MySQL/Redis | 待填写 | 待填写 | 记录 checkpoint、孤立行和 key |
-| J1-J8 | 历史回归集合 | WSL .venv-wsl | 待填写 | 待填写 | 不得用 demo 通过掩盖历史失败 |
-| GF1-GF10 | 真实企微 E2E | 测试企业 | 待填写 | 待填写 | 无凭证/WSS 时必须 BLOCKED |
+| A4 | `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d --build` | WSL/Docker | PASS | compose 重建后全部服务 running/healthy | 记录镜像与服务版本 |
+| B2 | Phase 17 demo control-plane migration | 隔离 MySQL | PASS | Phase17/18/19 已执行并完成 schema 对账 | 记录 SHA256、表/索引对账 |
+| C4 | production + DEMO_MODE_ENABLED=true 启动校验 | 配置副本 | PASS（自动化） | fail-closed 专项通过 | 必须 fail-closed |
+| D1-D7 | AIBot callback/transport/connection 专项 pytest | WSL .venv-wsl | PASS（自动化） | 长连接/消息链路专项通过 | DB-backed/真实 WSS 分开标记 |
+| E4-E10 | 管理授权/撤销或服务契约测试 | 隔离 MySQL/Redis | PASS（自动化） | 身份/授权/撤销专项通过 | 只记录 digest，不记录 actor 原文 |
+| F1-F10 | 企微单聊命令与 Redis/Outbox 对账 | 测试企业 | PASS（自动化） | 三角色与 session 隔离专项通过 | 记录三角色 session 隔离 |
+| H5-H7 | 后台 disable/preview | 测试后台 | PASS（自动化） | 后台生命周期专项通过 | 记录 RBAC 和审计 |
+| I2-I8 | cleanup runner/retry/replay | 隔离 MySQL/Redis | PASS（自动化） | cleanup/retry/replay 专项通过 | 记录 checkpoint、孤立行和 key |
+| J1-J8 | 历史回归集合 | WSL .venv-wsl | PASS | `2671 passed`，静态校验通过 | 不得用 demo 通过掩盖历史失败 |
+| GF1-GF10 | 真实企微 E2E | 测试企业 | BLOCKED | 尚无在线 WSS Golden Flow 证据 | 无凭证/WSS 时必须 BLOCKED |
 
 ## 完成判定
 
