@@ -297,6 +297,12 @@ def resolve_active_context(
         if refreshed.is_usable():
             save_active_context(refreshed)
             return refreshed
+        # Keep disabled/cleaning/failed workspace state visible to the Worker
+        # so an already-queued turn is rejected instead of falling through to
+        # the real account path.
+        if refreshed.workspace_status != "active" and refreshed.demo_id:
+            clear_active_context(real_actor_userid)
+            return refreshed
         clear_active_context(real_actor_userid)
         return None
     return pointer if pointer.is_usable() else None
