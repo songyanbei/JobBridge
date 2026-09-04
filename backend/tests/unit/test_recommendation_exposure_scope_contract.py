@@ -84,3 +84,10 @@ def test_phase19_migration_has_guarded_scope_rekey_and_conflict_gate():
     assert "drop primary key" in migration
     assert "add primary key (`stat_date`, `target_type`, `target_id`, `scope_key`)" in migration
     assert migration.count("prepare phase19_stmt from @ddl") >= 5
+    # MySQL 8.0.45 rejects the previous form that embedded subqueries in a
+    # dynamic IF expression.  Existence checks must be materialized first,
+    # then only a single prepared statement is selected for execution.
+    assert "select count(*) into @phase19_has_scope_key" in migration
+    assert "select count(*) into @phase19_conflicts" in migration
+    assert "select count(*) into @phase19_has_scope_constraint" in migration
+    assert "set @ddl = if(" not in migration
