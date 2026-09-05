@@ -36,7 +36,23 @@ OUTBOX_LEASE_SECONDS = 180
 OUTBOX_BATCH_SIZE = 20
 EVENT_RESPONSE_TIMEOUT_SECONDS = 5.0
 ACCEPTANCE_TIMEOUT_SECONDS = 5.0
+DEMO_WELCOME_RESPONSE_CONTENT = (
+    "您好！我是 JobBridge 招聘演示助手。\n"
+    "发送 /演示 可查看演示模式说明；也可以发送以下指令切换体验角色：\n"
+    "/演示 求职者：体验找工作、岗位推荐\n"
+    "/演示 厂家：体验发布岗位、招聘管理\n"
+    "/演示 中介：体验找岗位、找工人\n"
+    "切换后直接描述您的需求即可。"
+)
 WELCOME_RESPONSE_CONTENT = "您好！我是智能助手。"
+
+
+def welcome_response_content(callback: Any) -> str:
+    """Return the demo introduction only for an enabled, allowlisted bot."""
+    bot_id = str(getattr(callback, "aibot_id", "") or "").strip()
+    if settings.demo_mode_enabled and bot_id in settings.demo_allowed_bot_id_list:
+        return DEMO_WELCOME_RESPONSE_CONTENT
+    return WELCOME_RESPONSE_CONTENT
 
 
 def stable_aibot_ack_req_id(outbox_id: int | str, provider_req_id: str | None = None) -> str:
@@ -824,7 +840,10 @@ class AibotConnection:
         if remaining <= 0:
             logger.warning("aibot enter_chat welcome deadline exceeded")
             return result
-        frame = transport.client.respond_welcome(callback.req_id, WELCOME_RESPONSE_CONTENT)
+        frame = transport.client.respond_welcome(
+            callback.req_id,
+            welcome_response_content(callback),
+        )
         try:
             await transport.send(frame, timeout=remaining)
         except Exception:
