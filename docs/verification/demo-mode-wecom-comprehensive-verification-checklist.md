@@ -30,6 +30,12 @@
 - [ ] BLOCKED GF5-GF10：第二企微账号授权/撤销、后台禁用、preview/cleanup/replay、connector/Worker 重启接管、ACK 丢失/Redis 短暂不可用，以及生产配置副本 fail-closed 尚未完成在线演练；不得用自动化/mock 结果替代。
 - [x] 旧的 `multiple users` dead-letter 记录保留为修复前历史证据，未伪装成已重试成功；修复后的新事件单独核对 `done/sent`。
 
+## 增量执行结果（2026-09-05）
+
+- [x] PASS 首次 `enter_chat` 自我介绍已在提交 `f345b04` 实现：仅当 `DEMO_MODE_ENABLED=true` 且回调 `aibot_id` 命中 `DEMO_ALLOWED_BOT_IDS` 时展示演示欢迎语；演示关闭或 Bot 未命中 allowlist 时保持原通用欢迎语。
+- [x] PASS 演示欢迎语覆盖 `/演示`、`/演示 求职者`、`/演示 厂家`、`/演示 中介`，并提示切换角色后可直接描述需求；正文 UTF-8 长度为 `331 bytes`，低于企微文本限制。
+- [x] PASS 独立代码审查和 AIBot 协议相邻回归完成：`55 passed`，无阻断性问题；durable acceptance、重复 `enter_chat` 欢迎重放和 5 秒响应截止语义保持不变。
+
 ## 0. 硬门禁与停止条件
 
 - [ ] BLOCKED/ PASS 0.1 已确认测试企业、测试 Bot、身份应用和管理员权限；凭证通过环境变量或密钥存储注入，未写入仓库。
@@ -84,6 +90,7 @@
 - [ ] PASS D10 open_userid 转换成功后，canonical userid、binding、registration 在同一事务内幂等落库；转换失败不产生半个 User 或角色授权。
 - [ ] PASS D11 AIBot Bot Secret、身份自建应用 Secret、legacy 企微凭证三者隔离；故意替换其中一个，错误应明确且不回退到另一凭证。
 - [ ] PASS D12 入站/出站/审计日志只记录 actor digest、bot_id 脱敏值、provider msgid 摘要、reason_code 和 trace_id，不记录 opaque actor 明文。
+- [x] PASS D13 首次 `enter_chat` 在持久化接收成功后选择欢迎语：demo enabled 且 Bot 命中 allowlist 时返回演示自我介绍，否则返回通用欢迎语；重复事件与 5 秒 deadline 行为不变。
 
 ## E. 演示工作区创建与多企微账号快速授权
 
@@ -180,6 +187,7 @@
 | B2 | Phase 17 demo control-plane migration | 隔离 MySQL | PASS | Phase17/18/19 已执行并完成 schema 对账 | 记录 SHA256、表/索引对账 |
 | C4 | production + DEMO_MODE_ENABLED=true 启动校验 | 配置副本 | PASS（自动化） | fail-closed 专项通过 | 必须 fail-closed |
 | D1-D7 | AIBot callback/transport/connection 专项 pytest | WSL .venv-wsl | PASS（自动化） | 长连接/消息链路专项通过 | DB-backed/真实 WSS 分开标记 |
+| D13 | 首次 `enter_chat` 演示自我介绍专项 | 独立审查/测试环境 | PASS（自动化） | `f345b04`；演示/非演示/allowlist 边界及协议相邻回归 `55 passed`；正文 UTF-8 `331 bytes` | 真实测试 Bot 下次新会话时补充可视化截图，不记录 Bot 或账号敏感标识 |
 | E4-E10 | 管理授权/撤销或服务契约测试 | 隔离 MySQL/Redis | PASS（自动化） | 身份/授权/撤销专项通过 | 只记录 digest，不记录 actor 原文 |
 | F1-F10 | 企微单聊命令与 Redis/Outbox 对账 | 测试企业 | PASS（自动化） | 三角色与 session 隔离专项通过 | 记录三角色 session 隔离 |
 | H5-H7 | 后台 disable/preview | 测试后台 | PASS（自动化） | 后台生命周期专项通过 | 记录 RBAC 和审计 |
