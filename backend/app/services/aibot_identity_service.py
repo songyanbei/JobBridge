@@ -151,14 +151,28 @@ class AibotIdentityService:
             # Keep the same durable identity, binding, and registration writes
             # as the real resolver so business-path tests exercise production
             # boundaries without trusting an opaque provider id.
-            canonical = str(getattr(settings, "wecom_aibot_simulated_userid", "")).strip()
-            if not _CANONICAL_RE.fullmatch(canonical):
+            simulated_prefix = str(getattr(settings, "wecom_aibot_simulated_userid", "")).strip()
+            if not _CANONICAL_RE.fullmatch(simulated_prefix):
                 row.identity_status = "rejected"
                 row.last_error_code = "simulated_userid_invalid"
                 self._audit(db, bot, digest, actor_id, "identity_simulated", "rejected", "simulated_userid_invalid")
                 db.flush()
                 aibot_identity_metrics.record_resolution("rejected", "simulated_userid_invalid")
                 return ResolvedActor(actor_id, actor_id_kind, "rejected", reason_code="simulated_userid_invalid")
+            # Earlier single-account test deployments used the configured userid
+            # directly. Preserve each actor's existing binding (including an
+            # administrator-assigned one), while deriving a separate stable
+            # canonical userid for every newly seen bot/actor pair.
+            existing = db.query(AibotIdentityBinding).filter(
+                AibotIdentityBinding.bot_id == bot,
+                AibotIdentityBinding.opaque_actor_digest == digest,
+                AibotIdentityBinding.binding_status == "active",
+            ).first()
+            canonical = (
+                existing.canonical_userid if existing is not None else
+                f"{simulated_prefix[:16]}-"
+                f"{hashlib.sha256(f'{bot}:{digest}'.encode('utf-8')).hexdigest()[:40]}"
+            )
             row.mapped_external_userid = canonical
             row.canonical_userid = canonical
             row.identity_status = "verified"

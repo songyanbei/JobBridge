@@ -46,6 +46,7 @@ def test_open_userid_success_reaches_verified(monkeypatch):
 
 def test_simulated_identity_reaches_verified_without_directory_client(monkeypatch):
     db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = None
     row = _row()
     svc = service.AibotIdentityService(client=Mock(), bot_id="bot")
     monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
@@ -59,11 +60,55 @@ def test_simulated_identity_reaches_verified_without_directory_client(monkeypatc
     result = svc.resolve_for_event(db, actor_id="opaque-from-wecom", actor_id_kind="open_userid")
 
     assert result.verified
-    assert result.canonical_userid == "wecom-test-user"
+    assert result.canonical_userid.startswith("wecom-test-user-")
+    assert len(result.canonical_userid) <= 64
     assert row.identity_status == "verified"
-    assert row.canonical_userid == "wecom-test-user"
-    registered.assert_called_once_with(db, "wecom-test-user", binding)
+    assert row.canonical_userid == result.canonical_userid
+    registered.assert_called_once_with(db, result.canonical_userid, binding)
     assert db.add.call_args.args[0].action == "identity_simulated"
+
+
+def test_simulated_identities_are_stable_and_isolated_per_actor_and_bot(monkeypatch):
+    db = Mock()
+    db.query.return_value.filter.return_value.first.return_value = None
+    svc = service.AibotIdentityService(bot_id="bot")
+    monkeypatch.setattr(svc, "observe_actor", lambda _db, actor, **_kw: _row(opaque_actor_digest=registration_service.actor_digest(actor)))
+    binding = SimpleNamespace(binding_id="binding")
+    ensure = Mock(return_value=binding)
+    monkeypatch.setattr(service, "ensure_binding", ensure)
+    monkeypatch.setattr(service, "auto_register_worker", Mock())
+    monkeypatch.setattr(service.settings, "wecom_aibot_identity_mode", "simulated")
+    monkeypatch.setattr(service.settings, "wecom_aibot_simulated_userid", "wecom-test-user")
+
+    first = svc.resolve_for_event(db, actor_id="actor-one", bot_id="bot")
+    repeat = svc.resolve_for_event(db, actor_id="actor-one", bot_id="bot")
+    second = svc.resolve_for_event(db, actor_id="actor-two", bot_id="bot")
+    other_bot = svc.resolve_for_event(db, actor_id="actor-one", bot_id="other-bot")
+
+    assert first.canonical_userid == repeat.canonical_userid
+    assert len({first.canonical_userid, second.canonical_userid, other_bot.canonical_userid}) == 3
+    assert all(result.verified for result in (first, repeat, second, other_bot))
+    assert ensure.call_count == 4
+
+
+def test_simulated_identity_preserves_existing_actor_binding(monkeypatch):
+    db = Mock()
+    legacy = SimpleNamespace(binding_id="legacy", canonical_userid="wecom-test-user", binding_status="active")
+    db.query.return_value.filter.return_value.first.side_effect = [None, legacy]
+    row = _row()
+    svc = service.AibotIdentityService(bot_id="bot")
+    monkeypatch.setattr(svc, "observe_actor", lambda *args, **kwargs: row)
+    ensure = Mock(return_value=legacy)
+    monkeypatch.setattr(service, "ensure_binding", ensure)
+    monkeypatch.setattr(service, "auto_register_worker", Mock())
+    monkeypatch.setattr(service.settings, "wecom_aibot_identity_mode", "simulated")
+    monkeypatch.setattr(service.settings, "wecom_aibot_simulated_userid", "different-configured-prefix")
+
+    result = svc.resolve_for_event(db, actor_id="existing-actor")
+
+    assert result.canonical_userid == "wecom-test-user"
+    assert result.binding_id == "legacy"
+    assert ensure.call_args.kwargs["canonical_userid"] == "wecom-test-user"
 
 
 def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatch):
