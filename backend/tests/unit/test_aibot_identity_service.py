@@ -111,6 +111,49 @@ def test_simulated_identity_preserves_existing_actor_binding(monkeypatch):
     assert ensure.call_args.kwargs["canonical_userid"] == "wecom-test-user"
 
 
+def test_simulated_two_actors_register_under_real_unique_constraints(monkeypatch):
+    """Exercise the real resolver and binding tables, not mocked uniqueness."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.dialects import mysql, sqlite
+    from sqlalchemy.ext.compiler import compiles
+    from sqlalchemy.orm import Session
+    from app.models import (
+        Base, User, WecomAibotIdentity, AibotIdentityBinding,
+        AibotRegistration, AibotIdentityAudit,
+    )
+
+    for mysql_type in (mysql.TINYINT, mysql.SMALLINT, mysql.INTEGER, mysql.BIGINT, mysql.DATETIME):
+        compiles(mysql_type, "sqlite")(lambda _type, _compiler, **_kw: "INTEGER")
+
+    class TestDDLCompiler(sqlite.base.SQLiteDDLCompiler):
+        def get_column_specification(self, column, **kwargs):
+            return super().get_column_specification(column, **kwargs).replace(
+                "CURRENT_TIMESTAMP(6)", "CURRENT_TIMESTAMP",
+            )
+
+    engine = create_engine("sqlite:///:memory:")
+    engine.dialect.ddl_compiler = TestDDLCompiler
+    Base.metadata.create_all(engine, tables=[
+        User.__table__, WecomAibotIdentity.__table__,
+        AibotIdentityBinding.__table__, AibotRegistration.__table__,
+        AibotIdentityAudit.__table__,
+    ])
+    monkeypatch.setattr(service.settings, "wecom_aibot_identity_mode", "simulated")
+    monkeypatch.setattr(service.settings, "wecom_aibot_simulated_userid", "wecom-test-user")
+
+    with Session(engine) as db:
+        resolver = service.AibotIdentityService(bot_id="bot")
+        first = resolver.resolve_for_event(db, actor_id="actor-one")
+        second = resolver.resolve_for_event(db, actor_id="actor-two")
+        db.commit()
+        assert first.canonical_userid != second.canonical_userid
+        assert db.query(AibotIdentityBinding).filter_by(binding_status="active").count() == 2
+        assert db.query(AibotRegistration).filter_by(registration_status="active").count() == 2
+        assert db.query(User).count() == 2
+        assert resolver.resolve_for_event(db, actor_id="actor-one").canonical_userid == first.canonical_userid
+        db.commit()
+
+
 def test_open_userid_client_error_returns_pending_without_unbound_exc(monkeypatch):
     db = Mock()
     row = _row()
