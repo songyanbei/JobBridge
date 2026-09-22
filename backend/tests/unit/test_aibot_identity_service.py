@@ -113,17 +113,22 @@ def test_simulated_identity_preserves_existing_actor_binding(monkeypatch):
 
 def test_simulated_two_actors_register_under_real_unique_constraints(monkeypatch):
     """Exercise the real resolver and binding tables, not mocked uniqueness."""
-    from sqlalchemy import create_engine
-    from sqlalchemy.dialects import mysql, sqlite
-    from sqlalchemy.ext.compiler import compiles
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.dialects import sqlite
     from sqlalchemy.orm import Session
     from app.models import (
         Base, User, WecomAibotIdentity, AibotIdentityBinding,
         AibotRegistration, AibotIdentityAudit,
     )
 
-    for mysql_type in (mysql.TINYINT, mysql.SMALLINT, mysql.INTEGER, mysql.BIGINT, mysql.DATETIME):
-        compiles(mysql_type, "sqlite")(lambda _type, _compiler, **_kw: "INTEGER")
+    class TestTypeCompiler(sqlite.base.SQLiteTypeCompiler):
+        def visit_TINYINT(self, type_, **kwargs):
+            return "INTEGER"
+
+        visit_SMALLINT = visit_TINYINT
+        visit_INTEGER = visit_TINYINT
+        visit_BIGINT = visit_TINYINT
+        visit_DATETIME = visit_TINYINT
 
     class TestDDLCompiler(sqlite.base.SQLiteDDLCompiler):
         def get_column_specification(self, column, **kwargs):
@@ -132,7 +137,9 @@ def test_simulated_two_actors_register_under_real_unique_constraints(monkeypatch
             )
 
     engine = create_engine("sqlite:///:memory:")
+    engine.dialect.type_compiler_instance = TestTypeCompiler(engine.dialect)
     engine.dialect.ddl_compiler = TestDDLCompiler
+    event.listen(engine, "connect", lambda connection, _: connection.execute("PRAGMA foreign_keys=ON"))
     Base.metadata.create_all(engine, tables=[
         User.__table__, WecomAibotIdentity.__table__,
         AibotIdentityBinding.__table__, AibotRegistration.__table__,
