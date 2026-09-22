@@ -536,6 +536,7 @@ class Worker:
                     # otherwise be lost forever.
                     and_(
                         WecomInboundEvent.status == "failed",
+                        WecomInboundEvent.retry_count <= MAX_RETRY,
                         or_(
                             WecomInboundEvent.worker_finished_at.is_(None),
                             WecomInboundEvent.worker_finished_at <= processing_before,
@@ -740,8 +741,14 @@ class Worker:
         try:
             query = db.query(WecomInboundEvent.id).filter(
                 WecomInboundEvent.id < int(inbound_event_id),
-                WecomInboundEvent.status.in_(
-                    ("received", "processing", "session_pending", "failed"),
+                or_(
+                    WecomInboundEvent.status.in_(
+                        ("received", "processing", "session_pending"),
+                    ),
+                    and_(
+                        WecomInboundEvent.status == "failed",
+                        WecomInboundEvent.retry_count <= MAX_RETRY,
+                    ),
                 ),
             )
             if ordering_key and ordering_key != userid:
@@ -840,16 +847,27 @@ class Worker:
                 except Exception:
                     db.rollback()
                     logger.exception("worker: AIBot identity resolution failed")
-                    self._mark_event_fail(inbound_event_id, "failed", "identity_resolution_failed", retry_count + 1)
+                    self._handle_error(
+                        msg_data, inbound_event_id, retry_count,
+                        RuntimeError("identity_resolution_failed"),
+                        send_fallback=False,
+                    )
                     return "identity_resolution_failed"
                 if not resolved.verified:
-                    status = "failed" if resolved.status == "conversion_pending" else "dead_letter"
-                    self._mark_event_fail(
-                        inbound_event_id, status,
-                        f"identity_{resolved.reason_code or resolved.status}",
-                        retry_count + 1,
+                    # Persist the resolver's audit/pending state before the
+                    # retry helper opens its own session to update the event.
+                    db.commit()
+                    reason = f"identity_{resolved.reason_code or resolved.status}"
+                    if resolved.status == "conversion_pending":
+                        self._handle_error(
+                            msg_data, inbound_event_id, retry_count,
+                            RuntimeError(reason), send_fallback=False,
+                        )
+                        return "identity_pending" if retry_count < MAX_RETRY else "identity_dead_letter"
+                    self._mark_aibot_identity_dead_letter(
+                        inbound_event_id, reason, retry_count + 1,
                     )
-                    return "identity_pending" if status == "failed" else "identity_rejected"
+                    return "identity_rejected"
                 # From this point onward every business service sees only the
                 # verified canonical userid.  Group ordering remains chat-id
                 # based, while permissions/audit use this member userid.
@@ -3365,6 +3383,40 @@ class Worker:
         finally:
             db.close()
 
+    def _mark_aibot_identity_dead_letter(
+        self, event_id: Any, error_msg: str, retry_count: int,
+    ) -> None:
+        """Terminalize an identity failure and stage its AIBot reply atomically."""
+        if not event_id:
+            return
+        db = SessionLocal()
+        try:
+            row = db.query(WecomInboundEvent).filter(
+                WecomInboundEvent.id == int(event_id),
+            ).with_for_update().first()
+            if row is None or row.status in ("done", "dead_letter"):
+                db.rollback()
+                return
+            if row.provider_req_id and row.from_userid:
+                existing_reply = db.query(WecomOutboundOutbox.id).filter(
+                    WecomOutboundOutbox.inbound_event_id == int(event_id),
+                    WecomOutboundOutbox.reply_index == 0,
+                ).first()
+                if existing_reply is None:
+                    self._stage_outbox(db, event_id, [
+                        ReplyMessage(userid=row.from_userid, content=DEAD_LETTER_REPLY),
+                    ])
+            row.status = "dead_letter"
+            row.error_message = error_msg[:1000]
+            row.retry_count = retry_count
+            row.worker_finished_at = func.now(6)
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("worker: AIBot identity dead-letter failed id=%s", event_id)
+        finally:
+            db.close()
+
     def _update_retry_and_error_keep_processing(
         self, event_id: Any, retry_count: int, error_msg: str,
     ) -> None:
@@ -3544,6 +3596,8 @@ class Worker:
         event_id: Any,
         retry_count: int,
         error: Exception,
+        *,
+        send_fallback: bool = True,
     ) -> None:
         error_text = f"{type(error).__name__}: {error}"
         new_retry = retry_count + 1
@@ -3580,13 +3634,17 @@ class Worker:
             # 死信入队失败仍应落库 dead_letter，Worker 不再自动恢复
             # （运营侧从 status=dead_letter + error_message 介入）
             logger.exception("worker: push to dead_letter failed")
-        self._mark_event_fail(event_id, "dead_letter", error_text, new_retry)
+        if send_fallback:
+            self._mark_event_fail(event_id, "dead_letter", error_text, new_retry)
+        else:
+            self._mark_aibot_identity_dead_letter(event_id, error_text, new_retry)
 
         # 兜底回复
-        try:
-            self._wecom_client.send_text(msg_data.get("from_userid", ""), DEAD_LETTER_REPLY)
-        except Exception:
-            logger.warning("worker: dead-letter fallback reply failed", exc_info=True)
+        if send_fallback:
+            try:
+                self._wecom_client.send_text(msg_data.get("from_userid", ""), DEAD_LETTER_REPLY)
+            except Exception:
+                logger.warning("worker: dead-letter fallback reply failed", exc_info=True)
 
 
 # ===========================================================================
